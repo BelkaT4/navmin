@@ -1,0 +1,64 @@
+site_name: NavMin
+
+theme:
+  name: material
+  language: ru
+  features:
+    - content.code.copy        # копируемые блоки кода
+    - navigation.tabs          # вкладки для основных разделов
+    - navigation.sections      # раскрывающиеся секции в боковом меню
+    - navigation.top           # кнопка "наверх"
+    - search.suggest           # подсказки при поиске
+    - search.highlight         # подсветка результатов
+
+plugins:
+  - search
+  - autorefs          # автоматические ссылки на заголовки
+  - git-revision-date-localized:
+      type: date
+      fallback_to_build_date: true
+  - minify:
+      minify_html: true
+      minify_js: false   # чтобы избежать багов
+      minify_css: false  # Material сам минифицирует CSS
+
+markdown_extensions:
+  - admonition
+  - pymdownx.details
+  - pymdownx.superfences
+  - pymdownx.highlight
+  - pymdownx.snippets
+  - pymdownx.tabbed:
+      alternate_style: true
+  - tables
+  - toc:
+      permalink: true
+
+nav:
+  - Главная: index.md
+
+  - Для пользователей:
+    - Обзор: user/index.md
+    - Быстрый старт (основы управления): user/quick-start.md
+    - Дополнительные функции: user/features.md
+    - Калибровки: user/calibration.md
+    - Устранение неисправностей: user/troubleshooting.md
+
+  - Для разработчиков:
+    - Обзор: dev/index.md
+    - Как начать работать над проектом: dev/getting-started.md
+    - Архитектура и протоколы:
+      - Общая схема системы: dev/architecture/overview.md
+      - Известные проблемы и ограничения: dev/architecture/problems.md
+      - Протокол связи с контроллером: dev/architecture/serial-protocol.md
+    - Внутренние модули:
+      - Ядро (core): dev/modules/core/index.md
+      - Графический интерфейс (gui): dev/modules/gui/index.md
+      - Управление турелью: dev/modules/turret/index.md
+      - Система обнаружения: dev/modules/vision/index.md
+    - Другие руководства и шаблоны:
+      - Работа с Git и GitHub: dev/how-to/git/index.md
+      - Типы диаграмм: dev/how-to/diagram-types.md
+      - Шаблоны (PR, задачи и др.): dev/how-to/templates.md
+
+  - API-справочник: api/index.md

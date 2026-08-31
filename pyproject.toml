@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "NavMin"
+version = "0.1.0"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "pyserial>=3.5",
+    "opencv-python>=4.8",
+    "PyQt6>=6.5",
+]
+
+[project.optional-dependencies]
+dev = [
+    "ruff>=0.1.0",
+    "pytest>=7.0",
+]
+docs = [
+    "mkdocs>=1.5",
+    "mkdocs-material>=9.0",
+    "mkdocs-autorefs>=1.0",
+    "mkdocs-git-revision-date-localized-plugin>=1.0",
+    "mkdocs-minify-plugin>=0.8",
+    "pymdown-extensions>=10.0",
+]
+
+[tool.ruff]
+# Можно оставить пустым
+
+[tool.pytest.ini_options]
+minversion = "7.0"
+addopts = "-ra -q"
+testpaths = ["tests"]
