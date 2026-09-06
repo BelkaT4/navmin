@@ -1,0 +1,23 @@
+flowchart TB
+  flag_core_in>"IN: состояние системы<br>от Core"]
+  flag_core_out>"OUT: действия пользователя<br>в Core"]
+  flag_frame_in>"IN: latest frame<br>от Camera Manager"]
+  flag_config_in>"IN: UI settings<br>от Config Manager"]
+  subgraph ui ["UI / PyQt6"]
+    settings_window["Settings Window<br>Basic / Advanced"]
+    frame_timer["QTimer<br>≈ 60 Гц"]
+    subgraph main_window ["Main Window"]
+      top_bar["Top Bar"]
+      camera_viewer["Camera Viewer"]
+      bottom_bar["Bottom Bar"]
+    end
+  end
+
+  top_bar -->|"открыть"| settings_window
+  flag_core_in --> main_window
+  main_window --> flag_core_out
+  flag_config_in -.-> settings_window
+  frame_timer -->|"обновить отображение"| camera_viewer
+  flag_frame_in -->|"latest frame"| camera_viewer
+%% graph:positions {"ui":{"x":232,"y":630,"w":575,"h":346},"main_window":{"x":332,"y":30,"w":216,"h":290},"flag_core_in":{"x":504,"y":1092},"flag_core_out":{"x":684,"y":1092},"flag_frame_in":{"x":588,"y":504},"flag_config_in":{"x":300,"y":1092},"settings_window":{"x":68,"y":238},"frame_timer":{"x":20,"y":72},"top_bar":{"x":24,"y":130},"camera_viewer":{"x":24,"y":42},"bottom_bar":{"x":24,"y":208}}
+%% graph:edges {"flag_frame_in>camera_viewer":{"label":[1,-37]}}

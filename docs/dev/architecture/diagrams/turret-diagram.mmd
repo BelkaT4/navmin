@@ -1,0 +1,27 @@
+flowchart TB
+  flag_core_commands>"IN: turret commands<br>от Core"]
+  flag_core_status>"OUT: turret status<br>+ status_queue_ready<br>в Core"]
+  flag_config_in>"IN: Turret settings<br>от Config Manager"]
+  flag_heartbeat_out>"OUT: heartbeat<br>в Supervisor"]
+  stm32["STM32"]
+  subgraph turret ["Turret"]
+    command_queue[["command_queue<br>FIFO"]]
+    publish_status["Публикация статуса<br>данные + Qt notification"]
+    subgraph turret_thread ["Поток управления турелью"]
+      turret_controller["Turret Controller"]
+      turret_hal["Turret HAL"]
+    end
+  end
+
+  turret_controller <-->|"команды / ответы / состояние"| turret_hal
+  flag_core_commands --> command_queue
+  command_queue --> turret_controller
+  turret_controller -->|"состояние / ошибки"| publish_status
+  publish_status --> flag_core_status
+  flag_config_in -.->|"turret settings"| turret_controller
+  flag_config_in -.->|"UART settings"| turret_hal
+  turret_hal <-->|"Serial bus / UART"| stm32
+  turret_controller -.-> flag_heartbeat_out
+%% graph:positions {"turret":{"x":11,"y":189,"w":518,"h":542},"turret_thread":{"x":135,"y":71,"w":355,"h":364},"flag_core_commands":{"x":146,"y":828},"flag_core_status":{"x":336,"y":828},"flag_config_in":{"x":-228,"y":390},"flag_heartbeat_out":{"x":564,"y":468},"stm32":{"x":240,"y":60},"command_queue":{"x":135,"y":459},"publish_status":{"x":325,"y":459},"turret_controller":{"x":94,"y":208},"turret_hal":{"x":94,"y":76}}
+%% graph:edges {"turret_controller>publish_status":{"label":[81,1]},"flag_config_in>turret_controller":{"label":[93,40]},"flag_config_in>turret_hal":{"label":[94,-64]}}
+%% graph:waypoints {"flag_config_in>turret_controller":[[-6,418]],"flag_config_in>turret_hal":[[-6,427]]}
