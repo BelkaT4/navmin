@@ -25,7 +25,10 @@ plugins:
 markdown_extensions:
   - admonition
   - pymdownx.details
-  - pymdownx.superfences
+  - pymdownx.superfences:
+      custom_fences:
+        - name: mermaid
+          class: mermaid
   - pymdownx.highlight
   - pymdownx.snippets
   - pymdownx.tabbed:
@@ -39,26 +42,36 @@ nav:
 
   - Для пользователей:
     - Обзор: user/index.md
-    - Быстрый старт (основы управления): user/quick-start.md
+    - Быстрый старт: user/quick-start.md
     - Дополнительные функции: user/features.md
-    - Калибровки: user/calibration.md
+    - Калибровка: user/calibration.md
     - Устранение неисправностей: user/troubleshooting.md
 
   - Для разработчиков:
     - Обзор: dev/index.md
-    - Как начать работать над проектом: dev/getting-started.md
+    - Начало работы: dev/getting-started.md
+
     - Архитектура и протоколы:
-      - Общая схема системы: dev/architecture/overview.md
-      - Известные проблемы и ограничения: dev/architecture/problems.md
-      - Протокол связи с контроллером: dev/architecture/serial-protocol.md
+      - Общая архитектура: dev/architecture/overview.md
+      - Уточнения архитектуры: dev/architecture/architecture-updates.md
+      - Открытые вопросы: dev/architecture/problems.md
+      - Конфигурация: dev/architecture/configuration.md
+      - Протокол STM32: dev/architecture/serial-protocol.md
+
     - Внутренние модули:
-      - Ядро (core): dev/modules/core/index.md
-      - Графический интерфейс (gui): dev/modules/gui/index.md
-      - Управление турелью: dev/modules/turret/index.md
-      - Система обнаружения: dev/modules/vision/index.md
+      - Core: dev/modules/core/index.md
+      - Vision: dev/modules/vision/index.md
+      - Turret: dev/modules/turret/index.md
+      - UI: dev/modules/ui/index.md
+
     - Другие руководства и шаблоны:
-      - Работа с Git и GitHub: dev/how-to/git/index.md
+      - Работа с Git и GitHub:
+        - Обзор: dev/how-to/git/index.md
+        - Начало работы: dev/how-to/git/getting-started.md
+        - Командная работа: dev/how-to/git/team-workflow.md
+        - Учебный план: dev/how-to/git/learning-plan.md
+        - Шпаргалка по командам: dev/how-to/git/cheat-sheet.md
       - Типы диаграмм: dev/how-to/diagram-types.md
-      - Шаблоны (PR, задачи и др.): dev/how-to/templates.md
+      - Шаблоны: dev/how-to/templates.md
 
   - API-справочник: api/index.md

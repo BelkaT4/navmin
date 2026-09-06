@@ -1,0 +1,48 @@
+flowchart TB
+  flag_vision_objects>"IN: detected objects<br>+ object_queue_ready<br>от Vision"]
+  flag_vision_target>"OUT: active_target_id<br>в Vision"]
+  flag_turret_commands>"OUT: turret commands<br>в Turret"]
+  flag_turret_status>"IN: turret status<br>+ status_queue_ready<br>от Turret"]
+  flag_ui_in>"IN: UI actions<br>от UI"]
+  flag_ui_out>"OUT: UI updates<br>в UI"]
+  flag_config_vision>"OUT: config updates<br>в Vision"]
+  flag_config_turret>"OUT: config updates<br>в Turret"]
+  flag_config_ui>"OUT: config updates<br>в UI"]
+  flag_heartbeat_vision>"IN: Vision health / heartbeat<br>от Vision"]
+  flag_heartbeat_turret>"IN: heartbeat<br>от Turret"]
+  config_file[("config.json")]
+  subgraph core ["Core / Mediator"]
+    mediator["Mediator<br>маршрутизация сообщений"]
+    active_target["active_target_id"]
+    object_queue[["object_queue<br>latest only"]]
+    status_queue[["status_queue<br>FIFO"]]
+    object_ready["Qt signal<br>object_queue_ready"]
+    status_ready["Qt signal<br>status_queue_ready"]
+    config_manager["Config Manager"]
+    supervisor["Supervisor<br>(опционально)"]
+  end
+
+  flag_vision_objects --> object_queue
+  flag_vision_objects -.-> object_ready
+  object_queue -->|"прочитать latest"| mediator
+  object_ready -->|"уведомить"| mediator
+  flag_ui_in --> mediator
+  mediator --> flag_ui_out
+  mediator --> active_target
+  active_target --> flag_vision_target
+  mediator --> flag_turret_commands
+  flag_turret_status --> status_queue
+  flag_turret_status -.-> status_ready
+  status_queue -->|"прочитать FIFO"| mediator
+  status_ready -->|"уведомить"| mediator
+  config_file <-->|"загрузка / сохранение"| config_manager
+  mediator -->|"изменение настроек"| config_manager
+  config_manager -.-> flag_config_vision
+  config_manager -.-> flag_config_turret
+  config_manager -.-> flag_config_ui
+  flag_heartbeat_vision -.-> supervisor
+  flag_heartbeat_turret -.-> supervisor
+  supervisor -.->|"ошибка / предупреждение"| mediator
+%% graph:positions {"core":{"x":380,"y":292,"w":1049,"h":588},"flag_vision_objects":{"x":120,"y":565},"flag_vision_target":{"x":120,"y":720},"flag_turret_commands":{"x":1488,"y":558},"flag_turret_status":{"x":1488,"y":666},"flag_ui_in":{"x":756,"y":942},"flag_ui_out":{"x":936,"y":942},"flag_config_vision":{"x":1476,"y":312},"flag_config_turret":{"x":1476,"y":384},"flag_config_ui":{"x":1476,"y":240},"flag_heartbeat_vision":{"x":648,"y":60},"flag_heartbeat_turret":{"x":828,"y":60},"config_file":{"x":1104,"y":114},"mediator":{"x":460,"y":350},"active_target":{"x":124,"y":428},"object_queue":{"x":124,"y":236},"status_queue":{"x":856,"y":428},"object_ready":{"x":124,"y":320},"status_ready":{"x":856,"y":320},"config_manager":{"x":592,"y":20},"supervisor":{"x":328,"y":20}}
+%% graph:edges {"object_queue>mediator":{"label":[-73,-105]},"object_ready>mediator":{"label":[-63,-49]},"status_queue>mediator":{"label":[58,41]},"status_ready>mediator":{"label":[60,-36]},"config_file>config_manager":{"label":[-61,26]},"mediator>config_manager":{"label":[67,-71]},"supervisor>mediator":{"label":[-142,-64]}}
+%% graph:waypoints {"object_queue>mediator":[[801,555]],"object_ready>mediator":[[787,687]],"mediator>active_target":[[807,651]],"mediator>flag_turret_commands":[[1038,696]]}

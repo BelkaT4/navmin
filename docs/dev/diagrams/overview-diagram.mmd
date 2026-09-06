@@ -1,0 +1,29 @@
+flowchart TB
+
+cameras["Камеры x3<br/>(Raspberry Pi)"]
+stm32["STM32"]
+config_file[("config.json")]
+
+subgraph vision["Vision"]
+    vision_module["Получение и обработка видео"]
+end
+
+subgraph main_thread["Главный поток приложения"]
+    direction TB
+    ui["UI<br/>(PyQt6)"]
+    core["Core / Mediator"]
+end
+
+subgraph turret["Turret"]
+    turret_module["Управление турелью"]
+end
+
+cameras -->|"UDP MJPEG (RTP опционально)"| vision_module
+vision_module <-->|"обнаруженные объекты / выбранная цель"| core
+vision_module -->|"актуальный кадр для отображения"| ui
+ui <-->|"команды пользователя / состояние системы"| core
+core <-->|"команды / состояние"| turret_module
+turret_module <-->|"Serial bus / UART"| stm32
+config_file <-->|"загрузка / сохранение настроек"| core
+%% graph:positions {"vision":{"x":-360,"y":414,"w":192,"h":122},"main_thread":{"x":103,"y":283,"w":304,"h":254},"turret":{"x":564,"y":414,"w":192,"h":122},"cameras":{"x":-344,"y":264},"stm32":{"x":580,"y":264},"config_file":{"x":183,"y":624},"vision_module":{"x":16,"y":41},"ui":{"x":80,"y":53},"core":{"x":80,"y":172},"turret_module":{"x":16,"y":40}}
+%% graph:edges {"cameras>vision_module":{"label":[1,-23]},"vision_module>core":{"label":[-25,26]},"vision_module>ui":{"label":[-1,-126]},"core>turret_module":{"label":[22,1]},"config_file>core":{"label":[0,16]}}

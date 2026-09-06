@@ -8,7 +8,7 @@
 - `mkdocs build` - Собрать сайт с документацией (файл /site/index.html)
 
 ## Быстрые ссылки
-- [Разработчикам: как начать работать над проектом](./dev/getting%20started.md)
-- [Общая архитектура](./dev/global-architecture.md)
-- [Руководство пользователя](./user%20manual/getting%20started.md)
+- [Разработчикам: как начать работать над проектом](./dev/getting-started.md)
+- [Общая архитектура](./dev/architecture/overview.md)
+- [Руководство пользователя](./user/index.md)
 

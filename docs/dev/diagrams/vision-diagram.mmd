@@ -1,0 +1,60 @@
+flowchart TB
+  cam1["Camera 1"]
+  cam2["Camera 2"]
+  cam3["Camera 3"]
+  flag_core_in>"IN: active_target_id<br>от Core"]
+  flag_core_out>"OUT: detected objects<br>+ object_queue_ready<br>в Core"]
+  flag_ui_out>"OUT: latest frame<br>в UI"]
+  flag_config_in>"IN: Vision settings<br>от Config Manager"]
+  flag_heartbeat_out>"OUT: Vision health / heartbeat<br>в Supervisor"]
+  subgraph vision ["Vision"]
+    frame_queue[["frame_queue<br>кадр / синхропара<br>latest only"]]
+    vision_command_queue[["vision_command_queue<br>active_target_id"]]
+    vision_config["Vision settings<br>камеры / Detector / Tracker / Distance Provider"]
+    vision_health["Vision health / heartbeat"]
+    subgraph capture ["Захват видео"]
+      cc1["CameraController #1"]
+      cc2["CameraController #2"]
+      cc3["CameraController #3"]
+      camera_manager["Camera Manager<br>latest_frame / frame_id / timestamp / state"]
+    end
+    subgraph vision_thread ["Vision Pipeline<br>отдельный поток"]
+      detector["Detector"]
+      tracker["Tracker"]
+      target_selector["Поиск active_target_id<br>среди DetectedObject"]
+      publish_result["Публикация результата<br>данные + Qt notification"]
+      subgraph distance_provider ["Distance Provider"]
+        distance_switch["Выбор источника дальности"]
+        stereo_distance["Stereo Distance"]
+        manual_distance["Manual Distance"]
+        distance_result["distance + distance_source"]
+      end
+    end
+  end
+
+  distance_switch --> stereo_distance
+  distance_switch --> manual_distance
+  stereo_distance --> distance_result
+  manual_distance --> distance_result
+  detector -->|"list[Detection]"| tracker
+  tracker -->|"list[DetectedObject]"| target_selector
+  target_selector -->|"выбранная цель"| distance_switch
+  distance_result --> publish_result
+  cam1 -->|"UDP MJPEG / RTP опционально"| cc1
+  cam2 -->|"UDP MJPEG / RTP опционально"| cc2
+  cam3 -->|"UDP MJPEG / RTP опционально"| cc3
+  cc1 -->|"latest frame"| camera_manager
+  cc2 -->|"latest frame"| camera_manager
+  cc3 -->|"latest frame"| camera_manager
+  camera_manager --> frame_queue
+  frame_queue -->|"рабочий кадр"| detector
+  frame_queue -.->|"синхропара"| stereo_distance
+  flag_core_in --> vision_command_queue
+  vision_command_queue --> target_selector
+  flag_config_in -.-> vision_config
+  publish_result --> flag_core_out
+  camera_manager --> flag_ui_out
+  vision_health -.-> flag_heartbeat_out
+%% graph:positions {"vision":{"x":-449,"y":-183,"w":1113,"h":1496},"capture":{"x":215,"y":75,"w":648,"h":250},"vision_thread":{"x":215,"y":507,"w":596,"h":956},"distance_provider":{"x":32,"y":512,"w":528,"h":270},"cam1":{"x":-202,"y":-300},"cam2":{"x":10,"y":-300},"cam3":{"x":222,"y":-300},"flag_core_in":{"x":-696,"y":696},"flag_core_out":{"x":708,"y":1176},"flag_ui_out":{"x":708,"y":60},"flag_config_in":{"x":-696,"y":204},"flag_heartbeat_out":{"x":708,"y":-108},"frame_queue":{"x":459,"y":387},"vision_command_queue":{"x":29,"y":879},"vision_config":{"x":29,"y":376,"w":172,"h":76},"vision_health":{"x":929,"y":75},"cc1":{"x":32,"y":48},"cc2":{"x":244,"y":48},"cc3":{"x":456,"y":48},"camera_manager":{"x":244,"y":156},"detector":{"x":208,"y":120},"tracker":{"x":208,"y":264},"target_selector":{"x":208,"y":372},"publish_result":{"x":196,"y":852,"w":184,"h":54},"distance_switch":{"x":176,"y":16},"stereo_distance":{"x":322,"y":108},"manual_distance":{"x":27,"y":108},"distance_result":{"x":176,"y":192}}
+%% graph:edges {"target_selector>distance_switch":{"label":[0,-15]},"frame_queue>detector":{"label":[-19,42]},"frame_queue>stereo_distance":{"label":[100,47]}}
+%% graph:waypoints {"frame_queue>stereo_distance":[[99,348]]}
