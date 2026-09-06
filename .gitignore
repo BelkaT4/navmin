@@ -17,3 +17,5 @@ site/
 .ruff_cache/
 
 logs/
+
+*.zip
