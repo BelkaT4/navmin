@@ -115,8 +115,8 @@ Normal test run не должен требовать hardware.
 | Этап | Статус | Основной результат | Зависит от |
 |---|---|---|---|
 | 1. Foundation | done | package/test skeleton, contracts, runtime primitives | — |
-| 2. Config + Calibration foundation | not-started | typed config, persistence, calibration loading/model boundary | 1 |
-| 3. Turret PC stack | not-started | PC protocol/transport/controller/HAL + simulator | 1, 2 |
+| 2. Config + Calibration foundation | done | typed config, persistence, calibration loading/model boundary | 1 |
+| 3. Turret PC stack | in-progress | PC protocol/transport/controller/HAL + simulator | 1, 2 |
 | 4. STM32 firmware + RS485 | not-started | firmware protocol/control + real link validation | 3 |
 | 5. Vision | not-started | camera pipelines, generations, working frame, manual distance | 1, 2 |
 | 6. Core + Aiming | not-started | mediator/state transitions/aiming/tracking error | 2, 3, 5 |
@@ -266,7 +266,7 @@ Qt notification coalescing (#5) остаётся до UI-этапа.
 
 ## 8. Этап 3 — Turret PC stack
 
-**Статус:** `not-started`
+**Статус:** `in-progress`
 
 ### Цель
 
