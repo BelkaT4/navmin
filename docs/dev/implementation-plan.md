@@ -114,7 +114,7 @@ Normal test run не должен требовать hardware.
 
 | Этап | Статус | Основной результат | Зависит от |
 |---|---|---|---|
-| 1. Foundation | not-started | package/test skeleton, contracts, runtime primitives | — |
+| 1. Foundation | done | package/test skeleton, contracts, runtime primitives | — |
 | 2. Config + Calibration foundation | not-started | typed config, persistence, calibration loading/model boundary | 1 |
 | 3. Turret PC stack | not-started | PC protocol/transport/controller/HAL + simulator | 1, 2 |
 | 4. STM32 firmware + RS485 | not-started | firmware protocol/control + real link validation | 3 |
@@ -129,7 +129,7 @@ Normal test run не должен требовать hardware.
 
 ## 6. Этап 1 — Foundation
 
-**Статус:** `not-started`
+**Статус:** `done`
 
 ### Цель
 
@@ -212,7 +212,7 @@ Qt notification coalescing (#5) остаётся до UI-этапа.
 - `docs/dev/modules/core/aiming.md`
 - `docs/dev/modules/vision/index.md`
 - `docs/dev/modules/turret/index.md`
-- релевантные пункты `problems.md` #7 и #12
+- релевантный пункт `problems.md` #7; базовая v1 persistence/schema policy уже закрыта в `configuration.md`
 
 ### Реализовать
 
@@ -228,14 +228,21 @@ Qt notification coalescing (#5) остаётся до UI-этапа.
 - immutable `CameraModel`/calibration data boundary, достаточный для Aiming/Vision;
 - validation errors, пригодные для UI/logging без generic event bus.
 
-### Decision checkpoint до кодирования соответствующей ветки
+### Закрытый decision checkpoint перед Stage 2
 
-В управляющем чате нужно закрыть текущую v1-часть `problems.md` #12:
+До начала реализации зафиксирована v1-policy:
 
-- поведение при полностью отсутствующем `config.json`;
-- поведение при неподдерживаемом `schema-version`.
+- полностью отсутствующий `config.json` — startup/config error; файл автоматически не создаётся;
+- malformed/corrupted JSON — startup/config error; исходный файл не изменяется;
+- отсутствующий/неверного типа `schema-version` — invalid config;
+- `schema-version != 1` — unsupported schema error без автоматической migration;
+- неизвестные поля — validation error;
+- отсутствующие required fields — validation error;
+- optional fields получают только явно документированные in-memory defaults;
+- invalid type/range/non-finite number — validation error без silent fallback;
+- невалидный runtime update не заменяет последний валидный snapshot и не записывается как частично применённая конфигурация.
 
-Это user-visible startup/persistence semantics, поэтому рабочий чат не должен выбирать её молча. Автоматический migration mechanism `v1 -> v2` в Stage 2 не проектируется: он deferred до появления реальной schema v2.
+Автоматический migration mechanism проектируется только после появления реальной schema v2. Базовая схема required/optional и validation rules закреплены в `configuration.md`; рабочий чат Stage 2 их реализует, а не выбирает заново.
 
 ### Тестовый фокус
 
@@ -770,7 +777,6 @@ Hardware tests остаются отдельным suite.
 | #1 RS485 half-duplex | 4 |
 | #2 capture_id / stereo pairing | deferred |
 | #3 DistanceResult stereo lifecycle | deferred / 5 только manual path |
-| #4 latest-state primitives | 1 |
 | #5 Qt coalescing | 7 |
 | #6 processor-specific config | 5 |
 | #7 runtime config edge cases | 2 только config infrastructure; 3 PID runtime checkpoint; 5 processor policy; 6 target-loss-timeout checkpoint |
@@ -778,7 +784,6 @@ Hardware tests остаются отдельным suite.
 | #9 UART reconnect | 3, hardware validation 4 |
 | #10 worker lifecycle | 1 foundation + owner stages + 8 final |
 | #11 partial failures | 7 + 8 |
-| #12 missing config / migrations | 2: missing config + unsupported schema behavior; automatic v1→v2 migration deferred до появления v2 |
 | #13 logging | 1 foundation + owner stages + 8 final |
 | #14 future STM32 events | deferred |
 | #15 tracking timing budget | 8 после измерений |

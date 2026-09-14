@@ -42,29 +42,6 @@ Generation уже не позволяет смешивать разные camera
 
 ## Во время первой реализации
 
-### 4. Concrete latest-state / thread-safe primitives
-
-Логическая семантика уже определена:
-
-```text
-VisionResult        latest-only per camera
-DistanceResult      latest-only / invalidatable
-TrackingError       latest-only + monotonic revision
-TurretState          latest-only
-CameraStatus         latest-only per camera
-ConfigUpdate         latest-only
-CameraSessionStarted ordered/barrier
-pending_motion       one latest unsent motion intent
-```
-
-Нужно выбрать concrete primitives:
-
-- one-slot/latest store;
-- lock/atomic reference;
-- notification mechanism;
-- `clear()/invalidate()`;
-- revision handling `TrackingError`;
-- barrier order `CameraSessionStarted → data generation=N` для Core и UI.
 
 ### 5. Qt notification coalescing
 
@@ -142,13 +119,12 @@ Auto `MOTOR_ON` отсутствует. Отдельная transport-reset comma
 
 ### 10. Worker lifecycle
 
-Нужно определить concrete lifecycle:
+Foundation уже определил общий cooperative `StopToken` и минимальную `request_stop() / join() / is_alive()` boundary. Остаются owner/integration details:
 
-- кто создаёт workers;
-- stop token/event;
-- прерывание GStreamer/UART wait;
-- join timeout;
-- worker, который не завершился штатно;
+- кто создаёт concrete workers;
+- как owner прерывает blocking GStreamer/UART wait;
+- конкретные join timeout;
+- policy для worker, который не завершился штатно;
 - детали startup/shutdown orchestration.
 
 Reconnect/recovery принадлежит owner-модулям; отдельный orchestration component без concrete v1 responsibility не вводится.
@@ -166,31 +142,16 @@ Reconnect/recovery принадлежит owner-модулям; отдельны
 
 `main_camera` автоматически на другую камеру не переключается.
 
-### 12. `config.json`: отсутствующий файл и future migrations
-
-Уже принято:
-
-```text
-schema-version = 1
-atomic save via temporary file + replace
-corrupted existing JSON не перезаписывается молча
-```
-
-Остаётся определить:
-
-- полностью отсутствующий config: defaults или startup error;
-- migration mechanism после schema v1;
-- UX reporting invalid field/range.
 
 ### 13. Logging
 
-Runtime state передаётся typed contracts, transient diagnostics — logging. Generic event-bus infrastructure заранее не вводится.
+Foundation уже имеет единый idempotent bootstrap стандартного Python logging для `navmin` logger tree. Runtime state передаётся typed contracts, transient diagnostics — logging; generic event bus не вводится.
 
-Нужно определить:
+Остаются детали, которые нужно решать только при реальной потребности owner/integration stages:
 
-- обычный logging vs QueueHandler/QueueListener;
+- нужен ли `QueueHandler/QueueListener` после profiling/concurrency integration;
 - rotation / file limits;
-- levels;
+- production levels/config source;
 - как UI показывает последние важные ошибки без превращения logging в machine-readable state.
 
 ### 14. Будущие STM32 hardware events

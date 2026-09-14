@@ -28,7 +28,39 @@ write temporary file
 
 Повреждённый существующий JSON не должен молча перезаписываться defaults: Config Manager сообщает startup/config error и сохраняет исходный файл для диагностики.
 
-Поведение при полностью отсутствующем `config.json` допускается определить при реализации Config Manager (создание defaults либо явная startup error).
+Полностью отсутствующий `config.json` — startup/config error. Config Manager не создаёт файл автоматически и не запускает normal runtime на неявных defaults.
+
+### Строгая validation policy v1
+
+`config.json` schema v1 валидируется строго и атомарно до публикации typed snapshots.
+
+```text
+parse JSON
+→ schema-version check
+→ required/unknown-field check
+→ type/value validation
+→ cross-field validation
+→ typed immutable snapshot
+→ publish
+```
+
+Правила:
+
+- `schema-version` обязателен, имеет тип integer (не `bool`) и в v1 равен ровно `1`;
+- отсутствующий или неверного типа `schema-version` — invalid config;
+- любое другое значение `schema-version` — unsupported schema error;
+- автоматической migration для неизвестной schema нет; migration проектируется только после появления реальной schema v2;
+- неизвестное поле на любом уровне schema — validation error, а не warning/ignore;
+- все поля v1 обязательны, кроме тех, которые ниже явно отмечены optional;
+- отсутствующий required field — validation error;
+- optional field получает только документированный in-memory default; Config Manager не дописывает его в файл только из-за загрузки;
+- неверный тип, значение вне допустимой области, `NaN`, `+Inf` или `-Inf` — validation error;
+- `bool` не принимается как integer/number;
+- invalid config не исправляется молча и не заменяется defaults;
+- ошибка по возможности содержит точный path поля и причину;
+- при invalid runtime update остаётся активным последний полностью валидный snapshot; partial apply/publication запрещены.
+
+После того как schema v1 реализована и считается опубликованной, добавление/удаление/переименование persisted fields требует нового `schema-version`, если старый v1 parser не сможет строго принять новый файл.
 
 ## Calibration отдельно от `config.json`
 
@@ -40,9 +72,40 @@ calibration/
   stereo.json
 ```
 
-Calibration содержит measured camera/stereo geometry и собственный `schema_version`.
+Calibration содержит measured camera/stereo geometry и собственный `schema_version`. Для первой реализации `schema_version = 1`.
+
+Calibration files также валидируются строго: malformed JSON, неизвестное поле, неверный тип/shape, non-finite matrix value или несовпадение `image_width/image_height` с source resolution дают calibration error. Config Manager/Vision не исправляют и не перезаписывают calibration автоматически.
+
+Отсутствующая/невалидная calibration не обязана останавливать всё приложение, но соответствующий camera pipeline не считается ready и не публикует raw frame как fallback.
 
 `config.json` не дублирует `K/D/R/T/P/Q`.
+
+### Минимальная validation boundary calibration v1
+
+Overview `calibration/overview.json`:
+
+```text
+schema_version = 1
+image_width / image_height: integer > 0
+K: 3x3 finite matrix
+D: finite coefficient vector, non-empty
+new_camera_matrix: 3x3 finite matrix
+```
+
+Stereo `calibration/stereo.json`:
+
+```text
+schema_version = 1
+image_width / image_height: integer > 0
+K_left / K_right: 3x3 finite matrices
+D_left / D_right: finite coefficient vectors, non-empty
+R / R1 / R2: 3x3 finite matrices
+T: finite vector length 3
+P1 / P2: 3x4 finite matrices
+Q: 4x4 finite matrix
+```
+
+Точный допустимый размер distortion vectors должен соответствовать реально используемой OpenCV camera model и проверяется loader'ом Stage 2; он не должен молча truncate/pad coefficients. Maps в JSON не сохраняются.
 
 ## Структура верхнего уровня
 
@@ -54,6 +117,39 @@ config
 ├── turret
 └── ui
 ```
+
+## Required и optional fields schema v1
+
+Базовое правило v1: **все перечисленные ниже поля required**, если явно не указано обратное. Это сделано намеренно: hardware/control параметры не получают скрытых аппаратных defaults.
+
+Единственные optional fields базовой schema v1:
+
+```text
+aiming.aim-points.overview.x-px
+aiming.aim-points.overview.y-px
+aiming.aim-points.stereo-left.x-px
+aiming.aim-points.stereo-left.y-px
+```
+
+Для каждого из них отсутствие поля или JSON `null` означает center соответствующего working frame. Если значение задано, это integer `>= 0`; проверка попадания в фактическое разрешение выполняется относительно принятого `CameraModel`/working frame.
+
+Все остальные поля в описанной ниже v1-схеме, включая booleans simulation/emulation и camera processing switches, должны присутствовать явно.
+
+### Общие ограничения значений
+
+- `address`, serial `port` path и `vision-processor-class` — непустые строки;
+- UDP/TCP camera `port` — integer `1..65535`;
+- buffer sizes — integer `>= 1`;
+- timeout/delay fields — integer `> 0`, кроме `lead-time-ms >= 0` и `max-retries >= 0`;
+- `manual-distance-m` — finite number `> 0`;
+- PID `Kp/Ki/Kd` — finite number `>= 0`;
+- `full-steps-per-revolution`, `microstep-divider` — integer `> 0`;
+- `max-relative-move-deg`, max speed и acceleration — finite number `> 0`;
+- `baudrate` — только значение из зафиксированного whitelist;
+- enum-like strings принимают только явно перечисленные значения;
+- booleans принимают только JSON `true/false`.
+
+Hardware-specific upper bounds, которых пока нет в архитектуре, не придумываются Config Manager: их owner проверяет на своей границе (например STM32 проверяет свои допустимые пределы `SET_CONFIG`).
 
 ## Vision
 
@@ -75,7 +171,7 @@ address: str
 port: int
 rtp-enabled: bool
 buffer-size: int
-processing-enabled: bool          # optional per-camera master switch
+processing-enabled: bool          # per-camera master switch
 vision-processor-class: str
 ```
 
@@ -167,7 +263,7 @@ turret.serial.max-retries
 turret.serial.inter-request-delay-ms
 ```
 
-Стартовые protocol defaults:
+Рекомендованные начальные protocol values (поля остаются required в `config.json`):
 
 ```text
 STM32 startup baudrate               = 9600
@@ -318,7 +414,7 @@ Processor-specific settings классифицируются вместе со �
 
 ## Пример `config.json`
 
-Все числа ниже демонстрационные и не являются аппаратными пределами.
+Все числа ниже демонстрационные и не являются аппаратными пределами. Пример показывает полную required schema v1; optional aim-point coordinates приведены как `null` для явности.
 
 ```json
 {
@@ -436,4 +532,4 @@ UI
 
 STM32-dependent config синхронизируется Turret HAL по правилам [Turret](../modules/turret/index.md) и [Serial Protocol](./serial-protocol.md).
 
-Concrete thread-safe primitive, processor-specific schemas и часть edge-case semantics runtime changes остаются открытыми.
+Concrete foundation primitives уже реализованы. Processor-specific schemas и отдельные runtime edge cases из `problems.md` остаются owner-specific/open; базовая persistence/validation policy schema v1 закрыта.

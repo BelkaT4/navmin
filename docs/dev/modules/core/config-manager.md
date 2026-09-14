@@ -13,7 +13,18 @@ Config Manager:
 - сохраняет пользовательские изменения атомарно через temporary file + replace;
 - публикует новые immutable snapshots заинтересованным компонентам.
 
-Рабочие модули не изменяют общий `config.json` напрямую. Первая версия файла имеет `schema-version = 1`. Повреждённый существующий JSON не перезаписывается молча defaults.
+Рабочие модули не изменяют общий `config.json` напрямую. Первая версия файла имеет `schema-version = 1`.
+
+Startup/persistence policy v1 строгая:
+
+- отсутствующий `config.json` — startup/config error, файл не создаётся автоматически;
+- malformed JSON, missing/invalid `schema-version`, unknown field, missing required field, invalid type/range/non-finite value — validation error;
+- `schema-version != 1` — unsupported schema error без automatic migration;
+- только явно документированные optional fields получают in-memory defaults;
+- invalid runtime update не заменяет последний валидный snapshot и не публикуется частично;
+- загрузка/validation сама по себе не переписывает пользовательский файл.
+
+Полный required/optional contract и value constraints находятся в [Конфигурации системы](../../architecture/configuration.md).
 
 ## Типизированные снимки
 
