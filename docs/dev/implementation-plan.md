@@ -266,7 +266,7 @@ Qt notification coalescing (#5) остаётся до UI-этапа.
 
 ## 8. Этап 3 — Turret PC stack
 
-**Статус:** `in-progress`
+**Статус:** `done`
 
 ### Цель
 
@@ -445,6 +445,8 @@ Turret-specific архитектурные вопросы reconnect/backoff, wor
 ### Тестовый фокус
 
 Host-side protocol tests из этапа 3 не дублировать в firmware как копию тех же Python cases. Firmware tests должны защищать firmware parser/control implementation; hardware suite — реальный boundary и timing/fault modes.
+
+Отложенный P2 из независимого аудита Stage 3: перед firmware/hardware integration повысить fidelity `FakeStm32Endpoint` для ordinary request sequence — `expected REQUEST_ID` и exact retry cache. Это simulator hardening, а не незакрытый production blocker Stage 3.
 
 ### Критерий завершения
 
