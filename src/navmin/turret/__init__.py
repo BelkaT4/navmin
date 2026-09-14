@@ -1,4 +1,4 @@
-"""PC-side Turret protocol and transport foundation."""
+"""PC-side Turret protocol, session, and transport foundation."""
 
 from .protocol import (
     CommandCode,
@@ -15,6 +15,17 @@ from .protocol import (
     encode_request,
     encode_response,
 )
+from .session import (
+    BaudRecoveryError,
+    EmergencyRetryExhaustedError,
+    SessionBlockedError,
+    SessionBusyError,
+    SessionError,
+    SessionResult,
+    SessionRetryExhaustedError,
+    SessionTransportError,
+    TurretSession,
+)
 from .transport import (
     PhysicalTransport,
     SerialTransport,
@@ -25,13 +36,21 @@ from .transport import (
 )
 
 __all__ = [
+    "BaudRecoveryError",
     "CommandCode",
+    "EmergencyRetryExhaustedError",
     "MoveRelativePayload",
     "PhysicalTransport",
     "ProtocolRequest",
     "ProtocolResponse",
     "ResultCode",
     "SerialTransport",
+    "SessionBlockedError",
+    "SessionBusyError",
+    "SessionError",
+    "SessionResult",
+    "SessionRetryExhaustedError",
+    "SessionTransportError",
     "SetBaudratePayload",
     "SetConfigPayload",
     "SetVelocityPayload",
@@ -39,6 +58,7 @@ __all__ = [
     "TransportError",
     "TransportIOError",
     "TransportTimeoutError",
+    "TurretSession",
     "crc16_modbus",
     "decode_request",
     "decode_response",
