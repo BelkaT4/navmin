@@ -433,6 +433,64 @@ PID config остаётся dynamic и полностью принадлежит
 
 ---
 
+## 22. Turret reconnect бесконечный с capped backoff; отсутствие STM32 не является fatal `ERROR`
+
+### Решение
+
+Turret сам владеет automatic serial reconnect. Transport loss признаётся после исчерпания ordinary/Emergency retries, physical I/O/disconnect failure или неуспешного bounded baud-recovery attempt. Matching command-level error сам по себе не означает physical transport loss; `INVALID_REQUEST_ID` переводит normal traffic в Emergency-based sequence resync.
+
+Reconnect cycles не имеют конечного лимита попыток. Между ними используется interruptible capped exponential backoff `0.25 → 0.5 → 1 → 2 → 2 ... s`, который сбрасывается после полного `READY`. Обычный baud search проверяет без дубликатов `last-known → desired → 9600`; после uncertain `SET_BAUDRATE` — `new → old → 9600`.
+
+Пока owner способен продолжать reconnect, отсутствие STM32/serial device отражается как `DISCONNECTED/CONNECTING`, а не `ERROR`. `ERROR` зарезервирован для действительно невосстановимой локальной ошибки/invariant failure, при которой automatic recovery нельзя корректно продолжить.
+
+### Почему
+
+Физическое отсутствие устройства — ожидаемый recoverable condition, а не причина завершать приложение. Бесконечный reconnect делает unplug/replug штатным сценарием, а capped backoff не создаёт busy loop. Явный порядок baud candidates делает recovery детерминированным и покрывает hardware reset на 9600 и lost response после `SET_BAUDRATE`.
+
+### Отвергнутые альтернативы
+
+- **Конечное число reconnect attempts с переходом в ERROR.** Отклонено: временно отсутствующий STM32 не должен требовать restart приложения.
+- **Постоянный короткий polling без backoff.** Отклонено: создаёт лишнюю нагрузку и log spam.
+- **Случайный/неопределённый порядок baud candidates.** Отклонено: усложняет тестирование и диагностику uncertain baud transition.
+
+---
+
+## 23. Turret worker останавливается cooperative через `StopToken`; отдельный Supervisor не нужен
+
+### Решение
+
+Turret worker создаётся/останавливается application orchestration. Serial waits должны быть bounded или cancellable, reconnect/backoff ожидается через `StopToken`, а shutdown выполняет `request_stop() → bounded join() → is_alive()` check. Numeric join timeout остаётся внутренним implementation tuning и не добавляется в `config.json`. Незавершившийся после bounded join worker является явной shutdown error и логируется; успешный shutdown в таком случае не объявляется.
+
+### Почему
+
+Это использует уже существующий Foundation lifecycle contract и не создаёт второй orchestration owner. Interruptible waits гарантируют, что бесконечный auto-reconnect не мешает остановке приложения.
+
+### Отвергнутые альтернативы
+
+- **Supervisor только ради остановки/restart Turret worker.** Отклонено как дублирование owner/application orchestration.
+- **Unbounded blocking UART read или `sleep()` в backoff.** Отклонено: `request_stop()` не смог бы гарантированно прервать ожидание.
+- **Новый user-configurable join timeout.** Отклонено: это implementation tuning без пользовательской domain-семантики.
+
+---
+
+## 24. Turret diagnostics остаются logging, без queue/event infrastructure в v1
+
+### Решение
+
+Turret использует существующий стандартный Python logging bootstrap. `QueueHandler/QueueListener` и generic diagnostic event bus в v1 не добавляются. INFO предназначен для lifecycle/connection/recovery/baud boundaries и значимых failures; `REQUEST_ID`, command/retry/candidate details доступны для более подробной диагностики. High-rate PID samples и обычные velocity setpoints не логируются на INFO.
+
+### Почему
+
+Typed state уже несёт machine-readable runtime состояние, а logging нужен для transient diagnostics. Queue-based logging без измеренной blocking/contention проблемы добавляет отдельную concurrency infrastructure, а INFO на частоте tracking loop создавал бы шум и потенциально влиял на timing.
+
+### Отвергнутые альтернативы
+
+- **`QueueHandler/QueueListener` с первой реализации.** Отклонено до profiling/измеренной contention problem.
+- **Логировать каждый PID/setpoint на INFO.** Отклонено из-за высокой частоты, шума и риска влияния на timing.
+- **Generic machine-readable diagnostic event bus.** Отклонено: обязательное runtime состояние уже выражено typed contracts.
+
+---
+
 ## Как использовать этот документ при реализации
 
 При разработке нового модуля сначала нужно следовать нормативным контрактам соответствующего документа. Если возникает желание вернуть ранее удалённый механизм, полезно проверить этот журнал: часто механизм был удалён не случайно, а потому что более простой инвариант закрывает тот же failure case.

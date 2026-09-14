@@ -405,6 +405,8 @@ class TurretState:
 - startup `control_mode = RELATIVE`;
 - `control_mode` — authoritative applied mode Turret Controller;
 - `READY` возможен только после успешной reconnect/init sequence и подтверждённого `SET_CONFIG`;
+- `CONNECTING` используется во время initial connect/automatic reconnect/recovery; отсутствие STM32/serial device не переводит Turret в `ERROR`, пока owner может продолжать automatic reconnect;
+- `ERROR` зарезервирован для действительно невосстановимой локальной ошибки/invariant failure, при которой automatic reconnect нельзя корректно продолжить;
 - после потери связи `motor_state = UNKNOWN`;
 - speed/acceleration — последние подтверждённо применённые пределы STM32;
 - достоверного absolute position и признака естественного завершения relative move в state нет;

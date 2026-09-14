@@ -367,7 +367,7 @@ PC после response + inter-request delay переключается на new
 
 ### Неопределённый результат
 
-Если response потерян, STM32 может быть уже на old или new baud. Exact retry использует тот же request/ID; PC проверяет кандидаты `old ↔ new` в рамках bounded recovery. Cached response exact retry может прийти уже на текущем baud STM32.
+Если response потерян, STM32 может быть уже на old или new baud. Exact retry использует тот же request/ID; PC проверяет кандидаты без дубликатов в порядке `new → old → 9600`, где startup `9600` добавляется только если ещё не проверялась. Cached response exact retry может прийти уже на текущем baud STM32.
 
 Поскольку motors гарантированно OFF, потеря UART во время baud transition не создаёт продолжающегося физического движения.
 
@@ -623,6 +623,15 @@ then send EMERGENCY_STOP with next global REQUEST_ID
 
 ## Connection loss / recovery
 
+Transport session считается потерянной и Turret входит в auto-reconnect, если происходит хотя бы одно из событий:
+
+- ordinary request исчерпал configured exact retries после timeout/invalid CRC/no valid matching response;
+- serial I/O сообщает disconnect/device disappearance или другой I/O failure, из-за которого текущий physical exchange нельзя продолжить;
+- Emergency transaction исчерпала bounded exact retries;
+- bounded baud-detection/`SET_BAUDRATE` recovery attempt не смог подтвердить рабочую transport session.
+
+CRC-valid matching response с command-level result сам по себе не означает потерю physical transport и не запускает reconnect только из-за result code. `INVALID_REQUEST_ID` является отдельной sequence-loss границей: normal traffic блокируется и выполняется Emergency-based resync/recovery.
+
 После признанной потери связи Turret:
 
 ```text
@@ -637,11 +646,23 @@ Turret публикует connection loss через `TurretState`; Core в от
 
 Уже принятый ограниченный `MOVE_RELATIVE` может закончиться во время разрыва связи. Velocity control остановится по `velocity_watchdog_timeout_ms`.
 
-Recovery не пытается продолжить старую session с середины.
+Recovery не пытается продолжить старую session с середины. Отсутствие STM32/serial device не является само по себе fatal `ERROR`: auto-reconnect продолжается без конечного лимита попыток, пока Turret worker не остановлен. Между неуспешными reconnect cycles используется capped exponential backoff:
+
+```text
+0.25 s → 0.5 s → 1 s → 2 s → 2 s → ...
+```
+
+Backoff сбрасывается после полного успешного выхода в `READY`. Ожидание backoff должно быть interruptible через cooperative stop, а не через неконтролируемый `sleep`.
 
 ### Обычный reconnect
 
-После hardware reset STM32 baud = 9600. PC знает desired configured baud и last-known/candidate baud. После обнаружения физической связи recovery выполняется через Emergency как safety + sequence boundary:
+После hardware reset STM32 baud = 9600. PC знает desired configured baud и last-known baud. Baud candidates проверяются без дубликатов с сохранением порядка:
+
+```text
+last-known baud → desired configured baud → 9600
+```
+
+После обнаружения физической связи recovery выполняется через Emergency как safety + sequence boundary:
 
 ```text
 find physical baud / connection
@@ -661,7 +682,13 @@ PC-side applied `control_mode` Controller может сохранить, но se
 
 ### Recovery после неопределённого `SET_BAUDRATE`
 
-Так как `SET_BAUDRATE` разрешён только при фактическом motors OFF, сначала определяется фактический baud через known old/new candidates. После нахождения рабочей скорости выполняется та же sequence:
+Так как `SET_BAUDRATE` разрешён только при фактическом motors OFF, после lost/uncertain response сначала определяется фактический baud. Candidates проверяются без дубликатов в порядке:
+
+```text
+new baud → old baud → 9600
+```
+
+`9600` добавляется только если он ещё не был проверен как `new` или `old`. После нахождения рабочей скорости выполняется та же sequence:
 
 ```text
 EMERGENCY_STOP → MOTOR_OFF → SET_CONFIG → READY

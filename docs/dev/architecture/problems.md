@@ -94,38 +94,14 @@ Freshness вычисляется отдельно по timestamp.
 
 При каждом новом pipeline start создаётся новая `generation`.
 
-### 9. UART/STM32 reconnect/backoff policy
-
-Safety/resync sequence уже определена:
-
-```text
-find physical connection / actual baud
-→ EMERGENCY_STOP → sequence resync
-→ MOTOR_OFF
-→ SET_BAUDRATE при необходимости
-→ SET_CONFIG(full snapshot)
-→ READY
-```
-
-Auto `MOTOR_ON` отсутствует. Отдельная transport-reset command в v1 не нужна: confirmed Emergency сама пересинхронизирует sequence.
-
-Остаётся определить:
-
-- какие transport errors запускают auto reconnect;
-- backoff / limit attempts;
-- временный reconnect vs fatal ERROR;
-- logging/diagnostics;
-- точный набор baud candidates в обычном reconnect и после uncertain `SET_BAUDRATE`.
-
 ### 10. Worker lifecycle
 
-Foundation уже определил общий cooperative `StopToken` и минимальную `request_stop() / join() / is_alive()` boundary. Остаются owner/integration details:
+Foundation уже определил общий cooperative `StopToken` и минимальную `request_stop() / join() / is_alive()` boundary. Turret-specific lifecycle закрыт: Turret worker создаёт/останавливает application orchestration, serial waits bounded/cancellable, reconnect backoff использует `StopToken`, join bounded, а незавершившийся worker считается явной shutdown error. Numeric join timeout остаётся implementation tuning, а не config field.
 
-- кто создаёт concrete workers;
-- как owner прерывает blocking GStreamer/UART wait;
-- конкретные join timeout;
-- policy для worker, который не завершился штатно;
-- детали startup/shutdown orchestration.
+Для будущих owner/integration stages остаётся определить только:
+
+- как Vision owner прерывает blocking GStreamer/video wait;
+- детали общего startup/shutdown orchestration нескольких workers и main-thread компонентов.
 
 Reconnect/recovery принадлежит owner-модулям; отдельный orchestration component без concrete v1 responsibility не вводится.
 
@@ -147,9 +123,10 @@ Reconnect/recovery принадлежит owner-модулям; отдельны
 
 Foundation уже имеет единый idempotent bootstrap стандартного Python logging для `navmin` logger tree. Runtime state передаётся typed contracts, transient diagnostics — logging; generic event bus не вводится.
 
-Остаются детали, которые нужно решать только при реальной потребности owner/integration stages:
+Turret-specific policy закрыта: в v1 остаётся обычный Python logging без `QueueHandler/QueueListener`; INFO содержит lifecycle/connection/recovery/baud boundaries и значимые failures, transaction/retry details доступны для diagnostics, а high-rate PID/setpoint traffic не логируется на INFO. Queue-based logging возвращается только при измеренной contention/blocking problem.
 
-- нужен ли `QueueHandler/QueueListener` после profiling/concurrency integration;
+Остаются общие integration/UI details, которые нужно решать только при реальной потребности:
+
 - rotation / file limits;
 - production levels/config source;
 - как UI показывает последние важные ошибки без превращения logging в machine-readable state.

@@ -390,9 +390,11 @@ Auto `MOTOR_ON` после reconnect отсутствует.
 
 ## Serial recovery
 
-Подробный wire contract: [Протокол STM32](../../architecture/serial-protocol.md).
+Подробный transport/wire contract: [Протокол STM32](../../architecture/serial-protocol.md).
 
-При ordinary retry exhaustion transport считается LOST. На PC:
+Auto-reconnect запускается после исчерпания ordinary retries, physical serial I/O/disconnect failure, исчерпания Emergency retries или неуспешного bounded baud-recovery attempt. CRC-valid matching command-level error сам по себе не означает transport loss; `INVALID_REQUEST_ID` требует Emergency-based sequence resync.
+
+При признанной потере transport session на PC:
 
 ```text
 pending_motion → None
@@ -404,6 +406,14 @@ new normal motion blocked
 ```
 
 Уже принятый limited `MOVE_RELATIVE` может закончиться; velocity control останавливается по watchdog.
+
+Отсутствие STM32/serial device не считается fatal `ERROR`: worker продолжает reconnect cycles без конечного лимита попыток. Между cycles используется interruptible capped backoff `0.25 → 0.5 → 1 → 2 → 2 ... s`, который сбрасывается после `READY`.
+
+Обычный baud search проверяет без дубликатов:
+
+```text
+last-known → desired → 9600
+```
 
 После обнаружения physical connection/baud:
 
@@ -426,7 +436,24 @@ Runtime command сохраняется, потому что требуется �
 
 STM32 разрешает `SET_BAUDRATE` только при фактическом motors OFF.
 
-При uncertain baud transition сначала определяется рабочий old/new baud, затем запускается обычный Emergency-based recovery. Не нужны отдельные baud generation/ID state.
+При lost/uncertain response рабочий baud ищется без дубликатов в порядке `new → old → 9600`, после чего запускается обычный Emergency-based recovery. Не нужны отдельные baud generation/ID state.
+
+## Worker lifecycle
+
+Turret worker создаётся и останавливается application orchestration; отдельный Supervisor для него не вводится.
+
+Все ожидания serial transport должны быть bounded или cooperative-cancellable. Reconnect/backoff ожидается через общий `StopToken.wait(timeout)`, а не через неконтролируемый `sleep`, чтобы `request_stop()` быстро прерывал ожидание. Concrete serial adapter не должен держать worker в бесконечном blocking read.
+
+Shutdown boundary:
+
+```text
+request_stop()
+→ interrupt/cancel bounded serial wait or backoff
+→ join(bounded timeout)
+→ verify !is_alive()
+```
+
+Точный numeric join timeout остаётся внутренним implementation tuning, а не новым `config.json` field. Если worker не завершился в bounded timeout, это явная shutdown error: её нужно залогировать и нельзя молча считать shutdown успешным.
 
 ## Ограничения механики
 
@@ -452,7 +479,11 @@ Turret публикует latest-only `TurretState` с:
 - authoritative applied `control_mode`;
 - подтверждёнными speed/acceleration limits.
 
-Transient diagnostics/errors в v1 идут в logging; обязательные runtime состояния имеют typed contracts. Generic event bus заранее не вводится.
+Transient diagnostics/errors в v1 идут в стандартный Python logging; обязательные runtime состояния имеют typed contracts. Generic event bus заранее не вводится.
+
+Для Turret в INFO достаточно lifecycle/connection/recovery/baud-transition boundaries и значимых failures. `REQUEST_ID`, command code, retry/attempt/candidate details должны быть доступны для диагностики на более подробном уровне, но high-rate PID samples и обычные velocity setpoints не логируются на INFO.
+
+`QueueHandler/QueueListener` в v1 заранее не вводятся: сначала используется существующий logging bootstrap, а queue-based logging добавляется только при измеренной проблеме blocking/contention.
 
 Wire `EVENTS` section STM32 зарезервирована, но пуста в v1. Hardware event queue проектируется только вместе с первым реальным hardware event.
 
@@ -462,8 +493,7 @@ Wire `EVENTS` section STM32 зарезервирована, но пуста в v
 
 ## Что ещё не определено
 
-- concrete thread-safe latest-state/notification primitives;
-- detailed UART reconnect/backoff policy;
+- Qt notification/coalescing details для доставки latest-state в main thread;
 - hardware upper limits step rate/acceleration/watchdog/static relative delta;
 - D-filter после измерений;
 - future position feedback/homing.

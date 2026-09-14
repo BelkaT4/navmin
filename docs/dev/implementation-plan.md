@@ -280,7 +280,6 @@ Qt notification coalescing (#5) остаётся до UI-этапа.
 - `docs/dev/architecture/decisions.md`
 - `docs/dev/modules/turret/index.md`
 - `docs/dev/diagrams/turret-diagram.mmd`
-- `problems.md` #9 и Turret-related часть #10/#13
 
 ### Реализовать
 
@@ -305,7 +304,9 @@ Qt notification coalescing (#5) остаётся до UI-этапа.
   - StopMotion;
   - motor state;
   - config application;
-- reconnect/recovery state machine;
+- reconnect/recovery state machine с agreed baud-candidate order и capped interruptible backoff;
+- cooperative Turret worker lifecycle поверх Foundation `StopToken`;
+- Turret diagnostics/logging policy без high-rate INFO spam;
 - Turret simulator/fake endpoint для integration tests без STM32.
 
 ### Не делать
@@ -332,6 +333,19 @@ Qt notification coalescing (#5) остаётся до UI-этапа.
 
 Processor-specific часть `problems.md` #7 остаётся Stage 5, а `target-lost-timeout-ms` — checkpoint Stage 6.
 
+### Закрытый decision checkpoint перед transport/recovery веткой
+
+До начала Stage 3 управляющий чат также зафиксировал Turret transport/lifecycle/logging semantics:
+
+- auto-reconnect запускается после retry exhaustion, physical serial I/O/disconnect failure, exhausted Emergency retries или неуспешного bounded baud recovery;
+- matching command-level result сам по себе не означает transport loss; `INVALID_REQUEST_ID` требует Emergency-based resync;
+- обычный baud search: `last-known → desired → 9600`, без дубликатов; uncertain `SET_BAUDRATE`: `new → old → 9600`, без дубликатов;
+- reconnect attempts не имеют конечного лимита; backoff `0.25 → 0.5 → 1 → 2 → 2 ... s`, reset после `READY`;
+- отсутствие STM32/device не является fatal `ERROR`, пока automatic reconnect может продолжаться;
+- Turret worker создаёт/останавливает application orchestration, serial waits bounded/cancellable, backoff interruptible через `StopToken`, shutdown использует bounded join;
+- numeric join timeout — implementation tuning, не config field; незавершившийся worker является явной shutdown error;
+- Turret использует обычный Python logging; INFO — lifecycle/connection/recovery/baud/failures, high-rate PID/setpoint traffic на INFO не идёт; `QueueHandler/QueueListener` не вводится без измеренной необходимости.
+
 ### Тестовый фокус
 
 Предпочитать protocol/state-machine matrices и parameterization вместо нового файла на каждую command.
@@ -354,17 +368,21 @@ Processor-specific часть `problems.md` #7 остаётся Stage 5, а `tar
 - `MOTOR_ON` не replay'ит старый motion intent;
 - StopMotion invalidates несовместимый unsent pending intent;
 - wire conversion/encoding явно отклоняет значения вне encodable `int32`/`uint32` range;
-- `SET_BAUDRATE` success/lost-response/old-new uncertainty/recovery на fake transport.
+- `SET_BAUDRATE` success/lost-response/old-new uncertainty/recovery на fake transport;
+- ordinary reconnect baud candidates `last-known → desired → 9600` с deduplication;
+- uncertain baud candidates `new → old → 9600` с deduplication;
+- reconnect backoff progression/cap/reset и отсутствие finite attempt limit;
+- `request_stop()` прерывает reconnect/backoff и worker завершается через bounded join;
+- matching command-level errors не ошибочно классифицируются как physical transport loss, а `INVALID_REQUEST_ID` ведёт в Emergency resync;
+- lifecycle/recovery logging не требует generic event bus и не пишет high-rate PID/setpoint traffic на INFO.
 
 Эти cases расширяют существующие protocol/state-machine matrices; отдельный test file для каждого case не требуется.
 
-### Открытые вопросы, которые должен закрыть этап
+### Открытые вопросы этапа
 
-- `problems.md` #9: reconnect/backoff policy;
-- Turret часть #10: worker wait/cancel lifecycle;
-- Turret часть #13: diagnostics/logging.
+Turret-specific архитектурные вопросы reconnect/backoff, worker lifecycle и logging закрыты до начала реализации. Stage 3 не должен заново выбирать эти semantics.
 
-Выбранные значения timeout/backoff, если они являются tuning parameters, должны оставаться config/tuning detail и не превращаться в новый architecture state.
+Точный numeric join timeout и другие чисто внутренние bounded timing constants можно выбрать как implementation tuning при условии сохранения зафиксированных cancellation/shutdown invariants; они не становятся новым architecture state или `config.json` field без отдельной причины.
 
 ### Критерий завершения
 
@@ -788,10 +806,9 @@ Hardware tests остаются отдельным suite.
 | #6 processor-specific config | 5 |
 | #7 runtime config edge cases | 2 config infrastructure; 5 processor policy; 6 target-loss-timeout checkpoint |
 | #8 camera reconnect | 5 |
-| #9 UART reconnect | 3, hardware validation 4 |
-| #10 worker lifecycle | 1 foundation + owner stages + 8 final |
+| #10 worker lifecycle | 1 foundation + Vision/integration stages + 8 final; Turret part closed before 3 |
 | #11 partial failures | 7 + 8 |
-| #13 logging | 1 foundation + owner stages + 8 final |
+| #13 logging | 1 foundation + UI/integration + 8 final; Turret part closed before 3 |
 | #14 future STM32 events | deferred |
 | #15 tracking timing budget | 8 после измерений |
 | #16 backlash | deferred |
