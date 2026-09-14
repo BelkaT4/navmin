@@ -236,9 +236,11 @@ PID работает с угловой ошибкой:
 
 Первый sample после reset: P-only, `I=0`, `D=0`.
 
-## STM32 / RS485
+## STM32 / serial transport
 
-Обмен строго последовательный:
+Первая реализация использует обычный full-duplex UART. Production RS485 half-duplex отложен и позднее должен заменить только physical byte transport без изменения binary protocol или PC-side semantics.
+
+Обмен на уровне protocol строго последовательный:
 
 ```text
 1 request → 1 response

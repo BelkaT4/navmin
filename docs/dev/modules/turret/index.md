@@ -461,6 +461,34 @@ request_stop()
 
 Точный numeric join timeout остаётся внутренним implementation tuning, а не новым `config.json` field. Если worker не завершился в bounded timeout, это явная shutdown error: её нужно залогировать и нельзя молча считать shutdown успешным.
 
+## STM32 hardware baseline первой реализации
+
+Firmware target Stage 4:
+
+```text
+MCU: STM32F103C8T6, LQFP48
+framework: STM32 HAL / CubeIDE-compatible project
+USART3 TX: PB10
+USART3 RX: PB11
+startup serial: 9600 8N1, full-duplex UART
+```
+
+Hardware mapping, восстановленный из старой рабочей прошивки и используемый как baseline:
+
+```text
+X / azimuth:   STEP PB7, DIR PB8, ENABLE PB9
+Y / elevation: STEP PB4, DIR PB5, ENABLE PB6
+ENABLE: active-low
+X DIR: 0 = right, 1 = left
+Y DIR: 0 = up,    1 = down
+```
+
+Legacy firmware использовал TIM2 periodic control tick (Prescaler 71, Period 49 при его clock setup). Эти timer numbers являются implementation reference, а не архитектурным timing contract: Stage 4 обязан вывести реальные firmware bounds из нового STEP generator.
+
+На legacy board также были входы PB12..PB15 для концевиков, но текущая v1 архитектура **не** использует limit switches как safety/position contract. Их наличие не меняет раздел «Ограничения механики» ниже.
+
+Старый firmware protocol не переносится. Единственный wire contract — [`serial-protocol.md`](../../architecture/serial-protocol.md). Будущий RS485 должен заменить только physical byte transport этого же protocol.
+
 ## Ограничения механики
 
 Первая конструкция не имеет:

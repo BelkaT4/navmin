@@ -510,6 +510,26 @@ Serial timing является свойством bounded transaction/session и
 
 ---
 
+## 26. Первая STM32 реализация использует UART; RS485 переносится в отдельную post-v1 migration
+
+### Решение
+
+Первый firmware target — `STM32F103C8T6` с STM32 HAL/CubeIDE-compatible project. Physical transport первой реализации — обычный full-duplex `USART3` (`PB10 TX`, `PB11 RX`, startup `9600 8N1`).
+
+Текущий binary protocol считается окончательным относительно physical transport: UART и будущий RS485 не получают разных frame/request/retry/state semantics. RS485 half-duplex, выбор transceiver, `DE/RE` или auto-direction, termination/biasing, electrical reference/isolation и turnaround measurements переносятся в отдельную migration после обязательной первой реализации.
+
+Старый firmware-проект используется только как hardware reference для MCU/pin mapping/polarity/timer baseline. Его старый serial protocol не является compatibility target и не переносится.
+
+### Почему
+
+Старая турель уже работала через обычный UART, а доступа к физической STM32/RS485 сборке сейчас нет. Protocol/control firmware можно реализовать и полноценно тестировать без смешивания новых RS485 electrical/timing unknowns с parser, request sequence, Emergency, motor planner и watchdog. Изоляция physical byte transport делает последующий переход на RS485 ограниченным hardware change.
+
+### Отвергнутые альтернативы
+
+- **Блокировать Stage 4 до выбора и проверки RS485 transceiver.** Отклонено: это связывает независимые protocol/control задачи с недоступным сейчас железом.
+- **Сделать отдельные UART и RS485 версии протокола.** Отклонено: physical medium не требует второго framing/request/state contract.
+- **Перенести старый UART protocol из legacy firmware.** Отклонено: authoritative v1 protocol уже определён в `serial-protocol.md`, а legacy firmware нужен только как hardware reference.
+
 ## Как использовать этот документ при реализации
 
 При разработке нового модуля сначала нужно следовать нормативным контрактам соответствующего документа. Если возникает желание вернуть ранее удалённый механизм, полезно проверить этот журнал: часто механизм был удалён не случайно, а потому что более простой инвариант закрывает тот же failure case.

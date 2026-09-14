@@ -8,7 +8,9 @@
 
 ### 1. Физическое управление полудуплексным RS485
 
-Логическая request/response-модель, framing, CRC, `REQUEST_ID`, Emergency-resync, retry и baudrate уже определены. Остаются hardware-dependent детали:
+RS485 перенесён за пределы обязательной первой реализации: Stage 4 и v1 используют обычный UART. Этот вопрос **не блокирует** UART-first firmware или завершение v1 и возвращается при отдельной RS485 migration.
+
+Логическая request/response-модель, framing, CRC, `REQUEST_ID`, Emergency-resync, retry и baudrate уже определены и должны сохраниться без protocol fork. Для будущей RS485 physical layer остаются hardware-dependent детали:
 
 - управляет ли STM32 `DE/RE` или transceiver/adapter делает это автоматически;
 - момент освобождения шины после последнего TX byte;

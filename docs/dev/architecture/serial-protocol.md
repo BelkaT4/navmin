@@ -1,6 +1,8 @@
 # Протокол STM32
 
-Этот документ определяет бинарный протокол `Turret HAL ↔ STM32` поверх полудуплексного UART/RS485.
+Этот документ определяет бинарный протокол `Turret HAL ↔ STM32` поверх последовательного byte stream.
+
+Первая реализация использует обычный full-duplex UART. Будущий production RS485 half-duplex меняет только physical byte transport: framing, request/response, `REQUEST_ID`, retry, Emergency, baud и command semantics остаются теми же.
 
 ## Физический интерфейс
 
@@ -15,7 +17,9 @@ stop bits = 1
 
 Желаемый рабочий baudrate можно менять runtime-командой `SET_BAUDRATE`, чтобы тестировать разные скорости без перепрошивки STM32.
 
-Управление `DE/RE`, termination/bias, общий reference/GND или galvanic isolation и точный turnaround delay относятся к физической реализации RS485 и проверяются на реальном железе.
+Для первой реализации STM32 использует USART3 как обычный full-duplex UART; `DE/RE` и turnaround отсутствуют.
+
+Управление `DE/RE` или auto-direction, termination/bias, общий reference/GND или galvanic isolation и точный turnaround delay относятся к будущей физической реализации RS485. Эти детали намеренно deferred за пределы обязательной первой реализации и не создают отдельную версию wire protocol.
 
 ## Модель обмена
 
@@ -617,7 +621,7 @@ wait current physical attempt response OR current timeout
 then send EMERGENCY_STOP with next global REQUEST_ID
 ```
 
-Второй packet не передаётся поверх незавершённого half-duplex exchange.
+Второй request не передаётся до завершения текущей physical attempt. Это правило действует и на full-duplex UART первой реализации, и на будущий half-duplex RS485: protocol сохраняет one-request-in-flight boundary независимо от возможностей физического канала.
 
 Если old ordinary response успел прийти — он обрабатывается штатно. Если текущая attempt timeout — её outcome остаётся неизвестным, но следующая подтверждённая Emergency уничтожает любое motion state и пересинхронизирует sequence независимо от старого expected ID.
 
@@ -754,4 +758,4 @@ MAX_RELATIVE_DELTA_Y_STEPS
 
 выбираются после реализации STEP generator и проверки timer/driver/mechanics.
 
-Требуемый turnaround delay RS485 transceiver также определяется на железе и не меняет binary framing.
+Требуемый turnaround delay будущего RS485 transceiver определяется только при отдельной RS485 hardware migration и не меняет binary framing. Для первой UART реализации такого delay нет.

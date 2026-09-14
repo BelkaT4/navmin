@@ -116,8 +116,8 @@ Normal test run не должен требовать hardware.
 |---|---|---|---|
 | 1. Foundation | done | package/test skeleton, contracts, runtime primitives | — |
 | 2. Config + Calibration foundation | done | typed config, persistence, calibration loading/model boundary | 1 |
-| 3. Turret PC stack | in-progress | PC protocol/transport/controller/HAL + simulator | 1, 2 |
-| 4. STM32 firmware + RS485 | not-started | firmware protocol/control + real link validation | 3 |
+| 3. Turret PC stack | done | PC protocol/transport/controller/HAL + simulator | 1, 2 |
+| 4. STM32 firmware + UART | in-progress | firmware protocol/control + UART integration boundary | 3 |
 | 5. Vision | not-started | camera pipelines, generations, working frame, manual distance | 1, 2 |
 | 6. Core + Aiming | not-started | mediator/state transitions/aiming/tracking error | 2, 3, 5 |
 | 7. UI | not-started | PyQt6 main/preview, controls, overlays, settings | 2, 3, 5, 6 |
@@ -394,13 +394,15 @@ Turret-specific архитектурные вопросы reconnect/backoff, wor
 
 ---
 
-## 9. Этап 4 — STM32 firmware + реальный RS485
+## 9. Этап 4 — STM32 firmware + UART
 
-**Статус:** `not-started`
+**Статус:** `in-progress`
 
 ### Цель
 
-Реализовать firmware counterpart существующего protocol contract и проверить его на реальном полудуплексном RS485 без изменения PC-side semantics ради особенностей конкретного адаптера.
+Реализовать firmware counterpart существующего protocol contract на STM32F103C8T6. Первая реализация использует обычный full-duplex UART как development/integration physical transport. Binary protocol, request/response, retry, Emergency, request-sequence и baud semantics остаются окончательными и не зависят от будущего перехода на RS485.
+
+Production RS485 half-duplex переносится за пределы обязательной первой реализации и должен позднее заменить только physical byte transport, не создавая вторую версию протокола.
 
 ### Читать перед началом
 
@@ -408,7 +410,7 @@ Turret-specific архитектурные вопросы reconnect/backoff, wor
 - `docs/dev/architecture/configuration.md`
 - `docs/dev/modules/turret/index.md`
 - `docs/dev/architecture/decisions.md`
-- `problems.md` #1
+- `problems.md` #1 — только как явно deferred RS485 hardware question; он не блокирует UART-first Stage 4
 
 ### Реализовать firmware
 
@@ -424,23 +426,30 @@ Turret-specific архитектурные вопросы reconnect/backoff, wor
 - atomic full `SET_CONFIG` snapshot;
 - bounded firmware sanity limits;
 - runtime `SET_BAUDRATE` semantics;
-- half-duplex TX/RX direction control для выбранного hardware.
+- serial byte I/O boundary поверх USART3 full-duplex UART;
+- firmware target и pin mapping, зафиксированные в Turret module docs.
 
-### Hardware integration
+### UART integration boundary
 
-- PC↔adapter↔RS485↔STM32 framing;
-- reconnect после физического разрыва;
-- реальный `SET_BAUDRATE` и uncertain baud transition подтверждают уже реализованный Stage 3 PC-side path;
-- Emergency under active motion;
-- motor off/on;
-- bounded relative motion;
-- watchdog stop velocity mode.
+- production binary frames должны передаваться через обычный USART3 TX/RX без protocol fork;
+- firmware build и host-side tests не требуют физической STM32-платы;
+- реальный PC↔USB-UART↔STM32 smoke переносится в Stage 8 user-side hardware checkpoint;
+- будущий RS485 transport не должен менять framing, request IDs, retry, Emergency или command semantics.
+
+### Durable checkpoints
+
+- **4A — Firmware foundation:** project skeleton, byte parser/resynchronization/inter-byte timeout, CRC, request sequence, exact retry cache, command/result framing, Emergency resync.
+- **4B — Motor/control:** STEP generation, relative planner, velocity target + acceleration limiter, watchdog, motor state, atomic `SET_CONFIG`, firmware bounds.
+- **4C — UART integration:** USART3 byte transport, runtime `SET_BAUDRATE`, reproducible firmware build, host-side integration tests and final Stage 4 verification.
+
+RS485 migration не входит в 4A–4C и возвращается отдельным post-v1 hardware change.
 
 ### Открытые вопросы, которые должен закрыть этап
 
-- `problems.md` #1: конкретное управление полудуплексом/DE-RE/адаптером;
 - фактические firmware bounds из `serial-protocol.md`;
-- реальные timing limits транспорта, если они влияют на protocol tuning.
+- software timing limits parser/control loop, если они влияют на protocol tuning.
+
+`problems.md` #1 про RS485 half-duplex остаётся открытым, но намеренно deferred и не блокирует завершение UART-first Stage 4.
 
 ### Тестовый фокус
 
@@ -452,9 +461,11 @@ Host-side protocol tests из этапа 3 не дублировать в firmwa
 
 - PC simulator tests всё ещё проходят;
 - firmware build воспроизводим;
-- hardware smoke подтверждает key safety/recovery paths;
+- firmware parser/protocol/control имеют hardware-independent tests;
+- USART3 transport реализует тот же production protocol без отдельной UART-версии;
 - normal Python suite остаётся hardware-independent;
-- найденные hardware-specific корректировки не меняют архитектуру молча.
+- отсутствие физической STM32-платы не блокирует Stage 4 acceptance; реальный UART hardware smoke остаётся обязательным Stage 8 checkpoint;
+- RS485-specific код/DE-RE/turnaround не добавляются до отдельного решения.
 
 ---
 
@@ -770,7 +781,7 @@ Hardware tests остаются отдельным suite.
 
 - все этапы 1–7 приняты;
 - normal test suite green без hardware;
-- обязательные STM32/RS485 и Raspberry Pi/camera hardware smoke scenarios выполнены и результаты зафиксированы;
+- обязательные STM32/UART и Raspberry Pi/camera hardware smoke scenarios выполнены и результаты зафиксированы;
 - нет известных P0/P1 противоречий между реализацией и архитектурой;
 - открытые deferred вопросы явно остаются в `problems.md`, а не скрываются временным кодом;
 - приложение проходит startup/shutdown/recovery paths;
@@ -792,6 +803,7 @@ Hardware tests остаются отдельным suite.
 - future latest-live-frame UI path;
 - режим «Самая быстрая»;
 - automatic Vision load adaptation;
+- production RS485 half-duplex migration (transceiver, DE/RE или auto-direction, termination/biasing, isolation/reference и turnaround measurements);
 - generic STM32 hardware event queue до появления конкретного event use case;
 - автоматический config migration mechanism за пределами `schema-version = 1` до появления реальной schema v2.
 
@@ -801,7 +813,7 @@ Hardware tests остаются отдельным suite.
 
 | Вопрос | Этап |
 |---|---|
-| #1 RS485 half-duplex | 4 |
+| #1 RS485 half-duplex | deferred post-v1 / отдельная RS485 migration |
 | #2 capture_id / stereo pairing | deferred |
 | #3 DistanceResult stereo lifecycle | deferred / 5 только manual path |
 | #5 Qt coalescing | 7 |
