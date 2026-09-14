@@ -43,6 +43,7 @@ from .transport import (
     TransportIOError,
     TransportTimeoutError,
 )
+from .worker import TransportFactory, TurretWorker, WorkerShutdownError
 
 __all__ = [
     "AxisPid",
@@ -73,11 +74,14 @@ __all__ = [
     "SetVelocityPayload",
     "TransportDisconnectedError",
     "TransportError",
+    "TransportFactory",
     "TransportIOError",
     "TransportTimeoutError",
     "TurretController",
     "TurretHal",
     "TurretSession",
+    "TurretWorker",
+    "WorkerShutdownError",
     "crc16_modbus",
     "decode_request",
     "decode_response",

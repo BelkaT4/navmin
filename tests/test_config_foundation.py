@@ -416,6 +416,10 @@ def test_change_metadata_reports_only_fixed_architecture_classification() -> Non
     data["vision"]["cameras"]["overview"]["vision-processor-class"] = "Other"
     data["turret"]["serial"]["port"] = "/dev/ttyUSB1"
     data["turret"]["serial"]["baudrate"] = 57600
+    data["turret"]["serial"]["response-timeout-ms"] = 150
+    data["turret"]["serial"]["max-retries"] = 3
+    data["turret"]["serial"]["inter-request-delay-ms"] = 3
+    data["turret"]["emulate-stm32"] = True
     data["turret"]["axes"]["x"]["microstep-divider"] = 8
     data["turret"]["axes"]["x"]["max-relative-move-deg"] = 60.0
     data["turret"]["axes"]["y"]["max-relative-move-deg"] = 75.0
@@ -442,6 +446,16 @@ def test_change_metadata_reports_only_fixed_architecture_classification() -> Non
     assert (
         config_apply_policy("turret.serial.baudrate")
         is ConfigApplyPolicy.CONTROLLED_SERIAL_TRANSITION
+    )
+    for path in (
+        "turret.serial.response-timeout-ms",
+        "turret.serial.max-retries",
+        "turret.serial.inter-request-delay-ms",
+    ):
+        assert config_apply_policy(path) is ConfigApplyPolicy.TURRET_RECONNECT
+    assert (
+        config_apply_policy("turret.emulate-stm32")
+        is ConfigApplyPolicy.APPLICATION_RESTART
     )
     assert (
         config_apply_policy("turret.axes.x.microstep-divider")

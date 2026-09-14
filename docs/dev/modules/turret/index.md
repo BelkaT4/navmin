@@ -22,6 +22,8 @@ Turret worker
 
 Turret worker — единственный owner UART/RS485.
 
+Cross-thread ingress не выполняет UART I/O. В частности Emergency request из Core/UI/application thread является только thread-safe signal: если ordinary physical attempt уже идёт, signal подавляет его будущие retries, но actual `EMERGENCY_STOP` frame передаёт только Turret worker после response/timeout текущей попытки; при idle UART worker делает Emergency следующей physical operation.
+
 ## Authoritative applied mode
 
 Turret Controller владеет applied:
@@ -358,6 +360,10 @@ STM32 проверяет hardware-supported ranges и применяет вес�
 
 HAL хранит applied/pending STM32 config state. Pending config — latest-only. Если во время in-flight exchange появился более новый snapshot, после завершения transaction отправляется freshest pending snapshot.
 
+Serial `response-timeout-ms`, `max-retries` и `inter-request-delay-ms` принадлежат concrete `TurretSession`; runtime изменение требует Turret reconnect и построения новой session boundary с freshest values. `emulate-stm32` в v1 application-restart-only и reconnect не переключает real ↔ fake transport.
+
+Desired baud latest-only: config update не выполняет hidden `MOTOR_OFF`. При confirmed motors OFF worker может выполнить controlled `SET_BAUDRATE`; при motors ON/UNKNOWN переход откладывается. После confirmed `MOTOR_OFF` pending desired baud применяется, а перед новым `MOTOR_ON` при motors OFF baud transition завершается первым.
+
 ## Config exchange во время TRACKING
 
 Во время физического non-motion request новые velocity packets не могут передаваться из-за one-in-flight rule. Controller сохраняет только freshest `pending_motion`; после response отправляется актуальный setpoint.
@@ -478,6 +484,8 @@ Turret публикует latest-only `TurretState` с:
 - confirmed `MotorState`;
 - authoritative applied `control_mode`;
 - подтверждёнными speed/acceleration limits.
+
+Если `HAL.applied_stm32_config is None`, четыре поля speed/acceleration в `TurretState` равны `None`; desired config не подменяет подтверждённое applied state. После successful `SET_CONFIG` публикуется именно подтверждённый snapshot, а после transport loss поля снова становятся `None`.
 
 Transient diagnostics/errors в v1 идут в стандартный Python logging; обязательные runtime состояния имеют typed contracts. Generic event bus заранее не вводится.
 

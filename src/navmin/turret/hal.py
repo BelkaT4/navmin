@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import dataclass
 from math import isfinite
 from typing import Literal
@@ -63,6 +64,7 @@ class TurretHal:
         self._applied_config_revision: int | None = None
         self._motor_state = MotorState.UNKNOWN
         self._operation_active = False
+        self._config_drain_defer_depth = 0
 
     @property
     def motor_state(self) -> MotorState:
@@ -79,6 +81,23 @@ class TurretHal:
     @property
     def pending_config_revision(self) -> int | None:
         return None if self._pending_config is None else self._pending_config.revision
+
+    def rebind_session(self, session: TurretSession) -> None:
+        """Bind a recovered session without changing restart-only mechanics."""
+        if not isinstance(session, TurretSession):
+            raise TypeError("session must be TurretSession")
+        if self._operation_active:
+            raise HalError("cannot rebind session during an active HAL operation")
+        self._session = session
+
+    @contextmanager
+    def defer_pending_config_drain(self):
+        """Suppress implicit SET_CONFIG drain across an explicit safety boundary."""
+        self._config_drain_defer_depth += 1
+        try:
+            yield
+        finally:
+            self._config_drain_defer_depth -= 1
 
     def effective_steps_per_revolution(self, axis: AxisName) -> int:
         mechanics = self._mechanics(axis)
@@ -177,15 +196,18 @@ class TurretHal:
         self._drain_pending_config_if_idle()
         return response
 
-    def apply_config_update(
-        self, update: ConfigUpdate[TurretConfig]
-    ) -> SessionResult | None:
+    def stage_config_update(self, update: ConfigUpdate[TurretConfig]) -> bool:
+        """Accept latest config without performing transport I/O.
+
+        Stage 3D uses this during recovery so the final SET_CONFIG is emitted
+        exactly once, after Emergency/MOTOR_OFF/baud recovery.
+        """
         if not isinstance(update, ConfigUpdate):
             raise TypeError("update must be ConfigUpdate[TurretConfig]")
         if not isinstance(update.config, TurretConfig):
             raise TypeError("update.config must be TurretConfig")
         if update.revision <= self._latest_config_revision:
-            return None
+            return False
         self._latest_config_revision = update.revision
 
         if update.config.stm32 != self._desired_stm32_config:
@@ -203,6 +225,13 @@ class TurretHal:
                 config=self._pending_config.config,
                 payload=self._pending_config.payload,
             )
+        return True
+
+    def apply_config_update(
+        self, update: ConfigUpdate[TurretConfig]
+    ) -> SessionResult | None:
+        if not self.stage_config_update(update):
+            return None
         if self._operation_active:
             return None
         return self.flush_pending_config()
@@ -258,6 +287,8 @@ class TurretHal:
         return result
 
     def _drain_pending_config_if_idle(self) -> None:
+        if self._config_drain_defer_depth > 0:
+            return
         if self._pending_config is not None and not self._operation_active:
             self.flush_pending_config()
 

@@ -394,10 +394,10 @@ class TurretState:
     connection_state: TurretConnectionState
     motor_state: MotorState
     control_mode: TurretControlMode
-    max_speed_x_deg_s: float
-    max_speed_y_deg_s: float
-    acceleration_x_deg_s2: float
-    acceleration_y_deg_s2: float
+    max_speed_x_deg_s: float | None
+    max_speed_y_deg_s: float | None
+    acceleration_x_deg_s2: float | None
+    acceleration_y_deg_s2: float | None
 ```
 
 Правила:
@@ -408,7 +408,7 @@ class TurretState:
 - `CONNECTING` используется во время initial connect/automatic reconnect/recovery; отсутствие STM32/serial device не переводит Turret в `ERROR`, пока owner может продолжать automatic reconnect;
 - `ERROR` зарезервирован для действительно невосстановимой локальной ошибки/invariant failure, при которой automatic reconnect нельзя корректно продолжить;
 - после потери связи `motor_state = UNKNOWN`;
-- speed/acceleration — последние подтверждённо применённые пределы STM32;
+- speed/acceleration — последние подтверждённо применённые пределы STM32; пока `HAL.applied_stm32_config is None`, все четыре поля равны `None` и desired config не публикуется как applied;
 - достоверного absolute position и признака естественного завершения relative move в state нет;
 - `TurretState` — latest-only;
 - смена mode считается применённой после публикации нового `TurretState` с новым `control_mode`.

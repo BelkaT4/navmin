@@ -196,10 +196,17 @@ def config_apply_policy(path: str) -> ConfigApplyPolicy | None:
         }:
             return ConfigApplyPolicy.CAMERA_PIPELINE_RESTART
 
-    if path == "turret.serial.port":
+    if path in {
+        "turret.serial.port",
+        "turret.serial.response-timeout-ms",
+        "turret.serial.max-retries",
+        "turret.serial.inter-request-delay-ms",
+    }:
         return ConfigApplyPolicy.TURRET_RECONNECT
     if path == "turret.serial.baudrate":
         return ConfigApplyPolicy.CONTROLLED_SERIAL_TRANSITION
+    if path == "turret.emulate-stm32":
+        return ConfigApplyPolicy.APPLICATION_RESTART
 
     if (
         len(parts) == 4

@@ -276,6 +276,8 @@ inter-request-delay-ms               = 2
 
 `baudrate` в `config.json` — желаемая рабочая скорость ПК. STM32 после hardware reset всегда стартует на 9600 и при необходимости переключается через `SET_BAUDRATE`.
 
+Runtime update desired baud не выполняет hidden `MOTOR_OFF`: при confirmed motors OFF controlled transition может выполняться сразу; при motors ON/UNKNOWN worker сохраняет только freshest desired baud и применяет его после последующего confirmed `MOTOR_OFF` либо в safe recovery. Если затем запрошен `MOTOR_ON`, pending desired baud при confirmed OFF применяется первым.
+
 Поддерживаемый первый whitelist:
 
 ```text
@@ -383,6 +385,8 @@ velocity-watchdog-timeout-ms < aiming.target-lost-timeout-ms
 turret.emulate-stm32: bool
 ```
 
+В v1 `emulate-stm32` — application-restart setting: runtime сохранение допустимо, но уже работающий Turret worker не переключает real ↔ fake transport до application restart.
+
 ### Backlash
 
 Backlash compensation пока не входит в обязательную конфигурацию. Добавлять параметры следует только после механических измерений и отдельного решения о месте компенсации.
@@ -417,9 +421,11 @@ UI overlays не являются частью recorded working frame.
 | camera source/address/port/GStreamer settings | camera pipeline restart / new generation |
 | calibration file/content | camera pipeline restart / new generation |
 | serial port | Turret reconnect |
-| desired serial baudrate | controlled `SET_BAUDRATE` / reconnect path |
+| `response-timeout-ms`, `max-retries`, `inter-request-delay-ms` | Turret reconnect; новая session использует freshest accepted values, active in-flight transaction не перенастраивается |
+| desired serial baudrate | controlled `SET_BAUDRATE` / reconnect path; при motors ON/UNKNOWN сохраняется latest desired baud и physical transition откладывается до confirmed motors OFF или recovery |
 | max speed / acceleration / velocity watchdog | dynamic full STM32 `SET_CONFIG` snapshot; уменьшение max speed также clamp'ит application-side PID I-term соответствующей оси без полного reset |
 | `invert`, steps/rev, microstep, `max-relative-move-deg` | restart-only; применяются только после Turret/application restart, не dynamic |
+| `emulate-stm32` | application restart; runtime real ↔ fake transport switching в v1 отсутствует |
 | UI-only display settings | dynamic |
 
 Processor-specific settings классифицируются вместе со схемой конкретного `VisionProcessor`.

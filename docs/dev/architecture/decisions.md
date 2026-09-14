@@ -491,6 +491,25 @@ Typed state уже несёт machine-readable runtime состояние, а lo
 
 ---
 
+
+## 25. Serial timing reconnect, deferred desired baud и restart-only emulation
+
+### Решение
+
+`response-timeout-ms`, `max-retries` и `inter-request-delay-ms` применяются через новую Turret session boundary после reconnect. `emulate-stm32` не переключается runtime и требует application restart. Desired baud остаётся latest-only: при confirmed motors OFF переход допустим, при motors ON/UNKNOWN он откладывается без hidden `MOTOR_OFF`; перед последующим `MOTOR_ON` pending baud применяется первым.
+
+### Почему
+
+Serial timing является свойством bounded transaction/session и не должен меняться посреди committed in-flight exchange. Runtime real ↔ fake switching создало бы второй transport lifecycle внутри одного процесса без v1-потребности. Отложенный baud сохраняет safety ownership: config change не должен сам выключать motors.
+
+### Отвергнутые альтернативы
+
+- **Mutate timing активной session.** Отклонено из-за неоднозначной семантики текущей transaction.
+- **Config baud update автоматически делает MOTOR_OFF.** Отклонено: motor state меняется только явной control operation/recovery.
+- **Runtime real ↔ fake switch.** Отклонено как лишний lifecycle mechanism для v1.
+
+---
+
 ## Как использовать этот документ при реализации
 
 При разработке нового модуля сначала нужно следовать нормативным контрактам соответствующего документа. Если возникает желание вернуть ранее удалённый механизм, полезно проверить этот журнал: часто механизм был удалён не случайно, а потому что более простой инвариант закрывает тот же failure case.

@@ -218,7 +218,10 @@ class TurretController:
         self._hal.mark_transport_lost()
 
     def apply_config_update(
-        self, update: ConfigUpdate[TurretConfig]
+        self,
+        update: ConfigUpdate[TurretConfig],
+        *,
+        defer_stm32: bool = False,
     ) -> SessionResult | None:
         if not isinstance(update, ConfigUpdate):
             raise TypeError("update must be ConfigUpdate[TurretConfig]")
@@ -245,6 +248,9 @@ class TurretController:
         )
         self._config = new
         self._config_revision = update.revision
+        if defer_stm32:
+            self._hal.stage_config_update(update)
+            return None
         return self._hal.apply_config_update(update)
 
     def _apply_axis_runtime_config(

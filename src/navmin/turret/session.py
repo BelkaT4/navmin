@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass
 from math import isfinite
+from threading import Event
 from time import monotonic, sleep
 
 from .protocol import (
@@ -174,7 +175,7 @@ class TurretSession:
         self._wait_hook = wait_hook
         self._transaction_active = False
         self._attempt_in_flight = False
-        self._emergency_requested = False
+        self._emergency_requested = Event()
         self._emergency_active = False
         self._normal_traffic_blocked = False
         self._inter_request_delay_pending = False
@@ -212,18 +213,18 @@ class TurretSession:
                     transaction, allow_emergency_preemption=True
                 )
                 response = outcome.response
-                if not outcome.transmitted and self._emergency_requested:
+                if not outcome.transmitted and self._emergency_requested.is_set():
                     emergency = self._run_emergency_transaction()
                     return SessionResult(None, emergency, True)
                 if response is not None:
                     if response.result is ResultCode.INVALID_REQUEST_ID:
                         self._normal_traffic_blocked = True
-                    if self._emergency_requested:
+                    if self._emergency_requested.is_set():
                         emergency = self._run_emergency_transaction()
                         return SessionResult(response, emergency, True)
                     return SessionResult(response)
 
-                if self._emergency_requested:
+                if self._emergency_requested.is_set():
                     emergency = self._run_emergency_transaction()
                     return SessionResult(None, emergency, True)
 
@@ -232,13 +233,23 @@ class TurretSession:
         finally:
             self._transaction_active = False
 
+    def signal_emergency(self) -> None:
+        """Thread-safe signal-only Emergency preemption boundary.
+
+        This method never performs transport I/O. The worker may call it from
+        another thread to suppress ordinary retries; the worker-owned session
+        operation services the Emergency at the next safe physical boundary.
+        """
+        self._normal_traffic_blocked = True
+        self._emergency_requested.set()
+
     def request_emergency(self) -> ProtocolResponse | None:
         """Request Emergency now, or queue it behind the current physical attempt."""
         self._normal_traffic_blocked = True
         if self._emergency_active:
             return None
         if self._transaction_active:
-            self._emergency_requested = True
+            self._emergency_requested.set()
             return None
 
         self._transaction_active = True
@@ -267,7 +278,7 @@ class TurretSession:
             outcome = self._physical_attempt(
                 transaction, allow_emergency_preemption=True
             )
-            if not outcome.transmitted and self._emergency_requested:
+            if not outcome.transmitted and self._emergency_requested.is_set():
                 emergency = self._run_emergency_transaction()
                 if emergency.result is not ResultCode.OK:
                     raise SessionBlockedError(
@@ -300,7 +311,7 @@ class TurretSession:
                     TransportIOError,
                 ) as exc:
                     self._normal_traffic_blocked = True
-                    self._emergency_requested = False
+                    self._emergency_requested.clear()
                     raise BaudRecoveryError(candidates) from exc
 
                 if response is None:
@@ -308,7 +319,7 @@ class TurretSession:
                 return self._finish_baud_and_service_emergency(response, baudrate)
 
             self._normal_traffic_blocked = True
-            self._emergency_requested = False
+            self._emergency_requested.clear()
             raise BaudRecoveryError(candidates)
         finally:
             self._transaction_active = False
@@ -319,10 +330,10 @@ class TurretSession:
         try:
             result = self._finish_baud_response(response, desired_baudrate)
         except BaudRecoveryError:
-            self._emergency_requested = False
+            self._emergency_requested.clear()
             raise
 
-        if self._emergency_requested:
+        if self._emergency_requested.is_set():
             self._run_emergency_transaction()
         return result
 
@@ -347,7 +358,7 @@ class TurretSession:
         return response
 
     def _run_emergency_transaction(self) -> ProtocolResponse:
-        self._emergency_requested = False
+        self._emergency_requested.clear()
         self._emergency_active = True
         try:
             transaction = self._new_transaction(CommandCode.EMERGENCY_STOP, None)
@@ -372,6 +383,9 @@ class TurretSession:
             raise EmergencyRetryExhaustedError(transaction.request, attempts)
         finally:
             self._emergency_active = False
+            # A signal received while Emergency itself was in flight is redundant
+            # with the active safety operation and must not become a latent ghost.
+            self._emergency_requested.clear()
 
     def _physical_attempt(
         self,
@@ -380,7 +394,7 @@ class TurretSession:
         allow_emergency_preemption: bool,
     ) -> _AttemptOutcome:
         self._consume_inter_request_delay()
-        if allow_emergency_preemption and self._emergency_requested:
+        if allow_emergency_preemption and self._emergency_requested.is_set():
             return _AttemptOutcome(response=None, transmitted=False)
 
         self._attempt_in_flight = True

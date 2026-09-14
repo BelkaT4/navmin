@@ -156,10 +156,10 @@ class TurretState:
     connection_state: TurretConnectionState
     motor_state: MotorState
     control_mode: TurretControlMode
-    max_speed_x_deg_s: float
-    max_speed_y_deg_s: float
-    acceleration_x_deg_s2: float
-    acceleration_y_deg_s2: float
+    max_speed_x_deg_s: float | None
+    max_speed_y_deg_s: float | None
+    acceleration_x_deg_s2: float | None
+    acceleration_y_deg_s2: float | None
 
 
 @dataclass(frozen=True)
