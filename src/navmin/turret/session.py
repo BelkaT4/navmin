@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass
 from math import isfinite
-from threading import Event
+from threading import Event, Lock
 from time import monotonic, sleep
 
 from .protocol import (
@@ -176,6 +176,7 @@ class TurretSession:
         self._transaction_active = False
         self._attempt_in_flight = False
         self._emergency_requested = Event()
+        self._emergency_state_lock = Lock()
         self._emergency_active = False
         self._normal_traffic_blocked = False
         self._inter_request_delay_pending = False
@@ -187,6 +188,11 @@ class TurretSession:
     @property
     def normal_traffic_blocked(self) -> bool:
         return self._normal_traffic_blocked
+
+    @property
+    def emergency_pending(self) -> bool:
+        with self._emergency_state_lock:
+            return self._emergency_requested.is_set()
 
     @property
     def physical_attempt_in_flight(self) -> bool:
@@ -233,24 +239,29 @@ class TurretSession:
         finally:
             self._transaction_active = False
 
-    def signal_emergency(self) -> None:
+    def signal_emergency(self) -> bool:
         """Thread-safe signal-only Emergency preemption boundary.
 
         This method never performs transport I/O. The worker may call it from
         another thread to suppress ordinary retries; the worker-owned session
         operation services the Emergency at the next safe physical boundary.
         """
-        self._normal_traffic_blocked = True
-        self._emergency_requested.set()
+        with self._emergency_state_lock:
+            if self._emergency_active:
+                return False
+            self._normal_traffic_blocked = True
+            self._emergency_requested.set()
+            return True
 
     def request_emergency(self) -> ProtocolResponse | None:
         """Request Emergency now, or queue it behind the current physical attempt."""
-        self._normal_traffic_blocked = True
-        if self._emergency_active:
-            return None
-        if self._transaction_active:
-            self._emergency_requested.set()
-            return None
+        with self._emergency_state_lock:
+            self._normal_traffic_blocked = True
+            if self._emergency_active:
+                return None
+            if self._transaction_active:
+                self._emergency_requested.set()
+                return None
 
         self._transaction_active = True
         try:
@@ -358,8 +369,9 @@ class TurretSession:
         return response
 
     def _run_emergency_transaction(self) -> ProtocolResponse:
-        self._emergency_requested.clear()
-        self._emergency_active = True
+        with self._emergency_state_lock:
+            self._emergency_requested.clear()
+            self._emergency_active = True
         try:
             transaction = self._new_transaction(CommandCode.EMERGENCY_STOP, None)
             attempts = self._max_retries + 1
@@ -382,10 +394,12 @@ class TurretSession:
             self._normal_traffic_blocked = True
             raise EmergencyRetryExhaustedError(transaction.request, attempts)
         finally:
-            self._emergency_active = False
-            # A signal received while Emergency itself was in flight is redundant
-            # with the active safety operation and must not become a latent ghost.
-            self._emergency_requested.clear()
+            with self._emergency_state_lock:
+                # A signal linearized while Emergency is active coalesces with it.
+                # A signal linearized after this completion boundary must remain
+                # pending for a subsequent Emergency.
+                self._emergency_requested.clear()
+                self._emergency_active = False
 
     def _physical_attempt(
         self,
@@ -442,9 +456,10 @@ class TurretSession:
         self, command: CommandCode, payload: RequestPayload
     ) -> _Transaction:
         request_id = self._next_request_id
-        self._next_request_id = (request_id + 1) & UINT16_MAX
         request = ProtocolRequest(request_id, command, payload)
-        return _Transaction(request=request, raw_request=encode_request(request))
+        raw_request = encode_request(request)
+        self._next_request_id = (request_id + 1) & UINT16_MAX
+        return _Transaction(request=request, raw_request=raw_request)
 
     def _consume_inter_request_delay(self) -> None:
         if not self._inter_request_delay_pending:

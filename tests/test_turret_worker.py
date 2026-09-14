@@ -280,6 +280,33 @@ def test_invalid_request_id_resyncs_with_emergency_without_reconnect() -> None:
         _shutdown(worker)
 
 
+def test_invalid_request_id_failed_emergency_resync_enters_recovery() -> None:
+    endpoint = FakeStm32Endpoint()
+    factory = _RecordingFactory(endpoint)
+    worker = TurretWorker(_config(), transport_factory=factory)
+    worker.start()
+    try:
+        _wait_state(worker, TurretConnectionState.READY)
+        call_count = len(factory.calls)
+        endpoint.queue_response(FakeResponseSpec(result=ResultCode.INVALID_REQUEST_ID))
+        endpoint.queue_response(FakeResponseSpec(result=ResultCode.INTERNAL_ERROR))
+        factory.always_fail = True
+        history_start = len(endpoint.request_history)
+
+        worker.submit_move_relative(MoveRelativeCommand(1.0, 0.0))
+
+        state = _wait_state(worker, TurretConnectionState.CONNECTING)
+        assert not worker.ready
+        assert state.connection_state is TurretConnectionState.CONNECTING
+        assert [request.command for request in endpoint.request_history[history_start:]] == [
+            CommandCode.MOVE_RELATIVE,
+            CommandCode.EMERGENCY_STOP,
+        ]
+        _wait_factory_calls(factory, call_count + 1)
+    finally:
+        _shutdown(worker)
+
+
 def test_matching_command_error_does_not_trigger_physical_reconnect() -> None:
     endpoint = FakeStm32Endpoint()
     factory = _RecordingFactory(endpoint)
@@ -892,5 +919,105 @@ def test_normal_ingress_during_active_recovery_is_not_replayed_after_ready() -> 
         assert CommandCode.MOTOR_ON not in commands
         assert CommandCode.MOVE_RELATIVE not in commands
         assert worker.current_state.motor_state is MotorState.OFF
+    finally:
+        _shutdown(worker)
+
+
+def test_emergency_during_active_recovery_is_serviced_before_ready() -> None:
+    endpoint = FakeStm32Endpoint()
+    factory = _BlockingRecoveryFactory(endpoint)
+    worker = TurretWorker(_config(), transport_factory=factory)
+    worker.start()
+    try:
+        _wait_state(worker, TurretConnectionState.READY)
+        history_start = len(endpoint.request_history)
+
+        factory.block_next_recovery_set_config = True
+        changed = replace(
+            worker._desired_config,
+            serial=replace(worker._desired_config.serial, response_timeout_ms=500),
+        )
+        worker.submit_config_update(ConfigUpdate(1, changed))
+
+        assert factory.blocked_transport_ready.wait(0.5)
+        blocked = factory.blocked_transport
+        assert blocked is not None
+        assert blocked.write_seen.wait(0.5)
+        assert worker.current_state.connection_state is TurretConnectionState.CONNECTING
+
+        worker.request_emergency()
+        blocked.release_read.set()
+        _wait_state(worker, TurretConnectionState.READY)
+
+        commands = [
+            request.command for request in endpoint.request_history[history_start:]
+        ]
+        assert commands == [
+            CommandCode.EMERGENCY_STOP,
+            CommandCode.MOTOR_OFF,
+            CommandCode.SET_CONFIG,
+            CommandCode.EMERGENCY_STOP,
+            CommandCode.MOTOR_OFF,
+            CommandCode.SET_CONFIG,
+        ]
+        assert worker.current_state.motor_state is MotorState.OFF
+    finally:
+        _shutdown(worker)
+
+
+def test_emergency_preempted_set_config_is_confirmed_before_later_motion() -> None:
+    endpoint = FakeStm32Endpoint()
+    factory = _RecordingFactory(endpoint)
+    worker = TurretWorker(_config(inter_request_delay_ms=10), transport_factory=factory)
+    worker.start()
+    try:
+        _wait_state(worker, TurretConnectionState.READY)
+        session = worker._session
+        assert session is not None
+        entered_wait = Event()
+        release_wait = Event()
+        wait_used = False
+
+        def wait_once(delay_s: float) -> None:
+            nonlocal wait_used
+            del delay_s
+            if wait_used:
+                return
+            wait_used = True
+            entered_wait.set()
+            assert release_wait.wait(0.5)
+
+        session._wait_hook = wait_once
+        history_start = len(endpoint.request_history)
+        changed = replace(
+            worker._desired_config,
+            stm32=replace(worker._desired_config.stm32, max_speed_x_deg_s=75.0),
+        )
+        worker.submit_config_update(ConfigUpdate(1, changed))
+        assert entered_wait.wait(0.5)
+
+        worker.request_emergency()
+        release_wait.set()
+
+        deadline = monotonic() + 1.0
+        while worker.current_state.max_speed_x_deg_s != 75.0:
+            assert monotonic() < deadline
+            Event().wait(0.002)
+
+        worker.submit_move_relative(MoveRelativeCommand(1.0, 0.0))
+        deadline = monotonic() + 1.0
+        while endpoint.request_history[-1].command is not CommandCode.MOVE_RELATIVE:
+            assert monotonic() < deadline
+            Event().wait(0.002)
+
+        commands = [
+            request.command for request in endpoint.request_history[history_start:]
+        ]
+        assert commands == [
+            CommandCode.EMERGENCY_STOP,
+            CommandCode.SET_CONFIG,
+            CommandCode.MOVE_RELATIVE,
+        ]
+        assert worker.current_state.max_speed_x_deg_s == 75.0
     finally:
         _shutdown(worker)

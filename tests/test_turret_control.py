@@ -201,6 +201,37 @@ def test_hal_set_config_rejects_uint32_overflow_before_transmission() -> None:
     assert transport.raw_write_history == []
 
 
+@pytest.mark.parametrize(
+    ("field_name", "value"),
+    [
+        ("max_speed_x_deg_s", 0.01),
+        ("acceleration_x_deg_s2", 0.01),
+    ],
+)
+def test_hal_positive_set_config_magnitude_quantized_to_zero_is_rejected(
+    field_name: str,
+    value: float,
+) -> None:
+    config = _config()
+    config = replace(config, stm32=replace(config.stm32, **{field_name: value}))
+    _, hal, _, transport, _ = _stack(config)
+
+    with pytest.raises(ProtocolValueError):
+        hal.sync_stm32_config()
+
+    assert transport.raw_write_history == []
+
+
+def test_hal_extreme_finite_conversion_raises_protocol_error_not_overflow() -> None:
+    config = _config(max_speed_x=1e308)
+    _, hal, _, transport, _ = _stack(config)
+
+    with pytest.raises(ProtocolValueError):
+        hal.sync_stm32_config()
+
+    assert transport.raw_write_history == []
+
+
 def test_hal_runtime_mechanics_change_is_restart_only() -> None:
     config = _config(invert_x=True, max_relative_x=10.0)
     _, hal, session, transport, _ = _stack(config)

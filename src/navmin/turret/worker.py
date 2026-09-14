@@ -49,6 +49,12 @@ class _ControlKind(Enum):
     MOTOR_OFF = "motor_off"
 
 
+class _RecoveryConfigStatus(Enum):
+    COMPLETE = "complete"
+    EMERGENCY_HANDLED = "emergency_handled"
+    FAILED = "failed"
+
+
 @dataclass(frozen=True)
 class _ControlIntent:
     kind: _ControlKind
@@ -127,6 +133,7 @@ class TurretWorker:
         self._config_updates: LatestValue[ConfigUpdate[TurretConfig]] = LatestValue()
         self._config_updates.publish(ConfigUpdate(0, config))
         self._emergency_signal = Event()
+        self._emergency_signal_lock = Lock()
         self._normal_ingress_lock = Lock()
         self._normal_ingress_open = False
         self._last_motion_revision = 0
@@ -224,10 +231,13 @@ class TurretWorker:
 
     def request_emergency(self) -> None:
         """Signal Emergency without performing UART I/O in the caller thread."""
-        self._emergency_signal.set()
-        session = self._session
-        if self._ready and session is not None:
-            session.signal_emergency()
+        with self._emergency_signal_lock:
+            session = self._session
+            if session is None:
+                self._emergency_signal.set()
+                return
+            if session.signal_emergency():
+                self._emergency_signal.set()
 
     def submit_config_update(self, update: ConfigUpdate[TurretConfig]) -> None:
         if not isinstance(update, ConfigUpdate):
@@ -320,45 +330,53 @@ class TurretWorker:
                 self._transport = transport
                 self._session = session
                 self._bind_stack(session)
-                if self._emergency_signal.is_set():
-                    session.signal_emergency()
+                with self._emergency_signal_lock:
+                    if self._emergency_signal.is_set():
+                        session.signal_emergency()
 
-                hal = self._hal_required()
-                with hal.defer_pending_config_drain():
-                    emergency = self._controller_required().emergency_stop()
-                    if emergency is None or emergency.result is not ResultCode.OK:
-                        self._close_transport()
-                        return False
-                    self._emergency_signal.clear()
-                    self._last_known_port = serial.port
-                    self._last_known_baud = candidate
-                    _LOGGER.info(
-                        "Turret physical connection found on %s at %d baud",
-                        serial.port,
-                        candidate,
-                    )
-
-                    motor_off = self._controller_required().motor_off()
-                    if not self._session_result_ok(motor_off):
-                        self._close_transport()
-                        return False
+                if not self._complete_recovery_emergency_boundary():
+                    self._close_transport()
+                    return False
+                self._last_known_port = serial.port
+                self._last_known_baud = candidate
+                _LOGGER.info(
+                    "Turret physical connection found on %s at %d baud",
+                    serial.port,
+                    candidate,
+                )
                 self._publish_state(TurretConnectionState.CONNECTING)
 
-                if not self._stabilize_recovery_config():
-                    self._close_transport()
-                    return False
+                while not self._stop_token.is_stop_requested():
+                    if not self._stabilize_recovery_config():
+                        self._close_transport()
+                        return False
 
-                if not self._sync_freshest_stm32_config():
-                    self._close_transport()
-                    return False
+                    config_status = self._sync_freshest_stm32_config()
+                    if config_status is _RecoveryConfigStatus.FAILED:
+                        self._close_transport()
+                        return False
+                    if config_status is _RecoveryConfigStatus.EMERGENCY_HANDLED:
+                        if not self._complete_recovery_motor_off_boundary():
+                            self._close_transport()
+                            return False
+                        continue
 
-                self._emergency_signal.clear()
-                with self._normal_ingress_lock:
-                    self._ready = True
-                    self._publish_state(TurretConnectionState.READY)
-                    self._normal_ingress_open = True
-                _LOGGER.info("Turret READY")
-                return True
+                    with self._emergency_signal_lock:
+                        session = self._session_required()
+                        if self._emergency_signal.is_set() or session.emergency_pending:
+                            pending_emergency = True
+                        else:
+                            pending_emergency = False
+                            with self._normal_ingress_lock:
+                                self._ready = True
+                                self._publish_state(TurretConnectionState.READY)
+                                self._normal_ingress_open = True
+                    if not pending_emergency:
+                        _LOGGER.info("Turret READY")
+                        return True
+                    if not self._complete_recovery_emergency_boundary():
+                        self._close_transport()
+                        return False
             except (SessionError, TransportError) as exc:
                 _LOGGER.debug("Turret baud candidate %d failed: %s", candidate, exc)
                 self._close_transport()
@@ -374,6 +392,21 @@ class TurretWorker:
                     except TransportError:
                         pass
         return False
+
+    def _complete_recovery_emergency_boundary(self) -> bool:
+        hal = self._hal_required()
+        with hal.defer_pending_config_drain():
+            emergency = self._controller_required().emergency_stop()
+            if emergency is None or emergency.result is not ResultCode.OK:
+                return False
+            self._clear_emergency_signal_if_serviced()
+            return self._complete_recovery_motor_off_boundary()
+
+    def _complete_recovery_motor_off_boundary(self) -> bool:
+        hal = self._hal_required()
+        with hal.defer_pending_config_drain():
+            motor_off = self._controller_required().motor_off()
+        return self._session_result_ok(motor_off)
 
     def _stabilize_recovery_config(self) -> bool:
         """Apply freshest accepted config before final SET_CONFIG/READY."""
@@ -397,13 +430,14 @@ class TurretWorker:
                 self._last_known_port = update.config.serial.port
                 self._last_known_baud = desired_baud
                 _LOGGER.info("Turret baud transitioned to %d", desired_baud)
+                self._clear_emergency_signal_if_serviced()
 
             latest = self._latest_config_update()
             if latest.revision == update.revision:
                 return True
         return False
 
-    def _sync_freshest_stm32_config(self) -> bool:
+    def _sync_freshest_stm32_config(self) -> _RecoveryConfigStatus:
         while not self._stop_token.is_stop_requested():
             update = self._latest_config_update()
             self._desired_config = update.config
@@ -411,24 +445,31 @@ class TurretWorker:
                 self._session_config_required()
             ):
                 self._stage_latest_config(update)
-                return False
+                return _RecoveryConfigStatus.FAILED
             self._stage_latest_config(update)
             transport = self._transport_required()
             desired_baud = update.config.serial.baudrate
             if transport.baudrate != desired_baud:
                 response = self._session_required().set_baudrate(desired_baud)
                 if response.result is not ResultCode.OK:
-                    return False
+                    return _RecoveryConfigStatus.FAILED
                 self._last_known_port = update.config.serial.port
                 self._last_known_baud = desired_baud
                 _LOGGER.info("Turret baud transitioned to %d", desired_baud)
+                self._clear_emergency_signal_if_serviced()
             result = self._hal_required().sync_stm32_config()
+            if result is not None and result.preempted_by_emergency:
+                emergency = result.emergency_response
+                if emergency is not None and emergency.result is ResultCode.OK:
+                    self._clear_emergency_signal_if_serviced()
+                    return _RecoveryConfigStatus.EMERGENCY_HANDLED
+                return _RecoveryConfigStatus.FAILED
             if not self._session_result_ok(result):
-                return False
+                return _RecoveryConfigStatus.FAILED
             latest = self._latest_config_update()
             if latest.revision == update.revision:
-                return True
-        return False
+                return _RecoveryConfigStatus.COMPLETE
+        return _RecoveryConfigStatus.FAILED
 
     def _process_ready_once(self) -> bool:
         if self._emergency_signal.is_set():
@@ -471,6 +512,19 @@ class TurretWorker:
         result = self._controller_required().apply_config_update(update)
         if result is not None:
             self._handle_session_result(result)
+            if (
+                result.preempted_by_emergency
+                and result.emergency_response is not None
+                and result.emergency_response.result is ResultCode.OK
+                and self._hal_required().pending_config_revision is not None
+            ):
+                pending_result = self._hal_required().flush_pending_config()
+                if pending_result is not None:
+                    self._handle_session_result(pending_result)
+                if not self._session_result_ok(pending_result):
+                    raise SessionError(
+                        "SET_CONFIG remained unconfirmed after Emergency preemption"
+                    )
 
         if old.serial.baudrate != new.serial.baudrate:
             if self._hal_required().motor_state is MotorState.OFF:
@@ -528,7 +582,7 @@ class TurretWorker:
     def _service_emergency(self) -> None:
         response = self._controller_required().emergency_stop()
         if response is not None and response.result is ResultCode.OK:
-            self._emergency_signal.clear()
+            self._clear_emergency_signal_if_serviced()
         self._publish_state(TurretConnectionState.READY)
 
     def _handle_session_result(self, result: SessionResult) -> None:
@@ -536,14 +590,22 @@ class TurretWorker:
             result.emergency_response is not None
             and result.emergency_response.result is ResultCode.OK
         ):
-            self._emergency_signal.clear()
+            self._clear_emergency_signal_if_serviced()
         response = result.response
         if response is None or response.result is not ResultCode.INVALID_REQUEST_ID:
             return
         # Sequence loss is not a physical disconnect. Resync on the same link.
         emergency = self._controller_required().emergency_stop()
         if emergency is not None and emergency.result is ResultCode.OK:
-            self._emergency_signal.clear()
+            self._clear_emergency_signal_if_serviced()
+            return
+        raise SessionError("Emergency resync failed after INVALID_REQUEST_ID")
+
+    def _clear_emergency_signal_if_serviced(self) -> None:
+        with self._emergency_signal_lock:
+            session = self._session
+            if session is not None and not session.emergency_pending:
+                self._emergency_signal.clear()
 
     def _apply_pending_baud_if_safe(self) -> bool:
         hal = self._hal_required()
@@ -556,6 +618,7 @@ class TurretWorker:
         response = self._session_required().set_baudrate(desired)
         if response.result is not ResultCode.OK:
             return False
+        self._clear_emergency_signal_if_serviced()
         self._last_known_port = self._desired_config.serial.port
         self._last_known_baud = desired
         _LOGGER.info("Turret baud transitioned to %d", desired)

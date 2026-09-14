@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from threading import Barrier, Event, Thread
 
 import pytest
 
 from navmin.turret.protocol import (
     CommandCode,
+    PayloadFormatError,
     ProtocolResponse,
     ResultCode,
     SetBaudratePayload,
@@ -40,6 +42,29 @@ class _AfterWriteTransport(FakeTransport):
         if self.after_write is not None and not self._hook_used:
             self._hook_used = True
             self.after_write()
+
+
+class _CompletionBoundaryEvent:
+    """Event wrapper that pauses the second clear at Emergency completion."""
+
+    def __init__(self) -> None:
+        self._event = Event()
+        self._clear_count = 0
+        self.completion_boundary = Barrier(2)
+        self.release_boundary = Barrier(2)
+
+    def set(self) -> None:
+        self._event.set()
+
+    def clear(self) -> None:
+        self._clear_count += 1
+        if self._clear_count == 2:
+            self.completion_boundary.wait(timeout=0.5)
+            self.release_boundary.wait(timeout=0.5)
+        self._event.clear()
+
+    def is_set(self) -> bool:
+        return self._event.is_set()
 
 
 def _session(
@@ -84,6 +109,18 @@ def test_request_id_wraps_from_65535_to_zero() -> None:
         0xFFFF,
         0,
     ]
+    assert session.next_request_id == 1
+
+
+def test_local_request_construction_failure_does_not_consume_request_id() -> None:
+    session, transport = _session(max_retries=0)
+
+    with pytest.raises(PayloadFormatError):
+        session.transact(CommandCode.PING, SetBaudratePayload(9600))
+
+    assert session.next_request_id == 0
+    session.transact(CommandCode.PING)
+    assert transport.endpoint.request_history[-1].request_id == 0
     assert session.next_request_id == 1
 
 
@@ -347,6 +384,38 @@ def test_repeated_emergency_during_active_emergency_is_coalesced_without_ghost()
         CommandCode.PING,
     ]
     assert session.next_request_id == 2
+
+
+def test_emergency_signal_linearized_after_completion_remains_pending() -> None:
+    session, transport = _session(max_retries=0)
+    completion_event = _CompletionBoundaryEvent()
+    session._emergency_requested = completion_event
+    responses: list[ProtocolResponse | None] = []
+
+    emergency_thread = Thread(target=lambda: responses.append(session.request_emergency()))
+    emergency_thread.start()
+    completion_event.completion_boundary.wait(timeout=0.5)
+
+    signal_thread = Thread(target=session.signal_emergency)
+    signal_thread.start()
+    completion_event.release_boundary.wait(timeout=0.5)
+    emergency_thread.join(0.5)
+    signal_thread.join(0.5)
+
+    assert not emergency_thread.is_alive()
+    assert not signal_thread.is_alive()
+    assert responses == [ProtocolResponse(0, CommandCode.EMERGENCY_STOP, ResultCode.OK)]
+    assert session.normal_traffic_blocked
+    assert session.emergency_pending
+
+    second = session.request_emergency()
+
+    assert second == ProtocolResponse(1, CommandCode.EMERGENCY_STOP, ResultCode.OK)
+    assert not session.normal_traffic_blocked
+    assert [decode_request(raw).command for raw in transport.raw_write_history] == [
+        CommandCode.EMERGENCY_STOP,
+        CommandCode.EMERGENCY_STOP,
+    ]
 
 
 def test_inter_request_delay_is_injected_not_real_sleep() -> None:

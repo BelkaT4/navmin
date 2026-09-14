@@ -19,6 +19,7 @@ from .protocol import (
     CommandCode,
     MoveRelativePayload,
     ProtocolResponse,
+    ProtocolValueError,
     ResultCode,
     SetConfigPayload,
     SetVelocityPayload,
@@ -120,18 +121,26 @@ class TurretHal:
     def speed_magnitude_to_steps_s(self, axis: AxisName, value_deg_s: float) -> int:
         value = self._require_nonnegative_finite(value_deg_s, name="value_deg_s")
         # Axis inversion must never affect unsigned magnitudes.
-        return require_uint32(
+        steps = require_uint32(
             self._round_steps(axis, value), name=f"{axis}_max_speed_steps_s"
         )
+        if steps == 0:
+            raise ProtocolValueError(f"{axis}_max_speed_steps_s must be greater than 0")
+        return steps
 
     def acceleration_magnitude_to_steps_s2(
         self, axis: AxisName, value_deg_s2: float
     ) -> int:
         value = self._require_nonnegative_finite(value_deg_s2, name="value_deg_s2")
         # Axis inversion must never affect unsigned magnitudes.
-        return require_uint32(
+        steps = require_uint32(
             self._round_steps(axis, value), name=f"{axis}_acceleration_steps_s2"
         )
+        if steps == 0:
+            raise ProtocolValueError(
+                f"{axis}_acceleration_steps_s2 must be greater than 0"
+            )
+        return steps
 
     def make_set_config_payload(self, config: Stm32Config) -> SetConfigPayload:
         if not isinstance(config, Stm32Config):
@@ -293,7 +302,12 @@ class TurretHal:
             self.flush_pending_config()
 
     def _round_steps(self, axis: AxisName, value: float) -> int:
-        return round(value * self.effective_steps_per_revolution(axis) / 360.0)
+        try:
+            return round(value * self.effective_steps_per_revolution(axis) / 360.0)
+        except OverflowError as exc:
+            raise ProtocolValueError(
+                f"{axis} step conversion exceeds protocol numeric range"
+            ) from exc
 
     def _mechanics(self, axis: AxisName) -> AxisMechanicsConfig:
         if axis == "x":
