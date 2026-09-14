@@ -1,27 +1,49 @@
 flowchart TB
-  flag_core_commands>"IN: turret commands<br>от Core"]
-  flag_core_status>"OUT: turret status<br>+ status_queue_ready<br>в Core"]
-  flag_config_in>"IN: Turret settings<br>от Config Manager"]
-  flag_heartbeat_out>"OUT: heartbeat<br>в Supervisor"]
-  stm32["STM32"]
-  subgraph turret ["Turret"]
-    command_queue[["command_queue<br>FIFO"]]
-    publish_status["Публикация статуса<br>данные + Qt notification"]
-    subgraph turret_thread ["Поток управления турелью"]
-      turret_controller["Turret Controller"]
-      turret_hal["Turret HAL"]
+  flag_motion_in>"IN: motion intent<br/>MoveRelative or TrackingError"
+  flag_mode_in>"IN: set_control_mode<br/>RELATIVE / TRACKING"
+  flag_control_in>"IN: StopMotion / MOTOR_ON / MOTOR_OFF<br/>EMERGENCY_STOP"
+  flag_config_in>"IN: Turret ConfigUpdate<br/>latest-only"
+  flag_core_out>"OUT: TurretState"
+
+  stm32["STM32<br/>relative/velocity control<br/>acceleration limiter + watchdog"]
+
+  subgraph turret["Turret"]
+    pending_motion[["pending_motion latest-only<br/>MoveRelative | Velocity | None"]]
+    pending_config[["latest pending<br/>STM32 config snapshot"]]
+    control_ops["Control operation<br/>mode / Stop / motor / Emergency"]
+
+    subgraph turret_thread["Turret worker"]
+      controller["Turret Controller<br/>authoritative control_mode<br/>ownership boundaries"]
+      pid["PID<br/>owned by Controller<br/>revision exactly once"]
+      hal["Turret HAL<br/>units / invert / recovery"]
+      arbiter["TX Arbiter<br/>one physical request in flight<br/>committed ordinary request"]
+      serial["Serial Protocol<br/>one REQUEST_ID counter<br/>ID + COMMAND correlation"]
     end
+
+    turret_state["TurretState<br/>control_mode / motor / connection"]
   end
 
-  turret_controller <-->|"команды / ответы / состояние"| turret_hal
-  flag_core_commands --> command_queue
-  command_queue --> turret_controller
-  turret_controller -->|"состояние / ошибки"| publish_status
-  publish_status --> flag_core_status
-  flag_config_in -.->|"turret settings"| turret_controller
-  flag_config_in -.->|"UART settings"| turret_hal
-  turret_hal <-->|"Serial bus / UART"| stm32
-  turret_controller -.-> flag_heartbeat_out
-%% graph:positions {"turret":{"x":11,"y":189,"w":518,"h":542},"turret_thread":{"x":135,"y":71,"w":355,"h":364},"flag_core_commands":{"x":146,"y":828},"flag_core_status":{"x":336,"y":828},"flag_config_in":{"x":-228,"y":390},"flag_heartbeat_out":{"x":564,"y":468},"stm32":{"x":240,"y":60},"command_queue":{"x":135,"y":459},"publish_status":{"x":325,"y":459},"turret_controller":{"x":94,"y":208},"turret_hal":{"x":94,"y":76}}
-%% graph:edges {"turret_controller>publish_status":{"label":[81,1]},"flag_config_in>turret_controller":{"label":[93,40]},"flag_config_in>turret_hal":{"label":[94,-64]}}
-%% graph:waypoints {"flag_config_in>turret_controller":[[-6,418]],"flag_config_in>turret_hal":[[-6,427]]}
+  flag_motion_in --> controller
+  controller -->|"RELATIVE intent"| pending_motion
+  controller --> pid
+  pid -->|"TRACKING velocity"| pending_motion
+  pending_motion --> hal
+
+  flag_mode_in --> control_ops --> controller
+  flag_control_in --> control_ops
+  controller -->|"zero handshake / mode apply"| hal
+  hal --> arbiter
+
+  flag_config_in --> pending_config --> hal
+
+  arbiter --> serial
+  serial <-->|"CONFIG / BAUD / MOVE / VELOCITY<br/>EMERGENCY / MOTOR / PING"| stm32
+
+  controller --> turret_state
+  hal --> turret_state
+  serial --> turret_state
+  turret_state --> flag_core_out
+
+%% graph:positions {"turret":{"x":20,"y":150,"w":900,"h":760},"turret_thread":{"x":250,"y":80,"w":520,"h":470},"flag_motion_in":{"x":40,"y":970},"flag_mode_in":{"x":330,"y":970},"flag_control_in":{"x":930,"y":720},"flag_config_in":{"x":-300,"y":390},"flag_core_out":{"x":960,"y":500},"stm32":{"x":360,"y":10},"pending_motion":{"x":80,"y":650},"pending_config":{"x":80,"y":340},"control_ops":{"x":700,"y":650},"controller":{"x":130,"y":390},"pid":{"x":390,"y":390},"hal":{"x":180,"y":180},"arbiter":{"x":470,"y":150},"serial":{"x":620,"y":150},"turret_state":{"x":720,"y":520}}
+%% graph:edges {"flag_motion_in>controller":{"label":[0,-15]},"flag_mode_in>control_ops":{"label":[10,15]},"controller>pid":{"label":[0,-20]},"pid>pending_motion":{"label":[45,-5]},"flag_control_in>control_ops":{"label":[-45,-20]},"flag_config_in>pending_config":{"label":[70,-10]},"arbiter>serial":{"label":[0,-20]},"turret_state>flag_core_out":{"label":[45,10]}}
+%% graph:waypoints {"flag_control_in>control_ops":[[880,700]],"pending_config>hal":[[230,430],[300,300]],"hal>arbiter":[[350,230]],"serial>stm32":[[650,90],[500,90]]}

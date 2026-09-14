@@ -1,23 +1,51 @@
 flowchart TB
-  flag_core_in>"IN: состояние системы<br>от Core"]
-  flag_core_out>"OUT: действия пользователя<br>в Core"]
-  flag_frame_in>"IN: latest frame<br>от Camera Manager"]
-  flag_config_in>"IN: UI settings<br>от Config Manager"]
-  subgraph ui ["UI / PyQt6"]
-    settings_window["Settings Window<br>Basic / Advanced"]
-    frame_timer["QTimer<br>≈ 60 Гц"]
-    subgraph main_window ["Main Window"]
-      top_bar["Top Bar"]
-      camera_viewer["Camera Viewer"]
+  flag_vision_in>"IN camera-derived: VisionResult<br/>working frames / overlays"
+  flag_session_in>"IN barrier: CameraSessionStarted<br/>→ CameraSessionGate"
+  flag_state_in>"IN typed state: TurretState / CameraStatus<br/>DistanceResult / config status"
+  flag_core_out>"OUT: TRACKING selection / swap / click / mode<br/>StopMotion / motor / Emergency / config"
+  flag_config_in>"IN: UiConfig snapshot"
+
+  subgraph ui["UI / PyQt6 main thread"]
+    session_gate["CameraSessionGate<br/>accepted_generation + CameraModel"]
+
+    subgraph main_window["Main Window"]
+      main_view["Main Camera View<br/>Overview or Stereo Left"]
+      preview_view["Preview View<br/>selection forbidden"]
+      top_bar["Top Bar<br/>swap / mode"]
       bottom_bar["Bottom Bar"]
+      diagnostics["Diagnostics<br/>Stereo Right optional"]
     end
+
+    settings["Settings Window<br/>Vision / Aiming / Turret / UI"]
+    selection["TRACKING target request<br/>camera + generation + track_id"]
+    click_move["Click-to-move<br/>confirmed RELATIVE + main only"]
+    turret_controls["Turret controls<br/>mode / motor / StopMotion / Emergency"]
+    recording["Clean recording<br/>FramePacket.image without overlays"]
+    state_view["Typed state<br/>camera freshness / Turret / distance"]
   end
 
-  top_bar -->|"открыть"| settings_window
-  flag_core_in --> main_window
-  main_window --> flag_core_out
-  flag_config_in -.-> settings_window
-  frame_timer -->|"обновить отображение"| camera_viewer
-  flag_frame_in -->|"latest frame"| camera_viewer
-%% graph:positions {"ui":{"x":232,"y":630,"w":575,"h":346},"main_window":{"x":332,"y":30,"w":216,"h":290},"flag_core_in":{"x":504,"y":1092},"flag_core_out":{"x":684,"y":1092},"flag_frame_in":{"x":588,"y":504},"flag_config_in":{"x":300,"y":1092},"settings_window":{"x":68,"y":238},"frame_timer":{"x":20,"y":72},"top_bar":{"x":24,"y":130},"camera_viewer":{"x":24,"y":42},"bottom_bar":{"x":24,"y":208}}
-%% graph:edges {"flag_frame_in>camera_viewer":{"label":[1,-37]}}
+  flag_session_in --> session_gate
+  flag_vision_in --> session_gate
+  session_gate --> main_view
+  session_gate --> preview_view
+  session_gate -.-> diagnostics
+  session_gate -.-> recording
+  flag_state_in --> state_view
+
+  main_view --> selection
+  main_view --> click_move
+  selection --> flag_core_out
+  click_move --> flag_core_out
+
+  top_bar --> turret_controls
+  top_bar --> flag_core_out
+  top_bar --> settings
+  bottom_bar --> turret_controls
+  turret_controls --> flag_core_out
+  settings --> flag_core_out
+  flag_config_in -.-> settings
+  state_view --> bottom_bar
+
+%% graph:positions {"ui":{"x":130,"y":110,"w":1100,"h":900},"main_window":{"x":230,"y":190,"w":870,"h":450},"flag_vision_in":{"x":-230,"y":360},"flag_session_in":{"x":-230,"y":160},"flag_state_in":{"x":-230,"y":560},"flag_core_out":{"x":1320,"y":600},"flag_config_in":{"x":-230,"y":760},"session_gate":{"x":70,"y":40},"main_view":{"x":120,"y":100},"preview_view":{"x":540,"y":100},"top_bar":{"x":300,"y":20},"bottom_bar":{"x":300,"y":340},"diagnostics":{"x":650,"y":340},"settings":{"x":90,"y":720},"selection":{"x":360,"y":720},"click_move":{"x":570,"y":720},"turret_controls":{"x":800,"y":720},"recording":{"x":90,"y":560},"state_view":{"x":500,"y":550}}
+%% graph:edges {"flag_session_in>session_gate":{"label":[60,-10]},"flag_vision_in>session_gate":{"label":[70,20]},"session_gate>main_view":{"label":[-20,-20]},"session_gate>preview_view":{"label":[25,-20]},"flag_state_in>state_view":{"label":[60,5]},"main_view>selection":{"label":[-30,55]},"main_view>click_move":{"label":[15,65]},"selection>flag_core_out":{"label":[80,10]},"click_move>flag_core_out":{"label":[70,25]},"turret_controls>flag_core_out":{"label":[45,-25]},"settings>flag_core_out":{"label":[85,45]}}
+%% graph:waypoints {"main_view>selection":[[430,520]],"main_view>click_move":[[520,570]],"selection>flag_core_out":[[950,820]],"turret_controls>flag_core_out":[[1080,820]]}

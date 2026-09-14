@@ -1,29 +1,38 @@
 flowchart TB
 
-cameras["Камеры x3<br/>(Raspberry Pi)"]
+cameras["Камеры x3<br/>(Overview / Stereo Left / Stereo Right)"]
 stm32["STM32"]
 config_file[("config.json")]
+calibration[("calibration/<br/>overview.json / stereo.json")]
 
 subgraph vision["Vision"]
-    vision_module["Получение и обработка видео"]
+    vision_module["3 camera pipelines<br/>decode + correction + VisionProcessor<br/>generation + CameraModel + Distance Provider"]
 end
 
 subgraph main_thread["Главный поток приложения"]
     direction TB
-    ui["UI<br/>(PyQt6)"]
-    core["Core / Mediator"]
+    session_gate["CameraSessionGate<br/>generation + CameraModel"]
+    ui["UI<br/>main + preview"]
+    core["Core<br/>Mediator + Aiming<br/>Config Manager"]
 end
 
 subgraph turret["Turret"]
-    turret_module["Управление турелью"]
+    turret_module["Turret Controller + HAL<br/>one pending_motion / RELATIVE / TRACKING"]
 end
 
-cameras -->|"UDP MJPEG (RTP опционально)"| vision_module
-vision_module <-->|"обнаруженные объекты / выбранная цель"| core
-vision_module -->|"актуальный кадр для отображения"| ui
-ui <-->|"команды пользователя / состояние системы"| core
-core <-->|"команды / состояние"| turret_module
-turret_module <-->|"Serial bus / UART"| stm32
-config_file <-->|"загрузка / сохранение настроек"| core
-%% graph:positions {"vision":{"x":-360,"y":414,"w":192,"h":122},"main_thread":{"x":103,"y":283,"w":304,"h":254},"turret":{"x":564,"y":414,"w":192,"h":122},"cameras":{"x":-344,"y":264},"stm32":{"x":580,"y":264},"config_file":{"x":183,"y":624},"vision_module":{"x":16,"y":41},"ui":{"x":80,"y":53},"core":{"x":80,"y":172},"turret_module":{"x":16,"y":40}}
-%% graph:edges {"cameras>vision_module":{"label":[1,-23]},"vision_module>core":{"label":[-25,26]},"vision_module>ui":{"label":[-1,-126]},"core>turret_module":{"label":[22,1]},"config_file>core":{"label":[0,16]}}
+cameras -->|"video stream"| vision_module
+calibration -->|"camera geometry"| vision_module
+vision_module -->|"CameraSessionStarted barrier"| session_gate
+vision_module -->|"VisionResult / DistanceResult / CameraStatus"| core
+vision_module -->|"VisionResult working frame"| ui
+session_gate --> core
+session_gate --> ui
+ui <-->|"actions / typed state<br/>main_camera + TRACKING selection"| core
+core -->|"MoveRelative / mode / TrackingError<br/>StopMotion / motor / Emergency"| turret_module
+turret_module -->|"TurretState"| core
+turret_module <-->|"RS485 / UART<br/>strict request ↔ response"| stm32
+config_file <-->|"atomic load / save"| core
+
+%% graph:positions {"vision":{"x":-380,"y":420,"w":240,"h":170},"main_thread":{"x":80,"y":240,"w":390,"h":350},"turret":{"x":620,"y":420,"w":250,"h":170},"cameras":{"x":-360,"y":260},"stm32":{"x":650,"y":260},"config_file":{"x":210,"y":690},"calibration":{"x":-350,"y":670},"vision_module":{"x":15,"y":50},"session_gate":{"x":110,"y":40},"ui":{"x":110,"y":135},"core":{"x":110,"y":250},"turret_module":{"x":20,"y":50}}
+%% graph:edges {"cameras>vision_module":{"label":[1,-23]},"vision_module>session_gate":{"label":[-15,-20]},"vision_module>core":{"label":[-25,26]},"vision_module>ui":{"label":[-1,-90]},"session_gate>core":{"label":[-35,5]},"session_gate>ui":{"label":[35,5]},"ui>core":{"label":[-40,0]},"core>ui":{"label":[40,0]},"core>turret_module":{"label":[22,1]},"turret_module>core":{"label":[20,25]},"config_file>core":{"label":[0,16]}}
+%% graph:waypoints {}

@@ -1,516 +1,330 @@
 # Конфигурация системы
 
-Этот документ описывает структуру конфигурации приложения и назначение основных параметров.
-
-`Config Manager` является частью Core. Он загружает настройки из `config.json`, хранит их в памяти, сохраняет изменения и передаёт обновления заинтересованным модулям.
+Этот документ описывает общие правила `config.json` и основные параметры модулей. Calibration data хранится отдельно и не является обычной пользовательской конфигурацией.
 
 ## Общие правила
 
-- Конфигурация хранится в `config.json`.
-- При запуске приложения `Config Manager` загружает файл в память.
-- Изменения из UI сначала поступают в Core, затем в `Config Manager`.
-- Рабочие модули не должны напрямую изменять общий файл конфигурации.
-- Каждый модуль получает только относящиеся к нему параметры.
-- Настройки, изменяемые пользователем и сохраняемые между запусками, должны находиться в конфигурации.
-- Какие параметры можно применять сразу, а какие требуют переинициализации компонента, будет определено отдельно.
+- `Config Manager` в Core — единственный источник актуальной общей конфигурации;
+- файл хранения — `config.json`;
+- первая версия schema: `schema-version = 1`;
+- после загрузки настройки валидируются и преобразуются в typed config objects;
+- изменения UI проходят через Core/Config Manager;
+- рабочие модули не записывают общий файл напрямую;
+- внутренние обновления передаются полным `ConfigUpdate[T]` с глобальным `revision`;
+- `ConfigUpdate` — latest-only;
+- владелец ресурса применяет заранее определённую policy: dynamic / pipeline restart / reconnect / application restart.
+
+Контракт: [ConfigUpdate](./contracts.md#configupdate).
+
+### Сохранение
+
+Запись `config.json` должна быть атомарной:
+
+```text
+write temporary file
+→ flush/close (и fsync там, где применимо)
+→ atomic replace config.json
+```
+
+Повреждённый существующий JSON не должен молча перезаписываться defaults: Config Manager сообщает startup/config error и сохраняет исходный файл для диагностики.
+
+Поведение при полностью отсутствующем `config.json` допускается определить при реализации Config Manager (создание defaults либо явная startup error).
+
+## Calibration отдельно от `config.json`
+
+Для первой реализации:
+
+```text
+calibration/
+  overview.json
+  stereo.json
+```
+
+Calibration содержит measured camera/stereo geometry и собственный `schema_version`.
+
+`config.json` не дублирует `K/D/R/T/P/Q`.
 
 ## Структура верхнего уровня
 
 ```text
 config
+├── schema-version
 ├── vision
+├── aiming
 ├── turret
-├── ui
-└── supervisor
+└── ui
 ```
 
-# vision
+## Vision
 
-Раздел `vision` содержит настройки трёх фиксированных camera pipeline и общего компонента определения дальности.
+### Cameras
 
-В системе используются три постоянные роли камер:
-
-- `overview`;
-- `stereo-left`;
-- `stereo-right`.
-
-Роли камер не меняются во время работы приложения.
-
-## vision.cameras
-
-```text
-vision
-└── cameras
-    ├── overview
-    ├── stereo-left
-    └── stereo-right
-```
-
-Каждая камера имеет собственный pipeline:
-
-```text
-получение кадра
-→ Detector
-→ Tracker
-→ VisionResult
-```
-
-Detector и Tracker могут быть включены или отключены отдельно для каждой камеры.
-
-## Общие параметры камеры
-
-Для каждой камеры используются следующие настройки.
-
-### enabled
-
-```text
-enabled: bool
-```
-
-Включает или отключает camera pipeline целиком.
-
-### address
-
-```text
-address: str
-```
-
-IP-адрес Raspberry Pi, с которого приходит видеопоток.
-
-### port
-
-```text
-port: int
-```
-
-UDP-порт видеопотока.
-
-### rtp-enabled
-
-```text
-rtp-enabled: bool
-```
-
-Использовать ли RTP для видеопотока.
-
-### buffer-size
-
-```text
-buffer-size: int
-```
-
-Размер буфера видеопотока.
-
-Точное значение подбирается экспериментально с учётом требования не накапливать задержку.
-
-### detection-enabled
-
-```text
-detection-enabled: bool
-```
-
-Включает Detector для этой камеры.
-
-### tracking-enabled
-
-```text
-tracking-enabled: bool
-```
-
-Включает Tracker для этой камеры.
-
-### detector-class
-
-```text
-detector-class: str
-```
-
-Имя используемой реализации Detector.
-
-### tracker-class
-
-```text
-tracker-class: str
-```
-
-Имя используемой реализации Tracker.
-
-## overview
-
-`overview` — обзорная камера.
-
-Она используется:
-
-- для отображения в основном интерфейсе;
-- для Detector;
-- для Tracker;
-- для отдельного пользовательского выбора цели.
-
-## stereo-left
-
-`stereo-left` — левая камера стереопары.
-
-Она используется:
-
-- для отображения в основном интерфейсе;
-- для Detector;
-- для Tracker;
-- для отдельного пользовательского выбора цели;
-- для запуска `Stereo / Distance Provider`.
-
-`Stereo / Distance Provider` выполняется в потоке `stereo-left`.
-
-## stereo-right
-
-`stereo-right` — правая камера стереопары.
-
-Она используется прежде всего для определения дальности.
-
-В обычном интерфейсе камера не отображается.
-
-Её изображение может включаться отдельно в диагностическом режиме.
-
-Detector и Tracker для `stereo-right` могут быть отключены, если они не нужны для текущей реализации.
-
-## vision.distance
-
-Раздел содержит настройки определения дальности.
-
-```text
-vision
-└── distance
-    ├── source
-    ├── manual-distance
-    └── stereo
-```
-
-### source
-
-```text
-source: str
-```
-
-Выбирает текущий источник дальности.
-
-Поддерживаемые значения на первом этапе:
-
-```text
-stereo
-manual
-```
-
-В будущем могут быть добавлены другие источники, например лидар.
-
-### manual-distance
-
-```text
-manual-distance: float
-```
-
-Постоянная дальность, задаваемая пользователем при:
-
-```text
-source = "manual"
-```
-
-Единица измерения должна быть окончательно определена вместе с контрактом `DistanceResult`.
-
-## vision.distance.stereo
-
-Настройки стереоопределения дальности.
-
-Левая и правая камеры аппаратно синхронизированы.
-
-Для сопоставления кадров используется `capture-id`.
-
-`receive-timestamp` используется отдельно для:
-
-- диагностики;
-- измерения задержки;
-- определения устаревшего видеопотока.
-
-### right-frame-buffer-size
-
-```text
-right-frame-buffer-size: int
-```
-
-Максимальное количество правых кадров, временно хранящихся для поиска кадра с соответствующим `capture-id`.
-
-Буфер должен быть небольшим и ограниченным.
-
-Он не используется как очередь последовательной обработки старых кадров.
-
-### pair-timeout-ms
-
-```text
-pair-timeout-ms: int
-```
-
-Максимальное время ожидания соответствующего кадра второй камеры.
-
-Точное значение будет определено после измерения реальной задержки между двумя Raspberry Pi.
-
-### stereo-enabled
-
-```text
-stereo-enabled: bool
-```
-
-Разрешает работу Stereo при выбранном источнике дальности `stereo`.
-
-## vision.camera-stale-timeout
-
-```text
-camera-stale-timeout: float
-```
-
-Время без нового кадра, после которого видеопоток считается устаревшим.
-
-Для определения используется `receive-timestamp`.
-
-Точное значение подбирается экспериментально.
-
-## vision.simulation-mode
-
-```text
-simulation-mode: bool
-```
-
-Включает режим работы Vision без реальных камер.
-
-Источник кадров в этом режиме может быть заменён на:
-
-- видеофайл;
-- набор изображений;
-- виртуальную камеру;
-- другой тестовый источник.
-
-## Параметры Detector и Tracker
-
-Окончательная схема хранения внутренних параметров конкретных Detector и Tracker пока не утверждена.
-
-Остаётся решить:
-
-- какие параметры являются внутренними константами реализации;
-- какие параметры должен менять пользователь;
-- какие параметры должны сохраняться между запусками;
-- как передавать изменения в работающий camera pipeline.
-
-До принятия этого решения в конфигурации фиксируются только:
-
-```text
-detector-class
-tracker-class
-detection-enabled
-tracking-enabled
-```
-
-# turret
-
-Раздел `turret` содержит настройки Turret Controller и Turret HAL.
-
-```text
-turret
-├── serial
-├── controller
-├── backlash
-└── emulate-stm32
-```
-
-## turret.serial
-
-Настройки последовательного интерфейса STM32.
-
-### port
-
-```text
-port: str
-```
-
-Имя последовательного порта.
-
-### baudrate
-
-```text
-baudrate: int
-```
-
-Скорость UART.
-
-### timeout-ms
-
-```text
-timeout-ms: int
-```
-
-Максимальное время ожидания ответа STM32.
-
-Точное поведение timeout зависит от будущего Serial Protocol.
-
-### retry-count
-
-```text
-retry-count: int
-```
-
-Максимальное количество повторных попыток передачи.
-
-Точная политика retry будет определена вместе с Serial Protocol.
-
-### uart-min-command-interval-ms
-
-```text
-uart-min-command-interval-ms: int
-```
-
-Минимальный интервал между последовательными командами, которые Turret HAL отправляет в STM32.
-
-Этот параметр нужен для защиты UART и STM32 от слишком частой отправки пакетов.
-
-Точное значение подбирается по:
-
-- `baudrate`;
-- размеру UART-пакета;
-- времени обработки команды STM32;
-- результатам тестов на реальном оборудовании.
-
-На этапе прототипа HAL не должен отправлять следующую обычную команду раньше этого интервала.
-
-## turret.controller
-
-Настройки высокоуровневого управления Turret.
-
-### pid-kp-x
-
-```text
-pid-kp-x: float
-```
-
-Пропорциональный коэффициент PI-регулятора по оси X.
-
-### pid-ki-x
-
-```text
-pid-ki-x: float
-```
-
-Интегральный коэффициент PI-регулятора по оси X.
-
-### pid-kp-y
-
-```text
-pid-kp-y: float
-```
-
-Пропорциональный коэффициент PI-регулятора по оси Y.
-
-### pid-ki-y
-
-```text
-pid-ki-y: float
-```
-
-Интегральный коэффициент PI-регулятора по оси Y.
-
-## turret.backlash
-
-Компенсация механического люфта.
-
-### x
-
-```text
-x: float
-```
-
-Компенсация люфта по оси X.
-
-### y
-
-```text
-y: float
-```
-
-Компенсация люфта по оси Y.
-
-## turret.emulate-stm32
-
-```text
-emulate-stm32: bool
-```
-
-Включает эмуляцию STM32 вместо физического контроллера.
-
-# ui
-
-Раздел `ui` содержит только настройки пользовательского интерфейса.
-
-## ui.default-camera
-
-```text
-default-camera: str
-```
-
-Камера, которая выбирается основной при запуске UI.
-
-Допустимые значения:
+Для:
 
 ```text
 overview
 stereo-left
+stereo-right
 ```
 
-`stereo-right` не используется как основная камера обычного интерфейса.
-
-## ui.show-fps
-
-```text
-show-fps: bool
-```
-
-Показывать ли FPS в интерфейсе.
-
-## ui.show-stereo-right-diagnostics
-
-```text
-show-stereo-right-diagnostics: bool
-```
-
-Разрешает отображение `stereo-right` в диагностическом режиме.
-
-Точное место отображения правой камеры в UI пока не определено.
-
-# supervisor
-
-Настройки контроля состояния рабочих компонентов.
-
-## supervisor.enabled
+основные поля:
 
 ```text
 enabled: bool
+address: str
+port: int
+rtp-enabled: bool
+buffer-size: int
+processing-enabled: bool          # optional per-camera master switch
+vision-processor-class: str
 ```
 
-Включает Supervisor.
+`processing-enabled = false` полностью запрещает VisionProcessor для этой камеры, но pipeline продолжает публиковать corrected working frame через `VisionResult` с пустым `tracked_objects`.
 
-## supervisor.heartbeat-timeout
+### Processing scope main / preview
+
+Для Overview + Stereo Left:
 
 ```text
-heartbeat-timeout: float
+vision.processing-scope = main-only | main-and-preview
 ```
 
-Максимальное допустимое время без обновления состояния контролируемого компонента.
+Effective processing:
 
-Какие именно компоненты Supervisor будет контролировать окончательно, пока не утверждено.
+```text
+processing-enabled(camera)
+AND
+(
+    processing-scope == main-and-preview
+    OR camera == main_camera
+)
+```
 
-# Пример config.json
+`Stereo Right` не подчиняется main/preview selection и используется по diagnostic/stereo policy.
 
-Ниже приведён пример структуры конфигурационного файла.
+Processor-specific settings остаются отдельным открытым вопросом.
 
-Значения являются демонстрационными и не считаются рекомендуемыми рабочими параметрами.
+### Distance
+
+```text
+vision.distance.source = stereo | manual
+vision.distance.manual-distance-m
+vision.distance.distance-stale-timeout-ms
+```
+
+Для Stereo:
+
+```text
+right-frame-buffer-size
+pair-timeout-ms
+stereo-enabled
+```
+
+Точный `capture_id`/resync определяется перед полноценным Stereo distance.
+
+### Camera stale / simulation
+
+```text
+vision.camera-stale-timeout-ms
+vision.simulation-mode
+```
+
+Camera connection state и freshness разделены. Stale вычисляется consumer по `last_receive_timestamp_ns`.
+
+Конкретная reconnect/backoff policy остаётся открытой.
+
+## Aiming
+
+Минимально:
+
+```text
+aiming.lead-time-ms
+aiming.target-lost-timeout-ms
+```
+
+Aim points — pixels working frame:
+
+```text
+aiming.aim-points.overview.x-px
+aiming.aim-points.overview.y-px
+aiming.aim-points.stereo-left.x-px
+aiming.aim-points.stereo-left.y-px
+```
+
+Если X/Y отсутствуют, используется center working frame.
+
+`R_camera_to_turret` в первой реализации не используется.
+
+## Turret
+
+### Serial / HAL
+
+```text
+turret.serial.port
+turret.serial.baudrate
+turret.serial.response-timeout-ms
+turret.serial.max-retries
+turret.serial.inter-request-delay-ms
+```
+
+Стартовые protocol defaults:
+
+```text
+STM32 startup baudrate               = 9600
+response-timeout-ms                  = 100
+max-retries                          = 2
+inter-request-delay-ms               = 2
+```
+
+`max-retries = 2` означает две повторные передачи после initial request, то есть максимум три attempts.
+
+`baudrate` в `config.json` — желаемая рабочая скорость ПК. STM32 после hardware reset всегда стартует на 9600 и при необходимости переключается через `SET_BAUDRATE`.
+
+Поддерживаемый первый whitelist:
+
+```text
+9600
+19200
+38400
+57600
+115200
+```
+
+### Axis mechanics on PC
+
+Для каждой оси:
+
+```text
+invert
+full-steps-per-revolution
+microstep-divider
+max-relative-move-deg
+```
+
+HAL вычисляет:
+
+```text
+effective_steps_per_revolution =
+    full_steps_per_revolution * microstep_divider
+```
+
+`microstep-divider` и mechanical limit одной relative move на STM32 не передаются.
+
+`max-relative-move-deg` проверяется на ПК до перевода degrees → steps.
+
+`invert`, `full-steps-per-revolution` и `microstep-divider` в v1 считаются restart-only: изменение сохраняется в config, но не меняет уже работающую mechanical conversion до Turret/application restart. Это исключает safe-point semantics посреди active motion.
+
+STM32 имеет отдельный compile-time/static sanity bound по `abs(delta_steps)` для защиты от аномального payload; он не является пользовательской настройкой и не дублирует `max-relative-move-deg`.
+
+### PID Controller
+
+Для каждой оси:
+
+```text
+pid-kp
+pid-ki
+pid-kd
+```
+
+I-term ограничивается `±max_speed` соответствующей оси. Отдельного `integral-limit` в прототипе нет.
+
+### STM32 config
+
+На уровне `config.json` параметры задаются в физических единицах ПК:
+
+```text
+max-speed-x-deg-s
+max-speed-y-deg-s
+acceleration-x-deg-s2
+acceleration-y-deg-s2
+velocity-watchdog-timeout-ms
+```
+
+HAL переводит их в `steps/s`, `steps/s²`, `ms` и передаёт одним `SET_CONFIG`.
+
+В `SET_CONFIG` не входят:
+
+```text
+PID Kp/Ki/Kd
+target-lost-timeout-ms
+lead-time-ms
+aim points
+invert
+full-steps-per-revolution
+microstep-divider
+max-relative-move-deg
+serial port
+desired baudrate
+```
+
+Желательный invariant:
+
+```text
+velocity-watchdog-timeout-ms < aiming.target-lost-timeout-ms
+```
+
+Конкретные timeout после первых измерений могут быть скорректированы.
+
+Эти пять STM32-параметров применяются dynamic через атомарный полный `SET_CONFIG` snapshot даже во время движения. Control loop/ISR не должен видеть смесь полей разных snapshots.
+
+Изменение `velocity-watchdog-timeout-ms` не считается новым `SET_VELOCITY` и не refresh'ит watchdog. Отсчёт сохраняется от последнего успешно принятого velocity setpoint; если новый timeout уже истёк, target velocity становится zero при ближайшей watchdog check.
+
+### Simulation
+
+```text
+turret.emulate-stm32: bool
+```
+
+### Backlash
+
+Backlash compensation пока не входит в обязательную конфигурацию. Добавлять параметры следует только после механических измерений и отдельного решения о месте компенсации.
+
+## UI
+
+```text
+ui.default-camera = overview | stereo-left
+ui.show-fps
+ui.show-stereo-right-diagnostics
+```
+
+`ui.default-camera` задаёт startup `main_camera`. `stereo-right` здесь недопустима.
+
+При недоступности main camera автоматического switch на preview нет.
+
+UI overlays не являются частью recorded working frame.
+
+## Классификация применения runtime config
+
+Базовая policy первой реализации:
+
+| Настройка | Policy |
+|---|---|
+| PID `Kp/Ki/Kd` | dynamic |
+| `lead-time-ms` | dynamic |
+| aim point | dynamic |
+| `target-lost-timeout-ms` | dynamic, точная семантика для уже потерянной цели уточняется при реализации |
+| `processing-scope` | dynamic |
+| `processing-enabled` | dynamic |
+| `vision-processor-class` | camera pipeline restart / new generation |
+| camera source/address/port/GStreamer settings | camera pipeline restart / new generation |
+| calibration file/content | camera pipeline restart / new generation |
+| serial port | Turret reconnect |
+| desired serial baudrate | controlled `SET_BAUDRATE` / reconnect path |
+| max speed / acceleration / velocity watchdog | dynamic full STM32 `SET_CONFIG` snapshot |
+| `invert`, steps/rev, microstep | restart-only; применяются только после Turret/application restart, не dynamic |
+| UI-only display settings | dynamic |
+
+Processor-specific settings классифицируются вместе со схемой конкретного `VisionProcessor`.
+
+## Пример `config.json`
+
+Все числа ниже демонстрационные и не являются аппаратными пределами.
 
 ```json
 {
+  "schema-version": 1,
   "vision": {
+    "processing-scope": "main-only",
     "cameras": {
       "overview": {
         "enabled": true,
@@ -518,10 +332,8 @@ heartbeat-timeout: float
         "port": 5001,
         "rtp-enabled": false,
         "buffer-size": 1,
-        "detection-enabled": true,
-        "tracking-enabled": true,
-        "detector-class": "ROIBasedDetector",
-        "tracker-class": "KalmanTracker"
+        "processing-enabled": true,
+        "vision-processor-class": "DefaultVisionProcessor"
       },
       "stereo-left": {
         "enabled": true,
@@ -529,10 +341,8 @@ heartbeat-timeout: float
         "port": 5002,
         "rtp-enabled": false,
         "buffer-size": 1,
-        "detection-enabled": true,
-        "tracking-enabled": true,
-        "detector-class": "ROIBasedDetector",
-        "tracker-class": "KalmanTracker"
+        "processing-enabled": true,
+        "vision-processor-class": "DefaultVisionProcessor"
       },
       "stereo-right": {
         "enabled": true,
@@ -540,41 +350,67 @@ heartbeat-timeout: float
         "port": 5003,
         "rtp-enabled": false,
         "buffer-size": 1,
-        "detection-enabled": false,
-        "tracking-enabled": false,
-        "detector-class": "ROIBasedDetector",
-        "tracker-class": "KalmanTracker"
+        "processing-enabled": false,
+        "vision-processor-class": "DefaultVisionProcessor"
       }
     },
     "distance": {
       "source": "manual",
-      "manual-distance": 100.0,
+      "manual-distance-m": 100.0,
+      "distance-stale-timeout-ms": 300,
       "stereo": {
-        "stereo-enabled": true,
+        "stereo-enabled": false,
         "right-frame-buffer-size": 4,
         "pair-timeout-ms": 100
       }
     },
-    "camera-stale-timeout": 0.5,
+    "camera-stale-timeout-ms": 500,
     "simulation-mode": false
+  },
+  "aiming": {
+    "lead-time-ms": 150,
+    "target-lost-timeout-ms": 500,
+    "aim-points": {
+      "overview": {"x-px": null, "y-px": null},
+      "stereo-left": {"x-px": null, "y-px": null}
+    }
   },
   "turret": {
     "serial": {
       "port": "/dev/ttyUSB0",
       "baudrate": 115200,
-      "timeout-ms": 100,
-      "retry-count": 3,
-      "uart-min-command-interval-ms": 10
+      "response-timeout-ms": 100,
+      "max-retries": 2,
+      "inter-request-delay-ms": 2
+    },
+    "axes": {
+      "x": {
+        "invert": false,
+        "full-steps-per-revolution": 2000,
+        "microstep-divider": 16,
+        "max-relative-move-deg": 45.0
+      },
+      "y": {
+        "invert": false,
+        "full-steps-per-revolution": 2000,
+        "microstep-divider": 16,
+        "max-relative-move-deg": 45.0
+      }
     },
     "controller": {
       "pid-kp-x": 1.0,
       "pid-ki-x": 0.0,
+      "pid-kd-x": 0.0,
       "pid-kp-y": 1.0,
-      "pid-ki-y": 0.0
+      "pid-ki-y": 0.0,
+      "pid-kd-y": 0.0
     },
-    "backlash": {
-      "x": 0.0,
-      "y": 0.0
+    "stm32": {
+      "max-speed-x-deg-s": 50.0,
+      "max-speed-y-deg-s": 50.0,
+      "acceleration-x-deg-s2": 100.0,
+      "acceleration-y-deg-s2": 100.0,
+      "velocity-watchdog-timeout-ms": 200
     },
     "emulate-stm32": false
   },
@@ -582,37 +418,22 @@ heartbeat-timeout: float
     "default-camera": "overview",
     "show-fps": true,
     "show-stereo-right-diagnostics": false
-  },
-  "supervisor": {
-    "enabled": true,
-    "heartbeat-timeout": 5.0
   }
 }
 ```
 
-# Применение изменений
+## Применение изменений
 
-Общий путь изменения настройки:
-
-```mermaid
-flowchart LR
-ui[Settings Window] --> core[Core]
-core --> config[Config Manager]
-config --> vision[Vision]
-config --> turret[Turret]
-config --> gui[UI]
+```text
+UI
+→ Core / Config Manager
+→ validate
+→ new typed snapshot
+→ revision + 1
+→ ConfigUpdate
+→ component
 ```
 
-Конкретный модуль получает только относящиеся к нему изменения.
+STM32-dependent config синхронизируется Turret HAL по правилам [Turret](../modules/turret/index.md) и [Serial Protocol](./serial-protocol.md).
 
-Безопасный механизм применения изменений между потоками пока не утверждён.
-
-Также пока не определено, какие параметры относятся к:
-
-- динамическим;
-- требующим локальной переинициализации;
-- доступным только при запуске.
-
-Эти вопросы перечислены в:
-
-[Открытые вопросы архитектуры](./problems.md)
+Concrete thread-safe primitive, processor-specific schemas и часть edge-case semantics runtime changes остаются открытыми.

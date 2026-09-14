@@ -1,393 +1,310 @@
 # Открытые вопросы архитектуры
 
-Этот файл содержит только те архитектурные вопросы, которые на текущем этапе ещё не имеют окончательного решения.
+Этот файл содержит только вопросы, которые пока не имеют окончательного решения. Уже принятые решения сюда не включаются.
 
-Уже принятые решения сюда не включаются.
+На момент синхронизации текущий набор **не блокирует начало первой реализации**; для каждого вопроса указан этап, к которому его нужно закрыть.
 
-## Высокий приоритет
+## До интеграции с реальным RS485-железом
 
-Эти вопросы желательно решить до окончательной фиксации архитектуры и начала основной реализации.
+### 1. Физическое управление полудуплексным RS485
 
-### 1. Контракты данных между модулями
+Логическая request/response-модель, framing, CRC, `REQUEST_ID`, Emergency-resync, retry и baudrate уже определены. Остаются hardware-dependent детали:
 
-Нужно последовательно определить структуры основных сообщений и данных:
+- управляет ли STM32 `DE/RE` или transceiver/adapter делает это автоматически;
+- момент освобождения шины после последнего TX byte;
+- нужна ли turnaround delay перед response;
+- реальные timing по измерениям;
+- общий reference/GND для неизолированных устройств или galvanic isolation;
+- termination/biasing для реальной линии и большой длины кабеля.
 
-- `FramePacket`;
-- `VisionResult`;
-- `DetectedObject`;
-- `TargetRef`;
-- `DistanceResult`;
-- `TurretCommand`;
-- `TurretState`;
-- `SystemEvent`;
-- `ConfigUpdate`.
+## До включения полноценного Stereo distance
 
-Для каждого типа нужно определить:
+### 2. Механизм `capture_id` и stereo pairing
 
-- поля;
-- типы;
-- единицы измерения;
-- идентификаторы;
-- timestamps;
-- правила актуальности;
-- обязательные и опциональные значения.
+Generation уже не позволяет смешивать разные camera sessions, но нужно определить:
 
-### 2. Преобразование результатов Vision в команды Turret
+- кто создаёт `capture_id` и как обе Raspberry Pi получают одно значение;
+- старт/перезапуск нумерации;
+- обнаружение и восстановление рассинхронизации;
+- wraparound;
+- duplicate/missing/out-of-order capture IDs;
+- `pair-timeout-ms`;
+- очистку bounded Stereo Right pairing buffer.
 
-Пока не определено, какой компонент отвечает за преобразование состояния выбранного объекта в управляющую команду Turret.
-
-Нужно решить, выполняет ли эту функцию:
-
-- Core;
-- Turret Controller;
-- отдельный логический компонент.
-
-Важно не перегружать Core вычислительной логикой и одновременно не связывать Turret напрямую с внутренними структурами Vision без необходимости.
-
-### 3. Потеря выбранного объекта
-
-Нужно определить:
-
-- когда объект считается потерянным;
-- когда очищается `selected_targets[source]`;
-- что происходит при пропадании объекта на один или несколько кадров;
-- нужен ли Tracker grace period;
-- что при этом отображает UI;
-- разрешено ли другим модулям использовать последнее известное состояние объекта.
-
-### 4. Актуальность DistanceResult
-
-Нужно определить:
-
-- когда результат дальности считается действительным;
-- как обозначается отсутствие дальности;
-- сколько времени может использоваться последнее значение;
-- что происходит при отсутствии синхронного правого кадра;
-- что происходит при потере выбранной цели;
-- что происходит при сбое Stereo;
-- как должна обрабатываться ручная дальность.
-
-### 5. Механизм capture_id
-
-Сам принцип использования `capture_id` для стереосопоставления уже принят.
-
-Остаётся решить:
-
-- кто создаёт `capture_id`;
-- как обе Raspberry Pi получают одинаковое значение;
-- как начинается нумерация;
-- что происходит после перезапуска одной Raspberry Pi;
-- как обнаруживается рассинхронизация;
-- как выполняется повторная синхронизация после сбоя.
-
-### 6. Serial Protocol STM32
-
-Нужно полностью определить протокол между Turret HAL и STM32:
-
-- framing;
-- типы команд;
-- формат параметров;
-- ответы;
-- CRC;
-- коды ошибок;
-- timeout;
-- retry;
-- request/sequence ID, если он нужен;
-- поведение при повторной передаче команды;
-- защита от повторного выполнения команды.
-
-### 7. Правила обмена HAL ↔ STM32
-
-Помимо формата протокола нужно определить поведение самого обмена:
-
-- требуется ли ответ на каждую команду;
-- можно ли отправлять следующую команду до получения ответа;
-- какие команды требуют подтверждения;
-- точное значение `uart_min_command_interval_ms`;
-- как рассчитывается безопасный интервал с учётом baudrate и размера пакета;
-- что делать при timeout;
-- что делать с обычной FIFO, если STM32 перестала отвечать.
-
-## Средний приоритет
-
-Эти вопросы влияют на устойчивость, многопоточность и предсказуемость работы системы.
-
-### 8. Применение Config Manager между потоками
-
-Config Manager работает в главном потоке, а camera pipelines и Turret — в собственных потоках.
-
-Нужно определить безопасный механизм доставки и применения настроек без гонок между потоками.
-
-### 9. Динамические настройки и переинициализация
-
-Нужно разделить настройки минимум на:
-
-- изменяемые сразу;
-- требующие переинициализации компонента;
-- при необходимости — доступные только при запуске.
-
-Нужно определить поведение при изменении, например:
-
-- параметров Detector/Tracker;
-- адреса или порта камеры;
-- параметров GStreamer;
-- serial port;
-- baudrate;
-- UI-настроек.
-
-### 10. Хранение параметров Detector и Tracker
-
-Нужно окончательно решить, где хранятся параметры конкретных реализаций Detector и Tracker.
-
-Варианты:
-
-- внутри реализации алгоритма;
-- в Config Manager;
-- смешанный вариант.
-
-Отдельно нужно определить, какие параметры пользователь может изменять и какие должны сохраняться между запусками.
-
-### 11. Состояние Turret и события Turret
-
-Нужно решить, достаточно ли одной `status_queue`.
-
-Возможный вариант:
-
-- текущее состояние Turret — latest-only;
-- ошибки и события — отдельная FIFO.
-
-Необходимо определить состав и назначение каждого типа данных.
-
-### 12. Коалесцирование Qt notification signals
-
-Даже если сами данные работают по принципу latest-only, уведомления `*_ready` могут накопиться в Qt event loop.
-
-Нужно решить, нужен ли механизм вроде:
-
-```text
-notification_pending
-```
-
-чтобы не отправлять повторное уведомление, пока предыдущее ещё не обработано Core.
-
-### 13. Состояния камер и стратегия переподключения
-
-Нужно определить окончательный набор состояний camera pipeline.
-
-Например:
-
-- `ONLINE`;
-- `STALE`;
-- `RECONNECTING`;
-- `DISCONNECTED`;
-- `ERROR`.
-
-Также нужно определить:
-
-- кто является владельцем этого состояния;
-- кто решает, когда переходить между состояниями;
-- как выполняются повторные подключения после потери потока;
-- нужен ли увеличивающийся интервал между повторными попытками (`backoff`);
-- когда количество неудачных попыток должно приводить к состоянию `ERROR`;
-- как состояние и история reconnect отображаются в UI и логах.
-
-### 14. Supervisor
-
-После изменения архитектуры Vision нужно определить, что именно контролирует Supervisor:
-
-- `overview`;
-- `stereo_left`;
-- `stereo_right`;
-- Turret;
-- Stereo / Distance Provider;
-- другие компоненты при необходимости.
-
-Также нужно решить, достаточно ли Supervisor в main thread, учитывая, что он не сможет обнаружить зависание самого main thread.
-
-### 15. Lifecycle потоков
-
-Нужно определить точный жизненный цикл рабочих потоков:
-
-- кто создаёт потоки;
-- кто запускает их;
-- механизм `stop_event`;
-- как останавливается GStreamer;
-- как прерывается ожидание UART;
-- timeout для `join`;
-- что делать, если worker не завершился штатно;
-- порядок завершения всего приложения.
-
-### 16. Поведение при частичных отказах
-
-Нужно определить, что продолжает работать при различных частичных сбоях.
-
-Например:
-
-- Overview работает, Stereo Left недоступна;
-- Stereo Left работает, Stereo Right недоступна;
-- Detector работает, но дальность недоступна;
-- Vision работает, но STM32 недоступна;
-- одна камера находится в reconnect.
-
-Нужно определить, какие функции остаются разрешены и что показывается UI.
-
-## Низкий приоритет / можно решить после базового прототипа
-
-Эти вопросы не блокируют первую рабочую версию, но должны быть предусмотрены для дальнейшего развития.
-
-### 17. Сопоставление объектов Overview ↔ Stereo Left
-
-Сейчас пользователь выбирает объекты на `overview` и `stereo_left` независимо.
-
-В будущем нужно разработать механизм `Target Handoff / Reacquisition`, который позволит сопоставлять один физический объект между двумя независимыми Tracker.
-
-Необходимо учитывать неизвестную и потенциально переменную задержку между видеопотоками.
-
-### 18. Поведение выбора объекта в UI
-
-Нужно определить:
-
-- выбор только внутри bbox или по ближайшему объекту;
-- поведение при перекрывающихся bbox;
-- что происходит при клике в пустую область;
-- как снимается текущий выбор;
-- как отображается выбранный объект.
-
-В старом описании использовалось простое базовое поведение:
-
-- клик по рамке выбирает объект;
-- клик по пустой области снимает выбор.
-
-Этот вариант можно использовать как отправную точку, но окончательно он пока не утверждён.
-
-### 19. Состав информации около объекта
-
-Пока окончательно не определено, какие данные UI показывает рядом с рамкой объекта.
-
-Возможные элементы:
-
-- ID;
-- дальность;
-- скорость;
-- confidence;
-- статус выбора;
-- другие диагностические параметры.
-
-### 20. Диагностический режим Stereo Right
-
-Принято, что правая камера может отображаться в диагностическом режиме.
+### 3. Lifecycle / staleness `DistanceResult`
 
 Остаётся определить:
 
-- где включается режим;
-- где отображается Stereo Right;
-- заменяет ли она одну из основных камер;
-- используется ли отдельная панель;
-- нужны ли Detector/Tracker overlays.
+- owner `distance-stale-timeout-ms`;
+- как latest `DistanceResult` явно инвалидируется (`None`) после staleness;
+- поведение при `stereo ↔ manual`;
+- защита от late result старого `TargetRef`/generation после длительного stereo computation.
 
-### 21. Будущий режим latest live frame
+## Во время первой реализации
 
-Сейчас UI показывает обработанный кадр, соответствующий `VisionResult`.
+### 4. Concrete latest-state / thread-safe primitives
 
-В будущем может понадобиться режим отображения самого свежего live-кадра.
+Логическая семантика уже определена:
 
-Механизм перехода будет проектироваться позже после фиксации контрактов данных.
+```text
+VisionResult        latest-only per camera
+DistanceResult      latest-only / invalidatable
+TrackingError       latest-only + monotonic revision
+TurretState          latest-only
+CameraStatus         latest-only per camera
+ConfigUpdate         latest-only
+CameraSessionStarted ordered/barrier
+pending_motion       one latest unsent motion intent
+```
 
-### 22. Новая MoveRelative во время выполнения предыдущей
+Нужно выбрать concrete primitives:
 
-Для прототипа команды выполняются через общую FIFO.
+- one-slot/latest store;
+- lock/atomic reference;
+- notification mechanism;
+- `clear()/invalidate()`;
+- revision handling `TrackingError`;
+- barrier order `CameraSessionStarted → data generation=N` для Core и UI.
 
-Нужно позже проверить, подходит ли постановка новых `MoveRelative` в очередь во время выполнения предыдущей команды для реального поведения STM32.
+### 5. Qt notification coalescing
 
-### 23. SetVelocity во время MoveRelative
+Latest payload не должен создавать backlog queued Qt signals.
 
-На этапе прототипа команды просто выполняются в порядке FIFO.
+Нужно определить единый notification/coalescing pattern для Vision, Turret и ConfigUpdate. `CameraSessionStarted` является barrier и не может быть потерян/coalesced как обычный latest notification.
 
-Позже нужно проверить, достаточно ли этого или требуется специальное правило переключения между относительным перемещением и управлением скоростью.
+### 6. Processor-specific configuration
 
-### 24. Нужна ли отдельная команда Cancel
+Нужно определить:
 
-Сейчас предусмотрены:
+- формат settings конкретного `VisionProcessor`;
+- schema validation;
+- какие поля доступны UI;
+- persistence;
+- какие changes dynamic, а какие требуют pipeline restart/new generation.
 
-- обычный `STOP`;
-- `EMERGENCY_STOP`.
+### 7. Edge cases runtime config apply
 
-Нужно позже определить, нужен ли отдельный неаварийный `Cancel` для отмены текущей операции без семантики аварийной остановки.
+Базовая classification уже определена в `configuration.md`. Остаются детали:
 
-### 25. Нужен ли latest-only для SetVelocity
+- что делать с текущим PID state при изменении `Kp/Ki/Kd` во время TRACKING;
+- I-term при уменьшении application-side PID output limit;
+- изменение `target-lost-timeout-ms` для уже временно потерянной цели;
+- processor-specific dynamic/restart policy.
 
-На этапе прототипа `SetVelocity` передаётся через общую FIFO.
+STM32 max speed / acceleration / velocity watchdog уже применяются dynamic полным атомарным `SET_CONFIG` snapshot. Mechanical conversion (`invert`, steps/rev, microstep) — restart-only и safe-point semantics для них не нужна.
 
-После измерений реальной задержки нужно решить, требуется ли отдельная latest-only семантика для команд скорости.
+### 8. Camera reconnect transitions / backoff
 
-### 26. Завершение MoveRelative
+Enum уже определён:
 
-Нужно определить, как STM32 сообщает, что относительное перемещение закончено.
+```text
+STARTING
+ONLINE
+RECONNECTING
+ERROR
+STOPPED
+```
 
-Этот вопрос связан с:
+Freshness вычисляется отдельно по timestamp.
 
-- Serial Protocol;
-- `TurretState`;
-- последовательным выполнением FIFO-команд.
+Остаётся определить:
 
-### 27. Логирование
+- точные state transitions;
+- reconnect/backoff;
+- критерий устойчивого ERROR;
+- restart/reset `VisionProcessor`;
+- reconnect history/logging.
 
-Нужно решить, достаточно ли обычного Python logging или следует использовать:
+При каждом новом pipeline start создаётся новая `generation`.
 
-- `QueueHandler`;
-- `QueueListener`;
-- отдельный поток записи.
+### 9. UART/STM32 reconnect/backoff policy
 
-Цель — не блокировать camera pipelines и Turret на записи логов.
+Safety/resync sequence уже определена:
 
-Также нужно определить:
+```text
+find physical connection / actual baud
+→ EMERGENCY_STOP → sequence resync
+→ MOTOR_OFF
+→ SET_BAUDRATE при необходимости
+→ SET_CONFIG(full snapshot)
+→ READY
+```
 
-- нужна ли ротация файлов логов;
-- ограничения размера и количества файлов;
-- какие уровни (`INFO`, `WARNING`, `ERROR`) записываются;
-- нужно ли показывать последние важные ошибки и предупреждения непосредственно в UI.
+Auto `MOTOR_ON` отсутствует. Отдельная transport-reset command в v1 не нужна: confirmed Emergency сама пересинхронизирует sequence.
 
-### 28. Диагностические метрики и профилирование
+Остаётся определить:
 
-Нужно определить минимальный обязательный набор измеряемых параметров.
+- какие transport errors запускают auto reconnect;
+- backoff / limit attempts;
+- временный reconnect vs fatal ERROR;
+- logging/diagnostics;
+- точный набор baud candidates в обычном reconnect и после uncertain `SET_BAUDRATE`.
 
-Возможные метрики:
+### 10. Worker lifecycle
 
-- FPS каждой камеры;
-- время Detector;
-- время Tracker;
-- время Stereo;
-- возраст кадра;
-- задержка между съёмкой и получением;
-- число пропущенных кадров;
-- число reconnect;
+Нужно определить concrete lifecycle:
+
+- кто создаёт workers;
+- stop token/event;
+- прерывание GStreamer/UART wait;
+- join timeout;
+- worker, который не завершился штатно;
+- детали startup/shutdown orchestration.
+
+Reconnect/recovery принадлежит owner-модулям; отдельный orchestration component без concrete v1 responsibility не вводится.
+
+### 11. Частичные отказы
+
+Нужно определить доступность функций/UI в сценариях:
+
+- Overview работает, Stereo Left unavailable;
+- Stereo Left работает, Stereo Right unavailable;
+- distance unavailable;
+- STM32 unavailable;
+- одна camera в RECONNECTING;
+- PC config изменён, но `SET_CONFIG` STM32 ещё не подтверждён.
+
+`main_camera` автоматически на другую камеру не переключается.
+
+### 12. `config.json`: отсутствующий файл и future migrations
+
+Уже принято:
+
+```text
+schema-version = 1
+atomic save via temporary file + replace
+corrupted existing JSON не перезаписывается молча
+```
+
+Остаётся определить:
+
+- полностью отсутствующий config: defaults или startup error;
+- migration mechanism после schema v1;
+- UX reporting invalid field/range.
+
+### 13. Logging
+
+Runtime state передаётся typed contracts, transient diagnostics — logging. Generic event-bus infrastructure заранее не вводится.
+
+Нужно определить:
+
+- обычный logging vs QueueHandler/QueueListener;
+- rotation / file limits;
+- levels;
+- как UI показывает последние важные ошибки без превращения logging в machine-readable state.
+
+### 14. Будущие STM32 hardware events
+
+Wire response сохраняет reserved `EVENTS` section, но в v1 она всегда пустая и event queue заранее не проектируется.
+
+При появлении первого реального hardware event нужно определить вместе:
+
+- concrete event code/payload schema;
+- нужен ли STM32 pending-event buffer;
+- capacity / overflow policy;
+- delivery/retry semantics;
+- typed PC contract вместо generic event, если это состояние лучше выразить отдельным типом.
+
+## После первых измерений и базового прототипа
+
+### 15. Timing budget TRACKING и точные timeout
+
+Роли timeout уже определены:
+
+```text
+velocity-watchdog-timeout-ms < target-lost-timeout-ms
+```
+
+Serial defaults:
+
+```text
+response-timeout-ms = 100
+max-retries = 2
+inter-request-delay-ms = 2
+```
+
+После измерений нужно подобрать camera FPS, Vision frequency, latency/jitter, watchdog, target-lost timeout и запас на config/serial exchanges.
+
+### 16. Backlash compensation
+
+После mechanical tests решить:
+
+- нужна ли software compensation;
+- только MoveRelative или также TRACKING;
+- Controller/HAL/STM32;
+- взаимодействие с PID и acceleration limiter.
+
+### 17. Camera-to-turret rotational extrinsic
+
+Первая версия предполагает близкую параллельность axes и компенсирует constant boresight через aim point.
+
+После tests решить необходимость `R_camera_to_turret`, calibration procedure и storage.
+
+### 18. Target handoff Overview ↔ Stereo Left
+
+Сейчас одна selected target существует только в TRACKING на текущей `main_camera`, а swap её сбрасывает.
+
+Будущий Target Handoff/Reacquisition должен сопоставлять один физический объект между независимыми VisionProcessors и учитывать latency streams.
+
+### 19. UI gestures selection / deselect
+
+Уже определено:
+
+- target выбирается только на main image и только в confirmed TRACKING;
+- в RELATIVE selection отсутствует;
+- click-to-move разрешён только в confirmed RELATIVE;
+- invalid/stale selection не создаёт target;
+- swap в TRACKING сбрасывает selection.
+
+Остаётся UX:
+
+- mouse/key gesture выбора bbox;
+- explicit deselect;
+- click empty area;
+- overlapping bbox;
+- нужен ли nearest-object helper.
+
+### 20. Object overlay content
+
+Определить, какие данные показывать рядом с bbox: ID, distance, velocity, selection status, diagnostics. `confidence` не является обязательным полем общего `TrackedObject`.
+
+### 21. Stereo Right diagnostics
+
+Определить layout/activation diagnostic view и processor-specific overlays. Stereo Right не становится обычной `main_camera`.
+
+### 22. Future latest-live-frame UI
+
+Сейчас UI показывает `VisionResult.frame`, поэтому frame+bbox синхронизированы.
+
+Если позже понадобится separate freshest live frame, потребуется отдельный overlay synchronization contract.
+
+### 23. D-filter и PID tuning
+
+После measurements проверить D noise, derivative kick и sufficiency текущего anti-windup.
+
+### 24. Per-camera Aiming parameters
+
+Aim point уже per-camera. После prototype проверить, достаточно ли общих `lead-time-ms` и `target-lost-timeout-ms` при разных FPS/latency Overview и Stereo Left.
+
+### 25. Diagnostics / profiling
+
+Минимальные candidates:
+
+- camera FPS;
+- Vision processing time;
+- frame age/latency;
+- dropped frames;
+- Stereo time;
+- reconnect count;
 - UART timeout/error count;
-- время обработки команд Turret.
+- command latency;
+- TrackingError/SET_VELOCITY frequency;
+- watchdog stops.
 
-Профилирование должно позволять понять, какой этап становится узким местом на реальном оборудовании.
+### 26. Режим «Самая быстрая»
 
-### 29. Режим «Самая быстрая»
+Определить судьбу старого automatic target-selection mode: basic product, postponed feature или удаление. Режим «Ближайшая» уже отложен.
 
-В старом UI был предусмотрен режим автоматического выбора цели «Самая быстрая».
+### 27. Vision load adaptation
 
-Режим «Ближайшая» уже отложен, но судьба режима «Самая быстрая» отдельно не обсуждалась.
-
-Нужно решить:
-
-- входит ли он в базовый прототип;
-- откладывается ли вместе с другими автоматическими режимами;
-- где должна находиться логика такого выбора, если режим будет реализован.
-
-### 30. Адаптация частоты обработки Vision при перегрузке
-
-Текущая latest-frame модель уже не допускает накопления старых кадров, однако при высокой нагрузке Detector, Tracker или Stereo могут значительно снизить фактическую частоту обработки.
-
-После профилирования нужно решить, требуется ли дополнительная политика адаптации, например:
-
-- обрабатывать только самый свежий кадр;
-- намеренно пропускать часть кадров;
-- запускать Detector реже Tracker, если архитектура конкретного алгоритма это допускает;
-- уменьшать нагрузку другими способами.
-
-Решение должно приниматься по измерениям, а не заранее.
-
+Latest-frame model уже исключает processing backlog. После profiling решить, нужны ли intentional frame skipping, processor optimization/replacement или снижение Stereo load.
