@@ -27,6 +27,12 @@ docs = [
     "pymdown-extensions>=10.0",
 ]
 
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
 [tool.ruff]
 # Можно оставить пустым
 
