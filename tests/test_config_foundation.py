@@ -417,12 +417,16 @@ def test_change_metadata_reports_only_fixed_architecture_classification() -> Non
     data["turret"]["serial"]["port"] = "/dev/ttyUSB1"
     data["turret"]["serial"]["baudrate"] = 57600
     data["turret"]["axes"]["x"]["microstep-divider"] = 8
+    data["turret"]["axes"]["x"]["max-relative-move-deg"] = 60.0
+    data["turret"]["axes"]["y"]["max-relative-move-deg"] = 75.0
     data["vision"]["camera-stale-timeout-ms"] = 700
     new = parse_config(data)
 
     paths = changed_config_paths(old, new)
 
     assert "aiming.lead-time-ms" in paths
+    assert "turret.axes.x.max-relative-move-deg" in paths
+    assert "turret.axes.y.max-relative-move-deg" in paths
     assert (
         config_apply_policy("aiming.lead-time-ms")
         is ConfigApplyPolicy.DYNAMIC
@@ -441,6 +445,14 @@ def test_change_metadata_reports_only_fixed_architecture_classification() -> Non
     )
     assert (
         config_apply_policy("turret.axes.x.microstep-divider")
+        is ConfigApplyPolicy.APPLICATION_RESTART
+    )
+    assert (
+        config_apply_policy("turret.axes.x.max-relative-move-deg")
+        is ConfigApplyPolicy.APPLICATION_RESTART
+    )
+    assert (
+        config_apply_policy("turret.axes.y.max-relative-move-deg")
         is ConfigApplyPolicy.APPLICATION_RESTART
     )
     assert config_apply_policy("vision.camera-stale-timeout-ms") is None

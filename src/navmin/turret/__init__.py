@@ -1,5 +1,14 @@
-"""PC-side Turret protocol, session, and transport foundation."""
+"""PC-side Turret protocol, session, HAL, and control stack."""
 
+from .controller import (
+    ControllerError,
+    ControllerModeError,
+    ControllerStateError,
+    PendingMotion,
+    TurretController,
+)
+from .hal import HalError, RelativeMoveLimitError, TurretHal
+from .pid import AxisPid, PidGains
 from .protocol import (
     CommandCode,
     MoveRelativePayload,
@@ -36,13 +45,21 @@ from .transport import (
 )
 
 __all__ = [
+    "AxisPid",
     "BaudRecoveryError",
     "CommandCode",
+    "ControllerError",
+    "ControllerModeError",
+    "ControllerStateError",
     "EmergencyRetryExhaustedError",
+    "HalError",
     "MoveRelativePayload",
+    "PendingMotion",
     "PhysicalTransport",
+    "PidGains",
     "ProtocolRequest",
     "ProtocolResponse",
+    "RelativeMoveLimitError",
     "ResultCode",
     "SerialTransport",
     "SessionBlockedError",
@@ -58,6 +75,8 @@ __all__ = [
     "TransportError",
     "TransportIOError",
     "TransportTimeoutError",
+    "TurretController",
+    "TurretHal",
     "TurretSession",
     "crc16_modbus",
     "decode_request",

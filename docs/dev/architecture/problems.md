@@ -68,7 +68,7 @@ Latest payload не должен создавать backlog queued Qt signals.
 - изменение `target-lost-timeout-ms` для уже временно потерянной цели;
 - processor-specific dynamic/restart policy.
 
-STM32 max speed / acceleration / velocity watchdog уже применяются dynamic полным атомарным `SET_CONFIG` snapshot. Mechanical conversion (`invert`, steps/rev, microstep) — restart-only и safe-point semantics для них не нужна.
+STM32 max speed / acceleration / velocity watchdog уже применяются dynamic полным атомарным `SET_CONFIG` snapshot. Axis mechanics (`invert`, steps/rev, microstep, `max-relative-move-deg`) — restart-only и safe-point semantics для них не нужна.
 
 ### 8. Camera reconnect transitions / backoff
 

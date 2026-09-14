@@ -308,7 +308,7 @@ effective_steps_per_revolution =
 
 `max-relative-move-deg` проверяется на ПК до перевода degrees → steps.
 
-`invert`, `full-steps-per-revolution` и `microstep-divider` в v1 считаются restart-only: изменение сохраняется в config, но не меняет уже работающую mechanical conversion до Turret/application restart. Это исключает safe-point semantics посреди active motion.
+`invert`, `full-steps-per-revolution`, `microstep-divider` и `max-relative-move-deg` в v1 считаются restart-only: изменение сохраняется в config, но не меняет уже работающую mechanical conversion или relative-move safety envelope до Turret/application restart. Это исключает safe-point semantics посреди active motion.
 
 STM32 имеет отдельный compile-time/static sanity bound по `abs(delta_steps)` для защиты от аномального payload; он не является пользовательской настройкой и не дублирует `max-relative-move-deg`.
 
@@ -419,7 +419,7 @@ UI overlays не являются частью recorded working frame.
 | serial port | Turret reconnect |
 | desired serial baudrate | controlled `SET_BAUDRATE` / reconnect path |
 | max speed / acceleration / velocity watchdog | dynamic full STM32 `SET_CONFIG` snapshot; уменьшение max speed также clamp'ит application-side PID I-term соответствующей оси без полного reset |
-| `invert`, steps/rev, microstep | restart-only; применяются только после Turret/application restart, не dynamic |
+| `invert`, steps/rev, microstep, `max-relative-move-deg` | restart-only; применяются только после Turret/application restart, не dynamic |
 | UI-only display settings | dynamic |
 
 Processor-specific settings классифицируются вместе со схемой конкретного `VisionProcessor`.

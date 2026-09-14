@@ -333,7 +333,7 @@ effective_steps_per_revolution =
 
 `invert`, steps/rev и microstep divider не передаются STM32.
 
-В v1 эти mechanical conversion settings restart-only: сохранённое изменение применяется только после Turret/application restart, не посреди active motion.
+В v1 `invert`, steps/rev, microstep divider и `max-relative-move-deg` restart-only: сохранённое изменение применяется только после Turret/application restart, не посреди active motion. Уже работающий HAL продолжает использовать startup snapshot, включая прежний relative-move safety envelope.
 
 ## STM32 config
 

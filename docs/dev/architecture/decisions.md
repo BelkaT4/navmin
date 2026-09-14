@@ -308,15 +308,15 @@ STM32 стартует на фиксированном startup baud, а рабо
 
 ### Решение
 
-`invert`, `full_steps_per_revolution`, `microstep_divider` в v1 не меняют active Turret mechanical conversion на лету. Сохранённое изменение требует Turret/application restart.
+`invert`, `full_steps_per_revolution`, `microstep_divider` и `max-relative-move-deg` в v1 не меняют active Turret mechanical conversion или relative-move safety envelope на лету. Сохранённое изменение требует Turret/application restart.
 
 ### Почему
 
-Runtime изменение преобразования degrees ↔ steps посреди active motion создаёт safe-point и consistency cases, которых текущие требования не требуют.
+Runtime изменение преобразования degrees ↔ steps или relative-move safety envelope посреди active motion создаёт safe-point и consistency cases, которых текущие требования не требуют.
 
 ### Отвергнутая альтернатива
 
-**Dynamic apply mechanical conversion.** Отклонено как ненужная сложность v1.
+**Dynamic apply mechanical conversion или `max-relative-move-deg`.** Отклонено как ненужная сложность v1.
 
 ---
 

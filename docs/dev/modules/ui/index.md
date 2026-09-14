@@ -211,7 +211,7 @@ UI может редактировать:
 - axis inversion (restart-only);
 - full steps per revolution (restart-only);
 - microstep divider (restart-only);
-- max relative move per axis;
+- max relative move per axis (restart-only);
 - desired serial baudrate/port;
 - simulation mode.
 

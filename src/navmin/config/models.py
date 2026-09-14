@@ -208,6 +208,7 @@ def config_apply_policy(path: str) -> ConfigApplyPolicy | None:
             "invert",
             "full-steps-per-revolution",
             "microstep-divider",
+            "max-relative-move-deg",
         }
     ):
         return ConfigApplyPolicy.APPLICATION_RESTART
