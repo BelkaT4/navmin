@@ -35,7 +35,55 @@ The control module deliberately does **not** implement motion yet. `MOVE_RELATIV
 
 `MOTOR_OFF` clears only minimal motion-intent presence flags before disabling drivers; 4B1 deliberately chooses no numeric velocity or position representation. Emergency performs the same hard motion clear but does not change driver enable state and creates no persistent latch. Repeated `MOTOR_ON`/`MOTOR_OFF` are idempotent at the driver callback boundary.
 
-`SET_CONFIG` first decodes and validates a local candidate and then replaces `control->config` with one aggregate struct assignment. There is no concurrent high-rate control reader in 4B1. Stage 4B2 must place the eventual control-loop/ISR critical-section boundary around this single full-snapshot replacement rather than mutate fields independently.
+`SET_CONFIG` first decodes and validates a local candidate and then replaces `control->config` with one aggregate struct assignment. There is no concurrent high-rate control reader wired into `navmin_control` yet. Stage 4B2b will connect the accepted full snapshot to the motion primitive and add the eventual control-loop/ISR critical-section boundary around one complete replacement rather than mutate fields independently.
+
+
+### Stage 4B2a — velocity motion primitive / acceleration / STEP scheduler
+
+`navmin_motion.c` adds an isolated hardware-independent numeric motion primitive. It is intentionally not wired to the protocol `SET_VELOCITY` command yet; command acceptance, timestamps and the velocity watchdog remain Stage 4B2b.
+
+The control update rate is fixed at compile time:
+
+```text
+NAVMIN_CONTROL_RATE_HZ = 20,000 Hz
+```
+
+Velocity uses signed fixed-point `int32_t` units of `1 / 20,000 steps/s`:
+
+```text
+velocity_q = velocity_steps_s * 20,000
+```
+
+This representation removes a high-rate acceleration division/remainder. For one 20 kHz tick:
+
+```text
+delta_velocity_q = acceleration_steps_s2
+```
+
+so every integer configured acceleration is represented exactly. Reversal braking clamps at exact zero and deliberately discards any unused acceleration budget for that tick; opposite-sign acceleration starts only on a later control tick. No floating-point arithmetic is used in the high-rate path.
+
+STEP scheduling uses a signed `int32_t` phase accumulator. Each tick adds `current_velocity_q`; one STEP is requested when phase reaches:
+
+```text
+NAVMIN_STEP_PHASE_THRESHOLD = 20,000 * 20,000 = 400,000,000
+```
+
+At the firmware speed ceiling of 10,000 steps/s, one tick contributes at most 200,000,000 phase units, so an axis can cross at most one STEP threshold per tick. X and Y are scheduled independently and may each emit one STEP during the same tick. One callback invocation represents exactly one STEP request with axis and signed direction. Commanded position is signed `int64_t` and changes only when that callback is actually invoked.
+
+At the supported numeric maxima:
+
+```text
+max |velocity_q|       = 10,000 * 20,000 = 200,000,000
+max acceleration delta = 100,000 velocity_q units/tick
+phase threshold         = 400,000,000
+max phase before fold   < 600,000,000
+```
+
+All hot-path velocity/acceleration/phase values therefore remain well inside signed 32-bit range (`2,147,483,647`). `int64_t` is used only for commanded position accounting. At 10,000 emitted steps/s, exhausting signed 64-bit position would require roughly 29 million years of continuous one-direction operation.
+
+Dynamic motion limits are supplied as an already-validated snapshot. Lowering max speed clips only the currently stored effective target; current velocity decelerates through the limiter. Raising max speed does not resurrect an older clipped request. Changing acceleration needs no fractional-history reset because this representation has no acceleration remainder; the new integer acceleration increment is used on the next control tick.
+
+When current velocity reaches stable zero, the per-axis STEP phase is cleared. `navmin_motion_hard_stop()` immediately clears current velocity, target velocity and STEP phase on both axes while preserving commanded position. This prevents latent fractional phase from creating a STEP after stop/restart.
 
 ## Stage 4B1 firmware sanity bounds
 
@@ -50,7 +98,7 @@ NAVMIN_MAX_SUPPORTED_WATCHDOG_TIMEOUT_MS   = 60,000 ms
 Rationale:
 
 - The legacy project is evidence that a 20 kHz control reference and about 8,000 steps/s were previously practical on STM32F103C8T6. A 10,000 steps/s ceiling stays at half of that 20 kHz reference, leaving scheduling/pulse-width margin for the future 4B2/4C implementation instead of claiming the theoretical one-step-per-tick limit.
-- The legacy acceleration ceiling was 50,000 steps/s². `100,000 steps/s²` remains small relative to 32-bit arithmetic and, at a possible future 20 kHz control update, corresponds to only 5 steps/s of velocity change per tick before any fixed-point refinement. Stage 4B1 does not choose the final velocity representation.
+- The legacy acceleration ceiling was 50,000 steps/s². `100,000 steps/s²` remains small relative to 32-bit arithmetic. With the Stage 4B2a 20 kHz fixed-point representation it contributes exactly 100,000 velocity-q units per tick, i.e. 5 steps/s of commanded-velocity change per tick.
 - `60,000 ms` is far above the expected operational watchdog range (hundreds of milliseconds) while providing a clear bounded sanity ceiling and remaining trivial for future wrap-safe `uint32_t` elapsed-time arithmetic.
 
 Relative-delta firmware bounds are intentionally not defined in 4B1. They belong to 4B3 together with the actual relative planner/integration representation.
@@ -62,12 +110,15 @@ firmware/stm32/
 ├── Core/
 │   ├── Inc/
 │   │   ├── navmin_control.h
+│   │   ├── navmin_motion.h
 │   │   └── navmin_protocol.h
 │   └── Src/
 │       ├── navmin_control.c
+│       ├── navmin_motion.c
 │       └── navmin_protocol.c
 ├── Tests/host/
 │   ├── test_navmin_control.c
+│   ├── test_navmin_motion.c
 │   └── test_navmin_protocol.c
 ├── Makefile
 └── README.md
@@ -85,7 +136,7 @@ From the project root:
 make -C firmware/stm32 host-test
 ```
 
-This builds and executes both the Stage 4A protocol tests and Stage 4B1 control tests.
+This builds and executes the Stage 4A protocol tests, Stage 4B1 control tests, and Stage 4B2a motion tests.
 
 To remove generated host binaries:
 
@@ -116,12 +167,13 @@ The legacy project used a 72 MHz HSE→PLL clock setup, TIM2 prescaler 71 / peri
 
 ## Explicitly deferred
 
-### Stage 4B2
+### Stage 4B2b
 
-- velocity/current-commanded-velocity representation;
-- acceleration limiter;
-- velocity watchdog and timestamp handling;
-- STEP scheduler/generation.
+- wire `SET_VELOCITY` acceptance and control-owner wiring;
+- protocol acceptance timestamp plumbing;
+- velocity watchdog;
+- dynamic `SET_CONFIG` integration with active velocity behaviour;
+- exact-retry/watchdog integration.
 
 ### Stage 4B3
 
