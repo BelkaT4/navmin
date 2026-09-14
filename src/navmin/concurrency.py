@@ -5,23 +5,19 @@ from __future__ import annotations
 from dataclasses import dataclass
 from queue import Queue
 from threading import Condition, Lock
-from typing import Generic, TypeVar
 
 from .contracts import CameraSessionStarted
 
 
-T = TypeVar("T")
-
-
 @dataclass(frozen=True)
-class LatestSnapshot(Generic[T]):
+class LatestSnapshot[T]:
     """Atomic view of one latest-state slot and its monotonic revision."""
 
     revision: int
     value: T | None
 
 
-class LatestValue(Generic[T]):
+class LatestValue[T]:
     """Thread-safe one-slot state: new publications replace older values."""
 
     def __init__(self) -> None:
@@ -65,7 +61,7 @@ class LatestValue(Generic[T]):
             self._condition.notify_all()
 
 
-class InvalidatableLatest(LatestValue[T]):
+class InvalidatableLatest[T](LatestValue[T]):
     """Latest-state slot where invalidation is itself an observable revision."""
 
     def invalidate(self) -> None:

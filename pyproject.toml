@@ -34,7 +34,7 @@ package-dir = {"" = "src"}
 where = ["src"]
 
 [tool.ruff]
-# Можно оставить пустым
+target-version = "py313"
 
 [tool.pytest.ini_options]
 minversion = "7.0"

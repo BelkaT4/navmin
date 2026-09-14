@@ -6,7 +6,6 @@ import logging
 from threading import Lock
 from typing import TextIO
 
-
 _LOGGER_NAME = "navmin"
 _HANDLER_NAME = "navmin-default"
 _CONFIG_LOCK = Lock()

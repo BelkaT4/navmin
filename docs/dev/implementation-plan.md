@@ -197,7 +197,7 @@ Qt notification coalescing (#5) остаётся до UI-этапа.
 
 ## 7. Этап 2 — Config + Calibration foundation
 
-**Статус:** `not-started`
+**Статус:** `done`
 
 ### Цель
 

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
-from typing import Generic, Protocol, TypeVar
+from typing import Protocol
 
 import numpy as np
 
@@ -162,10 +162,7 @@ class TurretState:
     acceleration_y_deg_s2: float
 
 
-T = TypeVar("T")
-
-
 @dataclass(frozen=True)
-class ConfigUpdate(Generic[T]):
+class ConfigUpdate[T]:
     revision: int
     config: T
