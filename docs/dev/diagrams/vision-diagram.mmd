@@ -2,88 +2,79 @@ flowchart TB
   overview_camera["Overview Camera"]
   left_camera["Stereo Left Camera"]
   right_camera["Stereo Right Camera"]
-
-  flag_core_in>"IN: main_camera / TRACKING selected_target<br/>Vision ConfigUpdate"
-  flag_session_out>"OUT barrier: CameraSessionStarted<br/>generation + CameraModel"
-  flag_data_out>"OUT latest: VisionResult / DistanceResult<br/>CameraStatus"
-  flag_ui_out>"OUT: VisionResult working frames<br/>generation checked by CameraSessionGate"
-  
-  calibration[("Calibration<br/>overview.json / stereo.json")]
-
-  subgraph vision["Vision"]
-    registry["Camera Registry<br/>current_generation[camera]"]
-    vision_config["VisionConfig<br/>processing-scope / per-camera master<br/>vision-processor-class"]
-
-    subgraph overview_thread["Overview pipeline"]
+  calibration[("Calibration<br>overview.json / stereo.json")]
+  flag_core_in["IN: main_camera / TRACKING selected_target<br>Vision ConfigUpdate"]
+  flag_session_out["OUT: barrier<br>CameraSessionStarted<br>generation + CameraModel"]
+  flag_ui_out["OUT: VisionResult working frames<br>generation checked by CameraSessionGate"]
+  subgraph vision ["Vision"]
+    registry["Camera Registry<br>current_generation[camera]"]
+    vision_config["VisionConfig<br>processing-scope / per-camera master<br>vision-processor-class"]
+    right_buffer[["Bounded Stereo Right buffer<br>generation + capture_id"]]
+    flag_data_out["OUT: latest<br>VisionResult / DistanceResult<br>CameraStatus"]
+    subgraph overview_thread ["Overview pipeline"]
       overview_source["Receive / decode"]
-      overview_geom["Undistort<br/>working FramePacket"]
-      overview_processor["VisionProcessor<br/>effective processing policy"]
-      overview_result["VisionResult<br/>latest-only"]
-      overview_source --> overview_geom --> overview_processor --> overview_result
+      overview_geom["Undistort<br>working FramePacket"]
+      overview_processor["VisionProcessor<br>effective processing policy"]
+      overview_result["VisionResult<br>latest-only"]
     end
-
-    subgraph left_thread["Stereo Left pipeline"]
+    subgraph left_thread ["Stereo Left pipeline"]
       left_source["Receive / decode"]
-      left_geom["Rectify Left<br/>working FramePacket + capture_id"]
-      left_processor["VisionProcessor<br/>effective processing policy"]
-      left_result["VisionResult<br/>latest-only"]
-
-      subgraph distance_provider["Stereo / Distance Provider"]
+      left_geom["Rectify Left<br>working FramePacket + capture_id"]
+      left_processor["VisionProcessor<br>effective processing policy"]
+      left_result["VisionResult<br>latest-only"]
+      subgraph distance_provider ["Stereo / Distance Provider"]
         distance_switch["source: stereo / manual"]
-        stereo_distance["Stereo Distance<br/>selected_target only if Stereo Left"]
+        stereo_distance["Stereo Distance<br>selected_target only if Stereo Left"]
         manual_distance["Manual Distance"]
-        distance_result["DistanceResult<br/>latest / invalidatable"]
+        distance_result["DistanceResult<br>latest / invalidatable"]
       end
-
-      left_source --> left_geom --> left_processor --> left_result
-      distance_switch --> stereo_distance
-      distance_switch --> manual_distance
-      stereo_distance --> distance_result
-      manual_distance --> distance_result
-      left_geom -.->|"left FramePacket"| stereo_distance
-      left_result -.->|"selected TrackedObject"| stereo_distance
     end
-
-    subgraph right_thread["Stereo Right pipeline"]
+    subgraph right_thread ["Stereo Right pipeline"]
       right_source["Receive / decode"]
-      right_geom["Rectify Right<br/>working FramePacket + capture_id"]
-      right_processor["VisionProcessor optional<br/>diagnostics"]
-      right_result["VisionResult<br/>diagnostics optional"]
-      right_source --> right_geom --> right_processor --> right_result
+      right_geom["Rectify Right<br>working FramePacket + capture_id"]
+      right_processor["VisionProcessor optional<br>diagnostics"]
+      right_result["VisionResult<br>diagnostics optional"]
     end
-
-    right_buffer[["Bounded Stereo Right buffer<br/>generation + capture_id"]]
-    right_geom --> right_buffer
-    right_buffer -.->|"same generation pair + capture_id"| stereo_distance
   end
 
+  overview_source --> overview_geom
+  overview_geom --> overview_processor
+  overview_processor --> overview_result
+  left_source --> left_geom
+  left_geom --> left_processor
+  left_processor --> left_result
+  distance_switch --> stereo_distance
+  distance_switch --> manual_distance
+  stereo_distance --> distance_result
+  manual_distance --> distance_result
+  left_geom -.->|"left FramePacket"| stereo_distance
+  left_result -.->|"selected TrackedObject"| stereo_distance
+  right_source --> right_geom
+  right_geom --> right_processor
+  right_processor --> right_result
+  right_geom --> right_buffer
+  right_buffer -.->|"same generation pair + capture_id"| stereo_distance
   overview_camera --> overview_source
   left_camera --> left_source
   right_camera --> right_source
   calibration -.-> overview_geom
   calibration -.-> left_geom
   calibration -.-> right_geom
-
   registry -.-> overview_source
   registry -.-> left_source
   registry -.-> right_source
   registry -->|"CameraSessionStarted before data"| flag_session_out
-
   flag_core_in -.-> vision_config
   flag_core_in -->|"selected_target"| distance_switch
   vision_config -.-> overview_processor
   vision_config -.-> left_processor
   vision_config -.-> right_processor
-
   overview_result --> flag_data_out
   left_result --> flag_data_out
   distance_result --> flag_data_out
-
   overview_result --> flag_ui_out
   left_result --> flag_ui_out
   right_result -.->|"diagnostics"| flag_ui_out
-
-
-%% graph:positions {"vision":{"x":-540,"y":-220,"w":1320,"h":1500},"overview_camera":{"x":-350,"y":-350},"left_camera":{"x":0,"y":-350},"right_camera":{"x":350,"y":-350},"flag_core_in":{"x":-800,"y":600},"flag_session_out":{"x":830,"y":-80},"flag_data_out":{"x":830,"y":940},"flag_ui_out":{"x":830,"y":180},"vision_config":{"x":10,"y":10,"w":330,"h":90},"registry":{"x":-300,"y":10},"overview_thread":{"x":-440,"y":180,"w":350,"h":600},"left_thread":{"x":-40,"y":180,"w":450,"h":1000},"right_thread":{"x":470,"y":180,"w":350,"h":600},"overview_source":{"x":70,"y":70},"overview_processor":{"x":70,"y":230},"overview_result":{"x":70,"y":390},"left_source":{"x":95,"y":60},"left_processor":{"x":95,"y":200},"left_result":{"x":95,"y":340},"distance_provider":{"x":40,"y":540,"w":370,"h":310},"distance_switch":{"x":120,"y":35},"stereo_distance":{"x":210,"y":135},"manual_distance":{"x":25,"y":135},"distance_result":{"x":120,"y":235},"right_source":{"x":70,"y":70},"right_processor":{"x":70,"y":230},"right_result":{"x":70,"y":390},"right_buffer":{"x":530,"y":900}}
-%% graph:edges {"registry>flag_session_out":{"label":[30,-20]},"flag_core_in>distance_switch":{"label":[-15,0]},"right_buffer>stereo_distance":{"label":[45,20]},"overview_result>flag_data_out":{"label":[20,0]},"left_result>flag_data_out":{"label":[20,0]},"distance_result>flag_data_out":{"label":[20,0]},"overview_result>flag_ui_out":{"label":[20,-20]},"left_result>flag_ui_out":{"label":[20,-20]}}
-%% graph:waypoints {"right_buffer>stereo_distance":[[440,950],[440,820]],"left_geom>stereo_distance":[[260,550]]}
+%% graph:positions {"vision":{"x":-2280,"y":-504,"w":1652,"h":2050},"overview_thread":{"x":96,"y":276,"w":320,"h":628},"left_thread":{"x":666,"y":276,"w":512,"h":1430},"distance_provider":{"x":48,"y":972,"w":428,"h":410},"right_thread":{"x":1240,"y":276,"w":284,"h":796},"overview_camera":{"x":-2112,"y":-606},"left_camera":{"x":-1466,"y":-606},"right_camera":{"x":-976,"y":-606},"calibration":{"x":-2540,"y":-338},"flag_core_in":{"x":-1426,"y":1584,"w":160,"h":78},"flag_session_out":{"x":-1586,"y":-804,"w":160,"h":78},"flag_ui_out":{"x":-540,"y":468,"w":160,"h":78},"registry":{"x":694,"y":46},"vision_config":{"x":246,"y":1894,"w":420,"h":110},"right_buffer":{"x":1464,"y":1170,"w":160,"h":78},"flag_data_out":{"x":156,"y":1114,"w":172,"h":90},"overview_source":{"x":72,"y":60},"overview_geom":{"x":72,"y":156},"overview_processor":{"x":72,"y":348},"overview_result":{"x":72,"y":528},"left_source":{"x":148,"y":70},"left_geom":{"x":148,"y":168},"left_processor":{"x":148,"y":348},"left_result":{"x":148,"y":528},"distance_switch":{"x":140,"y":326},"stereo_distance":{"x":234,"y":182},"manual_distance":{"x":30,"y":182},"distance_result":{"x":126,"y":50},"right_source":{"x":62,"y":60},"right_geom":{"x":62,"y":168},"right_processor":{"x":62,"y":348},"right_result":{"x":64,"y":528}}
+%% graph:waypoints {"left_geom>stereo_distance":[[-1386,53]],"right_geom>right_buffer":[[-889,58]],"calibration>overview_geom":[[-2201,-311]],"calibration>left_geom":[[-1633,-302]],"calibration>right_geom":[[-1085,-320]],"registry>overview_source":[[-1927,-431]],"registry>left_source":[[-1506,-382]],"registry>right_source":[[-1064,-431]],"vision_config>overview_processor":[[-1827,1390],[-1824,192]],"vision_config>left_processor":[[-1404,210],[-1386,183]],"vision_config>right_processor":[[-1827,222],[-913,142]],"left_result>flag_data_out":[[-1637,387]],"distance_result>flag_data_out":[[-1634,809]],"overview_result>flag_ui_out":[[-1928,336]],"left_result>flag_ui_out":[[-1168,516]]}
+%% graph:edges {"left_geom>stereo_distance":{"label":[68,509]},"left_result>stereo_distance":{"label":[-143,-81]},"right_buffer>stereo_distance":{"label":[-4,-25]},"registry>flag_session_out":{"label":[1,-90]},"flag_core_in>distance_switch":{"label":[0,-110]},"overview_result>flag_data_out":{"label":[25,0]},"left_result>flag_data_out":{"label":[25,0]},"distance_result>flag_data_out":{"label":[25,0]},"overview_result>flag_ui_out":{"label":[25,-25]},"left_result>flag_ui_out":{"label":[25,-25]},"right_result>flag_ui_out":{"label":[-3,-75]}}
