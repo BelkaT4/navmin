@@ -1,398 +1,258 @@
-# Графический интерфейс (gui)
+# UI
 
-Модуль `UI` предоставляет оператору доступ к видеопотокам, выбору цели, управлению турелью, настройкам и состоянию системы.
-
-Интерфейс написан на `PyQt6` и работает в главном потоке приложения.
+`UI` написан на PyQt6 и выполняется в главном потоке приложения вместе с Core и `CameraSessionGate`.
 
 ![Диаграмма модуля UI](../../diagrams/ui-diagram.png)
 
-## Общая структура
+## Ответственность
 
-UI состоит из:
+UI:
 
-- `Main Window` — основного рабочего окна;
-- `Camera Viewer` — области отображения видео;
-- `Top Bar` — верхней панели управления;
-- `Bottom Bar` — нижней панели состояния и быстрых действий;
-- `Settings Window` — окна настроек.
+- показывает Overview и Stereo Left как main + preview;
+- рисует overlays поверх working frame;
+- показывает camera/Turret/distance state и diagnostics;
+- принимает target selection только на main image;
+- принимает click-to-move только в RELATIVE;
+- предоставляет отдельный control `RELATIVE / TRACKING`;
+- предоставляет settings и motor/stop controls;
+- передаёт actions в Core.
 
-Core работает в том же главном потоке, но является отдельным логическим модулем.
+UI не выполняет VisionProcessor, calibration math, Aiming, PID или UART.
 
-```mermaid
-flowchart TB
-subgraph main[Главный поток приложения]
-    ui[UI / PyQt6]
-    core[Core / Mediator]
-end
-```
+## `main_camera` и preview
 
-UI не выполняет детекцию, трекинг или расчёт дальности. Он только отображает данные, которые уже подготовлены другими модулями, и передаёт действия пользователя в Core.
-
-## Взаимодействие с Core
-
-Поскольку UI и Core находятся в одном потоке, отдельные `ui_command_queue` и `ui_status_queue` не используются.
-
-Для взаимодействия применяются:
-
-- обычные вызовы методов;
-- Qt-сигналы.
-
-```mermaid
-flowchart LR
-ui[UI] <-->|"Qt signals / methods"| core[Core]
-```
-
-Примеры действий UI → Core:
-
-- выбор цели;
-- снятие выбора;
-- изменение режима работы;
-- команды Turret;
-- запуск калибровки;
-- экстренная остановка;
-- изменение настроек.
-
-Примеры данных Core → UI:
-
-- актуальный `list[DetectedObject]`;
-- `active_target_id`;
-- состояние Turret;
-- ошибки и предупреждения;
-- состояние модулей.
-
-Видеокадры через Core не передаются.
-
-## Получение видеокадров
-
-`Camera Viewer` получает актуальный кадр напрямую из `Camera Manager`.
-
-`Camera Manager` хранит для каждой камеры:
-
-- `latest_frame`;
-- `frame_id`;
-- `timestamp`;
-- `state`.
-
-UI не получает отдельный Qt-сигнал на каждый новый кадр. Вместо этого используется `QTimer` с частотой около 60 Гц.
-
-```mermaid
-flowchart LR
-timer[QTimer ≈ 60 Гц] --> viewer[Camera Viewer]
-manager[Camera Manager] -->|"latest frame"| viewer
-```
-
-При каждом срабатывании таймера UI проверяет состояние выбранной камеры.
-
-## frame_id
-
-UI хранит номер последнего отображённого кадра:
+Одна из двух камер является main:
 
 ```text
-last_displayed_frame_id
+OVERVIEW
+STEREO_LEFT
 ```
 
-Кадр перерисовывается только тогда, когда `frame_id` в `Camera Manager` изменился.
+Вторая автоматически является preview.
 
-Например, при камере 20 FPS и UI-таймере 60 Гц таймер срабатывает чаще, чем появляются новые кадры. Это нормально: повторное срабатывание не вызывает повторную отрисовку того же изображения.
+Startup `main_camera` берётся из `ui.default-camera`. `STEREO_RIGHT` обычной main camera не является.
 
-```mermaid
-flowchart TB
-timer[Срабатывание QTimer] --> check{frame_id изменился?}
-check -->|да| update[Обновить Camera Viewer]
-check -->|нет| skip[Ничего не делать]
+Пользователь может явно swap main/preview. Swap проходит через Core, потому что он влияет на selection и processing scope.
+
+При отказе main camera UI **не переключается автоматически** на preview. Текущий `main_camera` сохраняется, UI показывает stale/error/«Нет видеосигнала», а swap остаётся явным действием пользователя.
+
+## Данные и `CameraSessionGate`
+
+UI получает логически:
+
+- `VisionResult`;
+- `main_camera`;
+- `selected_target`;
+- `DistanceResult`;
+- `TurretState`;
+- camera state/freshness;
+- UiConfig.
+
+VisionResult может приходить прямо из Vision, но UI принимает его только если:
+
+```text
+result.frame.generation == CameraSessionGate.accepted_generation[result.frame.camera]
 ```
 
-Такой подход не создаёт очередь старых кадров. UI всегда работает с самым свежим изображением, сохранённым в `Camera Manager`.
+Новая generation не может отображаться раньше обработки `CameraSessionStarted(camera, generation, camera_model)`.
 
-## Контроль потери видеосигнала
+Эта проверка применяется ко **всем** camera-derived путям UI, включая main/preview, diagnostics и clean recording. Diagnostics/recording не имеют bypass мимо `CameraSessionGate`.
 
-Для каждой камеры известно время получения последнего кадра (`timestamp`).
+## Кадр и overlays
 
-UI сравнивает его с текущим временем. Если новый кадр не поступал дольше `stale_timeout`, видеопоток считается устаревшим.
+UI отображает:
 
-При превышении `stale_timeout`:
-
-- последний полученный кадр остаётся на экране;
-- поверх него отображается сообщение **«Нет видеосигнала»**.
-
-```mermaid
-flowchart TB
-check{Кадр старше stale_timeout?}
-check -->|нет| normal[Обычное отображение]
-check -->|да| stale[Оставить последний кадр<br/>и показать «Нет видеосигнала»]
+```text
+VisionResult.frame
++
+VisionResult.tracked_objects
 ```
 
-Само значение `stale_timeout` хранится в конфигурации и должно быть уточнено после тестов на реальных камерах.
+`FramePacket.image` уже corrected working frame:
 
-Обнаружение проблемы соединения и попытки переподключения выполняет `CameraController`, а UI только показывает пользователю текущее состояние.
+- Overview undistorted;
+- Stereo Left rectified.
 
-## Main Window
+Все UI clicks находятся в coordinates того же working frame.
 
-`Main Window` является основной рабочей областью оператора.
+Overlays не изменяют сам `FramePacket.image`.
 
-В нём находятся:
+## Запись видео
 
-- `Camera Viewer`;
-- `Top Bar`;
-- `Bottom Bar`.
+Основная camera recording сохраняет чистый working frame без UI overlays.
 
-## Camera Viewer
+Не записываются:
 
-`Camera Viewer` отображает видеопоток выбранной камеры.
+- bbox;
+- reticle;
+- aim point;
+- lead;
+- status text;
+- FPS.
 
-Поверх кадра могут отображаться рамки объектов из актуального `list[DetectedObject]`, полученного от Core.
+Это нужно для повторного запуска detector/tracker на записи.
 
-Для объекта могут показываться:
+## Vision processing main / preview
 
-- ID;
-- рамка;
-- скорость, если Tracker её вычисляет;
-- дальность для активной цели, если она определена;
-- дополнительное состояние, необходимое оператору.
+UI setting:
 
-Активная цель должна визуально отличаться от остальных объектов.
-
-### Выбор цели
-
-В ручном режиме оператор выбирает цель кликом по её рамке.
-
-```mermaid
-flowchart LR
-click[Клик по рамке] --> ui[UI]
-ui -->|"ID объекта"| core[Core]
-core --> active[active_target_id]
+```text
+main-only
+main-and-preview
 ```
 
-UI не хранит выбранную цель как основной источник состояния. Владельцем `active_target_id` является Core.
+При `main-only` bbox формируются только для main camera; preview остаётся live corrected image.
 
-Клик по пустой области может использоваться для снятия текущего выбора.
+При `main-and-preview` bbox могут рисоваться на обеих картинках.
 
-## Режимы выбора цели
+Target selection на preview запрещён независимо от processing scope. Selection вообще доступен только после подтверждённого `TurretState.control_mode == TRACKING`.
 
-В исходном описании предусмотрены три режима:
+## Выбор цели
 
-- **Ручная** — цель выбирает оператор;
-- **Ближайшая** — автоматически выбирается ближайший подходящий объект;
-- **Самая быстрая** — автоматически выбирается объект с максимальной скоростью.
+UI передаёт Core identity объекта из отображаемого `VisionResult`:
 
-Ручной режим рассматривается как режим по умолчанию.
-
-Точная логика автоматического выбора цели и место её реализации будут отдельно проверены на этапе архитектурного аудита. UI должен предоставлять переключение режима, но не обязательно самостоятельно выполнять алгоритм выбора объекта.
-
-## Top Bar
-
-Верхняя панель содержит глобальные действия.
-
-В текущем описании предусмотрены:
-
-- меню `Файл`;
-- меню `Вид`;
-- кнопка `Настройки`;
-- кнопка `Калибровка`;
-- кнопка `Экстренная остановка`;
-- индикатор системных ошибок.
-
-### Файл
-
-Меню может содержать:
-
-- загрузку конфигурации;
-- сохранение конфигурации;
-- выход из приложения.
-
-### Вид
-
-Меню используется для настроек отображения, например:
-
-- переключения камеры;
-- включения и отключения рамок объектов.
-
-### Настройки
-
-Открывает `Settings Window`.
-
-### Калибровка
-
-Передаёт в Core запрос на запуск процедуры калибровки Turret.
-
-### Экстренная остановка
-
-Отправляет в Core команду аварийной остановки.
-
-UI не должен напрямую обращаться к STM32 или `Turret HAL`.
-
-Поведение и приоритет команды `STOP` будут отдельно проверены при архитектурном аудите Turret.
-
-## Bottom Bar
-
-Нижняя панель используется для быстрого управления и отображения основного состояния системы.
-
-Здесь могут находиться:
-
-### Режим сопровождения
-
-- `Ручная`;
-- `Ближайшая`;
-- `Самая быстрая`.
-
-### Состояние оборудования
-
-- подключение каждой камеры;
-- состояние STM32;
-- состояние Turret.
-
-### Информация о цели
-
-- ID выбранного объекта;
-- дальность;
-- скорость;
-- другой краткий статус.
-
-### Состояние Vision
-
-Например:
-
-- количество обнаруженных объектов;
-- FPS обработки.
-
-Точный состав элементов может меняться при реализации UI, не затрагивая архитектуру взаимодействия модулей.
-
-## Settings Window
-
-`Settings Window` используется для изменения конфигурации системы.
-
-Пользователь изменяет параметры в UI, после чего новое значение передаётся в Core, а затем в `Config Manager`.
-
-```mermaid
-flowchart LR
-settings[Settings Window] --> core[Core]
-core --> config[Config Manager]
-config --> modules[Подписанные модули]
+```text
+camera + generation + track_id
 ```
 
-UI не должен напрямую изменять внутреннее состояние рабочих потоков.
+Core остаётся authoritative source и принимает selection только если:
 
-## Базовые настройки
+- latest `TurretState.control_mode == TRACKING`;
+- camera == current `main_camera`;
+- generation принята `CameraSessionGate`;
+- track_id всё ещё существует в latest `VisionResult` этой camera/generation.
 
-В базовой части могут находиться:
+Если объект уже исчез, новый selection не применяется.
 
-- выбор последовательного порта STM32;
-- включение или отключение обработки для каждой камеры;
-- выбор Detector для каждой камеры;
-- выбор Tracker для каждой камеры;
-- выбор источника дальности:
-  - `stereo`;
-  - `manual`;
-- ручное значение дальности при `distance_source = "manual"`.
+При swap current selection сбрасывается только если она существует, то есть в TRACKING. В RELATIVE уже сформированный manual `MOVE_RELATIVE` swap не отменяет.
 
-В будущем список источников дальности может быть расширен, например вариантом `lidar`.
+## RELATIVE / TRACKING
 
-## Расширенные настройки
+UI имеет отдельный control для режима:
 
-К расширенным настройкам относятся параметры, которые обычно не требуется менять во время обычной работы:
-
-- коэффициенты PI-регулятора;
-- компенсация люфта;
-- таймауты и повторные попытки STM32;
-- параметры видеопотока;
-- RTP;
-- параметры алгоритмов Vision.
-
-Точное место хранения параметров конкретных Detector и Tracker пока не фиксируется окончательно: в старом описании архитектуры по этому вопросу есть противоречие. Оно будет устранено при переработке `Config Manager`.
-
-Подробная структура настроек описана отдельно:
-
-[Конфигурация](../../architecture/configuration.md)
-
-## Динамическое применение настроек
-
-Изменение настроек проходит через Core:
-
-```mermaid
-flowchart LR
-ui[Settings Window] --> core[Core]
-core --> config[Config Manager]
-config --> vision[Vision]
-config --> turret[Turret]
-config --> gui[UI]
+```text
+RELATIVE
+TRACKING
 ```
 
-Конкретный модуль получает только относящиеся к нему изменения.
+Mode меняется только по явному действию пользователя. UI считает изменение подтверждённым после получения `TurretState.control_mode`.
 
-Некоторые параметры можно применить сразу, но для настроек, требующих пересоздания ресурса, может понадобиться локальный перезапуск соответствующего компонента. Точная политика будет определена при архитектурном аудите конфигурации.
+Допустимые состояния:
 
-## Ошибки и уведомления
+```text
+RELATIVE + no target
+TRACKING + no target
+TRACKING + selected target
+```
 
-UI отображает пользователю ошибки и предупреждения, которые получает от Core.
+`RELATIVE + selected target` недопустимо. При `TRACKING → RELATIVE` selection очищается. Потеря/deselect цели или swap не переключают applied mode автоматически.
 
-Примеры:
+## Click-to-move
 
-- потеря камеры;
-- устаревший видеопоток;
-- ошибка Vision;
-- потеря связи со STM32;
-- ошибка Turret;
-- предупреждение Supervisor.
+Click-to-move разрешён только после подтверждённого `TurretState.control_mode == RELATIVE`:
 
-В исходном описании для этого предусмотрены:
+```text
+UI click on main working frame
+→ Core/Mediator
+→ Aiming CameraModel
+→ relative angle
+→ MoveRelativeCommand
+```
 
-- краткое всплывающее уведомление;
-- индикатор системных ошибок;
-- возможность открыть подробное описание.
+В `TRACKING` click-to-move disabled/ignored в первой реализации.
 
-Логирование выполняется общим механизмом приложения. UI не должен самостоятельно записывать ошибки непосредственно в лог-файл.
+## Stop / Emergency / Motor controls
 
-## Производительность UI
+UI может инициировать:
 
-UI работает в главном потоке, поэтому в нём нельзя выполнять тяжёлые или блокирующие операции.
+- switch `RELATIVE / TRACKING`;
+- `StopMotion`;
+- `EMERGENCY_STOP`;
+- `MOTOR_ON`;
+- `MOTOR_OFF`.
 
-В частности, UI не должен:
+`StopMotion` — штатная остановка с acceleration limit.
 
-- декодировать сетевой видеопоток;
-- выполнять Detector;
-- выполнять Tracker;
-- рассчитывать стереодальность;
-- ожидать ответ STM32;
-- блокироваться на межпотоковых очередях.
+В TRACKING StopMotion снимает selected target и оставляет mode TRACKING. В RELATIVE StopMotion отменяет неотправленный manual intent и через Turret приводит firmware к zero velocity. Уже физически отправленный ordinary request считается committed и заканчивает normal retry cycle; для немедленного прерывания используется Emergency.
 
-Его основная работа:
+Emergency — отдельный priority action без acceleration limit. Persistent emergency latch / Resume state в первой реализации нет.
 
-- обработка событий пользователя;
-- получение уже готового состояния;
-- отображение актуального кадра;
-- рисование рамок и служебной информации;
-- обновление виджетов.
+## Настройки Vision
 
-Использование `QTimer` для просмотра `latest_frame` позволяет UI не зависеть от частоты камер и не создавать очередь событий для каждого полученного кадра.
+UI может редактировать:
 
-## Завершение приложения
+- source/network settings;
+- `processing-scope`;
+- optional per-camera `processing-enabled` master switch;
+- `vision-processor-class`;
+- processor-specific settings после определения schema.
 
-Закрытие главного окна инициирует штатное завершение всей системы через Core.
+Calibration data не является обычной UI-настройкой `config.json`; она хранится отдельными calibration files.
 
-UI не должен самостоятельно завершать рабочие потоки или закрывать аппаратные интерфейсы.
+## Настройки Aiming
 
-После начала завершения интерфейс должен предотвращать отправку новых обычных команд, пока Core координирует остановку остальных компонентов.
+Минимально:
 
-Точный порядок штатного завершения описывается на уровне Core и будет дополнительно проверен при архитектурном аудите.
+- `lead-time-ms`;
+- aim point Overview;
+- aim point Stereo Left;
+- `target-lost-timeout-ms`, если открыт пользователю.
 
-## Границы ответственности
+Aim point — pixels working frame.
 
-UI отвечает за:
+## Настройки Turret
 
-- отображение;
-- ввод пользователя;
-- представление состояния системы;
-- изменение настроек через Core.
+UI может редактировать:
 
-UI **не отвечает** за:
+- PID `Kp/Ki/Kd`;
+- max speed;
+- acceleration;
+- velocity watchdog;
+- axis inversion (restart-only);
+- full steps per revolution (restart-only);
+- microstep divider (restart-only);
+- max relative move per axis;
+- desired serial baudrate/port;
+- simulation mode.
 
-- хранение `active_target_id` как источника истины;
-- обработку видео;
-- обнаружение объектов;
-- сопровождение объектов;
-- расчёт дальности;
-- управление последовательным портом;
-- работу протокола STM32;
-- принятие низкоуровневых решений по управлению Turret.
+Все изменения проходят через Core/Config Manager.
 
-Такое разделение позволяет изменять внешний вид интерфейса без изменения алгоритмов Vision и Turret.
+## Потеря видеосигнала
+
+UI хранит camera connection state отдельно от freshness.
+
+```text
+ONLINE + fresh → обычный кадр
+ONLINE + stale → freeze last frame + «Нет видеосигнала»
+RECONNECTING / ERROR → соответствующий status
+```
+
+Freshness вычисляется в main thread по `last_receive_timestamp_ns`, а не только по bool от producer.
+
+## Производительность
+
+Latest-only VisionResult не должен превращаться в backlog Qt notifications. Concrete coalescing определяется при реализации.
+
+`CameraSessionStarted` — barrier event и не может быть потерян/coalesced как обычный latest notification.
+
+## Границы
+
+UI не:
+
+- хранит authoritative `selected_target` или applied `control_mode`;
+- автоматически меняет `main_camera` при отказе;
+- выполняет stereo distance;
+- вычисляет lead/ray/angles;
+- выполняет PID;
+- отправляет serial packets.
+
+## Что ещё не определено
+
+- точные mouse/key gestures selection/deselect;
+- overlap/empty-click UX;
+- состав object overlay;
+- Stereo Right diagnostic layout;
+- Qt notification coalescing primitives;
+- future latest-live-frame mode.
+
+Полный список: [Открытые вопросы](../../architecture/problems.md).

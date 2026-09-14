@@ -1,299 +1,351 @@
-# Зрение и детектирование (vision)
+# Vision
 
-Модуль `Vision` отвечает за получение видеопотоков с трёх камер, обнаружение и сопровождение объектов, а также определение дальности до выбранной цели.
+`Vision` отвечает за получение видеопотоков трёх камер, исправление геометрии, формирование tracked objects и определение дальности до выбранного объекта Stereo Left.
 
 ![Диаграмма модуля Vision](../../diagrams/vision-diagram.png)
 
-## Общая структура
+## Камеры и потоки
 
-В модуле используются четыре рабочих потока:
-
-- три отдельных потока `CameraController` — по одному на каждую камеру;
-- один поток `Vision Pipeline` — для Detector, Tracker и Distance Provider.
-
-`Camera Manager` собственного потока не имеет. Это общий потокобезопасный объект, через который контроллеры камер передают актуальные кадры, а Vision Pipeline и UI получают нужные данные.
-
-Основной путь обработки выглядит так:
-
-```mermaid
-flowchart LR
-
-n1[CameraController x3] --> n2[Camera Manager]
-n2 --> n3[frame_queue]
-n3 --> n4[Detector]
-n4 --> n5[Tracker]
-n5 --> n6[поиск active_target_id]
-n6 --> n7[Distance Provider]
-n7 --> n8[Core]
-```
-
-## Камеры
-
-Используются три Raspberry Pi с камерами, подключённые по Ethernet к общей локальной сети:
-
-- две камеры образуют стереопару и используются для точного прицеливания и определения дальности;
-- третья камера имеет больший угол обзора и используется для общего наблюдения.
-
-Каждая камера обслуживается своим экземпляром `CameraController`.
-
-## CameraController
-
-В системе создаются три экземпляра одного класса:
-
-- `CameraController #1`;
-- `CameraController #2`;
-- `CameraController #3`.
-
-Каждый экземпляр работает в отдельном потоке и отвечает только за свою камеру.
-
-Основные задачи `CameraController`:
-
-- подключение к указанному IP-адресу и порту;
-- получение MJPEG-видеопотока по UDP;
-- опциональное использование RTP;
-- декодирование изображения;
-- преобразование кадра в `NumPy Array`;
-- обновление актуального кадра в `Camera Manager`;
-- отслеживание состояния соединения;
-- автоматическое переподключение при потере видеопотока.
-
-Для получения видео используются OpenCV и GStreamer bindings. Отдельный бинарник FFmpeg для этого не требуется.
-
-Отдельные потоки нужны для того, чтобы проблема одной камеры не блокировала две остальные. Например, если одна камера перестала отвечать и её контроллер выполняет переподключение, другие `CameraController` продолжают принимать кадры.
-
-## Camera Manager
-
-`Camera Manager` объединяет доступ к трём камерам. Он не выполняется в отдельном потоке и не занимается тяжёлой обработкой изображения.
-
-Для каждой камеры он хранит:
-
-- `latest_frame` — последний полученный кадр;
-- `frame_id` — номер кадра;
-- `timestamp` — время его получения;
-- `state` — текущее состояние видеопотока.
-
-Новый кадр заменяет предыдущий. Старые кадры специально не накапливаются.
-
-Это важно для системы наведения: если обработка временно отстала, после освобождения ей нужен самый свежий кадр, а не очередь устаревших изображений.
-
-### Передача кадров в UI
-
-UI получает из `Camera Manager` только актуальный кадр. Подробная логика обновления изображения описана в документации модуля GUI.
-
-### Стереопара
-
-Когда используется стереоопределение дальности, `Camera Manager` формирует синхронизированную пару кадров левой и правой камеры.
-
-Поскольку обе камеры принимаются независимыми `CameraController`, кадры сопоставляются по времени получения (`timestamp`). Для обработки выбираются наиболее близкие по времени кадры.
-
-Если стереорежим не используется, синхропара для расчёта дальности не требуется.
-
-## frame_queue
-
-Между `Camera Manager` и `Vision Pipeline` используется `frame_queue`.
-
-Очередь имеет семантику **latest only**: в ней должен находиться только самый свежий элемент, необходимый для следующего цикла обработки.
-
-В зависимости от выбранного источника дальности элементом может быть:
-
-- один рабочий кадр;
-- синхронизированная пара кадров.
-
-Если новый кадр появился до того, как предыдущий был обработан, устаревший кадр можно заменить новым. Это предотвращает накопление задержки.
-
-## Vision Pipeline
-
-Detector, Tracker и Distance Provider выполняются последовательно в одном отдельном потоке `Vision Pipeline`.
-
-Общий цикл обработки:
-
-1. Получить самый свежий кадр или синхропару из `frame_queue`.
-2. Передать рабочий кадр в Detector.
-3. Получить `list[Detection]`.
-4. Передать его в Tracker.
-5. Получить `list[DetectedObject]`.
-6. Проверить, выбран ли в Core активный объект (`active_target_id`).
-7. Если активная цель существует в текущем списке объектов — определить дальность до неё через `Distance Provider`.
-8. Опубликовать актуальный список объектов для Core.
-9. Уведомить Core Qt-сигналом `object_queue_ready`.
-
-Detector, Tracker и Distance Provider не имеют собственных потоков.
-
-## Detector
-
-Detector обнаруживает объекты только в текущем кадре. Он не связывает обнаружения между разными кадрами.
-
-Результат работы — список `Detection`.
-
-Каждый `Detection` содержит:
-
-- координаты рамки `(x, y, w, h)`;
-- рассчитанные признаки объекта;
-- опциональную оценку уверенности (`confidence`).
-
-Detector реализуется как абстрактный интерфейс, поэтому конкретный алгоритм можно заменить без изменения Tracker и остальных частей Vision.
-
-### Подход 1. Скользящее окно
-
-Окно фиксированного размера перемещается по изображению с заданным шагом. Для каждой позиции вычисляются признаки, после чего классификатор определяет, находится ли объект внутри окна.
-
-Подход хорошо работает, когда размеры искомого объекта близки к размеру окна. Для объектов сильно разного размера требуется использовать несколько масштабов.
-
-### Подход 2. Поиск ROI
-
-Сначала быстрый алгоритм выделяет области-кандидаты (`ROI`), например по границам, контрасту или изменению яркости. После этого классификатор проверяет только найденные области.
-
-Этот вариант уменьшает число проверяемых участков кадра и лучше подходит для небольших контрастных объектов. В текущем описании проекта он рассматривается как основной вариант.
-
-### Признаки
-
-В старом описании архитектуры для классификатора был предложен набор геометрических, яркостных, контрастных, гистограммных, цветовых, текстурных, градиентных и пространственных признаков.
-
-Точная размерность этого вектора и окончательный набор признаков будут отдельно проверены на этапе архитектурного аудита. В текущем тексте есть несогласованность между перечисленными признаками и заявленным общим количеством, поэтому здесь число признаков пока не фиксируется как окончательное.
-
-## Tracker
-
-Tracker получает `list[Detection]` из последовательных кадров и связывает наблюдения с конкретными объектами во времени.
-
-Tracker также задаётся через абстрактный интерфейс. Возможные реализации включают, например, алгоритмы на основе:
-
-- венгерского алгоритма;
-- фильтра Калмана;
-- SORT.
-
-Результат — `list[DetectedObject]`.
-
-`DetectedObject` может содержать:
-
-- уникальный ID;
-- текущую рамку;
-- историю последних положений;
-- скорость;
-- оценку траектории;
-- признаки последнего обнаружения, если они нужны выбранной реализации Tracker.
-
-Именно ID позволяет Core хранить `active_target_id` и выбирать один конкретный объект для дальнейшего наведения.
-
-## Выбор активной цели
-
-Выбранная цель хранится не внутри Vision, а в Core как `active_target_id`.
-
-Core передаёт новое значение в Vision через `vision_command_queue`.
-
-Перед расчётом дальности Vision проверяет, присутствует ли объект с таким ID в текущем `list[DetectedObject]`.
-
-Если цель не выбрана или объект временно потерян, Distance Provider для этого кадра не выполняет расчёт дальности.
-
-## Distance Provider
-
-`Distance Provider` отвечает за получение дальности до активной цели независимо от конкретного способа измерения.
-
-Остальная часть Vision использует единый интерфейс и получает:
-
-- `distance` — дальность;
-- `distance_source` — источник значения.
-
-На текущем этапе предусмотрены два источника:
-
-- `stereo`;
-- `manual`.
-
-В будущем можно добавить другие реализации, например лидар, не меняя Detector, Tracker или Core.
-
-### Stereo Distance
-
-При `distance_source = "stereo"` Distance Provider использует синхронизированную пару кадров.
-
-Detector и Tracker работают по одному рабочему кадру пары. После получения ID активной цели Stereo Distance использует её рамку и второй кадр стереопары для вычисления расстояния.
-
-Дальность рассчитывается только для выбранного объекта, а не для всех обнаруженных объектов.
-
-Расчёт выполняется на каждом обработанном кадре, пока активная цель существует.
-
-### Manual Distance
-
-При `distance_source = "manual"` стереорасчёт не выполняется.
-
-Distance Provider подставляет постоянное значение дальности, которое пользователь задал в настройках.
-
-Такой режим использует тот же выходной интерфейс, что и стереозрение:
+Фиксированные роли:
 
 ```text
-distance
-distance_source = "manual"
+overview
+stereo-left
+stereo-right
 ```
 
-Поэтому Core и Turret не должны отдельно обрабатывать ручной и стереорежимы.
+В Python:
 
-## Обмен с Core
+```text
+overview
+stereo_left
+stereo_right
+```
 
-### Vision → Core
+Каждый camera pipeline работает в отдельном прикладном потоке. Отдельного `Camera Manager` нет.
 
-После обработки кадра Vision публикует актуальный `list[DetectedObject]`.
+```text
+Overview worker
+Stereo Left worker + Stereo / Distance Provider
+Stereo Right worker
+```
 
-Сама `object_queue` находится на стороне Core и имеет семантику **latest only**. После записи нового результата Vision посылает Qt-сигнал `object_queue_ready`, чтобы Core обработал данные без периодического polling.
+Vision хранит постоянный camera registry с `current_generation[camera]`.
 
-### Core → Vision
+## Working frame
 
-Для управляющих данных используется `vision_command_queue`, которая находится в Vision.
+Публичный `FramePacket.image` всегда содержит кадр с исправленной геометрией.
 
-На текущем этапе через неё передаётся прежде всего:
+```text
+Overview:
+receive/decode
+→ undistort
+→ FramePacket
+→ VisionProcessor
+→ VisionResult
 
-- выбор `active_target_id`;
-- снятие выбранной цели.
+Stereo Left / Right:
+receive/decode
+→ rectify
+→ FramePacket
+→ VisionProcessor
+→ VisionResult
+```
 
-Vision проверяет управляющие сообщения перед обработкой очередного кадра.
+Raw frame может существовать внутри pipeline, но наружу как обычный `FramePacket` не публикуется.
 
-## Состояние и heartbeat
+Все публичные pixel coordinates относятся к working frame:
 
-Vision передаёт в Supervisor общее состояние (`Vision health / heartbeat`).
+- `BBox`;
+- velocity tracked objects;
+- aim point;
+- lead point;
+- UI click.
 
-Heartbeat нужен для обнаружения ситуации, когда Vision или его рабочие части перестали обновляться.
+Geometric correction выполняется до `VisionProcessor`, потому что одна и та же geometry нужна Vision, UI, Aiming, stereo и recording.
 
-На диаграмме используется один общий интерфейс состояния Vision, чтобы не перегружать схему. Внутренняя детализация heartbeat для отдельных `CameraController` и Vision Pipeline может быть определена при реализации Supervisor.
+## Calibration и `CameraModel`
 
-## Ошибки видеопотока
+Calibration хранится отдельно от `config.json`:
 
-При потере соединения соответствующий `CameraController` пытается переподключиться автоматически.
+```text
+calibration/
+  overview.json
+  stereo.json
+```
 
-`Camera Manager` продолжает хранить:
+### Overview
 
-- последний полученный кадр;
-- время его получения;
-- состояние камеры.
+Минимально:
 
-Это позволяет UI определить, что кадр устарел, и показать пользователю сообщение о потере видеосигнала, не накапливая старые изображения.
+```text
+schema_version
+image_width
+image_height
+K
+D
+new_camera_matrix
+```
 
-## Конфигурация
+Working frame сохраняет исходное разрешение. Автоматического crop/resize в первой реализации нет.
 
-Vision получает изменения настроек от `Config Manager`.
+### Stereo
 
-К настройкам Vision относятся как минимум:
+`stereo.json` — единый атомарный файл пары:
 
-- параметры подключения камер;
-- включение RTP;
-- выбор Detector;
-- выбор Tracker;
-- настройки Distance Provider;
-- ручная дальность;
-- параметры стереорежима;
-- параметры контроля видеопотока.
+```text
+schema_version
+image_width
+image_height
+K_left / D_left
+K_right / D_right
+R / T
+R1 / R2
+P1 / P2
+Q
+```
 
-Подробная структура конфигурации вынесена в отдельный документ:
+Stereo Left working frame соответствует `P1`, Stereo Right — `P2`.
 
-[Конфигурация](../../architecture/configuration.md)
+Rectification/undistortion maps строятся при старте и живут в памяти; в calibration JSON они не хранятся.
 
-Точное место хранения внутренних параметров конкретных реализаций Detector и Tracker будет согласовано отдельно: старое описание архитектуры содержит по этому вопросу противоречивые требования.
+Если calibration отсутствует, повреждена или image size не совпадает, pipeline не считается ready и не публикует raw image как fallback.
 
-## Режим симуляции
+На основе calibration создаётся immutable `CameraModel` working frame.
 
-Для разработки без реальных камер `CameraController` может использовать другой источник кадров:
+## Camera generation и barrier
 
-- видеофайл;
-- последовательность изображений;
-- синтетический генератор;
-- виртуальную OBS-камеру.
+При каждом новом запуске/restart pipeline:
 
-Для остальных компонентов Vision источник должен выглядеть так же, как реальная камера: на выходе они получают актуальные кадры через тот же интерфейс.
+```text
+current_generation[camera] += 1
+frame_id = 0
+```
 
-Это позволяет тестировать Detector, Tracker и остальную систему без изменения их кода.
+До публикации любых camera-derived данных новой generation Vision публикует:
+
+```text
+CameraSessionStarted(camera, generation, camera_model)
+```
+
+Это ordered/barrier event, а не latest-state notification. Для каждого consumer гарантируется:
+
+```text
+CameraSessionStarted generation=N
+→ consumer принимает session
+→ только затем VisionResult generation=N может считаться валидным
+```
+
+Generation защищает от запоздалых результатов старого worker и от повторного использования `track_id` после restart.
+
+При restart одновременно очищаются локальные latest/buffer state и stereo pairing state соответствующей camera.
+
+## `CameraSessionGate`
+
+В main thread Core и UI используют общий `CameraSessionGate` с:
+
+```text
+accepted_generation[camera]
+camera_model[camera]
+```
+
+Vision может доставлять `VisionResult` напрямую UI для низкой задержки, но UI обязан проверять generation через тот же gate, что и Core.
+
+## `FramePacket`
+
+Video Source / camera pipeline:
+
+- получает и декодирует stream;
+- выполняет geometric correction;
+- назначает `generation` и `frame_id`;
+- фиксирует `receive_timestamp_ns`;
+- получает/формирует `capture_id` для stereo;
+- гарантирует безопасное владение памятью;
+- публикует read-only `FramePacket`.
+
+Полный контракт: [FramePacket](../../architecture/contracts.md#framepacket).
+
+## `VisionProcessor`
+
+Выбирается настройкой:
+
+```text
+vision-processor-class
+```
+
+Внутренняя реализация не фиксируется:
+
+```text
+Detector → Tracker
+integrated tracker
+другой алгоритм
+```
+
+Публичный результат обязан содержать `TrackedObject`:
+
+- устойчивый `track_id` внутри generation;
+- `bbox`;
+- velocity центра bbox;
+- `age_frames`.
+
+Если processing для камеры выключен effective policy, pipeline всё равно публикует working `VisionResult` с пустым `tracked_objects`.
+
+Если processing медленнее camera source, backlog старых кадров не создаётся: после текущей обработки берётся freshest available frame.
+
+## Processing scope main / preview
+
+Обычный UI показывает Overview + Stereo Left. Processing scope:
+
+```text
+main-only
+main-and-preview
+```
+
+При `main-only` VisionProcessor активен для текущей `main_camera`; preview продолжает публиковать working frames без tracked objects.
+
+При `main-and-preview` processing работает для обеих отображаемых камер. BBox могут отображаться на preview, но target selection всё равно разрешён только на main image.
+
+Per-camera `processing-enabled`, если сохраняется, является дополнительным master switch; effective processing определяется совместно с `processing-scope`.
+
+Stereo Right processing используется только для diagnostics и не участвует в user selection.
+
+## `VisionResult`
+
+```text
+FramePacket
++ tuple[TrackedObject]
++ processing_time_ns
+```
+
+UI отображает именно `VisionResult.frame` вместе с его bbox.
+
+Межпотоковая семантика `VisionResult` — latest-only per camera. Qt notification не должна превращать latest-state в backlog.
+
+## Overview
+
+Overview используется:
+
+- для main/preview UI;
+- VisionProcessor согласно processing scope;
+- user selection, только когда Overview является main camera;
+- Aiming.
+
+Working frame — undistorted.
+
+## Stereo Left
+
+Stereo Left используется:
+
+- для main/preview UI;
+- VisionProcessor согласно processing scope;
+- user selection, только когда Stereo Left является main camera;
+- Aiming;
+- как ведущий stream Distance Provider.
+
+Working frame — rectified.
+
+## Stereo Right
+
+Stereo Right прежде всего нужен для Stereo Distance. Он может иметь VisionProcessor и diagnostic display.
+
+Пользовательского `TargetRef` для Stereo Right нет.
+
+## Stereo pairing
+
+Stereo Left/Right аппаратно синхронизированы.
+
+Pairing должен учитывать:
+
+```text
+capture_id
+left generation
+right generation
+```
+
+Кадры разных generations нельзя объединять даже при одинаковом `capture_id`.
+
+Stereo Right использует небольшой bounded buffer по `capture_id`; это pairing buffer, а не очередь последовательной обработки старых кадров.
+
+Точный механизм генерации `capture_id`, resync, wraparound и pair timeout остаётся открытым до включения полноценного Stereo distance.
+
+## Stereo / Distance Provider
+
+Distance Provider работает в Stereo Left thread, но остаётся отдельным class.
+
+Источники:
+
+```text
+stereo
+manual
+```
+
+Distance вычисляется только в TRACKING, если текущий `selected_target` относится к Stereo Left и остаётся валиден по `camera + generation + track_id`. В RELATIVE selection отсутствует.
+
+### Stereo
+
+Успешный result содержит:
+
+- `source = STEREO`;
+- `source_frame_id`;
+- `capture_id`;
+- `measured_timestamp_ns`.
+
+Неуспешный расчёт не публикует invalid-object. Последний успешный result живёт до `distance-stale-timeout-ms`; точный owner invalidation остаётся открытым до включения Stereo distance.
+
+### Manual
+
+Manual source публикует постоянное значение для актуального selected target. Временного stale timeout нет.
+
+При смене target/generation старый result инвалидируется.
+
+## Camera state и freshness
+
+Connection/lifecycle enum:
+
+```text
+STARTING
+ONLINE
+RECONNECTING
+ERROR
+STOPPED
+```
+
+Vision публикует latest-only `CameraStatus` per camera с `camera`, `state`, `generation`, `last_receive_timestamp_ns` и optional diagnostic error fields.
+
+Freshness не является отдельным state. UI/Core вычисляют stale по `CameraStatus.last_receive_timestamp_ns` и `camera-stale-timeout-ms`.
+
+Конкретная reconnect/backoff policy остаётся открытым вопросом реализации.
+
+## Запись видео
+
+Основная запись сохраняет чистый:
+
+```text
+FramePacket.image
+```
+
+без UI overlays.
+
+В файл не добавляются bbox, reticle, aim point, lead, FPS и status text. Это позволяет использовать запись повторно для тестирования detector/tracker.
+
+## Обмен с Core/UI
+
+Vision логически публикует:
+
+- ordered/barrier `CameraSessionStarted`;
+- latest-only `VisionResult` per camera;
+- latest/invalidate-able `DistanceResult`;
+- latest-only `CameraStatus` per camera.
+
+Diagnostics/errors идут в logging, runtime state — через typed contracts. Generic event bus заранее не вводится. Конкретный thread-safe primitive и Qt notification coalescing остаются техническими вопросами реализации.
+
+## Что ещё не определено
+
+- механизм `capture_id` и stereo resync;
+- owner staleness `DistanceResult`;
+- processor-specific config;
+- camera reconnect/backoff;
+- concrete thread-safe primitives / notification coalescing;
+- адаптация нагрузки после profiling.
+
+Полный список: [Открытые вопросы](../../architecture/problems.md).

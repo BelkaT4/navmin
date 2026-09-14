@@ -1,60 +1,89 @@
 flowchart TB
-  cam1["Camera 1"]
-  cam2["Camera 2"]
-  cam3["Camera 3"]
-  flag_core_in>"IN: active_target_id<br>от Core"]
-  flag_core_out>"OUT: detected objects<br>+ object_queue_ready<br>в Core"]
-  flag_ui_out>"OUT: latest frame<br>в UI"]
-  flag_config_in>"IN: Vision settings<br>от Config Manager"]
-  flag_heartbeat_out>"OUT: Vision health / heartbeat<br>в Supervisor"]
-  subgraph vision ["Vision"]
-    frame_queue[["frame_queue<br>кадр / синхропара<br>latest only"]]
-    vision_command_queue[["vision_command_queue<br>active_target_id"]]
-    vision_config["Vision settings<br>камеры / Detector / Tracker / Distance Provider"]
-    vision_health["Vision health / heartbeat"]
-    subgraph capture ["Захват видео"]
-      cc1["CameraController #1"]
-      cc2["CameraController #2"]
-      cc3["CameraController #3"]
-      camera_manager["Camera Manager<br>latest_frame / frame_id / timestamp / state"]
+  overview_camera["Overview Camera"]
+  left_camera["Stereo Left Camera"]
+  right_camera["Stereo Right Camera"]
+
+  flag_core_in>"IN: main_camera / TRACKING selected_target<br/>Vision ConfigUpdate"
+  flag_session_out>"OUT barrier: CameraSessionStarted<br/>generation + CameraModel"
+  flag_data_out>"OUT latest: VisionResult / DistanceResult<br/>CameraStatus"
+  flag_ui_out>"OUT: VisionResult working frames<br/>generation checked by CameraSessionGate"
+  
+  calibration[("Calibration<br/>overview.json / stereo.json")]
+
+  subgraph vision["Vision"]
+    registry["Camera Registry<br/>current_generation[camera]"]
+    vision_config["VisionConfig<br/>processing-scope / per-camera master<br/>vision-processor-class"]
+
+    subgraph overview_thread["Overview pipeline"]
+      overview_source["Receive / decode"]
+      overview_geom["Undistort<br/>working FramePacket"]
+      overview_processor["VisionProcessor<br/>effective processing policy"]
+      overview_result["VisionResult<br/>latest-only"]
+      overview_source --> overview_geom --> overview_processor --> overview_result
     end
-    subgraph vision_thread ["Vision Pipeline<br>отдельный поток"]
-      detector["Detector"]
-      tracker["Tracker"]
-      target_selector["Поиск active_target_id<br>среди DetectedObject"]
-      publish_result["Публикация результата<br>данные + Qt notification"]
-      subgraph distance_provider ["Distance Provider"]
-        distance_switch["Выбор источника дальности"]
-        stereo_distance["Stereo Distance"]
+
+    subgraph left_thread["Stereo Left pipeline"]
+      left_source["Receive / decode"]
+      left_geom["Rectify Left<br/>working FramePacket + capture_id"]
+      left_processor["VisionProcessor<br/>effective processing policy"]
+      left_result["VisionResult<br/>latest-only"]
+
+      subgraph distance_provider["Stereo / Distance Provider"]
+        distance_switch["source: stereo / manual"]
+        stereo_distance["Stereo Distance<br/>selected_target only if Stereo Left"]
         manual_distance["Manual Distance"]
-        distance_result["distance + distance_source"]
+        distance_result["DistanceResult<br/>latest / invalidatable"]
       end
+
+      left_source --> left_geom --> left_processor --> left_result
+      distance_switch --> stereo_distance
+      distance_switch --> manual_distance
+      stereo_distance --> distance_result
+      manual_distance --> distance_result
+      left_geom -.->|"left FramePacket"| stereo_distance
+      left_result -.->|"selected TrackedObject"| stereo_distance
     end
+
+    subgraph right_thread["Stereo Right pipeline"]
+      right_source["Receive / decode"]
+      right_geom["Rectify Right<br/>working FramePacket + capture_id"]
+      right_processor["VisionProcessor optional<br/>diagnostics"]
+      right_result["VisionResult<br/>diagnostics optional"]
+      right_source --> right_geom --> right_processor --> right_result
+    end
+
+    right_buffer[["Bounded Stereo Right buffer<br/>generation + capture_id"]]
+    right_geom --> right_buffer
+    right_buffer -.->|"same generation pair + capture_id"| stereo_distance
   end
 
-  distance_switch --> stereo_distance
-  distance_switch --> manual_distance
-  stereo_distance --> distance_result
-  manual_distance --> distance_result
-  detector -->|"list[Detection]"| tracker
-  tracker -->|"list[DetectedObject]"| target_selector
-  target_selector -->|"выбранная цель"| distance_switch
-  distance_result --> publish_result
-  cam1 -->|"UDP MJPEG / RTP опционально"| cc1
-  cam2 -->|"UDP MJPEG / RTP опционально"| cc2
-  cam3 -->|"UDP MJPEG / RTP опционально"| cc3
-  cc1 -->|"latest frame"| camera_manager
-  cc2 -->|"latest frame"| camera_manager
-  cc3 -->|"latest frame"| camera_manager
-  camera_manager --> frame_queue
-  frame_queue -->|"рабочий кадр"| detector
-  frame_queue -.->|"синхропара"| stereo_distance
-  flag_core_in --> vision_command_queue
-  vision_command_queue --> target_selector
-  flag_config_in -.-> vision_config
-  publish_result --> flag_core_out
-  camera_manager --> flag_ui_out
-  vision_health -.-> flag_heartbeat_out
-%% graph:positions {"vision":{"x":-449,"y":-183,"w":1113,"h":1496},"capture":{"x":215,"y":75,"w":648,"h":250},"vision_thread":{"x":215,"y":507,"w":596,"h":956},"distance_provider":{"x":32,"y":512,"w":528,"h":270},"cam1":{"x":-202,"y":-300},"cam2":{"x":10,"y":-300},"cam3":{"x":222,"y":-300},"flag_core_in":{"x":-696,"y":696},"flag_core_out":{"x":708,"y":1176},"flag_ui_out":{"x":708,"y":60},"flag_config_in":{"x":-696,"y":204},"flag_heartbeat_out":{"x":708,"y":-108},"frame_queue":{"x":459,"y":387},"vision_command_queue":{"x":29,"y":879},"vision_config":{"x":29,"y":376,"w":172,"h":76},"vision_health":{"x":929,"y":75},"cc1":{"x":32,"y":48},"cc2":{"x":244,"y":48},"cc3":{"x":456,"y":48},"camera_manager":{"x":244,"y":156},"detector":{"x":208,"y":120},"tracker":{"x":208,"y":264},"target_selector":{"x":208,"y":372},"publish_result":{"x":196,"y":852,"w":184,"h":54},"distance_switch":{"x":176,"y":16},"stereo_distance":{"x":322,"y":108},"manual_distance":{"x":27,"y":108},"distance_result":{"x":176,"y":192}}
-%% graph:edges {"target_selector>distance_switch":{"label":[0,-15]},"frame_queue>detector":{"label":[-19,42]},"frame_queue>stereo_distance":{"label":[100,47]}}
-%% graph:waypoints {"frame_queue>stereo_distance":[[99,348]]}
+  overview_camera --> overview_source
+  left_camera --> left_source
+  right_camera --> right_source
+  calibration -.-> overview_geom
+  calibration -.-> left_geom
+  calibration -.-> right_geom
+
+  registry -.-> overview_source
+  registry -.-> left_source
+  registry -.-> right_source
+  registry -->|"CameraSessionStarted before data"| flag_session_out
+
+  flag_core_in -.-> vision_config
+  flag_core_in -->|"selected_target"| distance_switch
+  vision_config -.-> overview_processor
+  vision_config -.-> left_processor
+  vision_config -.-> right_processor
+
+  overview_result --> flag_data_out
+  left_result --> flag_data_out
+  distance_result --> flag_data_out
+
+  overview_result --> flag_ui_out
+  left_result --> flag_ui_out
+  right_result -.->|"diagnostics"| flag_ui_out
+
+
+%% graph:positions {"vision":{"x":-540,"y":-220,"w":1320,"h":1500},"overview_camera":{"x":-350,"y":-350},"left_camera":{"x":0,"y":-350},"right_camera":{"x":350,"y":-350},"flag_core_in":{"x":-800,"y":600},"flag_session_out":{"x":830,"y":-80},"flag_data_out":{"x":830,"y":940},"flag_ui_out":{"x":830,"y":180},"vision_config":{"x":10,"y":10,"w":330,"h":90},"registry":{"x":-300,"y":10},"overview_thread":{"x":-440,"y":180,"w":350,"h":600},"left_thread":{"x":-40,"y":180,"w":450,"h":1000},"right_thread":{"x":470,"y":180,"w":350,"h":600},"overview_source":{"x":70,"y":70},"overview_processor":{"x":70,"y":230},"overview_result":{"x":70,"y":390},"left_source":{"x":95,"y":60},"left_processor":{"x":95,"y":200},"left_result":{"x":95,"y":340},"distance_provider":{"x":40,"y":540,"w":370,"h":310},"distance_switch":{"x":120,"y":35},"stereo_distance":{"x":210,"y":135},"manual_distance":{"x":25,"y":135},"distance_result":{"x":120,"y":235},"right_source":{"x":70,"y":70},"right_processor":{"x":70,"y":230},"right_result":{"x":70,"y":390},"right_buffer":{"x":530,"y":900}}
+%% graph:edges {"registry>flag_session_out":{"label":[30,-20]},"flag_core_in>distance_switch":{"label":[-15,0]},"right_buffer>stereo_distance":{"label":[45,20]},"overview_result>flag_data_out":{"label":[20,0]},"left_result>flag_data_out":{"label":[20,0]},"distance_result>flag_data_out":{"label":[20,0]},"overview_result>flag_ui_out":{"label":[20,-20]},"left_result>flag_ui_out":{"label":[20,-20]}}
+%% graph:waypoints {"right_buffer>stereo_distance":[[440,950],[440,820]],"left_geom>stereo_distance":[[260,550]]}

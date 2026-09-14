@@ -1,229 +1,344 @@
 # Общая архитектура системы
 
-Этот документ даёт краткое представление о том, как устроена система и как связаны её основные модули. Подробное описание каждого модуля вынесено в отдельные документы.
+Этот документ описывает устойчивую верхнеуровневую структуру системы. Детали вынесены в документы модулей и общих контрактов.
 
-Этот документ активно дорабатывается. Исправления и уточнения, которые скоро будут внесены в него, см. в [Уточнения архитектуры](./architecture-updates.md)
+Причины ключевых решений и существенные отвергнутые альтернативы собраны в [архитектурных решениях](./decisions.md).
 
 ![Общая архитектура системы](../diagrams/overview-diagram.png)
 
 ## Основные модули
 
-Система разделена на четыре основных программных модуля:
+Система разделена на четыре верхнеуровневых программных модуля:
 
-- `Vision` — получает видео с трёх камер, обнаруживает и сопровождает объекты, а также определяет дальность до выбранной цели.
-- `Core` — координирует взаимодействие остальных модулей и хранит общее состояние системы, например `active_target_id`.
-- `Turret` — отвечает за наведение, калибровку и обмен со STM32.
-- `UI` — отображает видео и состояние системы, принимает действия пользователя и передаёт их в Core.
+- `Vision` — получает кадры трёх камер, исправляет их геометрию, формирует tracked objects и определяет дальность;
+- `Core` — координирует систему и содержит `Mediator`, `Aiming`, `Config Manager`;
+- `Turret` — преобразует требования управления в движение приводов и обменивается со STM32;
+- `UI` — отображает working frames и состояние системы, принимает действия пользователя.
 
-Core и UI являются отдельными логическими модулями, но выполняются в одном главном потоке приложения.
+Core и UI работают в главном Qt-потоке. Vision использует три camera worker, Turret — отдельный worker.
 
-### Vision
+## Vision и working frame
 
-Vision получает MJPEG-видеопотоки от трёх Raspberry Pi.
+Фиксированные роли:
 
-Каждая камера обслуживается отдельным `CameraController`. Кадры передаются через общий `Camera Manager`, который хранит только актуальное состояние каждой камеры.
+```text
+overview
+stereo-left
+stereo-right
+```
 
-Далее кадр проходит через `Vision Pipeline`:
+Публичные кадры всегда имеют исправленную геометрию:
 
-- Detector обнаруживает объекты;
-- Tracker связывает обнаружения между последовательными кадрами;
-- Core сообщает Vision, какой объект выбран как активная цель;
-- `Distance Provider` определяет дальность только до выбранной цели.
+```text
+Overview:
+receive/decode → undistort → FramePacket → VisionProcessor → VisionResult
 
-На первом этапе дальность может поступать из двух источников:
+Stereo Left / Right:
+receive/decode → rectify → FramePacket → VisionProcessor → VisionResult
+```
 
-- `stereo` — расчёт по стереопаре;
-- `manual` — постоянное значение, введённое пользователем.
+`FramePacket.image` — working frame. Raw image наружу как обычный `FramePacket` не публикуется.
 
-Подробное описание:
+Все публичные pixel coordinates (`BBox`, velocity, aim point, lead, UI click) относятся к working frame.
 
-[Vision](../modules/vision/index.md)
+Каждый camera pipeline имеет `generation`. Перед данными новой generation Vision публикует ordered/barrier:
 
-### Core
+```text
+CameraSessionStarted(camera, generation, camera_model)
+```
 
-Core используется как Mediator между основными частями приложения.
+В main thread общий `CameraSessionGate` атомарно принимает `generation + CameraModel`. Core и UI отбрасывают данные generation, которая не принята gate. Никакой consumer не должен принять `VisionResult generation=N` раньше session event `generation=N`.
 
-Он:
+`VisionProcessor` — заменяемый компонент и обязан выдавать `TrackedObject` со стабильными ID внутри одной generation.
 
-- получает актуальные результаты Vision;
-- хранит `active_target_id`;
-- передаёт выбранную цель обратно в Vision;
-- передаёт команды в Turret;
-- получает состояние Turret;
-- передаёт необходимое состояние в UI;
-- работает с `Config Manager`;
-- принимает предупреждения от `Supervisor`.
+Подробно: [Vision](../modules/vision/index.md).
 
-Core не выполняет тяжёлую обработку и не имеет собственного рабочего потока.
+## Calibration и геометрия
 
-Подробное описание:
+Calibration хранится отдельно от `config.json`:
 
-[Core](../modules/core/index.md)
+```text
+calibration/
+  overview.json
+  stereo.json
+```
 
-### Turret
+Overview использует mono calibration и undistortion. Stereo Left/Right используют единый stereo calibration и rectification.
 
-Turret отвечает за физическое управление турелью.
+Публичный геометрический контракт:
 
-Он состоит из:
+```text
+CameraModel.pixel_to_ray(x, y) → normalized CameraRay
+```
 
-- `Turret Controller` — высокоуровневая логика наведения, PI-регулятор, компенсация люфта и калибровка;
-- `Turret HAL` — низкоуровневый обмен со STM32 по UART.
+`CameraRay` использует `+Y вниз`, как image/OpenCV geometry. Aiming преобразует результат в логическую систему Turret, где `+Y вверх`.
 
-Controller и HAL работают в одном отдельном потоке управления турелью.
+При несовпадении calibration image size и camera image size pipeline не считается ready. Автоматический crop/resize/scaling calibration в первой реализации не выполняется.
 
-Подробное описание:
+## UI: main / preview
 
-[Turret](../modules/turret/index.md)
+В обычном интерфейсе одновременно отображаются Overview и Stereo Left:
 
-Протокол связи со STM32 описан отдельно:
+- одна камера — `main_camera`, занимает основную область;
+- вторая — preview;
+- пользователь может явно выполнить swap.
 
-[Протокол STM32](./serial-protocol.md)
+Начальная `main_camera` берётся из `ui.default-camera`; допустимы только `overview` и `stereo-left`.
 
-### UI
+Автоматического переключения `main_camera` при отказе камеры нет. UI показывает stale/error для текущей main camera, а swap остаётся явным действием пользователя.
 
-UI написан на PyQt6 и выполняется в главном потоке приложения.
+Vision processing имеет scope:
 
-Он отвечает за:
+```text
+main-only
+main-and-preview
+```
 
-- отображение видеопотока;
-- отображение обнаруженных объектов и состояния системы;
-- выбор цели;
-- управление режимами;
-- настройку системы;
-- отображение ошибок и предупреждений.
+BBox могут отображаться на preview, если processing для неё включён, но выбирать цель разрешено только на main image.
 
-Видеокадры UI получает напрямую из `Camera Manager`. Управляющие действия и состояние остальных модулей проходят через Core.
+## Selection и TRACKING
 
-Подробное описание:
+Core хранит одну authoritative selection, но только для подтверждённого `TRACKING`:
 
-[UI](../modules/ui/index.md)
+```text
+RELATIVE:
+    selected_target = None
+
+TRACKING:
+    selected_target: TargetRef | None
+```
+
+`TargetRef = camera + generation + track_id`. Selection разрешён только на `main_camera`, после того как `TurretState.control_mode == TRACKING`. Неуспешная попытка выбора не создаёт target.
+
+При swap в TRACKING selection очищается, `TrackingError`/lead/DistanceResult инвалидируются и Turret выполняет normal StopMotion. Сам applied mode остаётся TRACKING. В RELATIVE swap не отменяет уже успешно сформированный manual `MoveRelativeCommand`.
+
+При временной потере selected track `TargetRef` сохраняется до `target-lost-timeout-ms`; новые TrackingError/setpoints не создаются. STM32 velocity watchdog безопасно ведёт velocity target к zero, если updates не возобновились.
+
+При final loss/deselect в TRACKING:
+
+```text
+selected_target → None
+lead / TrackingError → clear/invalidate
+DistanceResult старой цели → invalidate
+Turret normal StopMotion
+```
+
+PID принадлежит Turret Controller и reset'ится там по control boundaries; Core не посылает отдельный `PID_RESET`.
+
+При смене цели A → B старый ещё не отправленный tracking motion intent инвалидируется, Turret reset'ит PID и рассчитывает новый setpoint без обязательного промежуточного zero.
+
+При `TRACKING → RELATIVE` selection очищается сразу. Если physical mode transition не завершится из-за UART failure, безопасное состояние остаётся `TRACKING + no target`.
+
+## Aiming
+
+Aiming преобразует target/lead pixel и aim point в `CameraRay`, затем в логическую угловую ошибку Turret.
+
+Постоянный `degrees_per_pixel` не используется.
+
+Логический результат Aiming:
+
+```text
++X → турели нужно вправо
++Y → турели нужно вверх
+```
+
+`invert-x/y` в HAL отвечают только за физическое направление двигателя.
+
+## Stereo / Distance Provider
+
+Distance Provider выполняется в потоке Stereo Left.
+
+Аппаратно синхронизированные Stereo Left / Right сопоставляются по `capture_id`, но pairing также обязан учитывать `generation` обеих camera sessions. Кадры разных generations нельзя объединять даже при одинаковом `capture_id`.
+
+Поддерживаются источники:
+
+```text
+stereo
+manual
+```
+
+Первая реализация может использовать manual distance без готового stereo pairing.
+
+## Turret
+
+Turret состоит из `Turret Controller` и `Turret HAL`. Applied `control_mode` принадлежит Turret Controller и публикуется через `TurretState`; Core/UI не держат вторую authoritative копию.
+
+Motion transport latest-only. Вместо двух независимых slots используется один:
+
+```text
+pending_motion =
+    MoveRelativeCommand
+    | AxisVelocitySetpoint
+    | None
+```
+
+В подтверждённом `RELATIVE` допустим только `MoveRelativeCommand`; в `TRACKING` — только velocity setpoint. Новый неотправленный intent заменяет старый. Normal control boundary инвалидирует только неотправленный pending intent. Уже физически отправленный ordinary request считается committed и завершает обычный response/retry cycle перед следующей normal control operation.
+
+Одновременно существует максимум один physical request in flight. Для немедленного прерывания normal retry cycle используется `EMERGENCY_STOP`.
+
+### StopMotion и mode transition
+
+`StopMotion` — штатная acceleration-limited остановка. `SET_VELOCITY(0,0)` — обычный нулевой velocity setpoint и не имеет скрытой application-семантики.
+
+В TRACKING StopMotion очищает selection/TrackingError и оставляет applied mode TRACKING. В RELATIVE он отменяет неотправленный manual intent и затем переводит firmware в velocity-control с target zero.
+
+При `RELATIVE → TRACKING` при motors ON всегда выполняется:
+
+```text
+invalidate unsent pending_motion
+→ SET_VELOCITY(0,0) → OK
+→ apply TRACKING
+→ TurretState(control_mode=TRACKING)
+```
+
+Selection разрешается только после этого подтверждения. При motors OFF физическое движение невозможно, поэтому zero handshake не требуется.
+
+### Emergency Stop
+
+`EMERGENCY_STOP` немедленно прекращает STEP generation без acceleration limit и является одновременно safety + request-sequence resync boundary. Persistent latch отсутствует.
+
+Если ordinary attempt уже физически отправлен, Emergency не передаётся параллельно: дальнейшие ordinary retries прекращаются, ожидается только response или timeout текущей попытки, затем отправляется Emergency с новым общим `REQUEST_ID`.
+
+После successful Emergency STM32 устанавливает `expected_request_id = emergency_id + 1`, поэтому дополнительная transport-reset команда не нужна.
+
+### Recovery
+
+После transport loss старая session не продолжается. После обнаружения физической связи/baud:
+
+```text
+EMERGENCY_STOP → OK
+→ MOTOR_OFF → OK
+→ SET_BAUDRATE при необходимости
+→ SET_CONFIG(full snapshot) → OK
+→ READY
+```
+
+Auto `MOTOR_ON` отсутствует. Уже принятый ограниченный `MOVE_RELATIVE` при внезапной потере связи может закончиться; velocity control защищён watchdog.
+
+## Relative move без completion lifecycle
+
+`MOVE_RELATIVE → OK` означает только принятие новой relative target. `MOVE_COMPLETED`, `command_id`, terminal lifecycle и completion polling отсутствуют.
+
+После успешной camera/session validation и вычисления relative angle последующий camera swap/restart/stale не отменяет уже сформированный manual intent.
+
+PC ограничивает move в градусах; STM32 дополнительно применяет простой static sanity bound по `abs(delta_steps)`.
+
+## PID
+
+PID работает с угловой ошибкой:
+
+- отдельные `Kp/Ki/Kd` по X/Y;
+- шаг ровно один раз на новый `TrackingError` revision;
+- `dt` по monotonic timestamp;
+- conditional anti-windup;
+- I-term ограничен `±max_speed`;
+- reset при входе/выходе TRACKING, смене цели, final loss и при gap больше watchdog timeout.
+
+Первый sample после reset: P-only, `I=0`, `D=0`.
+
+## STM32 / RS485
+
+Обмен строго последовательный:
+
+```text
+1 request → 1 response
+```
+
+STM32 не отправляет асинхронные packets.
+
+Физические команды:
+
+```text
+PING
+SET_CONFIG
+SET_BAUDRATE
+MOVE_RELATIVE
+SET_VELOCITY
+EMERGENCY_STOP
+MOTOR_ON
+MOTOR_OFF
+```
+
+Framing, CRC, retry, error codes и reconnect описаны в [Протоколе STM32](./serial-protocol.md).
+
+## Ограничения механики первой реализации
+
+В конструкции пока нет:
+
+- limit switches;
+- encoders;
+- достоверного absolute position feedback;
+- надёжного homing.
+
+Физические упоры существуют, но попадание в них считается нештатной ситуацией. STM32 знает число выданных STEP pulses, а не гарантированное фактическое перемещение.
+
+PC ограничивает величину одной relative move через `max-relative-move-*-deg` до перевода в steps. STM32 дополнительно отвергает аномально большой `delta_steps` по compile-time/static firmware bound; это не механический absolute limit.
+
+## UI и запись
+
+UI overlays рисуются только для отображения. Основная запись видео сохраняет чистый `FramePacket.image` без bbox, reticle, aim point, lead и status overlays, чтобы запись можно было повторно использовать для тестов Vision.
 
 ## Модель выполнения
 
-В системе используется **6 прикладных потоков**:
+Пять прикладных потоков:
 
-1. **Главный поток приложения**
-   - UI;
-   - Core;
-   - `Config Manager`;
-   - `Supervisor`.
+1. main thread: UI + Core + `CameraSessionGate`;
+2. Overview pipeline;
+3. Stereo Left pipeline + Distance Provider;
+4. Stereo Right pipeline;
+5. Turret Controller + HAL.
 
-2. **CameraController #1**
-   - получение видеопотока первой камеры.
+Внутренние потоки Qt/GStreamer/OpenCV сюда не входят.
 
-3. **CameraController #2**
-   - получение видеопотока второй камеры.
+## Startup / shutdown order
 
-4. **CameraController #3**
-   - получение видеопотока третьей камеры.
+Базовый startup order:
 
-5. **Vision Pipeline**
-   - Detector;
-   - Tracker;
-   - выбор активного объекта;
-   - Distance Provider.
+```text
+1. Config Manager: load + validate initial config
+2. создать shared latest-state stores и CameraSessionGate
+3. создать Core и UI, подключить consumers session/data notifications
+4. запустить Turret worker
+5. запустить Vision workers
+```
 
-6. **Поток управления Turret**
-   - Turret Controller;
-   - Turret HAL;
-   - обмен со STM32.
+Критический invariant: ни один Vision worker не может опубликовать первый `CameraSessionStarted`, пока `CameraSessionGate` и все consumers этого barrier event ещё не готовы его принять.
 
-Внутренние служебные потоки, которые могут создавать GStreamer, OpenCV, Qt или другие библиотеки, в эту модель не входят.
+Базовый shutdown order:
 
-## Обмен между потоками
+```text
+1. запретить новые user motion actions
+2. штатно остановить motion при необходимости
+3. MOTOR_OFF
+4. остановить Vision / Turret workers
+5. сохранить config и завершить Core/UI
+```
 
-Для межпотоковой передачи используются потокобезопасные очереди.
+Concrete stop tokens, join timeout и обработка зависшего worker остаются implementation questions.
 
-Основные правила:
+## Межпотоковая семантика
 
-- потоковые данные, для которых важно только актуальное состояние, не должны накапливаться;
-- `frame_queue` и `object_queue` работают по принципу **latest only**;
-- управляющие команды Turret передаются через FIFO `command_queue`;
-- выбранная цель передаётся в Vision через `vision_command_queue`;
-- состояние Turret передаётся через `status_queue`.
+```text
+VisionResult        → latest-only per camera
+DistanceResult      → latest-only / invalidatable
+TrackingError       → latest-only + monotonic revision
+TurretState          → latest-only
+CameraStatus         → latest-only per camera
+ConfigUpdate         → latest-only
+CameraSessionStarted → ordered/barrier
+pending_motion       → one latest unsent motion intent
+Emergency Stop       → dedicated priority operation
+```
 
-Если получателем является Core, рабочий поток после записи данных дополнительно отправляет Qt-сигнал. Он только уведомляет главный поток о появлении данных; сами данные остаются в очереди.
-
-Подробное устройство очередей описано в документации соответствующих модулей.
+Типизированные состояния покрывают runtime state, диагностические сообщения идут в logging, а reconnect/recovery принадлежит owner-модулям Vision/Turret. Concrete thread-safe primitives и Qt notification coalescing остаются техническими вопросами реализации.
 
 ## Конфигурация
 
-Общая конфигурация хранится в `Config Manager`, который является частью Core.
+Config Manager загружает `config.json`, валидирует его и публикует типизированные snapshots. Calibration хранится отдельно.
 
-При запуске настройки загружаются из `config.json`. Изменения из UI проходят через Core и затем передаются соответствующим модулям.
+`config.json` имеет `schema-version = 1`; сохранение выполняется через temporary file + atomic replace. Подробно: [Конфигурация](./configuration.md).
 
-Подробная структура:
+## Контракты и открытые вопросы
 
-[Конфигурация](./configuration.md)
-
-## Контроль состояния и восстановление
-
-Для контроля фоновых частей системы используется `Supervisor`.
-
-Vision и Turret передают heartbeat или информацию о своём состоянии. Если обновления не поступают дольше допустимого времени, Supervisor сообщает Core о проблеме, а UI показывает её пользователю.
-
-Локальное восстановление выполняет тот модуль, которому принадлежит ресурс. Например, при потере видеопотока переподключением занимается соответствующий `CameraController`.
-
-Автоматический перезапуск зависших потоков пока не считается обязательной частью первой реализации.
-
-## Логирование
-
-Логирование является общим сервисом приложения и используется всеми модулями.
-
-В лог записываются важные события, предупреждения и ошибки, например:
-
-- запуск и завершение компонентов;
-- подключение и потеря оборудования;
-- переподключение камер;
-- ошибки Vision;
-- ошибки Turret и STM32;
-- предупреждения Supervisor.
-
-Логирование не показано на архитектурных диаграммах, чтобы не перегружать их связями.
-
-## Потеря видеосигнала
-
-`Camera Manager` хранит время получения последнего кадра.
-
-Если новый кадр не поступает дольше `stale_timeout`, UI оставляет последний полученный кадр на экране и показывает поверх него сообщение **«Нет видеосигнала»**.
-
-Подробная логика описана в документации Vision и GUI.
-
-## Режимы симуляции
-
-Для разработки без реального оборудования предусмотрены два независимых режима:
-
-- Vision может использовать видеофайл, изображения, синтетический генератор или виртуальную камеру вместо физической Raspberry Pi камеры;
-- Turret может использовать эмулятор STM32 вместо реального контроллера.
-
-Остальные компоненты должны работать через те же интерфейсы независимо от того, используется реальное оборудование или симуляция.
-
-## Завершение приложения
-
-При штатном завершении Core координирует остановку системы.
-
-Необходимо:
-
-- прекратить приём новых пользовательских команд;
-- безопасно остановить Turret;
-- завершить Vision Pipeline;
-- остановить три `CameraController`;
-- сохранить необходимые настройки;
-- завершить приложение после остановки рабочих потоков.
-
-Точный порядок и таймауты завершения будут дополнительно проверены во время архитектурного аудита.
-
-## Открытые вопросы
-
-Вопросы, которые ещё требуют архитектурного решения или проверки, собраны отдельно:
-
-[Открытые вопросы](./problems.md)
-
-К ним, в частности, относятся вопросы о:
-
-- внутренних параметрах Detector и Tracker;
-- политике динамического применения настроек;
-- детализации heartbeat;
-- поведении очередей состояния и ошибок;
-- приоритете аварийной команды `STOP`;
-- безопасном завершении и восстановлении после сбоев.
+- [Общие контракты данных](./contracts.md)
+- [Открытые вопросы](./problems.md)

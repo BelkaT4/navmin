@@ -1,333 +1,459 @@
-# Управление турелью (turret)
+# Turret
 
-Модуль `Turret` отвечает за управление физической турелью: наведение по двум осям, калибровку, компенсацию люфта и обмен с контроллером STM32.
+`Turret` преобразует application motion intent в команды STM32 и владеет PID, serial transport, motor state и recovery.
 
 ![Диаграмма модуля Turret](../../diagrams/turret-diagram.png)
 
-## Общая структура
-
-Модуль состоит из двух основных уровней:
-
-- `Turret Controller` — высокоуровневая логика управления;
-- `Turret HAL` — низкоуровневое взаимодействие со STM32.
-
-Оба компонента работают в одном отдельном потоке управления турелью.
-
-Основной путь команды выглядит так:
-
-```mermaid
-flowchart TB
-core[Core] --> command_queue
-command_queue --> controller[Turret Controller]
-controller <--> hal[Turret HAL]
-hal <--> stm32[STM32]
-```
-
-Обратное состояние передаётся через отдельный канал:
-
-```mermaid
-flowchart TB
-controller[Turret Controller] --> publish[Публикация статуса]
-publish -->|"status"| status_queue[status_queue в Core]
-publish -->|"emit status_queue_ready"| signal[status_queue_ready]
-status_queue --> core[Core]
-signal --> core
-```
-
-## Поток управления турелью
-
-Для `Turret` используется один отдельный рабочий поток.
-
-В этом потоке выполняются:
-
-- чтение `command_queue`;
-- логика наведения;
-- PI-регулятор;
-- компенсация люфта;
-- калибровка;
-- вызовы `Turret HAL`;
-- обмен со STM32;
-- публикация состояния;
-- heartbeat для Supervisor.
-
-`Turret HAL` не имеет отдельного потока.
-
-Такое разделение позволяет выполнять операции с оборудованием независимо от главного потока UI/Core и от Vision Pipeline.
-
-## command_queue
-
-Команды Core → Turret передаются через `command_queue`.
-
-Очередь находится на стороне Turret и работает как обычная FIFO-очередь:
-
-```mermaid
-flowchart LR
-core[Core] --> queue[command_queue FIFO]
-queue --> controller[Turret Controller]
-```
-
-В отличие от потоковых данных Vision, команды управления нельзя автоматически заменять более новыми. Они должны обрабатываться в определённом порядке.
-
-Конкретный набор команд и их формат будет определён отдельно при проработке поведения Turret и протокола STM32.
-
-На этапе архитектурного аудита отдельно нужно проверить приоритет аварийной команды `STOP`: она не должна надолго задерживаться за обычными командами, если очередь уже заполнена.
-
-## Turret Controller
-
-`Turret Controller` реализует высокоуровневую логику управления турелью.
-
-Он получает команду от Core и решает, какие действия нужно выполнить через `Turret HAL`.
-
-### Основные функции
-
-#### Наведение
-
-Предусмотрены два основных режима.
-
-**Относительное смещение**
-
-Controller получает приращение по каждой оси:
-
-- `ΔX`;
-- `ΔY`.
-
-После этого он перемещает турель на заданное количество шагов или угловых единиц.
-
-**Сопровождение цели**
-
-Controller получает ошибку рассогласования между положением цели и прицельной точкой.
-
-Для каждой оси используется PI-регулятор:
-
-- пропорциональная составляющая определяет реакцию на текущую ошибку;
-- интегральная составляющая компенсирует постоянное небольшое отклонение.
-
-Регуляторы для X и Y работают независимо.
-
-Результатом работы регулятора становится команда движения, которая передаётся через `Turret HAL`.
-
-#### Компенсация люфта
-
-При смене направления движения Controller может добавлять дополнительное смещение, компенсирующее механический люфт.
-
-Компенсация задаётся отдельно для:
-
-- оси X;
-- оси Y.
-
-Это необходимо, потому что величина люфта механики по двум осям может различаться.
-
-#### Калибровка
-
-Калибровка включает как минимум:
-
-- пристрелку — определение смещения прицела относительно механической оси;
-- определение компенсации люфта для каждой оси.
-
-Конкретная последовательность действий пользователя и алгоритм калибровки должны быть описаны отдельно в документации процедуры калибровки.
-
-## Turret HAL
-
-`Turret HAL` (`Hardware Abstraction Layer`) скрывает от Controller детали последовательного протокола и конкретной реализации связи со STM32.
-
-Controller работает с высокоуровневыми операциями, а HAL преобразует их в команды протокола.
-
-Основные обязанности HAL:
-
-- открыть и настроить последовательный порт;
-- сформировать пакет команды;
-- передать пакет STM32;
-- принять ответ;
-- проверить корректность ответа;
-- обработать таймаут;
-- при необходимости повторить передачу;
-- сообщить Controller об ошибке.
-
-Взаимодействие Controller ↔ HAL является внутренним вызовом внутри одного потока:
-
-```mermaid
-flowchart LR
-controller[Turret Controller] <-->|"команды / ответы / состояние"| hal[Turret HAL]
-```
-
-## Связь со STM32
-
-STM32 непосредственно управляет исполнительными механизмами турели.
-
-Связь выполняется через последовательный интерфейс UART.
-
-Канал является **двунаправленным полудуплексным**: данные передаются в обе стороны, но не одновременно.
-
-Типичный обмен:
-
-```mermaid
-sequenceDiagram
-    participant HAL as Turret HAL
-    participant MCU as STM32
-
-    HAL->>MCU: Команда
-    MCU-->>HAL: Ответ / статус
-    HAL->>MCU: Следующая команда
-```
-
-HAL не должен отправлять следующую команду в момент, когда ожидается ответ на предыдущую, если это нарушает правила выбранного протокола.
-
-Подробный формат пакетов и набор кодов команд вынесены в отдельный документ:
-
-[Протокол контроллера](../../architecture/serial-protocol.md)
-
-## Таймауты и повторные попытки
-
-Если STM32 не отвечает за заданное время, `Turret HAL` считает попытку неуспешной.
-
-Далее HAL может повторить команду до `retry_count` раз.
-
-```mermaid
-flowchart TB
-send[Отправить команду] --> wait[Ожидать ответ]
-wait -->|ответ получен| ok[Передать результат Controller]
-wait -->|таймаут| retry{Остались попытки?}
-retry -->|да| send
-retry -->|нет| error[Сообщить об ошибке]
-```
-
-Конкретные значения `timeout_ms` и `retry_count` хранятся в конфигурации и должны подбираться с учётом реальной линии связи и времени реакции STM32.
-
-## Публикация состояния
-
-`Turret Controller` публикует состояние, которое должно быть доступно Core и UI.
-
-К нему могут относиться:
-
-- текущее положение;
-- режим работы;
-- готовность;
-- состояние калибровки;
-- ошибки связи;
-- другие ошибки Turret.
-
-На стороне Core находится `status_queue`.
-
-После подготовки нового состояния Turret:
-
-1. записывает данные в `status_queue`;
-2. отправляет Qt-сигнал `status_queue_ready`;
-3. Core получает уведомление и читает очередь.
-
-```mermaid
-flowchart TB
-turret[Turret Controller] -->|"status"| queue[status_queue]
-turret -->|"emit status_queue_ready"| signal[status_queue_ready]
-queue --> core[Core]
-signal --> core
-```
-
-На текущем этапе `status_queue` рассматривается как FIFO.
-
-Во время архитектурного аудита отдельно нужно проверить, стоит ли разделить:
-
-- текущее состояние, где важно прежде всего самое новое значение;
-- события и ошибки, которые нельзя терять.
-
-## Обработка ошибок
-
-Если связь со STM32 окончательно потеряна после всех повторных попыток:
-
-1. HAL сообщает об ошибке Controller;
-2. Controller переводит Turret в безопасное состояние;
-3. информация об ошибке публикуется для Core;
-4. Core передаёт её UI.
-
-Безопасное состояние как минимум предполагает прекращение движения приводов.
-
-Точное поведение при разных классах ошибок будет уточнено на этапе архитектурного аудита.
-
-## Heartbeat
-
-`Turret Controller` отправляет heartbeat в `Supervisor`.
-
-```mermaid
-flowchart LR
-turret[Turret Controller] --> supervisor[Supervisor]
-```
-
-Если heartbeat не поступает дольше допустимого времени, Supervisor сообщает Core о проблеме.
-
-На первом этапе Supervisor только обнаруживает сбой и уведомляет систему. Автоматический перезапуск потока Turret пока не является обязательным.
-
-## Конфигурация
-
-Настройки Turret поступают от `Config Manager` и применяются соответствующими компонентами.
-
-### Последовательный интерфейс
-
-- `port` — имя последовательного порта;
-- `baudrate` — скорость UART;
-- `timeout_ms` — таймаут ответа STM32;
-- `retry_count` — количество повторных попыток.
-
-### PI-регулятор
-
-Для каждой оси задаются свои коэффициенты:
-
-- `pid_kp_x`;
-- `pid_ki_x`;
-- `pid_kp_y`;
-- `pid_ki_y`.
-
-### Компенсация люфта
-
-- `backlash.x`;
-- `backlash.y`.
-
-Подробная структура конфигурации описана отдельно:
-
-[Конфигурация](../../architecture/configuration.md)
-
-## Эмуляция STM32
-
-Для разработки и тестирования без физической турели предусмотрен режим эмуляции STM32.
-
-Эмулятор должен предоставлять интерфейс, совместимый с реальным низкоуровневым взаимодействием, чтобы `Turret Controller` не зависел от того, подключено физическое устройство или используется симуляция.
-
-Эмулятор может:
-
-- принимать команды;
-- возвращать фиктивные ответы;
-- имитировать задержку выполнения;
-- имитировать движение приводов;
-- добавлять искусственный шум или ошибки для тестирования.
-
-Режим включается параметром конфигурации:
+## Состав
 
 ```text
-emulate_stm32: true
+Turret worker
+├── Turret Controller
+│   ├── applied control_mode
+│   ├── PID
+│   └── pending_motion latest-only
+└── Turret HAL
+    ├── unit conversion / invert
+    ├── STM32 config sync
+    ├── motor state
+    ├── TX arbiter
+    └── Serial Protocol / recovery
 ```
 
-Это позволяет проверять:
+Turret worker — единственный owner UART/RS485.
 
-- логику наведения;
-- PI-регулятор;
-- компенсацию люфта;
-- обработку команд;
-- обработку ошибок;
+## Authoritative applied mode
 
-без подключения реальной STM32.
+Turret Controller владеет applied:
 
-## Границы ответственности
+```text
+RELATIVE
+TRACKING
+```
 
-`Turret Controller` не должен:
+Startup mode — `RELATIVE`.
 
-- формировать байтовые пакеты UART;
-- напрямую работать с последовательным портом;
-- выполнять обработку изображения;
-- выбирать или сопровождать объект.
+Authoritative applied value публикуется через:
 
-`Turret HAL` не должен:
+```text
+TurretState.control_mode
+```
 
-- решать, куда нужно наводить турель;
-- выполнять PI-регулирование;
-- выбирать режим наведения;
-- содержать логику UI.
+Core/UI могут иметь pending user request на смену режима, но не держат отдельную applied-копию.
 
-Такое разделение позволяет менять протокол STM32 или способ управления приводами без необходимости переписывать высокоуровневую логику Turret.
+## Один latest-only `pending_motion`
+
+Вместо двух независимых slots используется один:
+
+```text
+pending_motion:
+    MoveRelativeCommand
+    | AxisVelocitySetpoint
+    | None
+```
+
+Допустимый тип определяется applied mode:
+
+```text
+RELATIVE → MoveRelativeCommand
+TRACKING → AxisVelocitySetpoint
+```
+
+Новый ещё не отправленный motion intent заменяет старый pending intent.
+
+Control boundaries инвалидируют только **неотправленный** `pending_motion`. Уже физически отправленный ordinary request считается committed и завершает обычный response/retry cycle перед следующей normal control operation.
+
+`motion_generation` не используется: один Turret worker, один UART owner, один in-flight request и один latest slot уже задают достаточную сериализацию.
+
+## Mode transition
+
+### `RELATIVE → TRACKING`
+
+Переход начинается с invalidation старого unsent `pending_motion`.
+
+Если motors ON:
+
+```text
+wait committed ordinary transaction if any
+→ SET_VELOCITY(0,0) → OK
+→ PID reset
+→ apply TRACKING
+→ publish TurretState(TRACKING)
+```
+
+`SET_VELOCITY(0,0)` здесь используется как ownership boundary firmware: после `OK` STM32 больше не следует старой relative target. `OK` не означает, что физическая скорость уже равна zero.
+
+Если motors OFF, physical motion невозможен и zero handshake не нужен; Controller reset'ит PID, применяет TRACKING и публикует `TurretState`.
+
+Пока transition не завершён, несовместимые новые normal motion actions не принимаются. Отдельный публичный `mode_transition_pending` не нужен: достаточно внутреннего состояния текущей Controller operation.
+
+### `TRACKING → RELATIVE`
+
+Core очищает target/TrackingError сразу до request mode change.
+
+Controller:
+
+```text
+invalidate unsent pending_motion
+→ PID reset
+→ if motors ON: SET_VELOCITY(0,0) → OK
+→ apply RELATIVE
+→ publish TurretState(RELATIVE)
+```
+
+Если transaction/recovery не завершилась, applied mode может остаться TRACKING, но target уже отсутствует и automatic tracking не возобновляется.
+
+## RELATIVE
+
+Core передаёт:
+
+```text
+MoveRelativeCommand(delta_x_deg, delta_y_deg)
+```
+
+Click-to-move разрешён только при confirmed `TurretState.control_mode == RELATIVE`.
+
+После успешной camera/session validation и вычисления угла camera swap/restart/stale не отменяет уже сформированный command.
+
+PC проверяет:
+
+```text
+abs(delta_x_deg) <= max-relative-move-x-deg
+abs(delta_y_deg) <= max-relative-move-y-deg
+```
+
+до degrees → steps conversion.
+
+STM32 дополнительно применяет static firmware sanity bound по `abs(delta_steps)`; это не mechanical absolute limit и не runtime config.
+
+После `MOVE_RELATIVE → OK` PC знает только, что STM32 приняла relative target. Естественное завершение не отслеживается.
+
+При внезапной потере связи уже принятый ограниченный `MOVE_RELATIVE` может завершиться полностью. Отдельного communication watchdog для relative move нет.
+
+## TRACKING
+
+Controller получает `TrackingError` через latest-state с monotonic revision:
+
+```text
+new TrackingError revision
+→ PID exactly once
+→ clamp ±max_speed
+→ AxisVelocitySetpoint
+→ pending_motion
+→ HAL
+→ SET_VELOCITY
+```
+
+Controller хранит `last_processed_revision` и не обрабатывает sample повторно.
+
+`MOVE_RELATIVE` в TRACKING отклоняется выше Turret и не является manual override в v1.
+
+При временной потере selected target новых TrackingError не появляется. STM32 velocity watchdog ведёт target velocity к zero, если новые velocity setpoints не возобновились.
+
+## PID ownership
+
+PID полностью принадлежит Turret Controller. Core не посылает отдельный `PID_RESET`.
+
+Controller reset'ит PID при domain/control boundaries, которые видны на Turret side:
+
+- вход/выход TRACKING;
+- смена `TargetRef` в новом `TrackingError`;
+- final loss/deselect/StopMotion;
+- Emergency Stop;
+- `MOTOR_OFF`;
+- UART reconnect/recovery;
+- gap между TrackingError больше `velocity-watchdog-timeout-ms` перед следующим sample.
+
+Первый sample после reset: P-only, `I=0`, `D=0`.
+
+PID работает в градусах по X/Y, отдельные `Kp/Ki/Kd`, real monotonic `dt`, conditional anti-windup и I-term clamp по `±max_speed`.
+
+D-filter добавляется только после измерений, если нужен.
+
+## `SET_VELOCITY(0,0)`
+
+Zero setpoint не является специальной application-командой.
+
+```text
+SET_VELOCITY(0,0)
+```
+
+означает только target velocity `(0,0)`. PID может штатно выдавать его, когда target находится в aim point.
+
+StopMotion, PID reset, target clear и mode change определяются явным control state/action, а не численным значением setpoint.
+
+## StopMotion
+
+Старой serial-команды `STOP` нет.
+
+### TRACKING
+
+Core предварительно очищает selection/TrackingError. Turret Controller:
+
+```text
+invalidate unsent pending_motion
+PID reset
+wait committed ordinary request if any
+if motors ON: SET_VELOCITY(0,0)
+```
+
+Applied mode остаётся TRACKING.
+
+### RELATIVE
+
+```text
+invalidate unsent pending_motion
+wait committed ordinary request if any
+if motors ON: SET_VELOCITY(0,0)
+```
+
+Успешный zero setpoint очищает firmware relative target и переводит STM32 в velocity-control behaviour; скорость плавно приходит к zero по acceleration limiter.
+
+Normal Stop может ждать ordinary retry cycle. Для срочной остановки существует Emergency.
+
+## Emergency Stop
+
+`EMERGENCY_STOP`:
+
+- имеет отдельный highest-priority transport path;
+- немедленно прекращает STEP generation без acceleration limit;
+- очищает STM32 relative target и velocity target;
+- drivers остаются enabled;
+- persistent emergency latch отсутствует;
+- является request-sequence resync boundary.
+
+При user Emergency:
+
+```text
+invalidate unsent pending_motion
+block new normal motion actions
+PID reset
+```
+
+Если UART idle, Emergency отправляется сразу.
+
+Если ordinary request уже физически отправлен:
+
+```text
+не планировать дальнейшие ordinary retries
+wait response OR timeout current physical attempt
+→ send EMERGENCY_STOP with next global REQUEST_ID
+```
+
+Matching successful Emergency `ID=N` заставляет STM32 установить:
+
+```text
+expected_request_id = N + 1 mod 65536
+```
+
+и PC продолжает с тем же `N+1`. Поэтому отдельная transport-reset transaction после successful Emergency не нужна.
+
+Emergency exact retries используют тот же `REQUEST_ID`. Если retries исчерпаны, motion/control остаётся blocked, transport переходит в LOST/RECOVERING.
+
+Отдельный публичный Emergency flag не является архитектурным state; internal in-flight operation Turret transport достаточно.
+
+## Turret HAL и TX arbiter
+
+HAL отвечает за:
+
+- UART/RS485 lifecycle;
+- binary framing/CRC;
+- one physical request in flight;
+- общий cyclic `REQUEST_ID` для ordinary и Emergency transactions;
+- response correlation по `REQUEST_ID + COMMAND_CODE`;
+- exact retry/cache contract;
+- Emergency preemption;
+- baudrate switching/recovery;
+- unit conversion;
+- axis inversion;
+- STM32 config sync;
+- motor state;
+- reconnect/recovery.
+
+Нет общей FIFO физических operations.
+
+Концептуально arbiter имеет:
+
+```text
+current in-flight transaction | None
+pending normal control operation | None
+pending motor state | None
+latest pending STM32 config | None
+pending_motion | None
+```
+
+Emergency может preempt ordinary **retry plan**, но не передаёт второй packet поверх уже незавершённой half-duplex physical attempt.
+
+## Normal committed request
+
+Если normal control boundary (`StopMotion`, mode transition, `MOTOR_OFF`) возникает, когда ordinary request уже физически in flight, этот request считается committed:
+
+```text
+finish normal response/retry cycle
+→ then execute boundary operation
+```
+
+Старый unsent `pending_motion` при этом инвалидируется сразу.
+
+Если committed transaction исчерпала retries, normal traffic не продолжается; запускается transport recovery.
+
+## Преобразование единиц
+
+PC-side для каждой оси:
+
+```text
+invert
+full_steps_per_revolution
+microstep_divider
+max-relative-move-deg
+```
+
+HAL вычисляет:
+
+```text
+effective_steps_per_revolution =
+    full_steps_per_revolution * microstep_divider
+```
+
+и преобразует degrees / deg/s / deg/s² в steps / steps/s / steps/s².
+
+Один protocol `step` = один STEP pulse driver.
+
+`invert`, steps/rev и microstep divider не передаются STM32.
+
+В v1 эти mechanical conversion settings restart-only: сохранённое изменение применяется только после Turret/application restart, не посреди active motion.
+
+## STM32 config
+
+Полный `SET_CONFIG`:
+
+```text
+max_speed_x_steps_s
+max_speed_y_steps_s
+acceleration_x_steps_s2
+acceleration_y_steps_s2
+velocity_watchdog_timeout_ms
+```
+
+HAL переводит application values в STEP units.
+
+STM32 проверяет hardware-supported ranges и применяет весь snapshot атомарно. Эти пять параметров dynamic даже во время motion.
+
+- снижение max speed отрабатывается через acceleration limiter;
+- новое acceleration используется со следующего control update;
+- relative planner использует актуальный snapshot;
+- изменение watchdog timeout не refresh'ит watchdog.
+
+HAL хранит applied/pending STM32 config state. Pending config — latest-only. Если во время in-flight exchange появился более новый snapshot, после завершения transaction отправляется freshest pending snapshot.
+
+## Config exchange во время TRACKING
+
+Во время физического non-motion request новые velocity packets не могут передаваться из-за one-in-flight rule. Controller сохраняет только freshest `pending_motion`; после response отправляется актуальный setpoint.
+
+Если пауза достаточно длинная, firmware watchdog безопасно ведёт velocity target к zero.
+
+## Motor state
+
+```python
+class MotorState(Enum):
+    UNKNOWN = "unknown"
+    OFF = "off"
+    ON = "on"
+```
+
+`motor_state` — последнее подтверждённое фактическое состояние STM32 drivers.
+
+После disconnect → `UNKNOWN`.
+
+`MOTOR_OFF` — normal control boundary:
+
+- unsent `pending_motion` invalidated;
+- PID reset;
+- уже in-flight ordinary request committed и заканчивает normal retry cycle;
+- затем `MOTOR_OFF` немедленно прекращает STEP generation, очищает firmware motion и disables drivers.
+
+`MOTOR_ON` включает drivers, но не восстанавливает старое motion и не выполняет hidden emergency re-arm.
+
+Auto `MOTOR_ON` после reconnect отсутствует.
+
+## Serial recovery
+
+Подробный wire contract: [Протокол STM32](../../architecture/serial-protocol.md).
+
+При ordinary retry exhaustion transport считается LOST. На PC:
+
+```text
+pending_motion → None
+selected tracking input уже invalidated Core при соответствующем failure handling
+PID reset
+MotorState → UNKNOWN
+applied STM32 config → unknown
+new normal motion blocked
+```
+
+Уже принятый limited `MOVE_RELATIVE` может закончиться; velocity control останавливается по watchdog.
+
+После обнаружения physical connection/baud:
+
+```text
+EMERGENCY_STOP(ID=N) → OK
+→ sequence synced to N+1
+→ MOTOR_OFF → OK
+→ SET_BAUDRATE(desired) при необходимости
+→ SET_CONFIG(full snapshot) → OK
+→ READY
+```
+
+После recovery motors OFF. `MOTOR_ON` — только новым user action.
+
+Applied `control_mode` можно сохранить через reconnect, но selected target/PID input/physical motion не replay'ятся.
+
+### `SET_BAUDRATE`
+
+Runtime command сохраняется, потому что требуется тестировать разные UART baudrate без перепрошивки STM32.
+
+STM32 разрешает `SET_BAUDRATE` только при фактическом motors OFF.
+
+При uncertain baud transition сначала определяется рабочий old/new baud, затем запускается обычный Emergency-based recovery. Не нужны отдельные baud generation/ID state.
+
+## Ограничения механики
+
+Первая конструкция не имеет:
+
+- limit switches;
+- encoders;
+- absolute position feedback;
+- надёжного homing.
+
+Физические упоры существуют, но попадание в них считается нештатным. STEP count не подтверждает фактическое перемещение.
+
+Нет достоверных software absolute limits или public absolute position. Blind hard-stop homing не используется.
+
+PC ограничивает одну relative move в градусах. STM32 имеет только консервативный static bound по `abs(delta_steps)` как sanity check payload.
+
+## Публикуемое состояние и logging
+
+Turret публикует latest-only `TurretState` с:
+
+- connection state;
+- confirmed `MotorState`;
+- authoritative applied `control_mode`;
+- подтверждёнными speed/acceleration limits.
+
+Transient diagnostics/errors в v1 идут в logging; обязательные runtime состояния имеют typed contracts. Generic event bus заранее не вводится.
+
+Wire `EVENTS` section STM32 зарезервирована, но пуста в v1. Hardware event queue проектируется только вместе с первым реальным hardware event.
+
+## Эмуляция
+
+Физический STM32 должен быть заменяем эмулятором через тот же HAL interface.
+
+## Что ещё не определено
+
+- concrete thread-safe latest-state/notification primitives;
+- detailed UART reconnect/backoff policy;
+- hardware upper limits step rate/acceleration/watchdog/static relative delta;
+- D-filter после измерений;
+- future position feedback/homing.
+
+Полный список: [Открытые вопросы](../../architecture/problems.md).
