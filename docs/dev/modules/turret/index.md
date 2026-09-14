@@ -168,6 +168,18 @@ Controller reset'ит PID при domain/control boundaries, которые ви�
 
 PID работает в градусах по X/Y, отдельные `Kp/Ki/Kd`, real monotonic `dt`, conditional anti-windup и I-term clamp по `±max_speed`.
 
+Runtime PID config применяется по осям независимо:
+
+- если во время TRACKING меняется любой `Kp/Ki/Kd` оси, Controller полностью reset'ит PID state этой оси перед следующим новым `TrackingError`;
+- первый sample после такого reset использует новые gains и остаётся P-only (`I=0`, `D=0`);
+- gain change вне TRACKING не требует отдельного действия: следующий вход в TRACKING уже является reset boundary;
+- уменьшение `max_speed` оси не делает full PID reset, но сразу clamp'ит сохранённый I-term в новый `±max_speed`;
+- увеличение `max_speed` сохраняет текущий I-term без масштабирования;
+- при одновременном изменении gains и `max_speed` gain-change reset имеет приоритет;
+- config update не создаёт motion command и не меняет `control_mode` сам по себе.
+
+Внешнего `PID_RESET` contract нет: это внутреннее состояние Turret Controller.
+
 D-filter добавляется только после измерений, если нужен.
 
 ## `SET_VELOCITY(0,0)`

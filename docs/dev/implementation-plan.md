@@ -280,7 +280,7 @@ Qt notification coalescing (#5) остаётся до UI-этапа.
 - `docs/dev/architecture/decisions.md`
 - `docs/dev/modules/turret/index.md`
 - `docs/dev/diagrams/turret-diagram.mmd`
-- `problems.md` #9 и Turret-related часть #7/#10/#13
+- `problems.md` #9 и Turret-related часть #10/#13
 
 ### Реализовать
 
@@ -318,14 +318,19 @@ Qt notification coalescing (#5) остаётся до UI-этапа.
 - автоматический MOTOR_ON после recovery;
 - absolute position/soft limits, которых нет в hardware model.
 
-### Decision checkpoint до config/PID runtime-ветки
+### Закрытый decision checkpoint перед config/PID runtime-веткой
 
-До реализации runtime-применения PID config в Stage 3 управляющий чат должен закрыть Turret-часть `problems.md` #7:
+До начала Stage 3 управляющий чат зафиксировал Turret-семантику runtime PID config:
 
-- что происходит с текущим PID state при изменении `Kp/Ki/Kd` во время TRACKING;
-- что происходит с I-term при уменьшении application-side PID output limit.
+- изменение `Kp/Ki/Kd` конкретной оси в TRACKING полностью reset'ит PID state только этой оси перед обработкой следующего нового `TrackingError`;
+- первый sample этой оси после reset использует новые gains и остаётся P-only: `I=0`, `D=0`;
+- если gains меняются вне TRACKING, отдельный runtime reset не нужен: при следующем входе в TRACKING срабатывает уже существующий reset boundary;
+- уменьшение application-side output limit (`max-speed-*-deg-s`) не reset'ит PID целиком, но немедленно clamp'ит сохранённый I-term соответствующей оси в новый диапазон `±max_speed`;
+- увеличение output limit сохраняет текущий I-term без искусственного масштабирования;
+- если в одном config revision меняются и gains, и output limit одной оси, gain-change reset имеет приоритет, поэтому новый I-term начинается с zero уже под новым limit;
+- config change сам по себе не создаёт motion command, не меняет `control_mode` и не вводит внешний `PID_RESET` contract.
 
-Рабочий чат не должен выбирать эти observable control semantics самостоятельно. Processor-specific часть #7 остаётся Stage 5, а `target-lost-timeout-ms` — checkpoint Stage 6.
+Processor-specific часть `problems.md` #7 остаётся Stage 5, а `target-lost-timeout-ms` — checkpoint Stage 6.
 
 ### Тестовый фокус
 
@@ -341,6 +346,8 @@ Qt notification coalescing (#5) остаётся до UI-этапа.
 - recovery sequence;
 - mode transition zero handshake;
 - PID reset boundaries;
+- runtime gain change reset по оси и P-only first sample;
+- output-limit decrease clamp I-term без полного PID reset, increase сохраняет I-term;
 - HAL conversion/inversion;
 - dynamic STM32 config snapshot semantics на PC-side;
 - `MOTOR_OFF` invalidates unsent `pending_motion`;
@@ -779,7 +786,7 @@ Hardware tests остаются отдельным suite.
 | #3 DistanceResult stereo lifecycle | deferred / 5 только manual path |
 | #5 Qt coalescing | 7 |
 | #6 processor-specific config | 5 |
-| #7 runtime config edge cases | 2 только config infrastructure; 3 PID runtime checkpoint; 5 processor policy; 6 target-loss-timeout checkpoint |
+| #7 runtime config edge cases | 2 config infrastructure; 5 processor policy; 6 target-loss-timeout checkpoint |
 | #8 camera reconnect | 5 |
 | #9 UART reconnect | 3, hardware validation 4 |
 | #10 worker lifecycle | 1 foundation + owner stages + 8 final |

@@ -410,6 +410,29 @@ Schema v1 использует `schema-version = 1`; automatic migration не п
 
 ---
 
+## 21. Runtime PID config reset'ит changed gains по оси, а уменьшение output limit только clamp'ит I-term
+
+### Решение
+
+PID config остаётся dynamic и полностью принадлежит Turret Controller. Если во время TRACKING меняется любой `Kp/Ki/Kd` конкретной оси, Controller полностью сбрасывает PID state только этой оси перед обработкой следующего нового `TrackingError`. Первый sample после reset использует новые gains и остаётся P-only: `I=0`, `D=0`.
+
+Изменение только application-side output limit (`max-speed-*-deg-s`) full PID reset не вызывает. При уменьшении limit сохранённый I-term соответствующей оси сразу clamp'ится в новый диапазон `±max_speed`; при увеличении limit текущий I-term сохраняется без масштабирования. Если gains и output limit одной оси меняются в одном config revision, gain-change reset имеет приоритет. Config update сам по себе не создаёт motion command и не меняет `control_mode`.
+
+### Почему
+
+Сохранение integral/derivative history после замены gains связывает новый controller tuning со state, накопленным при другой динамике, и делает переход плохо предсказуемым. Полный per-axis reset при смене gains даёт простой детерминированный boundary и согласуется с уже существующими Turret-owned PID reset rules.
+
+Для одного лишь уменьшения output limit полный reset избыточен: проблема состоит только в том, что накопленный I-term может оказаться вне нового допустимого диапазона. Clamp устраняет это состояние, сохраняя полезную историю controller там, где сами gains не менялись.
+
+### Отвергнутые альтернативы
+
+- **Сохранять PID state без изменений при смене `Kp/Ki/Kd`.** Отклонено: history была накоплена при других gains и может дать неочевидный transient на следующем sample.
+- **Масштабировать integral state при смене `Ki`, чтобы сохранить прежний I-output.** Отклонено для v1: это скрытая трансформация внутреннего state, усложняет сочетание с изменениями `Kp/Kd` и не даёт преимущества перед явным reset boundary.
+- **Полностью reset'ить PID при любом изменении max speed/output limit.** Отклонено: при неизменных gains достаточно clamp I-term к новому limit; потеря всей controller history не нужна.
+- **Посылать внешний `PID_RESET` из Core/Config Manager.** Отклонено по уже принятому ownership: PID state и его apply/reset policy принадлежат Turret Controller.
+
+---
+
 ## Как использовать этот документ при реализации
 
 При разработке нового модуля сначала нужно следовать нормативным контрактам соответствующего документа. Если возникает желание вернуть ранее удалённый механизм, полезно проверить этот журнал: часто механизм был удалён не случайно, а потому что более простой инвариант закрывает тот же failure case.

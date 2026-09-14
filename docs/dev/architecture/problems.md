@@ -61,10 +61,10 @@ Latest payload не должен создавать backlog queued Qt signals.
 
 ### 7. Edge cases runtime config apply
 
-Базовая classification уже определена в `configuration.md`. Остаются детали:
+Базовая classification уже определена в `configuration.md`. Turret-specific PID apply semantics закрыты и перенесены в `configuration.md`, `modules/turret/index.md` и `decisions.md`.
 
-- что делать с текущим PID state при изменении `Kp/Ki/Kd` во время TRACKING;
-- I-term при уменьшении application-side PID output limit;
+Остаются детали:
+
 - изменение `target-lost-timeout-ms` для уже временно потерянной цели;
 - processor-specific dynamic/restart policy.
 

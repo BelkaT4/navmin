@@ -324,6 +324,18 @@ pid-kd
 
 I-term ограничивается `±max_speed` соответствующей оси. Отдельного `integral-limit` в прототипе нет.
 
+Runtime apply policy принадлежит Turret Controller и применяется по осям независимо:
+
+- изменение любого из `Kp/Ki/Kd` оси в TRACKING полностью сбрасывает PID state этой оси перед обработкой следующего нового `TrackingError`;
+- первый sample после такого reset использует новые gains и остаётся P-only: `I=0`, `D=0`;
+- изменение gains вне TRACKING не создаёт дополнительного действия: при следующем входе в TRACKING действует обычный reset boundary;
+- уменьшение соответствующего `max-speed-*-deg-s` не сбрасывает PID целиком, но сразу clamp'ит сохранённый I-term в новый диапазон `±max_speed`;
+- увеличение `max-speed-*-deg-s` сохраняет накопленный I-term без масштабирования;
+- если один config revision меняет и gains, и output limit одной оси, gain-change reset имеет приоритет, поэтому I-term становится zero уже под новым limit;
+- config update сам по себе не создаёт motion command и не меняет `control_mode`.
+
+Core/Config Manager не посылает отдельный `PID_RESET`: внутреннее PID state и его reset/apply semantics остаются ответственностью Turret Controller.
+
 ### STM32 config
 
 На уровне `config.json` параметры задаются в физических единицах ПК:
@@ -395,7 +407,7 @@ UI overlays не являются частью recorded working frame.
 
 | Настройка | Policy |
 |---|---|
-| PID `Kp/Ki/Kd` | dynamic |
+| PID `Kp/Ki/Kd` | dynamic; изменение gains reset'ит PID state только соответствующей оси перед следующим новым sample в TRACKING |
 | `lead-time-ms` | dynamic |
 | aim point | dynamic |
 | `target-lost-timeout-ms` | dynamic, точная семантика для уже потерянной цели уточняется при реализации |
@@ -406,7 +418,7 @@ UI overlays не являются частью recorded working frame.
 | calibration file/content | camera pipeline restart / new generation |
 | serial port | Turret reconnect |
 | desired serial baudrate | controlled `SET_BAUDRATE` / reconnect path |
-| max speed / acceleration / velocity watchdog | dynamic full STM32 `SET_CONFIG` snapshot |
+| max speed / acceleration / velocity watchdog | dynamic full STM32 `SET_CONFIG` snapshot; уменьшение max speed также clamp'ит application-side PID I-term соответствующей оси без полного reset |
 | `invert`, steps/rev, microstep | restart-only; применяются только после Turret/application restart, не dynamic |
 | UI-only display settings | dynamic |
 
