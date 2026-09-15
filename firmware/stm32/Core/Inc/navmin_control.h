@@ -47,6 +47,9 @@ typedef struct {
        belongs only to motion and is cleared through the common hard stop. */
     bool velocity_target_present;
     bool relative_target_present;
+
+    bool velocity_watchdog_armed;
+    uint32_t last_velocity_setpoint_ms;
 } navmin_control_t;
 
 void navmin_control_init(
@@ -58,8 +61,11 @@ navmin_result_code_t navmin_control_execute_command(
     void *context,
     uint8_t command_code,
     const uint8_t *payload,
-    uint8_t payload_length
+    uint8_t payload_length,
+    uint32_t now_ms
 );
+
+void navmin_control_tick(navmin_control_t *control, uint32_t now_ms);
 
 void navmin_control_emergency_stop(void *context);
 

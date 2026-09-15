@@ -31,14 +31,14 @@ This tree is the single STM32 firmware tree for BelkaT4 / NavMin. It keeps the h
 - a logical driver-enable callback boundary;
 - executor/emergency callbacks compatible with the accepted Stage 4A protocol core.
 
-`MOVE_RELATIVE`, `SET_VELOCITY`, and `SET_BAUDRATE` still never receive fake success from the control owner; their real command semantics remain deferred to 4B2b2/4B3/4C.
+`SET_VELOCITY` is implemented by Stage 4B2b2 below. `MOVE_RELATIVE` and `SET_BAUDRATE` still never receive fake success from the control owner; their real command semantics remain deferred to 4B3/4C.
 
 `MOTOR_OFF` and Emergency share one control hard-stop boundary. Since Stage 4B2b1 this boundary delegates numeric velocity/target/phase clearing to the single owned `navmin_motion_t`, then clears only control-level intent flags. `MOTOR_OFF` additionally disables drivers; Emergency deliberately preserves driver and motor ON/OFF state and creates no persistent latch. Repeated `MOTOR_ON`/`MOTOR_OFF` remain idempotent at the driver callback boundary.
 
 
 ### Stage 4B2a — velocity motion primitive / acceleration / STEP scheduler
 
-`navmin_motion.c` adds an isolated hardware-independent numeric motion primitive. It is intentionally not wired to the protocol `SET_VELOCITY` command yet; command acceptance, timestamps and the velocity watchdog remain Stage 4B2b.
+`navmin_motion.c` adds the hardware-independent numeric motion primitive used by Stage 4B2b2. Its acceleration limiter and STEP scheduler remain protocol-agnostic; `navmin_control` owns wire command acceptance, watchdog timing and the control-tick integration.
 
 The control update rate is fixed at compile time:
 
@@ -107,9 +107,32 @@ enter critical
 
 This prevents a future timer/ISR reader from observing a new control snapshot with old motion limits or the reverse. If `navmin_motion_set_limits()` unexpectedly rejects the already validated candidate, it returns before mutating motion state; control exits the boundary with the previous config/motion snapshot intact and reports `INTERNAL_ERROR`.
 
-Dynamic speed/acceleration semantics therefore come directly from the accepted motion primitive: lowering max speed clips only the stored effective target while current velocity remains continuous; raising max speed does not resurrect a previously clipped request; a new acceleration limit is used on the next motion update. `velocity_watchdog_timeout_ms` remains part of the atomic control config snapshot but has no watchdog/timestamp behaviour in 4B2b1.
+Dynamic speed/acceleration semantics therefore come directly from the accepted motion primitive: lowering max speed clips only the stored effective target while current velocity remains continuous; raising max speed does not resurrect a previously clipped request; a new acceleration limit is used on the next motion update. Stage 4B2b2 adds the watchdog semantics for the already atomic `velocity_watchdog_timeout_ms` field without changing the config publication boundary.
 
 `navmin_control_init()` initializes the owned motion state with no valid limits and passes the common hardware STEP sink into it. `MOTOR_OFF` and Emergency call `navmin_motion_hard_stop()`, preserving commanded position while clearing current velocity, target velocity and STEP phase immediately. `MOTOR_ON` never restores old numeric motion.
+
+### Stage 4B2b2 — SET_VELOCITY / watchdog / control tick
+
+The Stage 4A executor callback now receives the `uint32_t now_ms` value from the protocol parser when a complete CRC-valid ordinary request is actually processed. Exact retries are still returned from the retry cache before the executor, so a transport retry never refreshes the velocity watchdog.
+
+`SET_VELOCITY` decodes two little-endian signed `int32_t` values. Every `int32_t` input is accepted as a wire value and the existing motion primitive clamps the effective target to the current configured max speed. A successful command atomically publishes the clamped target, velocity-control intent, clears any relative intent, stores `last_velocity_setpoint_ms`, and arms the watchdog under the existing hardware-independent critical-section callbacks. `SET_VELOCITY(0,0)` is an ordinary setpoint: it leaves motors/drivers enabled and decelerates through the acceleration limiter.
+
+The control-owned watchdog state is only:
+
+```text
+velocity_watchdog_armed
+last_velocity_setpoint_ms
+```
+
+`navmin_control_tick(control, now_ms)` represents exactly one 20 kHz control update. It first evaluates wrap-safe unsigned elapsed time:
+
+```text
+elapsed = now_ms - last_velocity_setpoint_ms
+```
+
+If the armed watchdog has expired (`elapsed >= velocity_watchdog_timeout_ms`), only the motion target is set to `(0,0)` and the watchdog is disarmed. The same call then performs exactly one `navmin_motion_control_tick()`, so deceleration remains acceleration-limited and STEP output may continue while the commanded velocity ramps down. Watchdog expiry is not a hard stop, does not disable drivers and does not clear the velocity-control intent.
+
+Dynamic `SET_CONFIG` does not alter the saved setpoint timestamp or watchdog armed state. A timeout decrease can therefore make the existing watchdog age expire on the next control tick; a timeout increase preserves the same age. Max-speed and acceleration changes keep the previously accepted Stage 4B2b1 semantics. `MOTOR_OFF` and Emergency disarm the watchdog inside their existing atomic hard-stop boundary, while `MOTOR_ON` does not re-arm it.
 
 ## Stage 4B1 firmware sanity bounds
 
@@ -192,13 +215,6 @@ The driver-enable callback is logical (`true` = drivers enabled); active-low GPI
 The legacy project used a 72 MHz HSE→PLL clock setup, TIM2 prescaler 71 / period 49, a historical 8,000 steps/s max-velocity bound, and 50,000 steps/s² max acceleration. These values are evidence only. No legacy serial parser, command set, application state machine, completion/status protocol, or limit-switch semantics are copied.
 
 ## Explicitly deferred
-
-### Stage 4B2b2
-
-- wire `SET_VELOCITY` acceptance;
-- protocol acceptance timestamp plumbing;
-- velocity watchdog and control-tick/watchdog integration;
-- exact retry must not refresh the watchdog.
 
 ### Stage 4B3
 

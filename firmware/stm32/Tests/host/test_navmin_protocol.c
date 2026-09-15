@@ -37,6 +37,7 @@ typedef struct {
     unsigned emergency_count;
     unsigned execute_count;
     uint8_t last_command;
+    uint32_t last_execute_time_ms;
     navmin_result_code_t next_result;
 } executor_state_t;
 
@@ -85,7 +86,8 @@ static navmin_result_code_t execute_command(
     void *context,
     uint8_t command_code,
     const uint8_t *payload,
-    uint8_t payload_length
+    uint8_t payload_length,
+    uint32_t now_ms
 )
 {
     executor_state_t *state = context;
@@ -93,6 +95,7 @@ static navmin_result_code_t execute_command(
     (void)payload_length;
     ++state->execute_count;
     state->last_command = command_code;
+    state->last_execute_time_ms = now_ms;
     return state->next_result;
 }
 
@@ -510,12 +513,14 @@ static void test_exact_retry_returns_cached_response_without_second_execution(vo
     build_request(request, 0U, NAVMIN_COMMAND_MOTOR_OFF, NULL, 0U);
     feed_bytes(&protocol, &log, request, sizeof(request), &now);
     ASSERT_EQ_U32(1U, state.execute_count);
+    ASSERT_EQ_U32(7U, state.last_execute_time_ms);
 
     state.next_result = NAVMIN_RESULT_INTERNAL_ERROR;
     feed_bytes(&protocol, &log, request, sizeof(request), &now);
 
     ASSERT_EQ_U32(2U, log.count);
     ASSERT_EQ_U32(1U, state.execute_count);
+    ASSERT_EQ_U32(7U, state.last_execute_time_ms);
     ASSERT_TRUE(memcmp(log.bytes[0], log.bytes[1], NAVMIN_MIN_RESPONSE_LENGTH) == 0);
     ASSERT_EQ_U32(1U, navmin_protocol_expected_request_id(&protocol));
 }

@@ -45,7 +45,8 @@ typedef navmin_result_code_t (*navmin_execute_command_fn)(
     void *context,
     uint8_t command_code,
     const uint8_t *payload,
-    uint8_t payload_length
+    uint8_t payload_length,
+    uint32_t now_ms
 );
 typedef void (*navmin_response_sink_fn)(
     void *context,

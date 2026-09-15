@@ -133,6 +133,7 @@ static void process_valid_request(
     navmin_protocol_t *protocol,
     const uint8_t *frame,
     uint8_t frame_length,
+    uint32_t now_ms,
     navmin_response_sink_fn response_sink,
     void *response_context
 )
@@ -217,7 +218,8 @@ static void process_valid_request(
             protocol->executor.context,
             command_code,
             payload,
-            payload_length);
+            payload_length,
+            now_ms);
         if ((uint8_t)result > (uint8_t)NAVMIN_RESULT_INTERNAL_ERROR) {
             result = NAVMIN_RESULT_INTERNAL_ERROR;
         }
@@ -294,6 +296,7 @@ static void parser_find_start(navmin_request_parser_t *parser)
 
 static void parser_process_buffer(
     navmin_protocol_t *protocol,
+    uint32_t now_ms,
     navmin_response_sink_fn response_sink,
     void *response_context
 )
@@ -332,6 +335,7 @@ static void parser_process_buffer(
             protocol,
             parser->bytes,
             frame_length,
+            now_ms,
             response_sink,
             response_context);
         parser_drop_prefix(parser, frame_length);
@@ -362,7 +366,7 @@ static void parser_apply_timeout(
        the buffer is no longer waiting on such a candidate. */
     do {
         parser_drop_prefix(parser, 1U);
-        parser_process_buffer(protocol, response_sink, response_context);
+        parser_process_buffer(protocol, now_ms, response_sink, response_context);
     } while (parser_has_incomplete_candidate(parser));
 }
 
@@ -390,14 +394,14 @@ void navmin_protocol_feed_byte(
     parser_apply_timeout(protocol, now_ms, response_sink, response_context);
     if (parser->length >= NAVMIN_MAX_FRAME_LENGTH) {
         parser_drop_prefix(parser, 1U);
-        parser_process_buffer(protocol, response_sink, response_context);
+        parser_process_buffer(protocol, now_ms, response_sink, response_context);
     }
 
     parser->bytes[parser->length] = byte;
     ++parser->length;
     parser->last_byte_time_ms = now_ms;
     parser->has_last_byte_time = true;
-    parser_process_buffer(protocol, response_sink, response_context);
+    parser_process_buffer(protocol, now_ms, response_sink, response_context);
 }
 
 void navmin_protocol_poll(
