@@ -184,8 +184,9 @@ UI может редактировать:
 - source/network settings;
 - `processing-scope`;
 - optional per-camera `processing-enabled` master switch;
-- `vision-processor-class`;
-- processor-specific settings после определения schema.
+- `vision-processor-class`.
+
+В v1 внутренние detector/tracker tuning constants конкретного `VisionProcessor` в UI не редактируются и не являются полями `config.json`.
 
 Calibration data не является обычной UI-настройкой `config.json`; она хранится отдельными calibration files.
 

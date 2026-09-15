@@ -331,7 +331,7 @@ Qt notification coalescing (#5) остаётся до UI-этапа.
 - если в одном config revision меняются и gains, и output limit одной оси, gain-change reset имеет приоритет, поэтому новый I-term начинается с zero уже под новым limit;
 - config change сам по себе не создаёт motion command, не меняет `control_mode` и не вводит внешний `PID_RESET` contract.
 
-Processor-specific часть `problems.md` #7 остаётся Stage 5, а `target-lost-timeout-ms` — checkpoint Stage 6.
+Processor-specific runtime policy для Vision закрыта decision checkpoint перед Stage 5: внутренний tuning не входит в `config.json` v1. `target-lost-timeout-ms` остаётся checkpoint Stage 6.
 
 ### Закрытый decision checkpoint перед transport/recovery веткой
 
@@ -485,7 +485,7 @@ Host-side protocol tests из этапа 3 не дублировать в firmwa
 - `docs/dev/architecture/decisions.md`
 - `docs/dev/modules/vision/index.md`
 - `docs/dev/diagrams/vision-diagram.mmd`
-- `problems.md` #6, #8, Vision часть #10/#13
+- `problems.md` #8, Vision часть #10/#13
 
 ### Реализовать
 
@@ -498,7 +498,11 @@ Host-side protocol tests из этапа 3 не дублировать в firmwa
 - Overview undistort → working frame;
 - Stereo Left/Right rectify → working frame;
 - immutable `CameraModel` binding к generation;
-- `VisionProcessor` interface;
+- `VisionProcessor` interface как единственную внешнюю boundary processing;
+- `Legacy14VisionProcessor` как default и `Legacy11VisionProcessor` как альтернативную baseline implementation;
+- чистый перенос detector-алгоритмов legacy Variant 1.4 / 1.1 без старой UI/application обвязки;
+- общий внутренний `SimpleTracker` для обоих processors: 2-hit confirmation, delete после 3 consecutive misses, 5 matched observations history, real-time robust median velocity, predicted-center/distance/size/IoU one-to-one association, без публикации predicted bbox и без полноценного reacquisition;
+- processor/tracker internal tuning через owner-local `settings.py` module constants, без processor-specific fields в `config.json`/UI v1;
 - per-camera processing config + processing scope;
 - `VisionResult` latest-only per camera;
 - camera reconnect/state transitions/backoff;
@@ -512,17 +516,27 @@ Host-side protocol tests из этапа 3 не дублировать в firmwa
 - production stereo depth;
 - target handoff;
 - load adaptation;
-- future latest-live-frame optimization.
+- future latest-live-frame optimization;
+- `AdvancedVisionProcessor` на базе VT11 identity/reference/reacquisition до получения baseline measurements.
 
 Stereo Right pipeline должен существовать настолько, насколько это требуется rectification/session/diagnostics architecture, но отсутствие production stereo distance не блокирует v1.
 
+### Закрытый decision checkpoint перед Vision implementation
+
+До начала Stage 5 управляющий чат зафиксировал baseline processing semantics:
+
+- `VisionProcessor` остаётся единственной архитектурной processing boundary; detector/tracker decomposition является private implementation detail;
+- baseline processors: `Legacy14VisionProcessor` (default) и `Legacy11VisionProcessor`, оба используют один `SimpleTracker`;
+- legacy detector algorithms переносятся чисто, без legacy UI/application glue и без копирования legacy tracker как есть;
+- tracker публикует track после 2 confirmations, удаляет после 3 consecutive misses, использует history=5 matched observations и real-time robust median velocity; prediction используется только внутри association, predicted bbox без detection наружу не публикуется;
+- internal detector/tracker tuning хранится рядом с owner code в `settings.py` как module-level constants и не входит в `config.json`/UI v1;
+- full VT11 identity/reacquisition остаётся будущим `AdvancedVisionProcessor`, не blocker baseline Stage 5.
+
 ### Открытые вопросы, которые должен закрыть этап
 
-- #6 processor-specific configuration;
 - #8 camera reconnect transitions/backoff;
 - Vision часть #10 worker lifecycle;
-- Vision часть #13 logging;
-- processor-specific часть `problems.md` #7: какие processor fields dynamic, а какие требуют pipeline restart/new generation.
+- Vision часть #13 logging.
 
 `problems.md` #2/#3 остаются deferred до полноценного stereo distance, если manual source достаточен для v1.
 
@@ -534,6 +548,10 @@ Stereo Right pipeline должен существовать настолько, 
 - corrected clean working frame contract без overlays;
 - reconnect state transitions;
 - processing scope;
+- both baseline processor classes produce the same public `TrackedObject` contract;
+- SimpleTracker confirmation/miss/ID non-reuse/real-time velocity/one-to-one association behavior;
+- no predicted `TrackedObject` publication on detector miss;
+- default processor selection is `Legacy14VisionProcessor`;
 - manual distance target binding/invalidation where defined.
 
 Rejection stale/unaccepted generation проверяется на реальных consumer boundaries в Stage 6/7, а не искусственным consumer внутри Vision.
@@ -817,8 +835,7 @@ Hardware tests остаются отдельным suite.
 | #2 capture_id / stereo pairing | deferred |
 | #3 DistanceResult stereo lifecycle | deferred / 5 только manual path |
 | #5 Qt coalescing | 7 |
-| #6 processor-specific config | 5 |
-| #7 runtime config edge cases | 2 config infrastructure; 5 processor policy; 6 target-loss-timeout checkpoint |
+| #7 runtime config edge cases | 2 config infrastructure; processor-specific Vision part closed before 5; 6 target-loss-timeout checkpoint |
 | #8 camera reconnect | 5 |
 | #10 worker lifecycle | 1 foundation + Vision/integration stages + 8 final; Turret part closed before 3 |
 | #11 partial failures | 7 + 8 |

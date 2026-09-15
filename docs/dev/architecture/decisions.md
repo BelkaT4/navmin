@@ -530,6 +530,36 @@ Serial timing является свойством bounded transaction/session и
 - **Сделать отдельные UART и RS485 версии протокола.** Отклонено: physical medium не требует второго framing/request/state contract.
 - **Перенести старый UART protocol из legacy firmware.** Отклонено: authoritative v1 protocol уже определён в `serial-protocol.md`, а legacy firmware нужен только как hardware reference.
 
+## 27. `VisionProcessor` остаётся единственной processing boundary; baseline v1 использует legacy 1.4/1.1 + общий `SimpleTracker`
+
+### Решение
+
+Публичная архитектура не разбивает Vision processing на обязательные `Detector` и `Tracker` модули. Конкретный `VisionProcessor` может быть detector+tracker, integrated algorithm или другой схемой, пока он соблюдает `TrackedObject` contract.
+
+Для baseline v1 реализуются:
+
+```text
+Legacy14VisionProcessor   # default
+Legacy11VisionProcessor
+```
+
+Они используют detector-алгоритмы legacy Variant 1.4 / Variant 1.1 и один общий внутренний `SimpleTracker`. Legacy tracker целиком не переносится. `SimpleTracker` использует короткую robust motion history, внутреннее prediction и one-to-one association; полноценный appearance identity/reacquisition остаётся будущей реализацией `AdvancedVisionProcessor`.
+
+Processor-specific tuning в v1 является implementation detail: owner-local `settings.py` с module-level constants. Эти параметры не входят в `config.json`, не persistятся Config Manager и не показываются UI.
+
+### Почему
+
+Такой boundary позволяет сначала получить простой измеримый baseline на двух detector variants, сравнивая их на одном tracker, а затем заменить внутренний algorithm на более сложный VT11-подобный processor без изменения Core, UI, Aiming или публичных Vision contracts.
+
+Локальные tuning constants не являются пользовательской политикой системы. Если преждевременно включить их в строгий `config.json`, экспериментальные thresholds становятся долгоживущим публичным schema/API и требуют validation, persistence и runtime apply semantics без доказанной необходимости.
+
+### Отвергнутые альтернативы
+
+- **Сделать `Detector` и `Tracker` отдельными архитектурными модулями.** Отклонено: это преждевременно фиксирует внутреннюю структуру всех будущих `VisionProcessor` implementations.
+- **Перенести legacy tracker как есть.** Отклонено: он несёт историческую application/reacquisition complexity, которая не нужна baseline multi-object tracking и мешает чисто сравнивать detector 1.1/1.4.
+- **Сразу использовать полный VT11 pipeline как обязательный Stage 5 processor.** Отклонено как blocker первой реализации; advanced identity/reacquisition должен сравниваться с простым baseline после первых измерений.
+- **Хранить все detector/tracker thresholds в общем `config.json` или UI.** Отклонено: внутренний tuning не должен становиться публичным config contract без реальной operator/runtime потребности.
+
 ## Как использовать этот документ при реализации
 
 При разработке нового модуля сначала нужно следовать нормативным контрактам соответствующего документа. Если возникает желание вернуть ранее удалённый механизм, полезно проверить этот журнал: часто механизм был удалён не случайно, а потому что более простой инвариант закрывает тот же failure case.

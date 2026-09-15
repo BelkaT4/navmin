@@ -198,7 +198,7 @@ AND
 
 `Stereo Right` не подчиняется main/preview selection и используется по diagnostic/stereo policy.
 
-Processor-specific settings остаются отдельным открытым вопросом.
+В v1 processor-specific tuning не входит в `config.json`: detector/tracker constants принадлежат реализации выбранного `VisionProcessor`, не persistятся Config Manager и не показываются UI. Публичным config contract остаётся выбор `vision-processor-class`. Если позднее конкретный processor parameter потребуется менять per-camera/runtime, он добавляется в schema только вместе с явной validation/apply policy.
 
 ### Distance
 
@@ -428,7 +428,7 @@ UI overlays не являются частью recorded working frame.
 | `emulate-stm32` | application restart; runtime real ↔ fake transport switching в v1 отсутствует |
 | UI-only display settings | dynamic |
 
-Processor-specific settings классифицируются вместе со схемой конкретного `VisionProcessor`.
+Processor-specific tuning в v1 не является частью config schema и поэтому не имеет runtime apply policy. Смена `vision-processor-class` остаётся restart/new-generation boundary.
 
 ## Пример `config.json`
 
@@ -447,7 +447,7 @@ Processor-specific settings классифицируются вместе со �
         "rtp-enabled": false,
         "buffer-size": 1,
         "processing-enabled": true,
-        "vision-processor-class": "DefaultVisionProcessor"
+        "vision-processor-class": "Legacy14VisionProcessor"
       },
       "stereo-left": {
         "enabled": true,
@@ -456,7 +456,7 @@ Processor-specific settings классифицируются вместе со �
         "rtp-enabled": false,
         "buffer-size": 1,
         "processing-enabled": true,
-        "vision-processor-class": "DefaultVisionProcessor"
+        "vision-processor-class": "Legacy14VisionProcessor"
       },
       "stereo-right": {
         "enabled": true,
@@ -465,7 +465,7 @@ Processor-specific settings классифицируются вместе со �
         "rtp-enabled": false,
         "buffer-size": 1,
         "processing-enabled": false,
-        "vision-processor-class": "DefaultVisionProcessor"
+        "vision-processor-class": "Legacy14VisionProcessor"
       }
     },
     "distance": {
@@ -550,4 +550,4 @@ UI
 
 STM32-dependent config синхронизируется Turret HAL по правилам [Turret](../modules/turret/index.md) и [Serial Protocol](./serial-protocol.md).
 
-Concrete foundation primitives уже реализованы. Processor-specific schemas и отдельные runtime edge cases из `problems.md` остаются owner-specific/open; базовая persistence/validation policy schema v1 закрыта.
+Concrete foundation primitives уже реализованы. Внутренний tuning `VisionProcessor` в v1 не является config schema; остальные runtime edge cases из `problems.md` остаются owner-specific/open. Базовая persistence/validation policy schema v1 закрыта.

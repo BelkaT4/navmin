@@ -51,16 +51,6 @@ Latest payload не должен создавать backlog queued Qt signals.
 
 Нужно определить единый notification/coalescing pattern для Vision, Turret и ConfigUpdate. `CameraSessionStarted` является barrier и не может быть потерян/coalesced как обычный latest notification.
 
-### 6. Processor-specific configuration
-
-Нужно определить:
-
-- формат settings конкретного `VisionProcessor`;
-- schema validation;
-- какие поля доступны UI;
-- persistence;
-- какие changes dynamic, а какие требуют pipeline restart/new generation.
-
 ### 7. Edge cases runtime config apply
 
 Базовая classification уже определена в `configuration.md`. Turret-specific PID apply semantics закрыты и перенесены в `configuration.md`, `modules/turret/index.md` и `decisions.md`.
@@ -68,7 +58,6 @@ Latest payload не должен создавать backlog queued Qt signals.
 Остаются детали:
 
 - изменение `target-lost-timeout-ms` для уже временно потерянной цели;
-- processor-specific dynamic/restart policy.
 
 STM32 max speed / acceleration / velocity watchdog уже применяются dynamic полным атомарным `SET_CONFIG` snapshot. Axis mechanics (`invert`, steps/rev, microstep, `max-relative-move-deg`) — restart-only и safe-point semantics для них не нужна.
 

@@ -173,7 +173,7 @@ Video Source / camera pipeline:
 vision-processor-class
 ```
 
-Внутренняя реализация не фиксируется:
+`VisionProcessor` является единственной архитектурной boundary обработки изображения. Его внутренняя реализация не фиксируется:
 
 ```text
 Detector → Tracker
@@ -181,12 +181,57 @@ integrated tracker
 другой алгоритм
 ```
 
+Внутренние detector/tracker/components не являются публичными модулями NavMin и не должны импортироваться Core/UI как отдельные архитектурные зависимости.
+
 Публичный результат обязан содержать `TrackedObject`:
 
 - устойчивый `track_id` внутри generation;
 - `bbox`;
 - velocity центра bbox;
 - `age_frames`.
+
+### Processor implementations v1
+
+Первая реализация содержит два взаимозаменяемых processor class:
+
+```text
+Legacy14VisionProcessor   # default
+Legacy11VisionProcessor
+```
+
+Оба используют чисто перенесённую detector-логику соответствующих legacy Variant 1.4 / Variant 1.1, без старой UI/application-обвязки и без переноса legacy tracker как публичной архитектуры. Оба processor используют один общий внутренний `SimpleTracker`, поэтому сравнение 1.1 и 1.4 не смешивает качество detector с разными tracker algorithms.
+
+`AdvancedVisionProcessor` на базе VT11/identity/reacquisition рассматривается как отдельная будущая реализация той же `VisionProcessor` boundary и не блокирует baseline Stage 5.
+
+### `SimpleTracker` v1
+
+`SimpleTracker` — внутренняя переиспользуемая часть первых processor implementations, а не отдельный межмодульный контракт. Для v1 фиксируются следующие semantics:
+
+- tentative track публикуется как `TrackedObject` после двух последовательных matched observations;
+- track после публикации хранится внутренне при кратком пропуске, но predicted bbox наружу не публикуется без нового detection;
+- после трёх последовательных misses track удаляется;
+- последние пять matched observations используются для motion history;
+- velocity центра оценивается по реальным monotonic timestamps как robust median последовательных `dx/dt`, `dy/dt`, а не из предполагаемого FPS;
+- association использует predicted center, жёсткий distance gate, consistency размера bbox и IoU, затем one-to-one matching;
+- prediction используется только для внутренней association; Aiming/lead остаётся ответственностью Core;
+- полноценный appearance identity/reacquisition в baseline tracker отсутствует; после окончательного удаления повторно найденный объект получает новый `track_id`;
+- `track_id` монотонно выделяется и не переиспользуется для другого объекта внутри одной camera generation; processor state очищается при новой generation.
+
+Точная cost formula, gates и numeric tuning являются внутренней настройкой processor/tracker и могут уточняться по измерениям без изменения публичного `VisionProcessor` contract.
+
+### Внутренние настройки processor/tracker
+
+В v1 algorithm tuning не входит в пользовательский `config.json` и не показывается в UI. Настройки хранятся рядом с owner-кодом как module-level constants:
+
+```text
+src/navmin/vision/processors/legacy_11/settings.py
+src/navmin/vision/processors/legacy_14/settings.py
+src/navmin/vision/tracking/settings.py
+```
+
+У processor-specific `settings.py` нет общей обязательной schema: Variant 1.1, Variant 1.4 и будущие processor implementations могут иметь разные поля. Общие настройки `SimpleTracker` не дублируются в processor directories. Runtime-derived/adaptive state хранится в экземпляре processor/tracker и не мутирует module constants.
+
+Если позже конкретный tuning-параметр действительно потребуется менять пользователю, per-camera или runtime, он переносится в основной config отдельным архитектурным решением с явной validation/apply policy; заранее такой compatibility/config layer не создаётся.
 
 Если processing для камеры выключен effective policy, pipeline всё равно публикует working `VisionResult` с пустым `tracked_objects`.
 
@@ -343,7 +388,6 @@ Diagnostics/errors идут в logging, runtime state — через typed contr
 
 - механизм `capture_id` и stereo resync;
 - owner staleness `DistanceResult`;
-- processor-specific config;
 - camera reconnect/backoff;
 - concrete thread-safe primitives / notification coalescing;
 - адаптация нагрузки после profiling.
