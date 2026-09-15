@@ -75,7 +75,9 @@ def _session(
     waits: list[float] | None = None,
     wait_hook: Callable[[float], None] | None = None,
 ) -> tuple[TurretSession, FakeTransport]:
-    transport = transport or FakeTransport()
+    transport = transport or FakeTransport(
+        FakeStm32Endpoint(initial_expected_request_id=initial_request_id)
+    )
     transport.open()
     wait_log = waits if waits is not None else []
     session = TurretSession(

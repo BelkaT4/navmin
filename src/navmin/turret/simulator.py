@@ -49,18 +49,31 @@ class FakeReadFailure(Enum):
 
 
 class FakeStm32Endpoint:
-    """Frame-level fake endpoint that parses requests using production codec."""
+    """Frame-level fake endpoint with firmware-like request sequencing/cache."""
 
-    def __init__(self, *, baudrate: int = 9600) -> None:
+    def __init__(
+        self,
+        *,
+        baudrate: int = 9600,
+        initial_expected_request_id: int = 0,
+    ) -> None:
         if baudrate not in SUPPORTED_BAUDRATES:
             raise ValueError("baudrate must be a supported protocol baudrate")
+        if (
+            isinstance(initial_expected_request_id, bool)
+            or not isinstance(initial_expected_request_id, int)
+            or not 0 <= initial_expected_request_id <= 0xFFFF
+        ):
+            raise ValueError("initial_expected_request_id must fit uint16")
         self.raw_request_history: list[bytes] = []
         self.request_history: list[ProtocolRequest] = []
+        self.executed_request_history: list[ProtocolRequest] = []
         self._response_specs: deque[FakeResponseSpec] = deque()
         self._baudrate = baudrate
         self._last_response_baudrate = baudrate
-        self._last_baud_request: bytes | None = None
-        self._last_baud_response: bytes | None = None
+        self._expected_request_id = initial_expected_request_id
+        self._last_signature: tuple[int, CommandCode, object | None] | None = None
+        self._last_response: bytes | None = None
 
     @property
     def baudrate(self) -> int:
@@ -70,8 +83,26 @@ class FakeStm32Endpoint:
     def last_response_baudrate(self) -> int:
         return self._last_response_baudrate
 
+    @property
+    def expected_request_id(self) -> int:
+        return self._expected_request_id
+
     def queue_response(self, spec: FakeResponseSpec) -> None:
         self._response_specs.append(spec)
+
+    @staticmethod
+    def _signature(request: ProtocolRequest) -> tuple[int, CommandCode, object | None]:
+        return (request.request_id, request.command, request.payload)
+
+    @staticmethod
+    def _invalid_request_id_response(request: ProtocolRequest) -> bytes:
+        return encode_response(
+            ProtocolResponse(
+                request_id=request.request_id,
+                command=request.command,
+                result=ResultCode.INVALID_REQUEST_ID,
+            )
+        )
 
     def handle_request(self, raw_frame: bytes) -> bytes | None:
         raw = bytes(raw_frame)
@@ -82,19 +113,31 @@ class FakeStm32Endpoint:
             return None
 
         self.request_history.append(request)
-        response_baudrate = self._baudrate
-        self._last_response_baudrate = response_baudrate
+        self._last_response_baudrate = self._baudrate
+        signature = self._signature(request)
 
-        if raw == self._last_baud_request and self._last_baud_response is not None:
-            return self._last_baud_response
+        # Firmware exact retry is handled before Emergency/ordinary sequence logic.
+        if signature == self._last_signature and self._last_response is not None:
+            return self._last_response
 
+        if request.command is not CommandCode.EMERGENCY_STOP:
+            if (
+                self._last_signature is not None
+                and self._last_signature[0] == request.request_id
+            ):
+                return self._invalid_request_id_response(request)
+            if request.request_id != self._expected_request_id:
+                return self._invalid_request_id_response(request)
+
+        # A new Emergency is a special sequence-resync boundary regardless of the
+        # ordinary expected ID. A new ordinary request reaches this point only at
+        # the currently expected ID.
+        self.executed_request_history.append(request)
         spec = (
             self._response_specs.popleft()
             if self._response_specs
             else FakeResponseSpec()
         )
-        if spec.raw_response is not None:
-            return bytes(spec.raw_response)
 
         response = ProtocolResponse(
             request_id=(
@@ -104,13 +147,14 @@ class FakeStm32Endpoint:
             result=spec.result,
         )
         canonical_response = encode_response(response)
-        raw_response = bytearray(canonical_response)
-        if spec.corrupt_crc:
-            raw_response[-1] ^= 0xFF
 
+        self._expected_request_id = (request.request_id + 1) & 0xFFFF
+        self._last_signature = signature
+        self._last_response = canonical_response
+
+        response_baudrate = self._baudrate
+        self._last_response_baudrate = response_baudrate
         if request.command is CommandCode.SET_BAUDRATE:
-            self._last_baud_request = raw
-            self._last_baud_response = canonical_response
             payload = request.payload
             if (
                 response.request_id == request.request_id
@@ -119,10 +163,15 @@ class FakeStm32Endpoint:
                 and isinstance(payload, SetBaudratePayload)
                 and payload.baudrate in SUPPORTED_BAUDRATES
             ):
-                # The response was physically emitted at response_baudrate; the
-                # endpoint changes baud only after that transmission completes.
+                # The response is modeled as physically emitted at the old baud;
+                # only then does the endpoint move to the requested baud.
                 self._baudrate = payload.baudrate
 
+        if spec.raw_response is not None:
+            return bytes(spec.raw_response)
+        raw_response = bytearray(canonical_response)
+        if spec.corrupt_crc:
+            raw_response[-1] ^= 0xFF
         return bytes(raw_response)
 
 

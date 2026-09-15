@@ -225,14 +225,14 @@ def test_command_payload_type_mismatch_is_rejected() -> None:
 def test_fake_transport_success_uses_real_encoded_frames() -> None:
     endpoint = FakeStm32Endpoint()
     transport = FakeTransport(endpoint)
-    request = ProtocolRequest(42, CommandCode.PING)
+    request = ProtocolRequest(0, CommandCode.PING)
     raw_request = encode_request(request)
 
     transport.open()
     transport.write_frame(raw_request, timeout_s=0.1)
     response = decode_response(transport.read_frame(timeout_s=0.1))
 
-    assert response == ProtocolResponse(42, CommandCode.PING, ResultCode.OK)
+    assert response == ProtocolResponse(0, CommandCode.PING, ResultCode.OK)
     assert endpoint.raw_request_history == [raw_request]
     assert endpoint.request_history == [request]
 
@@ -271,7 +271,7 @@ def test_fake_endpoint_can_generate_bad_crc_response() -> None:
     endpoint.queue_response(FakeResponseSpec(corrupt_crc=True))
     transport = FakeTransport(endpoint)
     transport.open()
-    transport.write_frame(encode_request(ProtocolRequest(1, CommandCode.PING)), 0.1)
+    transport.write_frame(encode_request(ProtocolRequest(0, CommandCode.PING)), 0.1)
 
     with pytest.raises(CrcMismatchError):
         decode_response(transport.read_frame(0.1))
@@ -283,7 +283,7 @@ def test_fake_endpoint_can_generate_bad_crc_response() -> None:
         (FakeResponseSpec(request_id=99), 99, CommandCode.PING),
         (
             FakeResponseSpec(command=CommandCode.MOTOR_OFF),
-            1,
+            0,
             CommandCode.MOTOR_OFF,
         ),
     ],
@@ -295,7 +295,7 @@ def test_fake_endpoint_can_generate_mismatched_response_identity(
     endpoint.queue_response(spec)
     transport = FakeTransport(endpoint)
     transport.open()
-    transport.write_frame(encode_request(ProtocolRequest(1, CommandCode.PING)), 0.1)
+    transport.write_frame(encode_request(ProtocolRequest(0, CommandCode.PING)), 0.1)
 
     response = decode_response(transport.read_frame(0.1))
 
@@ -308,31 +308,119 @@ def test_fake_endpoint_can_return_malformed_raw_response() -> None:
     endpoint.queue_response(FakeResponseSpec(raw_response=b"not-a-frame"))
     transport = FakeTransport(endpoint)
     transport.open()
-    transport.write_frame(encode_request(ProtocolRequest(1, CommandCode.PING)), 0.1)
+    transport.write_frame(encode_request(ProtocolRequest(0, CommandCode.PING)), 0.1)
 
     with pytest.raises(FrameFormatError):
         decode_response(transport.read_frame(0.1))
 
 
-def test_duplicate_exact_raw_request_is_observable_without_fake_normalization() -> None:
+def test_fake_endpoint_exact_retry_returns_cached_bytes_without_reexecution() -> None:
     endpoint = FakeStm32Endpoint()
     transport = FakeTransport(endpoint)
     raw = encode_request(
         ProtocolRequest(
-            7,
+            0,
             CommandCode.SET_VELOCITY,
             SetVelocityPayload(100, -100),
         )
     )
     transport.open()
 
+    responses = []
     for _ in range(2):
         transport.write_frame(raw, 0.1)
-        decode_response(transport.read_frame(0.1))
+        responses.append(transport.read_frame(0.1))
 
+    assert responses[0] == responses[1]
     assert transport.raw_write_history == [raw, raw]
     assert endpoint.raw_request_history == [raw, raw]
     assert endpoint.request_history[0] == endpoint.request_history[1]
+    assert endpoint.executed_request_history == [endpoint.request_history[0]]
+    assert endpoint.expected_request_id == 1
+
+
+def test_fake_endpoint_models_ordinary_request_sequence_and_signature_collision() -> None:
+    endpoint = FakeStm32Endpoint()
+    transport = FakeTransport(endpoint)
+    transport.open()
+
+    ping_0 = encode_request(ProtocolRequest(0, CommandCode.PING))
+    transport.write_frame(ping_0, 0.1)
+    assert decode_response(transport.read_frame(0.1)).result is ResultCode.OK
+    assert endpoint.expected_request_id == 1
+
+    same_id_other_command = encode_request(ProtocolRequest(0, CommandCode.MOTOR_OFF))
+    transport.write_frame(same_id_other_command, 0.1)
+    assert (
+        decode_response(transport.read_frame(0.1)).result
+        is ResultCode.INVALID_REQUEST_ID
+    )
+    assert endpoint.expected_request_id == 1
+
+    endpoint_payload = FakeStm32Endpoint()
+    payload_transport = FakeTransport(endpoint_payload)
+    payload_transport.open()
+    velocity_a = encode_request(
+        ProtocolRequest(
+            0,
+            CommandCode.SET_VELOCITY,
+            SetVelocityPayload(10, -10),
+        )
+    )
+    velocity_b = encode_request(
+        ProtocolRequest(
+            0,
+            CommandCode.SET_VELOCITY,
+            SetVelocityPayload(11, -10),
+        )
+    )
+    payload_transport.write_frame(velocity_a, 0.1)
+    assert decode_response(payload_transport.read_frame(0.1)).result is ResultCode.OK
+    payload_transport.write_frame(velocity_b, 0.1)
+    assert (
+        decode_response(payload_transport.read_frame(0.1)).result
+        is ResultCode.INVALID_REQUEST_ID
+    )
+    assert len(endpoint_payload.executed_request_history) == 1
+    assert endpoint_payload.expected_request_id == 1
+
+    wrong_next_id = encode_request(ProtocolRequest(2, CommandCode.PING))
+    transport.write_frame(wrong_next_id, 0.1)
+    assert (
+        decode_response(transport.read_frame(0.1)).result
+        is ResultCode.INVALID_REQUEST_ID
+    )
+    assert endpoint.expected_request_id == 1
+
+    motor_off_1 = encode_request(ProtocolRequest(1, CommandCode.MOTOR_OFF))
+    transport.write_frame(motor_off_1, 0.1)
+    assert decode_response(transport.read_frame(0.1)).result is ResultCode.OK
+    assert endpoint.expected_request_id == 2
+
+
+def test_fake_endpoint_emergency_resync_overrides_ordinary_sequence_and_cache_collision() -> None:
+    endpoint = FakeStm32Endpoint()
+    transport = FakeTransport(endpoint)
+    transport.open()
+
+    ping_0 = encode_request(ProtocolRequest(0, CommandCode.PING))
+    transport.write_frame(ping_0, 0.1)
+    assert decode_response(transport.read_frame(0.1)).result is ResultCode.OK
+
+    emergency_0 = encode_request(ProtocolRequest(0, CommandCode.EMERGENCY_STOP))
+    transport.write_frame(emergency_0, 0.1)
+    emergency_response = decode_response(transport.read_frame(0.1))
+    assert emergency_response.result is ResultCode.OK
+    assert endpoint.expected_request_id == 1
+    assert [request.command for request in endpoint.executed_request_history] == [
+        CommandCode.PING,
+        CommandCode.EMERGENCY_STOP,
+    ]
+
+    ping_1 = encode_request(ProtocolRequest(1, CommandCode.PING))
+    transport.write_frame(ping_1, 0.1)
+    assert decode_response(transport.read_frame(0.1)).result is ResultCode.OK
+    assert endpoint.expected_request_id == 2
 
 
 def test_command_level_error_remains_valid_protocol_response() -> None:
@@ -340,7 +428,7 @@ def test_command_level_error_remains_valid_protocol_response() -> None:
     endpoint.queue_response(FakeResponseSpec(result=ResultCode.INVALID_ARGUMENT))
     transport = FakeTransport(endpoint)
     transport.open()
-    transport.write_frame(encode_request(ProtocolRequest(1, CommandCode.PING)), 0.1)
+    transport.write_frame(encode_request(ProtocolRequest(0, CommandCode.PING)), 0.1)
 
     response = decode_response(transport.read_frame(0.1))
 
