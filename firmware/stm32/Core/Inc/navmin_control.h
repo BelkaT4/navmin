@@ -1,6 +1,7 @@
 #ifndef NAVMIN_CONTROL_H
 #define NAVMIN_CONTROL_H
 
+#include "navmin_motion.h"
 #include "navmin_protocol.h"
 
 #include <stdbool.h>
@@ -25,20 +26,25 @@ typedef struct {
 } navmin_control_config_t;
 
 typedef void (*navmin_set_drivers_enabled_fn)(void *context, bool enabled);
+typedef void (*navmin_control_critical_fn)(void *context);
 
 typedef struct {
     void *context;
     navmin_set_drivers_enabled_fn set_drivers_enabled;
+    navmin_emit_step_fn emit_step;
+    navmin_control_critical_fn enter_critical;
+    navmin_control_critical_fn exit_critical;
 } navmin_control_hardware_t;
 
 typedef struct {
     navmin_control_config_t config;
     navmin_control_hardware_t hardware;
+    navmin_motion_t motion;
     bool configured;
     bool motors_on;
 
-    /* Minimal intent-presence state owned by the common hard-stop primitive.
-       No numeric velocity/position representation is chosen in 4B1. */
+    /* Control-level behaviour intents. Numeric velocity/phase/position state
+       belongs only to motion and is cleared through the common hard stop. */
     bool velocity_target_present;
     bool relative_target_present;
 } navmin_control_t;

@@ -31,11 +31,9 @@ This tree is the single STM32 firmware tree for BelkaT4 / NavMin. It keeps the h
 - a logical driver-enable callback boundary;
 - executor/emergency callbacks compatible with the accepted Stage 4A protocol core.
 
-The control module deliberately does **not** implement motion yet. `MOVE_RELATIVE`, `SET_VELOCITY`, and `SET_BAUDRATE` therefore never receive fake success from the 4B1 control owner; their real owners remain deferred to 4B2/4B3/4C.
+`MOVE_RELATIVE`, `SET_VELOCITY`, and `SET_BAUDRATE` still never receive fake success from the control owner; their real command semantics remain deferred to 4B2b2/4B3/4C.
 
-`MOTOR_OFF` clears only minimal motion-intent presence flags before disabling drivers; 4B1 deliberately chooses no numeric velocity or position representation. Emergency performs the same hard motion clear but does not change driver enable state and creates no persistent latch. Repeated `MOTOR_ON`/`MOTOR_OFF` are idempotent at the driver callback boundary.
-
-`SET_CONFIG` first decodes and validates a local candidate and then replaces `control->config` with one aggregate struct assignment. There is no concurrent high-rate control reader wired into `navmin_control` yet. Stage 4B2b will connect the accepted full snapshot to the motion primitive and add the eventual control-loop/ISR critical-section boundary around one complete replacement rather than mutate fields independently.
+`MOTOR_OFF` and Emergency share one control hard-stop boundary. Since Stage 4B2b1 this boundary delegates numeric velocity/target/phase clearing to the single owned `navmin_motion_t`, then clears only control-level intent flags. `MOTOR_OFF` additionally disables drivers; Emergency deliberately preserves driver and motor ON/OFF state and creates no persistent latch. Repeated `MOTOR_ON`/`MOTOR_OFF` remain idempotent at the driver callback boundary.
 
 
 ### Stage 4B2a — velocity motion primitive / acceleration / STEP scheduler
@@ -84,6 +82,34 @@ All hot-path velocity/acceleration/phase values therefore remain well inside sig
 Dynamic motion limits are supplied as an already-validated snapshot. Lowering max speed clips only the currently stored effective target; current velocity decelerates through the limiter. Raising max speed does not resurrect an older clipped request. Changing acceleration needs no fractional-history reset because this representation has no acceleration remainder; the new integer acceleration increment is used on the next control tick.
 
 When current velocity reaches stable zero, the per-axis STEP phase is cleared. `navmin_motion_hard_stop()` immediately clears current velocity, target velocity and STEP phase on both axes while preserving commanded position. This prevents latent fractional phase from creating a STEP after stop/restart.
+
+### Stage 4B2b1 — control ↔ motion wiring
+
+`navmin_control_t` now owns exactly one `navmin_motion_t`. Control owns configured/motor/config/behaviour state; motion remains the sole owner of numeric current/target velocity, STEP phase, commanded position and numeric motion limits. No duplicate numeric motion state is added to control.
+
+`navmin_control_hardware_t` uses one hardware-independent context for three boundaries:
+
+- logical driver enable/disable;
+- individual STEP requests emitted by `navmin_motion`;
+- optional `enter_critical` / `exit_critical` callbacks.
+
+There are still no HAL, GPIO, TIM, UART or interrupt-register calls in this layer. Stage 4C will provide target implementations for these callbacks.
+
+A valid `SET_CONFIG` is decoded and fully validated before publication. Its motion limits are derived from the same local candidate. One critical-section boundary then performs:
+
+```text
+enter critical
+→ navmin_motion_set_limits(full next motion limits)
+→ control.config = full next config snapshot
+→ configured = true
+→ exit critical
+```
+
+This prevents a future timer/ISR reader from observing a new control snapshot with old motion limits or the reverse. If `navmin_motion_set_limits()` unexpectedly rejects the already validated candidate, it returns before mutating motion state; control exits the boundary with the previous config/motion snapshot intact and reports `INTERNAL_ERROR`.
+
+Dynamic speed/acceleration semantics therefore come directly from the accepted motion primitive: lowering max speed clips only the stored effective target while current velocity remains continuous; raising max speed does not resurrect a previously clipped request; a new acceleration limit is used on the next motion update. `velocity_watchdog_timeout_ms` remains part of the atomic control config snapshot but has no watchdog/timestamp behaviour in 4B2b1.
+
+`navmin_control_init()` initializes the owned motion state with no valid limits and passes the common hardware STEP sink into it. `MOTOR_OFF` and Emergency call `navmin_motion_hard_stop()`, preserving commanded position while clearing current velocity, target velocity and STEP phase immediately. `MOTOR_ON` never restores old numeric motion.
 
 ## Stage 4B1 firmware sanity bounds
 
@@ -167,13 +193,12 @@ The legacy project used a 72 MHz HSE→PLL clock setup, TIM2 prescaler 71 / peri
 
 ## Explicitly deferred
 
-### Stage 4B2b
+### Stage 4B2b2
 
-- wire `SET_VELOCITY` acceptance and control-owner wiring;
+- wire `SET_VELOCITY` acceptance;
 - protocol acceptance timestamp plumbing;
-- velocity watchdog;
-- dynamic `SET_CONFIG` integration with active velocity behaviour;
-- exact-retry/watchdog integration.
+- velocity watchdog and control-tick/watchdog integration;
+- exact retry must not refresh the watchdog.
 
 ### Stage 4B3
 

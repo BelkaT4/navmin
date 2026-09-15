@@ -12,10 +12,27 @@ static uint32_t read_u32_le(const uint8_t *bytes)
            ((uint32_t)bytes[3] << 24);
 }
 
+static void enter_critical(navmin_control_t *control)
+{
+    if (control->hardware.enter_critical != NULL) {
+        control->hardware.enter_critical(control->hardware.context);
+    }
+}
+
+static void exit_critical(navmin_control_t *control)
+{
+    if (control->hardware.exit_critical != NULL) {
+        control->hardware.exit_critical(control->hardware.context);
+    }
+}
+
 static void hard_stop_motion(navmin_control_t *control)
 {
+    enter_critical(control);
+    navmin_motion_hard_stop(&control->motion);
     control->velocity_target_present = false;
     control->relative_target_present = false;
+    exit_critical(control);
 }
 
 static bool config_is_valid(const navmin_control_config_t *config)
@@ -33,6 +50,19 @@ static bool config_is_valid(const navmin_control_config_t *config)
                NAVMIN_MAX_SUPPORTED_WATCHDOG_TIMEOUT_MS;
 }
 
+static navmin_motion_limits_t motion_limits_from_config(
+    const navmin_control_config_t *config
+)
+{
+    navmin_motion_limits_t limits;
+
+    limits.max_speed_x_steps_s = config->max_speed_x_steps_s;
+    limits.max_speed_y_steps_s = config->max_speed_y_steps_s;
+    limits.acceleration_x_steps_s2 = config->acceleration_x_steps_s2;
+    limits.acceleration_y_steps_s2 = config->acceleration_y_steps_s2;
+    return limits;
+}
+
 static navmin_result_code_t set_config(
     navmin_control_t *control,
     const uint8_t *payload,
@@ -40,6 +70,7 @@ static navmin_result_code_t set_config(
 )
 {
     navmin_control_config_t next;
+    navmin_motion_limits_t next_limits;
 
     if (payload_length != NAVMIN_SET_CONFIG_PAYLOAD_LENGTH || payload == NULL) {
         return NAVMIN_RESULT_PARSE_ERROR;
@@ -55,11 +86,19 @@ static navmin_result_code_t set_config(
         return NAVMIN_RESULT_INVALID_ARGUMENT;
     }
 
-    /* There is no concurrent high-rate reader in 4B1. Keep config as one
-       aggregate snapshot so 4B2 can wrap this single replacement in the
-       target critical-section boundary instead of mutating fields live. */
+    next_limits = motion_limits_from_config(&next);
+
+    /* Future timer/ISR readers must see one coherent replacement: motion
+       limits (including target clipping) and the matching control snapshot
+       are published under the same hardware-independent critical boundary. */
+    enter_critical(control);
+    if (!navmin_motion_set_limits(&control->motion, next_limits)) {
+        exit_critical(control);
+        return NAVMIN_RESULT_INTERNAL_ERROR;
+    }
     control->config = next;
     control->configured = true;
+    exit_critical(control);
     return NAVMIN_RESULT_OK;
 }
 
@@ -111,8 +150,14 @@ void navmin_control_init(
     navmin_control_hardware_t hardware
 )
 {
+    navmin_motion_step_sink_t step_sink;
+
     memset(control, 0, sizeof(*control));
     control->hardware = hardware;
+
+    step_sink.context = hardware.context;
+    step_sink.emit_step = hardware.emit_step;
+    navmin_motion_init(&control->motion, step_sink);
     hard_stop_motion(control);
 
     if (control->hardware.set_drivers_enabled != NULL) {
@@ -144,7 +189,7 @@ navmin_result_code_t navmin_control_execute_command(
     case NAVMIN_COMMAND_SET_VELOCITY:
     case NAVMIN_COMMAND_SET_BAUDRATE:
         /* Recognized protocol commands whose owners are intentionally deferred
-           to 4B2/4B3/4C. Never report fake success from the 4B1 control owner. */
+           to 4B2b2/4B3/4C. Never report fake success from this control owner. */
         return NAVMIN_RESULT_INTERNAL_ERROR;
     default:
         return NAVMIN_RESULT_INTERNAL_ERROR;

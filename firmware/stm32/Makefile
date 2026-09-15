@@ -20,9 +20,9 @@ $(HOST_PROTOCOL_TEST): $(PROTOCOL_SOURCE) Tests/host/test_navmin_protocol.c Core
 	mkdir -p $(HOST_BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(PROTOCOL_SOURCE) Tests/host/test_navmin_protocol.c -o $(HOST_PROTOCOL_TEST)
 
-$(HOST_CONTROL_TEST): $(PROTOCOL_SOURCE) $(CONTROL_SOURCE) Tests/host/test_navmin_control.c Core/Inc/navmin_protocol.h Core/Inc/navmin_control.h
+$(HOST_CONTROL_TEST): $(PROTOCOL_SOURCE) $(CONTROL_SOURCE) $(MOTION_SOURCE) Tests/host/test_navmin_control.c Core/Inc/navmin_protocol.h Core/Inc/navmin_control.h Core/Inc/navmin_motion.h
 	mkdir -p $(HOST_BUILD_DIR)
-	$(CC) $(CPPFLAGS) $(CFLAGS) $(PROTOCOL_SOURCE) $(CONTROL_SOURCE) Tests/host/test_navmin_control.c -o $(HOST_CONTROL_TEST)
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(PROTOCOL_SOURCE) $(CONTROL_SOURCE) $(MOTION_SOURCE) Tests/host/test_navmin_control.c -o $(HOST_CONTROL_TEST)
 
 $(HOST_MOTION_TEST): $(MOTION_SOURCE) Tests/host/test_navmin_motion.c Core/Inc/navmin_motion.h Core/Inc/navmin_control.h
 	mkdir -p $(HOST_BUILD_DIR)

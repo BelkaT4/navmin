@@ -30,6 +30,20 @@ typedef struct {
     unsigned call_count;
     unsigned enable_count;
     unsigned disable_count;
+    unsigned step_count;
+    unsigned positive_step_count;
+    unsigned negative_step_count;
+    unsigned critical_enter_count;
+    unsigned critical_exit_count;
+    unsigned critical_depth;
+    unsigned max_critical_depth;
+    navmin_control_t *observed_control;
+    bool observe_hard_stop;
+    bool hard_stop_active_at_enter;
+    bool hard_stop_cleared_at_exit;
+    bool drivers_enabled_at_hard_stop_exit;
+    int64_t expected_x_position;
+    int64_t expected_y_position;
 } driver_sink_t;
 
 typedef struct {
@@ -70,15 +84,97 @@ static void set_drivers_enabled(void *context, bool enabled)
     }
 }
 
+static void emit_step(
+    void *context,
+    navmin_motion_axis_t axis,
+    navmin_step_direction_t direction
+)
+{
+    driver_sink_t *sink = context;
+
+    (void)axis;
+    ++sink->step_count;
+    if (direction == NAVMIN_STEP_DIRECTION_POSITIVE) {
+        ++sink->positive_step_count;
+    } else {
+        ++sink->negative_step_count;
+    }
+}
+
+static void enter_critical(void *context)
+{
+    driver_sink_t *sink = context;
+
+    ++sink->critical_enter_count;
+    ++sink->critical_depth;
+    if (sink->critical_depth > sink->max_critical_depth) {
+        sink->max_critical_depth = sink->critical_depth;
+    }
+
+    if (sink->observe_hard_stop) {
+        navmin_control_t *control = sink->observed_control;
+
+        ASSERT_TRUE(control != NULL);
+        sink->hard_stop_active_at_enter =
+            control->motion.x.current_velocity_q != 0 &&
+            control->motion.x.target_velocity_q != 0 &&
+            control->motion.x.step_phase_q != 0 &&
+            control->motion.y.current_velocity_q != 0 &&
+            control->motion.y.target_velocity_q != 0 &&
+            control->motion.y.step_phase_q != 0 &&
+            control->velocity_target_present &&
+            control->relative_target_present;
+    }
+}
+
+static void exit_critical(void *context)
+{
+    driver_sink_t *sink = context;
+
+    ASSERT_EQ_U32(1U, sink->critical_depth);
+    if (sink->observe_hard_stop) {
+        const navmin_control_t *control = sink->observed_control;
+
+        ASSERT_TRUE(control != NULL);
+        sink->hard_stop_cleared_at_exit =
+            control->motion.x.current_velocity_q == 0 &&
+            control->motion.x.target_velocity_q == 0 &&
+            control->motion.x.step_phase_q == 0 &&
+            control->motion.y.current_velocity_q == 0 &&
+            control->motion.y.target_velocity_q == 0 &&
+            control->motion.y.step_phase_q == 0 &&
+            !control->velocity_target_present &&
+            !control->relative_target_present &&
+            control->motion.x.commanded_position_steps ==
+                sink->expected_x_position &&
+            control->motion.y.commanded_position_steps ==
+                sink->expected_y_position;
+        sink->drivers_enabled_at_hard_stop_exit = sink->enabled;
+    }
+    ++sink->critical_exit_count;
+    --sink->critical_depth;
+}
+
 static navmin_control_t make_control(driver_sink_t *sink)
 {
     navmin_control_t control;
     navmin_control_hardware_t hardware;
 
     memset(sink, 0, sizeof(*sink));
+    memset(&hardware, 0, sizeof(hardware));
     hardware.context = sink;
     hardware.set_drivers_enabled = set_drivers_enabled;
+    hardware.emit_step = emit_step;
+    hardware.enter_critical = enter_critical;
+    hardware.exit_critical = exit_critical;
     navmin_control_init(&control, hardware);
+
+    /* Init itself uses the common critical hard-stop. Operation tests measure
+       only the boundary they invoke after make_control() returns. */
+    sink->critical_enter_count = 0U;
+    sink->critical_exit_count = 0U;
+    sink->critical_depth = 0U;
+    sink->max_critical_depth = 0U;
     return control;
 }
 
@@ -127,12 +223,71 @@ static void seed_motion_state(navmin_control_t *control)
 {
     control->velocity_target_present = true;
     control->relative_target_present = true;
+
+    control->motion.x.current_velocity_q =
+        (int32_t)(700U * NAVMIN_VELOCITY_SCALE);
+    control->motion.x.target_velocity_q =
+        (int32_t)(800U * NAVMIN_VELOCITY_SCALE);
+    control->motion.x.step_phase_q = 12345;
+    control->motion.x.commanded_position_steps = 321;
+
+    control->motion.y.current_velocity_q =
+        -(int32_t)(500U * NAVMIN_VELOCITY_SCALE);
+    control->motion.y.target_velocity_q =
+        -(int32_t)(600U * NAVMIN_VELOCITY_SCALE);
+    control->motion.y.step_phase_q = -23456;
+    control->motion.y.commanded_position_steps = -654;
+}
+
+static void observe_hard_stop_boundary(
+    driver_sink_t *sink,
+    navmin_control_t *control
+)
+{
+    ASSERT_EQ_U32(0U, sink->critical_depth);
+    sink->critical_enter_count = 0U;
+    sink->critical_exit_count = 0U;
+    sink->max_critical_depth = 0U;
+    sink->observed_control = control;
+    sink->observe_hard_stop = true;
+    sink->hard_stop_active_at_enter = false;
+    sink->hard_stop_cleared_at_exit = false;
+    sink->drivers_enabled_at_hard_stop_exit = false;
+    sink->expected_x_position = control->motion.x.commanded_position_steps;
+    sink->expected_y_position = control->motion.y.commanded_position_steps;
+}
+
+static void assert_hard_stop_boundary_observed(const driver_sink_t *sink)
+{
+    ASSERT_TRUE(sink->hard_stop_active_at_enter);
+    ASSERT_TRUE(sink->hard_stop_cleared_at_exit);
+    ASSERT_TRUE(sink->drivers_enabled_at_hard_stop_exit);
+    ASSERT_EQ_U32(1U, sink->critical_enter_count);
+    ASSERT_EQ_U32(1U, sink->critical_exit_count);
+    ASSERT_EQ_U32(0U, sink->critical_depth);
+    ASSERT_EQ_U32(1U, sink->max_critical_depth);
 }
 
 static void assert_motion_cleared(const navmin_control_t *control)
 {
     ASSERT_TRUE(!control->velocity_target_present);
     ASSERT_TRUE(!control->relative_target_present);
+}
+
+static void assert_numeric_motion_hard_stopped(
+    const navmin_control_t *control,
+    int64_t expected_x_position,
+    int64_t expected_y_position
+)
+{
+    ASSERT_EQ_U32(0U, control->motion.x.current_velocity_q);
+    ASSERT_EQ_U32(0U, control->motion.x.target_velocity_q);
+    ASSERT_EQ_U32(0U, control->motion.x.step_phase_q);
+    ASSERT_EQ_U32(0U, control->motion.y.current_velocity_q);
+    ASSERT_EQ_U32(0U, control->motion.y.target_velocity_q);
+    ASSERT_EQ_U32(0U, control->motion.y.step_phase_q);
+    ASSERT_TRUE(control->motion.x.commanded_position_steps == expected_x_position);
+    ASSERT_TRUE(control->motion.y.commanded_position_steps == expected_y_position);
 }
 
 static size_t build_request(
@@ -239,6 +394,15 @@ static void test_boot_is_unconfigured_and_motors_off(void)
     ASSERT_TRUE(!sink.enabled);
     ASSERT_EQ_U32(1U, sink.disable_count);
     assert_motion_cleared(&control);
+    ASSERT_TRUE(!control.motion.limits_valid);
+    ASSERT_EQ_U32(0U, control.motion.x.current_velocity_q);
+    ASSERT_EQ_U32(0U, control.motion.x.target_velocity_q);
+    ASSERT_EQ_U32(0U, control.motion.x.step_phase_q);
+    ASSERT_TRUE(control.motion.x.commanded_position_steps == 0);
+    ASSERT_EQ_U32(0U, control.motion.y.current_velocity_q);
+    ASSERT_EQ_U32(0U, control.motion.y.target_velocity_q);
+    ASSERT_EQ_U32(0U, control.motion.y.step_phase_q);
+    ASSERT_TRUE(control.motion.y.commanded_position_steps == 0);
 }
 
 static void test_set_config_decodes_exact_little_endian_values(void)
@@ -256,6 +420,11 @@ static void test_set_config_decodes_exact_little_endian_values(void)
     ASSERT_EQ_U32(0x5678U, control.config.acceleration_x_steps_s2);
     ASSERT_EQ_U32(0x9ABCU, control.config.acceleration_y_steps_s2);
     ASSERT_EQ_U32(0x0FEDU, control.config.velocity_watchdog_timeout_ms);
+    ASSERT_TRUE(control.motion.limits_valid);
+    ASSERT_EQ_U32(0x1234U, control.motion.limits.max_speed_x_steps_s);
+    ASSERT_EQ_U32(0x2345U, control.motion.limits.max_speed_y_steps_s);
+    ASSERT_EQ_U32(0x5678U, control.motion.limits.acceleration_x_steps_s2);
+    ASSERT_EQ_U32(0x9ABCU, control.motion.limits.acceleration_y_steps_s2);
 }
 
 static void test_set_config_rejects_each_zero_field(void)
@@ -334,16 +503,38 @@ static void test_invalid_config_keeps_previous_snapshot_and_valid_replaces_all(v
     driver_sink_t sink;
     navmin_control_t control = make_control(&sink);
     navmin_control_config_t original;
+    navmin_motion_limits_t original_limits;
+    navmin_motion_axis_state_t original_x;
+    navmin_motion_axis_state_t original_y;
+    unsigned critical_enters_before_invalid;
 
     ASSERT_EQ_U32(
         NAVMIN_RESULT_OK,
         apply_config(&control, 1000U, 2000U, 3000U, 4000U, 500U));
+    navmin_motion_set_velocity_target(&control.motion, 900, -800);
+    control.motion.x.current_velocity_q =
+        (int32_t)(700U * NAVMIN_VELOCITY_SCALE);
+    control.motion.y.current_velocity_q =
+        -(int32_t)(600U * NAVMIN_VELOCITY_SCALE);
+    control.motion.x.step_phase_q = 123;
+    control.motion.y.step_phase_q = -456;
+
     original = control.config;
+    original_limits = control.motion.limits;
+    original_x = control.motion.x;
+    original_y = control.motion.y;
+    critical_enters_before_invalid = sink.critical_enter_count;
 
     ASSERT_EQ_U32(
         NAVMIN_RESULT_INVALID_ARGUMENT,
         apply_config(&control, 0U, 2222U, 3333U, 4444U, 555U));
     ASSERT_TRUE(memcmp(&control.config, &original, sizeof(original)) == 0);
+    ASSERT_TRUE(
+        memcmp(&control.motion.limits, &original_limits, sizeof(original_limits)) == 0);
+    ASSERT_TRUE(memcmp(&control.motion.x, &original_x, sizeof(original_x)) == 0);
+    ASSERT_TRUE(memcmp(&control.motion.y, &original_y, sizeof(original_y)) == 0);
+    ASSERT_TRUE(control.configured);
+    ASSERT_EQ_U32(critical_enters_before_invalid, sink.critical_enter_count);
 
     ASSERT_EQ_U32(
         NAVMIN_RESULT_OK,
@@ -353,6 +544,136 @@ static void test_invalid_config_keeps_previous_snapshot_and_valid_replaces_all(v
     ASSERT_EQ_U32(3333U, control.config.acceleration_x_steps_s2);
     ASSERT_EQ_U32(4444U, control.config.acceleration_y_steps_s2);
     ASSERT_EQ_U32(555U, control.config.velocity_watchdog_timeout_ms);
+    ASSERT_EQ_U32(1111U, control.motion.limits.max_speed_x_steps_s);
+    ASSERT_EQ_U32(2222U, control.motion.limits.max_speed_y_steps_s);
+    ASSERT_EQ_U32(3333U, control.motion.limits.acceleration_x_steps_s2);
+    ASSERT_EQ_U32(4444U, control.motion.limits.acceleration_y_steps_s2);
+}
+
+static void test_set_config_uses_one_critical_replacement_boundary(void)
+{
+    driver_sink_t sink;
+    navmin_control_t control = make_control(&sink);
+
+    ASSERT_EQ_U32(0U, sink.critical_enter_count);
+    ASSERT_EQ_U32(0U, sink.critical_exit_count);
+
+    ASSERT_EQ_U32(
+        NAVMIN_RESULT_OK,
+        apply_config(&control, 1234U, 2345U, 3456U, 4567U, 500U));
+
+    ASSERT_EQ_U32(1U, sink.critical_enter_count);
+    ASSERT_EQ_U32(1U, sink.critical_exit_count);
+    ASSERT_EQ_U32(0U, sink.critical_depth);
+    ASSERT_EQ_U32(1U, sink.max_critical_depth);
+    ASSERT_EQ_U32(
+        control.config.max_speed_x_steps_s,
+        control.motion.limits.max_speed_x_steps_s);
+    ASSERT_EQ_U32(
+        control.config.max_speed_y_steps_s,
+        control.motion.limits.max_speed_y_steps_s);
+    ASSERT_EQ_U32(
+        control.config.acceleration_x_steps_s2,
+        control.motion.limits.acceleration_x_steps_s2);
+    ASSERT_EQ_U32(
+        control.config.acceleration_y_steps_s2,
+        control.motion.limits.acceleration_y_steps_s2);
+}
+
+static void test_runtime_max_speed_decrease_and_increase_wire_motion_limits(void)
+{
+    driver_sink_t sink;
+    navmin_control_t control = make_control(&sink);
+    int32_t current_before;
+
+    ASSERT_EQ_U32(
+        NAVMIN_RESULT_OK,
+        apply_config(&control, 8000U, 8000U, 50000U, 50000U, 200U));
+
+    navmin_motion_set_velocity_target(&control.motion, 7000, 0);
+    control.motion.x.current_velocity_q =
+        (int32_t)(7000U * NAVMIN_VELOCITY_SCALE);
+    current_before = control.motion.x.current_velocity_q;
+
+    ASSERT_EQ_U32(
+        NAVMIN_RESULT_OK,
+        apply_config(&control, 5000U, 8000U, 50000U, 50000U, 200U));
+
+    ASSERT_EQ_U32((uint32_t)current_before, control.motion.x.current_velocity_q);
+    ASSERT_EQ_U32(
+        5000U * NAVMIN_VELOCITY_SCALE,
+        control.motion.x.target_velocity_q);
+    ASSERT_EQ_U32(5000U, control.config.max_speed_x_steps_s);
+    ASSERT_EQ_U32(5000U, control.motion.limits.max_speed_x_steps_s);
+
+    ASSERT_EQ_U32(
+        NAVMIN_RESULT_OK,
+        apply_config(&control, 9000U, 8000U, 50000U, 50000U, 200U));
+
+    ASSERT_EQ_U32((uint32_t)current_before, control.motion.x.current_velocity_q);
+    ASSERT_EQ_U32(
+        5000U * NAVMIN_VELOCITY_SCALE,
+        control.motion.x.target_velocity_q);
+    ASSERT_EQ_U32(9000U, control.motion.limits.max_speed_x_steps_s);
+}
+
+static void test_runtime_acceleration_change_applies_on_next_motion_tick(void)
+{
+    driver_sink_t sink;
+    navmin_control_t control = make_control(&sink);
+    int32_t current_before;
+
+    ASSERT_EQ_U32(
+        NAVMIN_RESULT_OK,
+        apply_config(&control, 8000U, 8000U, 50000U, 50000U, 200U));
+
+    navmin_motion_set_velocity_target(&control.motion, 1000, 0);
+    control.motion.x.current_velocity_q =
+        (int32_t)(100U * NAVMIN_VELOCITY_SCALE);
+    current_before = control.motion.x.current_velocity_q;
+
+    ASSERT_EQ_U32(
+        NAVMIN_RESULT_OK,
+        apply_config(&control, 8000U, 8000U, 100000U, 50000U, 200U));
+
+    ASSERT_EQ_U32((uint32_t)current_before, control.motion.x.current_velocity_q);
+    ASSERT_EQ_U32(100000U, control.motion.limits.acceleration_x_steps_s2);
+
+    navmin_motion_control_tick(&control.motion);
+    ASSERT_EQ_U32(
+        (uint32_t)(current_before + 100000),
+        control.motion.x.current_velocity_q);
+}
+
+static void test_control_owned_motion_routes_step_to_hardware_boundary(void)
+{
+    driver_sink_t sink;
+    navmin_control_t control = make_control(&sink);
+
+    ASSERT_EQ_U32(
+        NAVMIN_RESULT_OK,
+        apply_config(
+            &control,
+            NAVMIN_MAX_SUPPORTED_STEP_RATE,
+            NAVMIN_MAX_SUPPORTED_STEP_RATE,
+            NAVMIN_MAX_SUPPORTED_ACCELERATION,
+            NAVMIN_MAX_SUPPORTED_ACCELERATION,
+            200U));
+
+    navmin_motion_set_velocity_target(
+        &control.motion,
+        (int32_t)NAVMIN_MAX_SUPPORTED_STEP_RATE,
+        0);
+    control.motion.x.current_velocity_q =
+        (int32_t)(NAVMIN_MAX_SUPPORTED_STEP_RATE * NAVMIN_VELOCITY_SCALE);
+
+    navmin_motion_control_tick(&control.motion);
+    navmin_motion_control_tick(&control.motion);
+
+    ASSERT_EQ_U32(1U, sink.step_count);
+    ASSERT_EQ_U32(1U, sink.positive_step_count);
+    ASSERT_EQ_U32(0U, sink.negative_step_count);
+    ASSERT_TRUE(control.motion.x.commanded_position_steps == 1);
 }
 
 static void test_set_config_is_allowed_while_motors_on(void)
@@ -449,17 +770,49 @@ static void test_motor_off_while_on_hard_stops_and_disables(void)
         navmin_control_execute_command(
             &control, NAVMIN_COMMAND_MOTOR_ON, NULL, 0U));
     seed_motion_state(&control);
+    observe_hard_stop_boundary(&sink, &control);
 
     ASSERT_EQ_U32(
         NAVMIN_RESULT_OK,
         navmin_control_execute_command(
             &control, NAVMIN_COMMAND_MOTOR_OFF, NULL, 0U));
 
+    assert_hard_stop_boundary_observed(&sink);
     ASSERT_TRUE(!control.motors_on);
     ASSERT_TRUE(!sink.enabled);
     ASSERT_EQ_U32(1U, sink.enable_count);
     ASSERT_EQ_U32(2U, sink.disable_count);
     assert_motion_cleared(&control);
+    assert_numeric_motion_hard_stopped(&control, 321, -654);
+}
+
+static void test_motor_off_then_motor_on_does_not_restore_numeric_motion(void)
+{
+    driver_sink_t sink;
+    navmin_control_t control = make_control(&sink);
+
+    ASSERT_EQ_U32(
+        NAVMIN_RESULT_OK,
+        apply_config(&control, 1000U, 1000U, 5000U, 5000U, 200U));
+    ASSERT_EQ_U32(
+        NAVMIN_RESULT_OK,
+        navmin_control_execute_command(
+            &control, NAVMIN_COMMAND_MOTOR_ON, NULL, 0U));
+
+    seed_motion_state(&control);
+    ASSERT_EQ_U32(
+        NAVMIN_RESULT_OK,
+        navmin_control_execute_command(
+            &control, NAVMIN_COMMAND_MOTOR_OFF, NULL, 0U));
+    ASSERT_EQ_U32(
+        NAVMIN_RESULT_OK,
+        navmin_control_execute_command(
+            &control, NAVMIN_COMMAND_MOTOR_ON, NULL, 0U));
+
+    ASSERT_TRUE(control.motors_on);
+    ASSERT_TRUE(sink.enabled);
+    assert_motion_cleared(&control);
+    assert_numeric_motion_hard_stopped(&control, 321, -654);
 }
 
 static void test_emergency_while_on_hard_stops_without_disabling_drivers(void)
@@ -476,11 +829,14 @@ static void test_emergency_while_on_hard_stops_without_disabling_drivers(void)
         navmin_control_execute_command(
             &control, NAVMIN_COMMAND_MOTOR_ON, NULL, 0U));
     seed_motion_state(&control);
+    observe_hard_stop_boundary(&sink, &control);
     calls_before = sink.call_count;
 
     navmin_control_emergency_stop(&control);
 
+    assert_hard_stop_boundary_observed(&sink);
     assert_motion_cleared(&control);
+    assert_numeric_motion_hard_stopped(&control, 321, -654);
     ASSERT_TRUE(control.motors_on);
     ASSERT_TRUE(sink.enabled);
     ASSERT_EQ_U32(calls_before, sink.call_count);
@@ -495,6 +851,7 @@ static void test_emergency_before_config_while_off_is_repeatable_without_latch(v
     seed_motion_state(&control);
     navmin_control_emergency_stop(&control);
     assert_motion_cleared(&control);
+    assert_numeric_motion_hard_stopped(&control, 321, -654);
     ASSERT_TRUE(!control.configured);
     ASSERT_TRUE(!control.motors_on);
     ASSERT_EQ_U32(calls_after_init, sink.call_count);
@@ -502,6 +859,7 @@ static void test_emergency_before_config_while_off_is_repeatable_without_latch(v
     seed_motion_state(&control);
     navmin_control_emergency_stop(&control);
     assert_motion_cleared(&control);
+    assert_numeric_motion_hard_stopped(&control, 321, -654);
     ASSERT_EQ_U32(calls_after_init, sink.call_count);
 
     ASSERT_EQ_U32(
@@ -574,6 +932,7 @@ static void test_protocol_integration_set_config_motor_on_motor_off(void)
     ASSERT_TRUE(control.motors_on);
     ASSERT_TRUE(sink.enabled);
     assert_motion_cleared(&control);
+    assert_numeric_motion_hard_stopped(&control, 321, -654);
 
     seed_motion_state(&control);
     length = build_request(request, 3U, NAVMIN_COMMAND_MOTOR_OFF, NULL, 0U);
@@ -582,6 +941,7 @@ static void test_protocol_integration_set_config_motor_on_motor_off(void)
     ASSERT_TRUE(!control.motors_on);
     ASSERT_TRUE(!sink.enabled);
     assert_motion_cleared(&control);
+    assert_numeric_motion_hard_stopped(&control, 321, -654);
 }
 
 static void test_protocol_exact_retries_do_not_repeat_control_side_effects(void)
@@ -615,6 +975,8 @@ static void test_protocol_exact_retries_do_not_repeat_control_side_effects(void)
     feed_frame(&protocol, &log, request, length, &now);
     feed_frame(&protocol, &log, request, length, &now);
     ASSERT_EQ_U32(1U, probe.execute_count);
+    ASSERT_EQ_U32(1U, sink.critical_enter_count);
+    ASSERT_EQ_U32(1U, sink.critical_exit_count);
     ASSERT_TRUE(memcmp(log.bytes[0], log.bytes[1], NAVMIN_MIN_RESPONSE_LENGTH) == 0);
 
     length = build_request(request, 1U, NAVMIN_COMMAND_MOTOR_ON, NULL, 0U);
@@ -633,16 +995,21 @@ int main(void)
     test_set_config_accepts_all_firmware_bounds();
     test_set_config_rejects_each_bound_plus_one();
     test_invalid_config_keeps_previous_snapshot_and_valid_replaces_all();
+    test_set_config_uses_one_critical_replacement_boundary();
+    test_runtime_max_speed_decrease_and_increase_wire_motion_limits();
+    test_runtime_acceleration_change_applies_on_next_motion_tick();
+    test_control_owned_motion_routes_step_to_hardware_boundary();
     test_set_config_is_allowed_while_motors_on();
     test_motor_on_requires_config_then_is_idempotent();
     test_motor_off_before_config_and_while_off_is_idempotent();
     test_motor_off_while_on_hard_stops_and_disables();
+    test_motor_off_then_motor_on_does_not_restore_numeric_motion();
     test_emergency_while_on_hard_stops_without_disabling_drivers();
     test_emergency_before_config_while_off_is_repeatable_without_latch();
     test_unimplemented_motion_and_baud_commands_do_not_fake_success();
     test_protocol_integration_set_config_motor_on_motor_off();
     test_protocol_exact_retries_do_not_repeat_control_side_effects();
 
-    puts("navmin firmware control host tests: PASS (15 cases)");
+    puts("navmin firmware control host tests: PASS (20 cases)");
     return EXIT_SUCCESS;
 }
