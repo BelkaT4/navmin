@@ -134,6 +134,56 @@ If the armed watchdog has expired (`elapsed >= velocity_watchdog_timeout_ms`), o
 
 Dynamic `SET_CONFIG` does not alter the saved setpoint timestamp or watchdog armed state. A timeout decrease can therefore make the existing watchdog age expire on the next control tick; a timeout increase preserves the same age. Max-speed and acceleration changes keep the previously accepted Stage 4B2b1 semantics. `MOTOR_OFF` and Emergency disarm the watchdog inside their existing atomic hard-stop boundary, while `MOTOR_ON` does not re-arm it.
 
+### Stage 4B3 — MOVE_RELATIVE / relative planner
+
+`MOVE_RELATIVE` decodes two little-endian signed `int32_t` deltas and applies the fixed firmware sanity bounds:
+
+```text
+NAVMIN_MAX_RELATIVE_DELTA_X_STEPS = 100,000
+NAVMIN_MAX_RELATIVE_DELTA_Y_STEPS = 100,000
+```
+
+The bounds protect the firmware from anomalous payloads; they are not mechanical absolute limits and do not replace the PC-side `max-relative-move-deg` check. Magnitude checks promote to `int64_t`, so `INT32_MIN` is rejected without signed overflow.
+
+A relative target is stored as signed `int64_t` commanded-position coordinates. Acceptance computes each target from the actual commanded position at that moment:
+
+```text
+relative_target_x = motion.x.commanded_position_steps + delta_x
+relative_target_y = motion.y.commanded_position_steps + delta_y
+```
+
+The additions are checked before publication; an unrepresentable `int64_t` target returns `INTERNAL_ERROR` without partial state mutation. Successful acceptance is one existing critical-section publication: the new X/Y targets become active, velocity-control intent is cleared, and the velocity watchdog is disarmed. Current velocity, STEP phase and commanded position are deliberately preserved, so replacement while moving is continuous rather than a hidden hard stop.
+
+The relative planner runs independently per axis from `navmin_control_tick()`. It never emits STEP directly and never writes commanded position. Instead it chooses only a desired velocity target for the accepted `navmin_motion` primitive:
+
+```text
+direction to relative target
++ current velocity / STEP phase
++ current max-speed and acceleration limits
+→ desired velocity {-max_speed, 0, +max_speed}
+→ navmin_motion acceleration limiter
+→ navmin_motion STEP scheduler
+```
+
+Braking uses bounded integer look-ahead. For the current velocity direction, the planner computes the exact future fixed-point phase accumulated if the motion target is changed to zero immediately. The sum is an arithmetic progression of future decelerating velocities, so no distance-dependent loop or floating point is needed. Dividing current directed phase plus that future phase by the STEP phase threshold gives the number of whole STEP requests still unavoidable under immediate braking. If that count is at least the remaining target distance, the planner requests velocity zero; otherwise it requests the current configured max speed toward the target. The real velocity transition remains exclusively in `navmin_motion`.
+
+With the accepted Stage 4B2a bounds, the largest velocity magnitude is 200,000,000 velocity-q units. Even with the minimum valid acceleration of 1 step/s², the arithmetic-progression intermediate is below about `2e16`, safely inside `uint64_t`/`int64_t`. Position-distance math uses unsigned difference so opposite-sign `int64_t` positions do not cause signed subtraction overflow.
+
+A replacement `MOVE_RELATIVE` always rebases on the current commanded position, not the previous target. If the new target is behind current motion, the existing acceleration limiter brakes through exact zero before opposite acceleration; unavoidable transient overshoot is permitted and the planner then converges back to the target. `MOVE_RELATIVE(0,0)` is still a new relative target at the current position and does not hard-stop existing motion.
+
+Relative motion has no communication watchdog. A successful `MOVE_RELATIVE` disarms the velocity watchdog; subsequent control ticks ignore stale velocity timeout state while the relative target owns motion. A later successful `SET_VELOCITY` clears the relative target and re-arms the velocity watchdog. Dynamic `SET_CONFIG` does not snapshot a profile: each relative control update uses the current motion max-speed and acceleration limits, so speed/acceleration changes apply to the active move without changing its position target.
+
+Natural completion is internal only. The relative intent clears after both axes simultaneously satisfy:
+
+```text
+commanded_position_steps == relative target
+current_velocity_q == 0
+target_velocity_q == 0
+step_phase_q == 0
+```
+
+No response/event is emitted at that point. The only wire response was the original `MOVE_RELATIVE → OK` acceptance response. Exact protocol retry is still intercepted before the executor, so retrying the same raw transaction never rebases the target from a later commanded position.
+
 ## Stage 4B1 firmware sanity bounds
 
 These are compile-time implementation-protection limits, not mechanical absolute limits and not `config.json` defaults:
@@ -150,7 +200,7 @@ Rationale:
 - The legacy acceleration ceiling was 50,000 steps/s². `100,000 steps/s²` remains small relative to 32-bit arithmetic. With the Stage 4B2a 20 kHz fixed-point representation it contributes exactly 100,000 velocity-q units per tick, i.e. 5 steps/s of commanded-velocity change per tick.
 - `60,000 ms` is far above the expected operational watchdog range (hundreds of milliseconds) while providing a clear bounded sanity ceiling and remaining trivial for future wrap-safe `uint32_t` elapsed-time arithmetic.
 
-Relative-delta firmware bounds are intentionally not defined in 4B1. They belong to 4B3 together with the actual relative planner/integration representation.
+Stage 4B3 adds separate static relative-delta sanity bounds of ±100,000 steps per axis. They are implementation protection only and remain distinct from PC-side mechanical `max-relative-move-deg`.
 
 ## Current layout
 
@@ -185,7 +235,7 @@ From the project root:
 make -C firmware/stm32 host-test
 ```
 
-This builds and executes the Stage 4A protocol tests, Stage 4B1 control tests, and Stage 4B2a motion tests.
+This builds and executes the Stage 4A protocol tests, the cumulative Stage 4B control/integration tests (including velocity/watchdog and relative planner behavior), and the standalone Stage 4B2a motion primitive tests.
 
 To remove generated host binaries:
 
@@ -215,12 +265,6 @@ The driver-enable callback is logical (`true` = drivers enabled); active-low GPI
 The legacy project used a 72 MHz HSE→PLL clock setup, TIM2 prescaler 71 / period 49, a historical 8,000 steps/s max-velocity bound, and 50,000 steps/s² max acceleration. These values are evidence only. No legacy serial parser, command set, application state machine, completion/status protocol, or limit-switch semantics are copied.
 
 ## Explicitly deferred
-
-### Stage 4B3
-
-- relative target representation/integration;
-- relative sanity bounds;
-- relative planner, braking, target completion and reversal behaviour.
 
 ### Stage 4C
 

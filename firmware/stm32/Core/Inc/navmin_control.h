@@ -11,11 +11,13 @@
 extern "C" {
 #endif
 
-/* Stage 4B1 firmware sanity bounds. These are implementation protection
-   limits, not mechanical absolute limits or user configuration defaults. */
+/* Firmware sanity bounds. These are implementation protection limits, not
+   mechanical absolute limits or user configuration defaults. */
 #define NAVMIN_MAX_SUPPORTED_STEP_RATE UINT32_C(10000)
 #define NAVMIN_MAX_SUPPORTED_ACCELERATION UINT32_C(100000)
 #define NAVMIN_MAX_SUPPORTED_WATCHDOG_TIMEOUT_MS UINT32_C(60000)
+#define NAVMIN_MAX_RELATIVE_DELTA_X_STEPS INT32_C(100000)
+#define NAVMIN_MAX_RELATIVE_DELTA_Y_STEPS INT32_C(100000)
 
 typedef struct {
     uint32_t max_speed_x_steps_s;
@@ -47,6 +49,8 @@ typedef struct {
        belongs only to motion and is cleared through the common hard stop. */
     bool velocity_target_present;
     bool relative_target_present;
+    int64_t relative_target_x_steps;
+    int64_t relative_target_y_steps;
 
     bool velocity_watchdog_armed;
     uint32_t last_velocity_setpoint_ms;

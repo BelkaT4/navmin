@@ -36,6 +36,17 @@
     } \
 } while (0)
 
+#define ASSERT_EQ_I64(expected, actual) do { \
+    int64_t expected_value_ = (int64_t)(expected); \
+    int64_t actual_value_ = (int64_t)(actual); \
+    if (expected_value_ != actual_value_) { \
+        fprintf(stderr, "%s:%d: expected %lld, got %lld\n", \
+                __FILE__, __LINE__, \
+                (long long)expected_value_, (long long)actual_value_); \
+        exit(EXIT_FAILURE); \
+    } \
+} while (0)
+
 typedef struct {
     bool enabled;
     unsigned call_count;
@@ -44,6 +55,10 @@ typedef struct {
     unsigned step_count;
     unsigned positive_step_count;
     unsigned negative_step_count;
+    unsigned x_positive_step_count;
+    unsigned x_negative_step_count;
+    unsigned y_positive_step_count;
+    unsigned y_negative_step_count;
     unsigned critical_enter_count;
     unsigned critical_exit_count;
     unsigned critical_depth;
@@ -103,12 +118,21 @@ static void emit_step(
 {
     driver_sink_t *sink = context;
 
-    (void)axis;
     ++sink->step_count;
     if (direction == NAVMIN_STEP_DIRECTION_POSITIVE) {
         ++sink->positive_step_count;
+        if (axis == NAVMIN_MOTION_AXIS_X) {
+            ++sink->x_positive_step_count;
+        } else {
+            ++sink->y_positive_step_count;
+        }
     } else {
         ++sink->negative_step_count;
+        if (axis == NAVMIN_MOTION_AXIS_X) {
+            ++sink->x_negative_step_count;
+        } else {
+            ++sink->y_negative_step_count;
+        }
     }
 }
 
@@ -215,6 +239,16 @@ static void build_velocity_payload(
     write_u32_le(&payload[4], (uint32_t)velocity_y_steps_s);
 }
 
+static void build_relative_payload(
+    uint8_t payload[8],
+    int32_t delta_x_steps,
+    int32_t delta_y_steps
+)
+{
+    write_u32_le(&payload[0], (uint32_t)delta_x_steps);
+    write_u32_le(&payload[4], (uint32_t)delta_y_steps);
+}
+
 static navmin_result_code_t set_velocity_direct(
     navmin_control_t *control,
     int32_t velocity_x_steps_s,
@@ -231,6 +265,23 @@ static navmin_result_code_t set_velocity_direct(
         payload,
         (uint8_t)sizeof(payload),
         now_ms);
+}
+
+static navmin_result_code_t move_relative_direct(
+    navmin_control_t *control,
+    int32_t delta_x_steps,
+    int32_t delta_y_steps
+)
+{
+    uint8_t payload[8];
+
+    build_relative_payload(payload, delta_x_steps, delta_y_steps);
+    return navmin_control_execute_command(
+        control,
+        NAVMIN_COMMAND_MOVE_RELATIVE,
+        payload,
+        (uint8_t)sizeof(payload),
+        0U);
 }
 
 static navmin_result_code_t apply_config(
@@ -279,6 +330,36 @@ static void configure_and_motor_on(
         NAVMIN_RESULT_OK,
         navmin_control_execute_command(
             control, NAVMIN_COMMAND_MOTOR_ON, NULL, 0U, 0U));
+}
+
+static unsigned run_until_relative_settled(
+    navmin_control_t *control,
+    unsigned max_ticks
+)
+{
+    unsigned tick;
+
+    for (tick = 0U; tick < max_ticks; ++tick) {
+        navmin_control_tick(control, 0U);
+        if (!control->relative_target_present) {
+            return tick + 1U;
+        }
+    }
+
+    fprintf(stderr, "%s:%d: relative planner did not settle in %u ticks\n",
+            __FILE__, __LINE__, max_ticks);
+    exit(EXIT_FAILURE);
+}
+
+static void assert_relative_axis_settled(
+    const navmin_motion_axis_state_t *axis,
+    int64_t expected_position
+)
+{
+    ASSERT_EQ_I64(expected_position, axis->commanded_position_steps);
+    ASSERT_EQ_I32(0, axis->current_velocity_q);
+    ASSERT_EQ_I32(0, axis->target_velocity_q);
+    ASSERT_EQ_I32(0, axis->step_phase_q);
 }
 
 static void seed_motion_state(navmin_control_t *control)
@@ -1257,16 +1338,414 @@ static void test_protocol_set_velocity_retry_timestamp_and_fresh_request(void)
     ASSERT_EQ_U32(1000U, control.last_velocity_setpoint_ms);
 }
 
-static void test_deferred_relative_and_baud_commands_do_not_fake_success(void)
+
+static void test_move_relative_validation_bounds_and_safe_target_addition(void)
 {
     driver_sink_t sink;
     navmin_control_t control = make_control(&sink);
-    uint8_t payload[8] = {0};
+    uint8_t payload[8];
+    int64_t accepted_target_x;
+    int64_t accepted_target_y;
+    int32_t invalid_values[] = {
+        INT32_C(100001),
+        -INT32_C(100001),
+        INT32_MAX,
+        INT32_MIN,
+    };
+    size_t i;
+
+    build_relative_payload(payload, 1, 2);
+    ASSERT_EQ_U32(
+        NAVMIN_RESULT_PARSE_ERROR,
+        navmin_control_execute_command(
+            &control, NAVMIN_COMMAND_MOVE_RELATIVE, payload, 7U, 0U));
+
+    /* Argument validation precedes config/motor state validation. */
+    ASSERT_EQ_U32(
+        NAVMIN_RESULT_INVALID_ARGUMENT,
+        move_relative_direct(&control, INT32_C(100001), 0));
+    ASSERT_EQ_U32(
+        NAVMIN_RESULT_NOT_CONFIGURED,
+        move_relative_direct(&control, 1, 0));
 
     ASSERT_EQ_U32(
-        NAVMIN_RESULT_INTERNAL_ERROR,
+        NAVMIN_RESULT_OK,
+        apply_config(&control, 1000U, 1000U, 50000U, 50000U, 500U));
+    ASSERT_EQ_U32(
+        NAVMIN_RESULT_MOTORS_OFF,
+        move_relative_direct(&control, 1, 0));
+    ASSERT_EQ_U32(
+        NAVMIN_RESULT_OK,
         navmin_control_execute_command(
-            &control, NAVMIN_COMMAND_MOVE_RELATIVE, payload, 8U, 0U));
+            &control, NAVMIN_COMMAND_MOTOR_ON, NULL, 0U, 0U));
+
+    control.motion.x.commanded_position_steps = INT64_C(123);
+    control.motion.y.commanded_position_steps = -INT64_C(456);
+    ASSERT_EQ_U32(
+        NAVMIN_RESULT_OK,
+        move_relative_direct(
+            &control,
+            NAVMIN_MAX_RELATIVE_DELTA_X_STEPS,
+            -NAVMIN_MAX_RELATIVE_DELTA_Y_STEPS));
+    ASSERT_EQ_I64(INT64_C(100123), control.relative_target_x_steps);
+    ASSERT_EQ_I64(-INT64_C(100456), control.relative_target_y_steps);
+    ASSERT_TRUE(control.relative_target_present);
+    ASSERT_TRUE(!control.velocity_target_present);
+    ASSERT_TRUE(!control.velocity_watchdog_armed);
+    accepted_target_x = control.relative_target_x_steps;
+    accepted_target_y = control.relative_target_y_steps;
+
+    ASSERT_EQ_U32(
+        NAVMIN_RESULT_OK,
+        move_relative_direct(
+            &control,
+            -NAVMIN_MAX_RELATIVE_DELTA_X_STEPS,
+            NAVMIN_MAX_RELATIVE_DELTA_Y_STEPS));
+    ASSERT_EQ_I64(-INT64_C(99877), control.relative_target_x_steps);
+    ASSERT_EQ_I64(INT64_C(99544), control.relative_target_y_steps);
+    accepted_target_x = control.relative_target_x_steps;
+    accepted_target_y = control.relative_target_y_steps;
+
+    for (i = 0U; i < sizeof(invalid_values) / sizeof(invalid_values[0]); ++i) {
+        ASSERT_EQ_U32(
+            NAVMIN_RESULT_INVALID_ARGUMENT,
+            move_relative_direct(&control, invalid_values[i], 0));
+        ASSERT_EQ_U32(
+            NAVMIN_RESULT_INVALID_ARGUMENT,
+            move_relative_direct(&control, 0, invalid_values[i]));
+        ASSERT_EQ_I64(accepted_target_x, control.relative_target_x_steps);
+        ASSERT_EQ_I64(accepted_target_y, control.relative_target_y_steps);
+    }
+
+    control.motion.x.commanded_position_steps = INT64_MAX - INT64_C(50);
+    ASSERT_EQ_U32(
+        NAVMIN_RESULT_INTERNAL_ERROR,
+        move_relative_direct(&control, 100, 0));
+    ASSERT_EQ_I64(accepted_target_x, control.relative_target_x_steps);
+    ASSERT_EQ_I64(accepted_target_y, control.relative_target_y_steps);
+
+    control.motion.x.commanded_position_steps = INT64_MIN + INT64_C(50);
+    ASSERT_EQ_U32(
+        NAVMIN_RESULT_INTERNAL_ERROR,
+        move_relative_direct(&control, -100, 0));
+    ASSERT_EQ_I64(accepted_target_x, control.relative_target_x_steps);
+    ASSERT_EQ_I64(accepted_target_y, control.relative_target_y_steps);
+}
+
+static void test_relative_planner_exact_axes_short_and_zero_moves(void)
+{
+    driver_sink_t sink;
+    navmin_control_t control = make_control(&sink);
+    unsigned x_negative_before;
+    unsigned y_positive_before;
+    unsigned steps_before;
+
+    configure_and_motor_on(&control, 1000U, 50000U, 500U);
+
+    ASSERT_EQ_U32(NAVMIN_RESULT_OK, move_relative_direct(&control, 25, -17));
+    navmin_control_tick(&control, 0U);
+    ASSERT_EQ_I32(INT32_C(50000), control.motion.x.current_velocity_q);
+    ASSERT_EQ_I32(-INT32_C(50000), control.motion.y.current_velocity_q);
+    ASSERT_EQ_I32(
+        (int32_t)(1000U * NAVMIN_VELOCITY_SCALE),
+        control.motion.x.target_velocity_q);
+    ASSERT_EQ_I32(
+        -(int32_t)(1000U * NAVMIN_VELOCITY_SCALE),
+        control.motion.y.target_velocity_q);
+    run_until_relative_settled(&control, 200000U);
+    assert_relative_axis_settled(&control.motion.x, 25);
+    assert_relative_axis_settled(&control.motion.y, -17);
+    ASSERT_EQ_U32(25U, sink.x_positive_step_count);
+    ASSERT_EQ_U32(0U, sink.x_negative_step_count);
+    ASSERT_EQ_U32(17U, sink.y_negative_step_count);
+    ASSERT_EQ_U32(0U, sink.y_positive_step_count);
+
+    x_negative_before = sink.x_negative_step_count;
+    y_positive_before = sink.y_positive_step_count;
+    ASSERT_EQ_U32(NAVMIN_RESULT_OK, move_relative_direct(&control, -12, 9));
+    run_until_relative_settled(&control, 200000U);
+    assert_relative_axis_settled(&control.motion.x, 13);
+    assert_relative_axis_settled(&control.motion.y, -8);
+    ASSERT_EQ_U32(x_negative_before + 12U, sink.x_negative_step_count);
+    ASSERT_EQ_U32(y_positive_before + 9U, sink.y_positive_step_count);
+
+    steps_before = sink.step_count;
+    ASSERT_EQ_U32(NAVMIN_RESULT_OK, move_relative_direct(&control, 0, 0));
+    ASSERT_TRUE(control.relative_target_present);
+    run_until_relative_settled(&control, 4U);
+    ASSERT_EQ_U32(steps_before, sink.step_count);
+    assert_relative_axis_settled(&control.motion.x, 13);
+    assert_relative_axis_settled(&control.motion.y, -8);
+
+    ASSERT_EQ_U32(NAVMIN_RESULT_OK, move_relative_direct(&control, 1, 0));
+    run_until_relative_settled(&control, 10000U);
+    assert_relative_axis_settled(&control.motion.x, 14);
+    assert_relative_axis_settled(&control.motion.y, -8);
+}
+
+static void test_relative_replacement_uses_current_position_and_reverses_without_hard_stop(void)
+{
+    driver_sink_t sink;
+    navmin_control_t control = make_control(&sink);
+    unsigned tick;
+    int64_t replacement_base;
+    int64_t reversal_base;
+    int32_t velocity_before;
+    int32_t phase_before;
+    int64_t zero_delta_target;
+
+    configure_and_motor_on(&control, 1000U, 100000U, 500U);
+    ASSERT_EQ_U32(NAVMIN_RESULT_OK, move_relative_direct(&control, 1000, 0));
+
+    for (tick = 0U; tick < 300U; ++tick) {
+        navmin_control_tick(&control, 0U);
+    }
+    ASSERT_TRUE(control.motion.x.commanded_position_steps > 0);
+    ASSERT_TRUE(control.motion.x.current_velocity_q > 0);
+
+    replacement_base = control.motion.x.commanded_position_steps;
+    velocity_before = control.motion.x.current_velocity_q;
+    phase_before = control.motion.x.step_phase_q;
+    ASSERT_EQ_U32(NAVMIN_RESULT_OK, move_relative_direct(&control, 100, 0));
+    ASSERT_EQ_I64(replacement_base + 100, control.relative_target_x_steps);
+    ASSERT_EQ_I32(velocity_before, control.motion.x.current_velocity_q);
+    ASSERT_EQ_I32(phase_before, control.motion.x.step_phase_q);
+
+    for (tick = 0U; tick < 40U; ++tick) {
+        navmin_control_tick(&control, 0U);
+    }
+    ASSERT_TRUE(control.motion.x.current_velocity_q > 0);
+
+    /* A zero-delta replacement targets the current position but preserves the
+       already moving numeric state; the planner must brake and return if it
+       cannot stop before that acceptance position. */
+    zero_delta_target = control.motion.x.commanded_position_steps;
+    velocity_before = control.motion.x.current_velocity_q;
+    ASSERT_EQ_U32(NAVMIN_RESULT_OK, move_relative_direct(&control, 0, 0));
+    ASSERT_EQ_I64(zero_delta_target, control.relative_target_x_steps);
+    ASSERT_EQ_I32(velocity_before, control.motion.x.current_velocity_q);
+    run_until_relative_settled(&control, 200000U);
+    assert_relative_axis_settled(&control.motion.x, zero_delta_target);
+
+    ASSERT_EQ_U32(NAVMIN_RESULT_OK, move_relative_direct(&control, 400, 0));
+    for (tick = 0U; tick < 250U; ++tick) {
+        navmin_control_tick(&control, 0U);
+    }
+    ASSERT_TRUE(control.motion.x.current_velocity_q > 0);
+    reversal_base = control.motion.x.commanded_position_steps;
+    velocity_before = control.motion.x.current_velocity_q;
+    phase_before = control.motion.x.step_phase_q;
+    ASSERT_EQ_U32(NAVMIN_RESULT_OK, move_relative_direct(&control, -60, 0));
+    ASSERT_EQ_I64(reversal_base - 60, control.relative_target_x_steps);
+    ASSERT_EQ_I32(velocity_before, control.motion.x.current_velocity_q);
+    ASSERT_EQ_I32(phase_before, control.motion.x.step_phase_q);
+    run_until_relative_settled(&control, 300000U);
+    assert_relative_axis_settled(&control.motion.x, reversal_base - 60);
+}
+
+static void test_relative_and_velocity_behaviour_replace_each_other_without_watchdog_leak(void)
+{
+    driver_sink_t sink;
+    navmin_control_t control = make_control(&sink);
+    unsigned tick;
+    int32_t velocity_before;
+
+    configure_and_motor_on(&control, 1000U, 50000U, 100U);
+    ASSERT_EQ_U32(NAVMIN_RESULT_OK, set_velocity_direct(&control, 500, 0, 10U));
+    for (tick = 0U; tick < 100U; ++tick) {
+        navmin_control_tick(&control, 10U);
+    }
+    ASSERT_TRUE(control.motion.x.current_velocity_q > 0);
+    ASSERT_TRUE(control.velocity_watchdog_armed);
+
+    velocity_before = control.motion.x.current_velocity_q;
+    ASSERT_EQ_U32(NAVMIN_RESULT_OK, move_relative_direct(&control, 30, 0));
+    ASSERT_TRUE(control.relative_target_present);
+    ASSERT_TRUE(!control.velocity_target_present);
+    ASSERT_TRUE(!control.velocity_watchdog_armed);
+    ASSERT_EQ_I32(velocity_before, control.motion.x.current_velocity_q);
+
+    /* Relative motion has no communication watchdog even at a timestamp far
+       beyond the previous velocity timeout. */
+    navmin_control_tick(&control, 100000U);
+    ASSERT_TRUE(control.relative_target_present);
+    ASSERT_TRUE(!control.velocity_watchdog_armed);
+
+    velocity_before = control.motion.x.current_velocity_q;
+    ASSERT_EQ_U32(NAVMIN_RESULT_OK, set_velocity_direct(&control, -300, 0, 200000U));
+    ASSERT_TRUE(!control.relative_target_present);
+    ASSERT_TRUE(control.velocity_target_present);
+    ASSERT_TRUE(control.velocity_watchdog_armed);
+    ASSERT_EQ_U32(200000U, control.last_velocity_setpoint_ms);
+    ASSERT_EQ_I32(velocity_before, control.motion.x.current_velocity_q);
+}
+
+static void test_relative_planner_uses_dynamic_config_limits(void)
+{
+    driver_sink_t sink;
+    navmin_control_t control = make_control(&sink);
+    unsigned tick;
+    int64_t target_position;
+    int32_t current_before;
+
+    configure_and_motor_on(&control, 1000U, 100000U, 500U);
+    ASSERT_EQ_U32(NAVMIN_RESULT_OK, move_relative_direct(&control, 1000, 0));
+    target_position = control.relative_target_x_steps;
+
+    for (tick = 0U; tick < 180U; ++tick) {
+        navmin_control_tick(&control, 0U);
+    }
+    ASSERT_TRUE(control.motion.x.current_velocity_q >
+                (int32_t)(300U * NAVMIN_VELOCITY_SCALE));
+
+    current_before = control.motion.x.current_velocity_q;
+    ASSERT_EQ_U32(
+        NAVMIN_RESULT_OK,
+        apply_config(&control, 300U, 1000U, 100000U, 100000U, 500U));
+    ASSERT_EQ_I64(target_position, control.relative_target_x_steps);
+    ASSERT_EQ_I32(current_before, control.motion.x.current_velocity_q);
+    ASSERT_EQ_I32(
+        (int32_t)(300U * NAVMIN_VELOCITY_SCALE),
+        control.motion.x.target_velocity_q);
+    navmin_control_tick(&control, 0U);
+    ASSERT_EQ_I32(current_before - INT32_C(100000), control.motion.x.current_velocity_q);
+
+    current_before = control.motion.x.current_velocity_q;
+    ASSERT_EQ_U32(
+        NAVMIN_RESULT_OK,
+        apply_config(&control, 1000U, 1000U, 20000U, 100000U, 500U));
+    ASSERT_EQ_I64(target_position, control.relative_target_x_steps);
+    ASSERT_EQ_I32(current_before, control.motion.x.current_velocity_q);
+    navmin_control_tick(&control, 0U);
+    ASSERT_EQ_I32(
+        (int32_t)(1000U * NAVMIN_VELOCITY_SCALE),
+        control.motion.x.target_velocity_q);
+    ASSERT_EQ_I32(current_before + INT32_C(20000), control.motion.x.current_velocity_q);
+    ASSERT_TRUE(!control.velocity_watchdog_armed);
+
+    run_until_relative_settled(&control, 500000U);
+    assert_relative_axis_settled(&control.motion.x, target_position);
+}
+
+static void test_relative_motor_off_emergency_and_motor_on_do_not_restore_target(void)
+{
+    driver_sink_t sink;
+    navmin_control_t control = make_control(&sink);
+    unsigned tick;
+    int64_t position_before_stop;
+
+    configure_and_motor_on(&control, 1000U, 100000U, 500U);
+    ASSERT_EQ_U32(NAVMIN_RESULT_OK, move_relative_direct(&control, 200, 0));
+    for (tick = 0U; tick < 200U; ++tick) {
+        navmin_control_tick(&control, 0U);
+    }
+    position_before_stop = control.motion.x.commanded_position_steps;
+    ASSERT_TRUE(control.relative_target_present);
+
+    ASSERT_EQ_U32(
+        NAVMIN_RESULT_OK,
+        navmin_control_execute_command(
+            &control, NAVMIN_COMMAND_MOTOR_OFF, NULL, 0U, 0U));
+    ASSERT_TRUE(!control.relative_target_present);
+    ASSERT_TRUE(!control.velocity_watchdog_armed);
+    assert_numeric_motion_hard_stopped(&control, position_before_stop, 0);
+    ASSERT_TRUE(!control.motors_on);
+    ASSERT_TRUE(!sink.enabled);
+
+    ASSERT_EQ_U32(
+        NAVMIN_RESULT_OK,
+        navmin_control_execute_command(
+            &control, NAVMIN_COMMAND_MOTOR_ON, NULL, 0U, 0U));
+    ASSERT_TRUE(!control.relative_target_present);
+    ASSERT_EQ_I64(position_before_stop, control.motion.x.commanded_position_steps);
+    ASSERT_EQ_I32(0, control.motion.x.current_velocity_q);
+
+    ASSERT_EQ_U32(NAVMIN_RESULT_OK, move_relative_direct(&control, -200, 0));
+    for (tick = 0U; tick < 200U; ++tick) {
+        navmin_control_tick(&control, 0U);
+    }
+    position_before_stop = control.motion.x.commanded_position_steps;
+    ASSERT_TRUE(control.relative_target_present);
+    navmin_control_emergency_stop(&control);
+    ASSERT_TRUE(!control.relative_target_present);
+    ASSERT_TRUE(!control.velocity_watchdog_armed);
+    assert_numeric_motion_hard_stopped(&control, position_before_stop, 0);
+    ASSERT_TRUE(control.motors_on);
+    ASSERT_TRUE(sink.enabled);
+}
+
+static void test_protocol_move_relative_exact_retry_does_not_rebase_but_fresh_request_does(void)
+{
+    driver_sink_t sink;
+    navmin_control_t control = make_control(&sink);
+    navmin_protocol_t protocol;
+    response_log_t log = {0};
+    executor_probe_t probe;
+    navmin_protocol_executor_t executor;
+    uint8_t config_payload[20];
+    uint8_t relative_payload[8];
+    uint8_t request[28];
+    size_t length;
+    unsigned tick;
+    int64_t original_target;
+    int64_t current_position;
+
+    probe.control = &control;
+    probe.execute_count = 0U;
+    probe.emergency_count = 0U;
+    executor.context = &probe;
+    executor.emergency_stop = probe_emergency;
+    executor.execute_command = probe_execute;
+    navmin_protocol_init(&protocol, 0U, executor);
+
+    build_config_payload(config_payload, 1000U, 1000U, 100000U, 100000U, 500U);
+    length = build_request(
+        request, 0U, NAVMIN_COMMAND_SET_CONFIG, config_payload, 20U);
+    feed_frame_ending_at(&protocol, &log, request, length, 10U);
+    assert_response_result(&log, 0U, NAVMIN_RESULT_OK);
+
+    length = build_request(request, 1U, NAVMIN_COMMAND_MOTOR_ON, NULL, 0U);
+    feed_frame_ending_at(&protocol, &log, request, length, 30U);
+    assert_response_result(&log, 1U, NAVMIN_RESULT_OK);
+
+    build_relative_payload(relative_payload, 50, 0);
+    length = build_request(
+        request, 2U, NAVMIN_COMMAND_MOVE_RELATIVE, relative_payload, 8U);
+    feed_frame_ending_at(&protocol, &log, request, length, 50U);
+    assert_response_result(&log, 2U, NAVMIN_RESULT_OK);
+    ASSERT_EQ_U32(3U, probe.execute_count);
+    original_target = control.relative_target_x_steps;
+    ASSERT_EQ_I64(50, original_target);
+
+    for (tick = 0U; tick < 500U; ++tick) {
+        navmin_control_tick(&control, 0U);
+    }
+    current_position = control.motion.x.commanded_position_steps;
+    ASSERT_TRUE(current_position > 0);
+    ASSERT_TRUE(current_position < original_target);
+
+    feed_frame_ending_at(&protocol, &log, request, length, 900U);
+    assert_response_result(&log, 3U, NAVMIN_RESULT_OK);
+    ASSERT_EQ_U32(3U, probe.execute_count);
+    ASSERT_EQ_I64(original_target, control.relative_target_x_steps);
+    ASSERT_TRUE(memcmp(log.bytes[2], log.bytes[3], NAVMIN_MIN_RESPONSE_LENGTH) == 0);
+
+    length = build_request(
+        request, 3U, NAVMIN_COMMAND_MOVE_RELATIVE, relative_payload, 8U);
+    feed_frame_ending_at(&protocol, &log, request, length, 1000U);
+    assert_response_result(&log, 4U, NAVMIN_RESULT_OK);
+    ASSERT_EQ_U32(4U, probe.execute_count);
+    ASSERT_EQ_I64(
+        control.motion.x.commanded_position_steps + 50,
+        control.relative_target_x_steps);
+}
+
+static void test_deferred_baud_command_does_not_fake_success(void)
+{
+    driver_sink_t sink;
+    navmin_control_t control = make_control(&sink);
+    uint8_t payload[4] = {0};
+
     ASSERT_EQ_U32(
         NAVMIN_RESULT_INTERNAL_ERROR,
         navmin_control_execute_command(
@@ -1394,10 +1873,17 @@ int main(void)
     test_velocity_watchdog_uint32_wrap();
     test_motor_off_and_emergency_disarm_velocity_watchdog();
     test_protocol_set_velocity_retry_timestamp_and_fresh_request();
-    test_deferred_relative_and_baud_commands_do_not_fake_success();
+    test_move_relative_validation_bounds_and_safe_target_addition();
+    test_relative_planner_exact_axes_short_and_zero_moves();
+    test_relative_replacement_uses_current_position_and_reverses_without_hard_stop();
+    test_relative_and_velocity_behaviour_replace_each_other_without_watchdog_leak();
+    test_relative_planner_uses_dynamic_config_limits();
+    test_relative_motor_off_emergency_and_motor_on_do_not_restore_target();
+    test_protocol_move_relative_exact_retry_does_not_rebase_but_fresh_request_does();
+    test_deferred_baud_command_does_not_fake_success();
     test_protocol_integration_set_config_motor_on_motor_off();
     test_protocol_exact_retries_do_not_repeat_control_side_effects();
 
-    puts("navmin firmware control host tests: PASS (27 cases)");
+    puts("navmin firmware control host tests: PASS (34 cases)");
     return EXIT_SUCCESS;
 }
