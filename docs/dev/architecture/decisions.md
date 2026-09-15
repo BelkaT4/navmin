@@ -560,6 +560,32 @@ Processor-specific tuning в v1 является implementation detail: owner-lo
 - **Сразу использовать полный VT11 pipeline как обязательный Stage 5 processor.** Отклонено как blocker первой реализации; advanced identity/reacquisition должен сравниваться с простым baseline после первых измерений.
 - **Хранить все detector/tracker thresholds в общем `config.json` или UI.** Отклонено: внутренний tuning не должен становиться публичным config contract без реальной operator/runtime потребности.
 
+## 28. UI v1 prioritizes a fixed operational bar and minimal main/preview interaction
+
+### Решение
+
+Основной UI стартует fullscreen. Overview и Stereo Left образуют pair `main + preview`; preview — небольшое окно в правом нижнем углу области видео, swap выполняется click'ом по preview или его action-icon.
+
+Постоянная нижняя operational bar содержит fixed-size controls для `RELATIVE / TRACKING`, подтверждённого motor state/control, connection state и крупного `EMERGENCY` в правом нижнем углу. Motor toggle выполняется одним click без confirmation dialog. Dedicated ordinary Stop button в первом prototype не показывается.
+
+В TRACKING левый click по bbox выбирает target, empty click снимает selection, overlap разрешается ближайшим к click центром среди bbox, содержащих точку. В RELATIVE левый click по main image выполняет click-to-move. Preview click только выполняет swap.
+
+Baseline overlay показывает bbox и selection highlight без постоянных ID/distance/velocity/age labels. Stereo Right доступен только как отдельный diagnostic view. Recording запускается из верхнего menu bar; активная запись обозначается в левом верхнем углу main view мигающим красным кругом и статической белой надписью `Запись`.
+
+### Почему
+
+Первая цель проекта — быстро получить runnable prototype для относительного движения и TRACKING. Поэтому постоянно видимыми остаются только действия и states, нужные оператору во время управления, а редко используемые функции уходят в menu/diagnostics. Fixed geometry исключает смещение кнопок при изменении текста состояния, а Emergency остаётся быстро достижимым.
+
+### Отвергнутые альтернативы
+
+- **Постоянные Motor/Recording/Settings buttons в отдельной панели.** Отклонено как лишнее загромождение; motor остаётся в operational bar, recording/settings доступны из menu.
+- **Dedicated ordinary Stop button в первом prototype.** Отложен: архитектурный `StopMotion` остаётся, но отдельная пользовательская кнопка пока не нужна.
+- **Выбор nearest object вне bbox.** Отклонён для v1 как неочевидное действие; click должен попадать в отображаемый bbox.
+- **Постоянные diagnostic labels возле каждого bbox.** Отклонены ради читаемого основного изображения; расширенная диагностика может включаться отдельно.
+- **Stereo Right как обычная main/preview camera.** Отклонено: её роль остаётся diagnostic/stereo и не должна менять обычный two-camera interaction contract.
+
+---
+
 ## Как использовать этот документ при реализации
 
 При разработке нового модуля сначала нужно следовать нормативным контрактам соответствующего документа. Если возникает желание вернуть ранее удалённый механизм, полезно проверить этот журнал: часто механизм был удалён не случайно, а потому что более простой инвариант закрывает тот же failure case.

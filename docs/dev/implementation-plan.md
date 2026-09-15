@@ -117,13 +117,29 @@ Normal test run не должен требовать hardware.
 | 1. Foundation | done | package/test skeleton, contracts, runtime primitives | — |
 | 2. Config + Calibration foundation | done | typed config, persistence, calibration loading/model boundary | 1 |
 | 3. Turret PC stack | done | PC protocol/transport/controller/HAL + simulator | 1, 2 |
-| 4. STM32 firmware + UART | in-progress | firmware protocol/control + UART integration boundary | 3 |
+| 4. STM32 firmware + UART | done | firmware protocol/control + UART integration boundary | 3 |
 | 5. Vision | not-started | camera pipelines, generations, working frame, manual distance | 1, 2 |
 | 6. Core + Aiming | not-started | mediator/state transitions/aiming/tracking error | 2, 3, 5 |
 | 7. UI | not-started | PyQt6 main/preview, controls, overlays, settings | 2, 3, 5, 6 |
 | 8. System integration and v1 hardening | not-started | startup/shutdown, failure paths, E2E, hardware smoke/performance | 4, 5, 6, 7 |
 
 Полноценный stereo distance, camera-to-turret rotational extrinsic, target handoff и другие явно отложенные возможности не являются условиями завершения v1, если архитектурные документы не будут изменены отдельным решением.
+
+### Prototype-first checkpoint для этапов 5–7
+
+После Stage 4 первая цель — как можно раньше получить запускаемый end-to-end prototype и проверить реальные относительные перемещения и TRACKING. Для этапов 5–7 разрешён один последовательный vertical-slice checkpoint до полного завершения каждого этапа:
+
+```text
+Stage 5 minimum: Legacy14VisionProcessor + SimpleTracker + рабочие Overview/Stereo Left frames
+→ Stage 6 minimum: RELATIVE click-to-move + TRACKING selection/error path
+→ Stage 7 minimum: fullscreen main/preview + mode/motor/link/Emergency + bbox/selection
+→ первый runnable relative/tracking smoke
+→ затем завершение оставшегося scope Stage 5/6/7
+```
+
+Это не создаёт временную параллельную архитектуру: prototype использует те же `VisionProcessor`, Core/Aiming, Turret и UI contracts, которые остаются production path. Упрощается только набор реализованных функций. Recording, расширенная диагностика, Stereo Right diagnostic view, второй baseline processor 1.1, полный settings UI и presentation polish не должны блокировать первый runnable prototype, если их отсутствие не нарушает используемый contract.
+
+Рабочие чаты по-прежнему выполняются последовательно на одной ветке; этот checkpoint не разрешает параллельные конкурирующие реализации. Статус полного Stage меняется на `done` только после выполнения его полного критерия завершения.
 
 ---
 
@@ -396,7 +412,7 @@ Turret-specific архитектурные вопросы reconnect/backoff, wor
 
 ## 9. Этап 4 — STM32 firmware + UART
 
-**Статус:** `in-progress`
+**Статус:** `done`
 
 ### Цель
 
@@ -510,6 +526,8 @@ Host-side protocol tests из этапа 3 не дублировать в firmwa
 - manual `DistanceResult` source как полноценный v1 path;
 - camera/pipeline simulation suitable for tests and UI development.
 
+Для первого runnable vertical slice достаточно сначала реализовать `Legacy14VisionProcessor` (default) + общий `SimpleTracker` и working-frame path Overview/Stereo Left. `Legacy11VisionProcessor` остаётся обязательным для полного завершения Stage 5, но не блокирует первый end-to-end smoke.
+
 ### Отложить
 
 - полноценный `capture_id` pairing algorithm;
@@ -614,6 +632,8 @@ Rejection stale/unaccepted generation проверяется на реальны
 - lead computation согласно текущим contracts/config;
 - Core хранит/передаёт только актуальный target-bound `DistanceResult` по существующему контракту; Stage 6 не придумывает новое влияние distance на Aiming/ballistics.
 
+Для первого runnable vertical slice приоритетны только подтверждённый `RELATIVE` click-to-move и минимальный `TRACKING` path `selection → TrackingError → Turret`. Остальные loss/config/diagnostic edge cases закрываются до полного `done` Stage 6.
+
 ### Decision checkpoint до target-loss runtime-ветки
 
 До реализации поведения временно потерянной цели управляющий чат должен закрыть Core-часть `problems.md` #7:
@@ -676,33 +696,42 @@ Rejection stale/unaccepted generation проверяется на реальны
 - `docs/dev/architecture/configuration.md`
 - `docs/dev/architecture/decisions.md`
 - `docs/dev/diagrams/ui-diagram.mmd`
-- `problems.md` #5, #11, #19–#21
+- `problems.md` #5, #11, #22
 
 ### Реализовать
 
-- main window / main + preview;
-- explicit swap;
-- selection/click только main view согласно mode;
-- overlays как presentation layer;
+Для первого runnable vertical slice:
+
+- приложение стартует fullscreen;
+- Overview / Stereo Left отображаются как large main + небольшой preview в правом нижнем углу области видео; preview не перекрывает нижнюю operational bar;
+- click по preview и отдельный кликабельный swap-icon в preview выполняют explicit swap;
+- нижняя operational bar имеет fixed-size controls и не меняет геометрию из-за текста/состояния;
+- нижняя bar содержит `RELATIVE / TRACKING`, кликабельный confirmed motor state, connection state и крупный `EMERGENCY` в правом нижнем углу; dedicated ordinary Stop button в первом prototype отсутствует;
+- в TRACKING левый click по bbox выбирает target, empty click выполняет deselect; при overlapping bbox выбирается содержащий click bbox с ближайшим центром; nearest-object helper вне bbox не используется;
+- в RELATIVE левый click по main working frame означает click-to-move; preview click не выполняет selection/click-to-move;
+- baseline overlay показывает bbox всех текущих объектов и явно выделяет selected target, без постоянных ID/distance/velocity/age labels;
+- camera/turret status presentation достаточна для запуска prototype.
+
+До полного завершения Stage 7 также реализовать:
+
 - stale/error overlay с сохранением последнего кадра;
-- controls для mode, Stop, Emergency, motors;
+- top menu bar для recording/view/diagnostics/settings;
+- clean recording implementation + controls в main-thread/UI-side path: только accepted через `CameraSessionGate` `FramePacket.image`, без overlays; при активной записи в левом верхнем углу main view мигает красный круг и постоянно отображается белая надпись `Запись`;
 - settings UI поверх Config Manager, без прямой записи module internals;
-- camera/turret status presentation;
-- clean recording implementation + controls в main-thread/UI-side path: только accepted через `CameraSessionGate` `FramePacket.image`, без overlays;
+- Stereo Right открывается только из Diagnostics как отдельный diagnostic view и не участвует в main/preview swap;
 - recording lifecycle/file I/O остаются вне Vision worker;
 - Qt notification bridge/coalescing для latest-state;
 - ordered handling `CameraSessionStarted` отдельно от coalesced latest payloads;
 - partial-failure UX для доступных v1 сценариев.
 
+Motor control выполняется одним click без confirmation dialog. Текст/индикатор motor control отражает подтверждённый `TurretState.motor_state`, а не optimistic UI state.
+
 ### Открытые вопросы, которые должен закрыть этап
 
 - #5 Qt notification coalescing;
-- UI часть #11 partial failures;
-- #19 selection/deselect gestures;
-- #20 overlay content;
-- минимальный v1 scope #21 Stereo Right diagnostics.
+- UI часть #11 partial failures.
 
-Если решение этих пунктов меняет user-visible architecture contract, вернуть вопрос в управляющий чат; чистое presentation решение можно принять внутри этапа.
+Future latest-live-frame mode (#22) остаётся deferred. Gesture/overlay/Stereo Right baseline UX уже закрыт управляющим чатом и не должен проектироваться заново внутри Stage 7.
 
 ### Тестовый фокус
 
@@ -845,9 +874,6 @@ Hardware tests остаются отдельным suite.
 | #16 backlash | deferred |
 | #17 camera-to-turret extrinsic | deferred |
 | #18 target handoff | deferred |
-| #19 UI gestures | 7 |
-| #20 overlay content | 7 |
-| #21 Stereo Right diagnostics | 7 minimal / later expansion |
 | #22 latest-live-frame UI | deferred |
 | #23 D-filter / PID tuning | 8 tuning, D-filter deferred unless evidence |
 | #24 per-camera Aiming parameters | deferred |

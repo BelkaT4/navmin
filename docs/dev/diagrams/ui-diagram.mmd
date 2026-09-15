@@ -11,15 +11,15 @@ flowchart TB
     subgraph main_window["Main Window"]
       main_view["Main Camera View<br/>Overview or Stereo Left"]
       preview_view["Preview View<br/>selection forbidden"]
-      top_bar["Top Bar<br/>swap / mode"]
-      bottom_bar["Bottom Bar"]
-      diagnostics["Diagnostics<br/>Stereo Right optional"]
+      top_bar["Menu Bar<br/>recording / view / diagnostics / settings"]
+      bottom_bar["Operational Bar<br/>mode / motor / link / Emergency<br/>fixed-size controls"]
+      diagnostics["Diagnostics View<br/>Stereo Right separate"]
     end
 
     settings["Settings Window<br/>Vision / Aiming / Turret / UI"]
     selection["TRACKING target request<br/>camera + generation + track_id"]
     click_move["Click-to-move<br/>confirmed RELATIVE + main only"]
-    turret_controls["Turret controls<br/>mode / motor / StopMotion / Emergency"]
+    turret_controls["Turret controls<br/>mode / motor / Emergency"]
     recording["Clean recording<br/>FramePacket.image without overlays"]
     state_view["Typed state<br/>camera freshness / Turret / distance"]
   end
@@ -37,9 +37,10 @@ flowchart TB
   selection --> flag_core_out
   click_move --> flag_core_out
 
-  top_bar --> turret_controls
-  top_bar --> flag_core_out
+  preview_view --> flag_core_out
   top_bar --> settings
+  top_bar --> diagnostics
+  top_bar --> recording
   bottom_bar --> turret_controls
   turret_controls --> flag_core_out
   settings --> flag_core_out

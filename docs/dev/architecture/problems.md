@@ -175,32 +175,6 @@ inter-request-delay-ms = 2
 
 Будущий Target Handoff/Reacquisition должен сопоставлять один физический объект между независимыми VisionProcessors и учитывать latency streams.
 
-### 19. UI gestures selection / deselect
-
-Уже определено:
-
-- target выбирается только на main image и только в confirmed TRACKING;
-- в RELATIVE selection отсутствует;
-- click-to-move разрешён только в confirmed RELATIVE;
-- invalid/stale selection не создаёт target;
-- swap в TRACKING сбрасывает selection.
-
-Остаётся UX:
-
-- mouse/key gesture выбора bbox;
-- explicit deselect;
-- click empty area;
-- overlapping bbox;
-- нужен ли nearest-object helper.
-
-### 20. Object overlay content
-
-Определить, какие данные показывать рядом с bbox: ID, distance, velocity, selection status, diagnostics. `confidence` не является обязательным полем общего `TrackedObject`.
-
-### 21. Stereo Right diagnostics
-
-Определить layout/activation diagnostic view и processor-specific overlays. Stereo Right не становится обычной `main_camera`.
-
 ### 22. Future latest-live-frame UI
 
 Сейчас UI показывает `VisionResult.frame`, поэтому frame+bbox синхронизированы.
