@@ -88,7 +88,7 @@ Overview `calibration/overview.json`:
 schema_version = 1
 image_width / image_height: integer > 0
 K: 3x3 finite matrix
-D: finite coefficient vector, non-empty
+D: ровно 4 finite коэффициента OpenCV fisheye
 new_camera_matrix: 3x3 finite matrix
 ```
 
@@ -105,7 +105,7 @@ P1 / P2: 3x4 finite matrices
 Q: 4x4 finite matrix
 ```
 
-Точный допустимый размер distortion vectors должен соответствовать реально используемой OpenCV camera model и проверяется loader'ом Stage 2; он не должен молча truncate/pad coefficients. Maps в JSON не сохраняются.
+Overview использует fisheye vector длины 4. Stereo `D_left/D_right` используют поддерживаемые OpenCV pinhole lengths `{4, 5, 8, 12, 14}`. Loader не должен молча truncate/pad coefficients. Maps в JSON не сохраняются.
 
 ## Структура верхнего уровня
 
@@ -174,6 +174,16 @@ buffer-size: int
 processing-enabled: bool          # per-camera master switch
 vision-processor-class: str
 ```
+
+Для production camera source v1 эти существующие поля имеют следующую operational semantics:
+
+- `address` — local bind/listen address PC receiver для `udpsrc`; portable default для обычного listen — `0.0.0.0`; это не Raspberry Pi source IP;
+- `port` — local UDP listen port на PC; role→port не hardcode'ится production source;
+- `rtp-enabled = true` обязателен для текущего RTP/JPEG source; non-RTP transport этим source не реализуется;
+- `buffer-size` — bounded `appsink max-buffers`; для low-latency prototype используется `1`; `drop=true` и `sync=false` не допускают накопления FIFO старых кадров;
+- `processing-enabled` и `vision-processor-class` сохраняют существующую processing semantics.
+
+Фактически подтверждённая v1 deployment mapping: Overview `8888`, Stereo Left `8889`, Stereo Right `8890`. Raspberry Pi IP относится к sender-side/service configuration и не используется PC receiver для correlation.
 
 `processing-enabled = false` полностью запрещает VisionProcessor для этой камеры, но pipeline продолжает публиковать corrected working frame через `VisionResult` с пустым `tracked_objects`.
 
@@ -442,27 +452,27 @@ Processor-specific tuning в v1 не является частью config schema
     "cameras": {
       "overview": {
         "enabled": true,
-        "address": "192.168.1.101",
-        "port": 5001,
-        "rtp-enabled": false,
+        "address": "0.0.0.0",
+        "port": 8888,
+        "rtp-enabled": true,
         "buffer-size": 1,
         "processing-enabled": true,
         "vision-processor-class": "Legacy14VisionProcessor"
       },
       "stereo-left": {
         "enabled": true,
-        "address": "192.168.1.102",
-        "port": 5002,
-        "rtp-enabled": false,
+        "address": "0.0.0.0",
+        "port": 8889,
+        "rtp-enabled": true,
         "buffer-size": 1,
         "processing-enabled": true,
         "vision-processor-class": "Legacy14VisionProcessor"
       },
       "stereo-right": {
         "enabled": true,
-        "address": "192.168.1.103",
-        "port": 5003,
-        "rtp-enabled": false,
+        "address": "0.0.0.0",
+        "port": 8890,
+        "rtp-enabled": true,
         "buffer-size": 1,
         "processing-enabled": false,
         "vision-processor-class": "Legacy14VisionProcessor"

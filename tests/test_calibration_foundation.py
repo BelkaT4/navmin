@@ -24,7 +24,7 @@ def _overview_calibration() -> dict:
         "image_width": 640,
         "image_height": 480,
         "K": [[1000.0, 0.0, 300.0], [0.0, 1000.0, 200.0], [0.0, 0.0, 1.0]],
-        "D": [0.1, -0.2, 0.001, 0.002, 0.0],
+        "D": [0.1, -0.2, 0.001, 0.002],
         "new_camera_matrix": [
             [100.0, 0.0, 320.0],
             [0.0, 100.0, 240.0],
@@ -76,7 +76,7 @@ def test_valid_overview_calibration_is_immutable(tmp_path) -> None:
     calibration = load_overview_calibration(path, source_size=(640, 480))
 
     assert calibration.image_width == 640
-    assert len(calibration.D) == 5
+    assert len(calibration.D) == 4
     with pytest.raises(FrozenInstanceError):
         calibration.image_width = 1  # type: ignore[misc]
 
@@ -94,16 +94,34 @@ def test_valid_stereo_calibration_normalizes_vector_shapes(tmp_path) -> None:
     assert len(calibration.Q) == 4
 
 
-@pytest.mark.parametrize("length", [4, 5, 8, 12, 14])
-def test_opencv_pinhole_distortion_lengths_are_accepted(tmp_path, length) -> None:
+def test_overview_requires_exact_opencv_fisheye_distortion_length(tmp_path) -> None:
     path = tmp_path / "overview.json"
     data = _overview_calibration()
-    data["D"] = [0.0] * length
     _write(path, data)
 
     calibration = load_overview_calibration(path)
+    assert len(calibration.D) == 4
 
-    assert len(calibration.D) == length
+    data["D"] = [0.0] * 5
+    _write(path, data)
+    with pytest.raises(CalibrationValidationError) as exc_info:
+        load_overview_calibration(path)
+    assert exc_info.value.path == "D"
+    assert "fisheye" in exc_info.value.reason
+
+
+@pytest.mark.parametrize("length", [4, 5, 8, 12, 14])
+def test_stereo_opencv_pinhole_distortion_lengths_are_accepted(tmp_path, length) -> None:
+    path = tmp_path / "stereo.json"
+    data = _stereo_calibration()
+    data["D_left"] = [0.0] * length
+    data["D_right"] = [0.0] * length
+    _write(path, data)
+
+    calibration = load_stereo_calibration(path)
+
+    assert len(calibration.D_left) == length
+    assert len(calibration.D_right) == length
 
 
 @pytest.mark.parametrize(

@@ -584,6 +584,25 @@ Baseline overlay показывает bbox и selection highlight без пос�
 - **Постоянные diagnostic labels возле каждого bbox.** Отклонены ради читаемого основного изображения; расширенная диагностика может включаться отдельно.
 - **Stereo Right как обычная main/preview camera.** Отклонено: её роль остаётся diagnostic/stereo и не должна менять обычный two-camera interaction contract.
 
+## 29. Camera transport v1 — RTP/JPEG через GStreamer; Overview correction — OpenCV fisheye без silent scaling
+
+### Решение
+
+Production camera source v1 использует фактически подтверждённый sender/receiver path RTP/JPEG over UDP. PC receiver декодирует через GStreamer в raw BGR и хранит только freshest frame; geometric correction остаётся единственной responsibility `VisionPipeline`. `appsink` работает bounded/latest-oriented (`drop=true`, `sync=false`, prototype `max-buffers=1`).
+
+Overview calibration schema v1 трактуется как OpenCV fisheye: `D` содержит ровно четыре коэффициента, maps строятся через `cv2.fisheye.initUndistortRectifyMap`, а исправленная geometry использует `new_camera_matrix`. Source size обязан точно совпадать с calibration size; автоматическое scaling `K/new_camera_matrix` не выполняется.
+
+### Почему
+
+Этот RTP/JPEG sender/receiver path уже реально работает на camera setup и GStreamer appsink даёт прямой low-latency latest-frame boundary без отдельной display loop architecture. Fisheye API обязателен, потому что фактическая Overview calibration была получена через OpenCV fisheye model; обычный pinhole `initUndistortRectifyMap` описывает другую camera model. Exact-size validation сохраняет явную геометрическую ошибку вместо скрытого изменения calibration.
+
+### Отвергнутые альтернативы
+
+- **Выполнять fisheye correction внутри camera source.** Отклонено: это дублировало бы correction path и смешало transport с geometry.
+- **Автоматически масштабировать `K`/`new_camera_matrix` под любой decoded size.** Отклонено: silent scaling скрывает geometry mismatch; NavMin требует exact calibration resolution.
+- **Использовать Raspberry Pi IP как `CameraConfig.address` receiver-side correlation.** Отклонено: UDP sender уже направляет stream на PC; receiver bind address и local listen port являются достаточной source boundary.
+- **Копировать process-global `GLib.MainLoop` из reference viewer.** Отклонено: appsink callback и polling bus достаточны owner-local source и не создают новый application-global manager.
+
 ---
 
 ## Как использовать этот документ при реализации

@@ -32,21 +32,39 @@ Stereo Right worker
 
 Vision хранит постоянный camera registry с `current_generation[camera]`.
 
+### Production camera transport v1
+
+Текущий production source — `GStreamerRtpJpegSource`: RTP/JPEG (MJPEG) over UDP → `rtpjpegdepay` → `jpegdec` → `videoconvert` → BGR `appsink`. Source владеет Gst pipeline, получает фактические width/height из sample caps и копирует Gst buffer в независимый NumPy frame до `unmap()`.
+
+Low-latency boundary:
+
+```text
+appsink emit-signals=true max-buffers=<CameraConfig.buffer-size> drop=true sync=false
+```
+
+Для prototype `buffer-size = 1`; source и `VisionPipeline` оба latest-only и не образуют processing FIFO. `receive_timestamp_ns` ставится monotonic clock в момент application-side получения decoded frame. Текущий RTP transport не несёт согласованный cross-camera `capture_id`, поэтому Overview/Stereo Left/Stereo Right source публикуют `capture_id = None` до отдельного stereo-pairing решения.
+
+`CameraConfig.address` — local bind address PC receiver, `port` — local listen UDP port, `rtp-enabled=true` обязателен. Рабочая mapping: Overview `8888`, Stereo Left `8889`, Stereo Right `8890`.
+
+Appsink callback выполняется GStreamer streaming thread; process-global `GLib.MainLoop` для source не требуется. Один application `CameraWorker` на camera соединяет source с существующим `VisionPipeline.submit_decoded_frame() → process_latest()`, использует cooperative stop и bounded join. Reconnect/backoff policy в этом checkpoint не вводится.
+
 ## Working frame
 
 Публичный `FramePacket.image` всегда содержит кадр с исправленной геометрией.
 
 ```text
 Overview:
-receive/decode
-→ undistort
+RTP/JPEG over UDP
+→ GStreamer decode to raw BGR
+→ OpenCV fisheye undistort
 → FramePacket
 → VisionProcessor
 → VisionResult
 
 Stereo Left / Right:
-receive/decode
-→ rectify
+RTP/JPEG over UDP
+→ GStreamer decode to raw BGR
+→ pinhole/stereo rectify
 → FramePacket
 → VisionProcessor
 → VisionResult
@@ -62,7 +80,7 @@ Raw frame может существовать внутри pipeline, но нар
 - lead point;
 - UI click.
 
-Geometric correction выполняется до `VisionProcessor`, потому что одна и та же geometry нужна Vision, UI, Aiming, stereo и recording.
+Geometric correction выполняется ровно один раз в `VisionPipeline` до `VisionProcessor`, потому что одна и та же geometry нужна Vision, UI, Aiming, stereo и recording. Camera source публикует только raw decoded BGR и не выполняет undistort/rectify.
 
 ## Calibration и `CameraModel`
 
@@ -76,18 +94,20 @@ calibration/
 
 ### Overview
 
-Минимально:
+Overview calibration использует именно OpenCV fisheye model:
 
 ```text
 schema_version
 image_width
 image_height
-K
-D
-new_camera_matrix
+K: 3x3 finite
+D: ровно 4 finite fisheye coefficients
+new_camera_matrix: 3x3 finite
 ```
 
-Working frame сохраняет исходное разрешение. Автоматического crop/resize в первой реализации нет.
+Maps строятся через `cv2.fisheye.initUndistortRectifyMap(K, D, I, new_camera_matrix, ...)`. Исправленный working-frame `CameraModel` использует `new_camera_matrix`.
+
+Working frame сохраняет точное calibration resolution. Автоматического crop/resize или scaling `K/new_camera_matrix` в NavMin нет. Фактически наблюдавшийся Overview sender request `1296x972` может декодироваться как `1296x976`; source обязан брать размер из GStreamer sample caps, и calibration должна совпасть именно с фактическим размером.
 
 ### Stereo
 

@@ -12,13 +12,13 @@ flowchart TB
     right_buffer[["Bounded Stereo Right buffer<br>generation + capture_id"]]
     flag_data_out["OUT: latest<br>VisionResult / DistanceResult<br>CameraStatus"]
     subgraph overview_thread ["Overview pipeline"]
-      overview_source["Receive / decode"]
-      overview_geom["Undistort<br>working FramePacket"]
+      overview_source["RTP/JPEG UDP / GStreamer decode<br>raw BGR latest-only"]
+      overview_geom["Fisheye undistort<br>exact calibration size<br>working FramePacket"]
       overview_processor["VisionProcessor<br>effective processing policy"]
       overview_result["VisionResult<br>latest-only"]
     end
     subgraph left_thread ["Stereo Left pipeline"]
-      left_source["Receive / decode"]
+      left_source["RTP/JPEG UDP / GStreamer decode<br>raw BGR latest-only"]
       left_geom["Rectify Left<br>working FramePacket + capture_id"]
       left_processor["VisionProcessor<br>effective processing policy"]
       left_result["VisionResult<br>latest-only"]
@@ -30,7 +30,7 @@ flowchart TB
       end
     end
     subgraph right_thread ["Stereo Right pipeline"]
-      right_source["Receive / decode"]
+      right_source["RTP/JPEG UDP / GStreamer decode<br>raw BGR latest-only"]
       right_geom["Rectify Right<br>working FramePacket + capture_id"]
       right_processor["VisionProcessor optional<br>diagnostics"]
       right_result["VisionResult<br>diagnostics optional"]

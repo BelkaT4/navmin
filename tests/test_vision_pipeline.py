@@ -3,6 +3,7 @@ from __future__ import annotations
 from threading import Event, Lock, Thread, current_thread
 from typing import Self
 
+import cv2
 import numpy as np
 import pytest
 
@@ -44,7 +45,7 @@ def overview_calibration() -> OverviewCalibration:
         image_width=WIDTH,
         image_height=HEIGHT,
         K=K,
-        D=(0.2, 0.0, 0.0, 0.0, 0.0),
+        D=(0.2, -0.03, 0.005, -0.001),
         new_camera_matrix=K,
     )
 
@@ -168,6 +169,30 @@ def test_working_frame_correction_preserves_size_and_publishes_read_only_image(
     assert not fixed.flags.writeable
     assert fixed is not raw
     assert not np.array_equal(fixed, raw)
+
+
+def test_overview_corrector_matches_opencv_fisheye_maps() -> None:
+    calibration = overview_calibration()
+    raw = source_frame(17)
+    map_x, map_y = cv2.fisheye.initUndistortRectifyMap(
+        np.asarray(calibration.K, dtype=np.float64),
+        np.asarray(calibration.D, dtype=np.float64).reshape(4, 1),
+        np.eye(3, dtype=np.float64),
+        np.asarray(calibration.new_camera_matrix, dtype=np.float64),
+        (WIDTH, HEIGHT),
+        cv2.CV_32FC1,
+    )
+    expected = cv2.remap(
+        raw,
+        map_x,
+        map_y,
+        interpolation=cv2.INTER_LINEAR,
+        borderMode=cv2.BORDER_CONSTANT,
+    )
+
+    actual = overview_corrector(calibration).correct(raw)
+
+    assert np.array_equal(actual, expected)
 
 
 def test_missing_calibration_is_explicit_and_has_no_raw_fallback() -> None:

@@ -91,8 +91,9 @@ Foundation уже определил общий cooperative `StopToken` и ми�
 
 Для будущих owner/integration stages остаётся определить только:
 
-- как Vision owner прерывает blocking GStreamer/video wait;
 - детали общего startup/shutdown orchestration нескольких workers и main-thread компонентов.
+
+Для текущего GStreamer RTP/JPEG source blocking read не используется: appsink callback публикует latest frame, worker делает cancellable idle wait, а source stop переводит Gst pipeline в NULL. Reconnect/backoff (#8) остаётся отдельным открытым вопросом.
 
 Reconnect/recovery принадлежит owner-модулям; отдельный orchestration component без concrete v1 responsibility не вводится.
 

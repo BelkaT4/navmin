@@ -182,11 +182,20 @@ def _vector(value: Any, path: str) -> Vector:
     _validation(path, "expected flat, 1xN, or Nx1 vector")
 
 
-def _distortion_vector(value: Any, path: str) -> Vector:
+def _pinhole_distortion_vector(value: Any, path: str) -> Vector:
     vector = _vector(value, path)
     if len(vector) not in OPENCV_PINHOLE_DISTORTION_LENGTHS:
-        allowed = ", ".join(str(length) for length in sorted(OPENCV_PINHOLE_DISTORTION_LENGTHS))
+        allowed = ", ".join(
+            str(length) for length in sorted(OPENCV_PINHOLE_DISTORTION_LENGTHS)
+        )
         _validation(path, f"expected OpenCV pinhole distortion length in {{{allowed}}}")
+    return vector
+
+
+def _fisheye_distortion_vector(value: Any, path: str) -> Vector:
+    vector = _vector(value, path)
+    if len(vector) != 4:
+        _validation(path, "expected OpenCV fisheye distortion vector length 4")
     return vector
 
 
@@ -308,7 +317,7 @@ def load_overview_calibration(
         image_width=_positive_int(obj["image_width"], "image_width"),
         image_height=_positive_int(obj["image_height"], "image_height"),
         K=_matrix(obj["K"], "K", 3, 3),  # type: ignore[arg-type]
-        D=_distortion_vector(obj["D"], "D"),
+        D=_fisheye_distortion_vector(obj["D"], "D"),
         new_camera_matrix=_matrix(  # type: ignore[arg-type]
             obj["new_camera_matrix"], "new_camera_matrix", 3, 3
         ),
@@ -348,9 +357,9 @@ def load_stereo_calibration(
         image_width=_positive_int(obj["image_width"], "image_width"),
         image_height=_positive_int(obj["image_height"], "image_height"),
         K_left=_matrix(obj["K_left"], "K_left", 3, 3),  # type: ignore[arg-type]
-        D_left=_distortion_vector(obj["D_left"], "D_left"),
+        D_left=_pinhole_distortion_vector(obj["D_left"], "D_left"),
         K_right=_matrix(obj["K_right"], "K_right", 3, 3),  # type: ignore[arg-type]
-        D_right=_distortion_vector(obj["D_right"], "D_right"),
+        D_right=_pinhole_distortion_vector(obj["D_right"], "D_right"),
         R=_matrix(obj["R"], "R", 3, 3),  # type: ignore[arg-type]
         T=_fixed_vector(obj["T"], "T", 3),
         R1=_matrix(obj["R1"], "R1", 3, 3),  # type: ignore[arg-type]

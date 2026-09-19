@@ -104,10 +104,10 @@ class _OpenCvMapCorrector:
 
 def overview_corrector(calibration: OverviewCalibration) -> _FrameCorrector:
     size = (calibration.image_width, calibration.image_height)
-    map_x, map_y = cv2.initUndistortRectifyMap(
+    map_x, map_y = cv2.fisheye.initUndistortRectifyMap(
         np.asarray(calibration.K, dtype=np.float64),
-        np.asarray(calibration.D, dtype=np.float64),
-        None,
+        np.asarray(calibration.D, dtype=np.float64).reshape(4, 1),
+        np.eye(3, dtype=np.float64),
         np.asarray(calibration.new_camera_matrix, dtype=np.float64),
         size,
         cv2.CV_32FC1,
@@ -164,17 +164,59 @@ class DecodedFrame:
 
     image: np.ndarray
     capture_id: int | None = None
+    receive_timestamp_ns: int | None = None
+
+
+class DecodedFrameSource(Protocol):
+    """Owner-local source boundary feeding raw decoded BGR frames."""
+
+    def start(self) -> None: ...
+
+    def stop(self) -> None: ...
+
+    def read(self) -> DecodedFrame | None: ...
+
+    @property
+    def failure(self) -> BaseException | None: ...
 
 
 class InMemoryFrameSource:
     """Deterministic hardware-free latest-frame source for prototype tests."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, timestamp_clock_ns: Callable[[], int] = monotonic_ns) -> None:
         self._latest: LatestValue[DecodedFrame] = LatestValue()
         self._last_read_revision = 0
+        self._timestamp_clock_ns = timestamp_clock_ns
 
-    def push(self, image: np.ndarray, *, capture_id: int | None = None) -> None:
-        self._latest.publish(DecodedFrame(image=image, capture_id=capture_id))
+    def start(self) -> None:
+        return None
+
+    def stop(self) -> None:
+        return None
+
+    @property
+    def failure(self) -> BaseException | None:
+        return None
+
+    def push(
+        self,
+        image: np.ndarray,
+        *,
+        capture_id: int | None = None,
+        receive_timestamp_ns: int | None = None,
+    ) -> None:
+        timestamp_ns = (
+            self._timestamp_clock_ns()
+            if receive_timestamp_ns is None
+            else receive_timestamp_ns
+        )
+        self._latest.publish(
+            DecodedFrame(
+                image=image,
+                capture_id=capture_id,
+                receive_timestamp_ns=timestamp_ns,
+            )
+        )
 
     def read(self) -> DecodedFrame | None:
         snapshot = self._latest.snapshot()
@@ -258,11 +300,53 @@ class VisionPipeline:
         LOGGER.info("Vision pipeline started camera=%s generation=%d", self.camera.value, generation)
         return session
 
+    def stop(self) -> None:
+        with self._state_lock:
+            generation = self._generation if self._generation > 0 else None
+            current = self.status.get()
+            last_receive_timestamp_ns = (
+                current.last_receive_timestamp_ns if current is not None else None
+            )
+            self.status.publish(
+                CameraStatus(
+                    camera=self.camera,
+                    state=CameraState.STOPPED,
+                    generation=generation,
+                    last_receive_timestamp_ns=last_receive_timestamp_ns,
+                )
+            )
+        LOGGER.info("Vision pipeline stopped camera=%s generation=%s", self.camera.value, generation)
+
+    def report_source_failure(self, error: BaseException) -> None:
+        with self._state_lock:
+            generation = self._generation if self._generation > 0 else None
+            current = self.status.get()
+            last_receive_timestamp_ns = (
+                current.last_receive_timestamp_ns if current is not None else None
+            )
+            self.status.publish(
+                CameraStatus(
+                    camera=self.camera,
+                    state=CameraState.ERROR,
+                    generation=generation,
+                    last_receive_timestamp_ns=last_receive_timestamp_ns,
+                    error_code=type(error).__name__,
+                    message=str(error),
+                )
+            )
+        LOGGER.warning(
+            "Vision source failed camera=%s generation=%s: %s",
+            self.camera.value,
+            generation,
+            error,
+        )
+
     def submit_decoded_frame(
         self,
         image: np.ndarray,
         *,
         capture_id: int | None = None,
+        receive_timestamp_ns: int | None = None,
     ) -> None:
         with self._state_lock:
             generation = self._generation
@@ -271,7 +355,11 @@ class VisionPipeline:
         if not isinstance(image, np.ndarray):
             raise WorkingFrameError("decoded frame must be numpy.ndarray")
         stable_image = np.array(image, copy=True, order="C")
-        received_ns = self._timestamp_clock_ns()
+        received_ns = (
+            self._timestamp_clock_ns()
+            if receive_timestamp_ns is None
+            else receive_timestamp_ns
+        )
         self._pending.publish(
             _PendingFrame(
                 generation=generation,
@@ -281,11 +369,15 @@ class VisionPipeline:
             )
         )
 
-    def submit_from_source(self, source: InMemoryFrameSource) -> bool:
+    def submit_from_source(self, source: DecodedFrameSource) -> bool:
         decoded = source.read()
         if decoded is None:
             return False
-        self.submit_decoded_frame(decoded.image, capture_id=decoded.capture_id)
+        self.submit_decoded_frame(
+            decoded.image,
+            capture_id=decoded.capture_id,
+            receive_timestamp_ns=decoded.receive_timestamp_ns,
+        )
         return True
 
     def process_latest(self) -> VisionResult | None:
@@ -358,6 +450,7 @@ class VisionPipeline:
 
 __all__ = [
     "DecodedFrame",
+    "DecodedFrameSource",
     "InMemoryFrameSource",
     "MissingCalibrationError",
     "VisionPipeline",

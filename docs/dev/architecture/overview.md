@@ -31,10 +31,10 @@ stereo-right
 
 ```text
 Overview:
-receive/decode → undistort → FramePacket → VisionProcessor → VisionResult
+RTP/JPEG UDP → GStreamer decode → fisheye undistort → FramePacket → VisionProcessor → VisionResult
 
 Stereo Left / Right:
-receive/decode → rectify → FramePacket → VisionProcessor → VisionResult
+RTP/JPEG UDP → GStreamer decode → rectify → FramePacket → VisionProcessor → VisionResult
 ```
 
 `FramePacket.image` — working frame. Raw image наружу как обычный `FramePacket` не публикуется.
@@ -63,7 +63,7 @@ calibration/
   stereo.json
 ```
 
-Overview использует mono calibration и undistortion. Stereo Left/Right используют единый stereo calibration и rectification.
+Overview использует OpenCV fisheye calibration (`K`, ровно 4 коэффициента `D`, `new_camera_matrix`) и fisheye-undistortion. Геометрия исправленного working frame строится по `new_camera_matrix`. Stereo Left/Right сохраняют отдельную pinhole/stereo OpenCV calibration и rectification.
 
 Публичный геометрический контракт:
 
@@ -73,7 +73,7 @@ CameraModel.pixel_to_ray(x, y) → normalized CameraRay
 
 `CameraRay` использует `+Y вниз`, как image/OpenCV geometry. Aiming преобразует результат в логическую систему Turret, где `+Y вверх`.
 
-При несовпадении calibration image size и camera image size pipeline не считается ready. Автоматический crop/resize/scaling calibration в первой реализации не выполняется.
+При несовпадении calibration image size и фактического decoded camera image size pipeline не считается ready. Размер берётся из decoded sample, а не из requested sender resolution. Автоматический crop/resize/scaling calibration в первой реализации не выполняется.
 
 ## UI: main / preview
 
