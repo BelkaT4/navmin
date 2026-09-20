@@ -13,6 +13,7 @@ changes are included.
 from __future__ import annotations
 
 import datetime as dt
+import hashlib
 import subprocess
 import sys
 import zipfile
@@ -84,12 +85,18 @@ def main() -> int:
         for source, rel in files:
             archive.write(source, rel.as_posix())
 
+    sha256 = hashlib.sha256()
+    with archive_path.open("rb") as archive_file:
+        for chunk in iter(lambda: archive_file.read(1024 * 1024), b""):
+            sha256.update(chunk)
+
     size_mb = archive_path.stat().st_size / (1024 * 1024)
     print()
     print("Archive created successfully.")
     print(f"Files:   {len(files)}")
     print(f"Size:    {size_mb:.2f} MiB")
     print(f"Archive: {archive_path}")
+    print(f"SHA-256: {sha256.hexdigest()}")
     print()
     return 0
 
