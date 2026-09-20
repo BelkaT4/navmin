@@ -316,7 +316,7 @@ UI overlays рисуются только для отображения. Осн�
 5. сохранить config и завершить Core/UI
 ```
 
-Concrete stop tokens, join timeout и обработка зависшего worker остаются implementation questions.
+Общий `StopToken`, boundary `request_stop() / join()` и bounded stop для `CameraWorker`/`TurretWorker` уже определены. Открытыми остаются application-wide startup/shutdown orchestration, aggregate handling зависших workers и cleanup после partial startup.
 
 ## Межпотоковая семантика
 

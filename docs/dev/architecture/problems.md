@@ -75,9 +75,10 @@ Freshness вычисляется отдельно по timestamp.
 - reconnect/backoff;
 - критерий устойчивого ERROR;
 - restart/reset `VisionProcessor`;
+- единственный production owner monotonic generation при reconnect или replacement экземпляра pipeline; current prototype владеет generation внутри существующего `VisionPipeline`, без отдельного `Camera Registry` или второго counter;
 - reconnect history/logging.
 
-При каждом новом pipeline start создаётся новая `generation`.
+При каждом новом pipeline start создаётся новая `generation`; replacement не должен сбрасывать или дублировать monotonic sequence соответствующей camera role.
 
 ### 10. Worker lifecycle
 

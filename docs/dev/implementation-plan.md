@@ -118,9 +118,9 @@ Normal test run не должен требовать hardware.
 | 2. Config + Calibration foundation | done | typed config, persistence, calibration loading/model boundary | 1 |
 | 3. Turret PC stack | done | PC protocol/transport/controller/HAL + simulator | 1, 2 |
 | 4. STM32 firmware + UART | done | firmware protocol/control + UART integration boundary | 3 |
-| 5. Vision | not-started | camera pipelines, generations, working frame, manual distance | 1, 2 |
-| 6. Core + Aiming | not-started | mediator/state transitions/aiming/tracking error | 2, 3, 5 |
-| 7. UI | not-started | PyQt6 main/preview, controls, overlays, settings | 2, 3, 5, 6 |
+| 5. Vision | in-progress — prototype minimum accepted | camera pipelines, generations, working frame, manual distance | 1, 2 |
+| 6. Core + Aiming | in-progress — prototype minimum accepted | mediator/state transitions/aiming/tracking error | 2, 3, 5 |
+| 7. UI | in-progress — prototype minimum accepted | PyQt6 main/preview, controls, overlays, settings | 2, 3, 5, 6 |
 | 8. System integration and v1 hardening | not-started | startup/shutdown, failure paths, E2E, hardware smoke/performance | 4, 5, 6, 7 |
 
 Полноценный stereo distance, camera-to-turret rotational extrinsic, target handoff и другие явно отложенные возможности не являются условиями завершения v1, если архитектурные документы не будут изменены отдельным решением.
@@ -193,9 +193,9 @@ Stage 5 minimum: Legacy14VisionProcessor + SimpleTracker + рабочие Overvi
 
 Не дублировать тест каждого concrete store для каждого будущего domain type, если один generic primitive уже покрыт и domain type не добавляет своей логики.
 
-### Открытые вопросы, которые должен закрыть этап
+### Закрытые prerequisites и открытые вопросы этапа
 
-- `problems.md` #4: concrete latest-state / thread-safe primitives;
+- concrete latest-state / thread-safe primitives закрыты в Foundation;
 - минимальная часть #10: общий stop/join contract;
 - минимальная часть #13: logging transport/setup.
 
@@ -487,7 +487,7 @@ Host-side protocol tests из этапа 3 не дублировать в firmwa
 
 ## 10. Этап 5 — Vision
 
-**Статус:** `not-started`
+**Статус:** `in-progress` — prototype minimum accepted
 
 ### Цель
 
@@ -505,10 +505,10 @@ Host-side protocol tests из этапа 3 не дублировать в firmwa
 
 ### Реализовать
 
-- camera registry по `CameraRole`;
+- camera pipelines по `CameraRole` без отдельного production `Camera Registry`;
 - по одному pipeline worker на роль;
-- generation lifecycle;
-- `CameraSessionStarted` до generation data;
+- в current accepted minimum каждый `VisionPipeline` владеет своей monotonic generation в пределах lifetime экземпляра, а `VisionPipeline.start()` публикует `CameraSessionStarted` до данных новой generation;
+- E2E-1 использует напрямую pipeline-owned `VisionPipeline.session_barriers`, `VisionPipeline.latest_result` и `VisionPipeline.status`;
 - `FramePacket` stamping;
 - receive timestamp/freshness;
 - Overview undistort → working frame;
@@ -527,6 +527,8 @@ Host-side protocol tests из этапа 3 не дублировать в firmwa
 - camera/pipeline simulation suitable for tests and UI development.
 
 Для первого runnable vertical slice достаточно сначала реализовать `Legacy14VisionProcessor` (default) + общий `SimpleTracker` и working-frame path Overview/Stereo Left. `Legacy11VisionProcessor` остаётся обязательным для полного завершения Stage 5, но не блокирует первый end-to-end smoke.
+
+Этот current minimum не принимает окончательного решения об ownership при будущем camera reconnect или replacement экземпляра pipeline. До/в E2E-4 и полном Stage 5 reconnect work нужно сохранить monotonic generation semantics и выбрать одного production owner; отдельный registry или второй generation counter не являются требованием E2E-1.
 
 ### Отложить
 
@@ -590,7 +592,7 @@ Rejection stale/unaccepted generation проверяется на реальны
 
 ## 11. Этап 6 — Core + Aiming
 
-**Статус:** `not-started`
+**Статус:** `in-progress` — prototype minimum accepted
 
 ### Цель
 
@@ -682,7 +684,7 @@ Rejection stale/unaccepted generation проверяется на реальны
 
 ## 12. Этап 7 — UI
 
-**Статус:** `not-started`
+**Статус:** `in-progress` — prototype minimum accepted
 
 ### Цель
 

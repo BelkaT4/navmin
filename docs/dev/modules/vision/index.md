@@ -30,7 +30,9 @@ Stereo Left worker + Stereo / Distance Provider
 Stereo Right worker
 ```
 
-Vision хранит постоянный camera registry с `current_generation[camera]`.
+В current accepted minimum отдельного постоянного production `Camera Registry` нет. Каждый `VisionPipeline` является фактическим owner своей generation в пределах lifetime экземпляра и предоставляет собственные `session_barriers`, `latest_result` и `status`. E2E-1 использует эти pipeline-owned boundaries напрямую.
+
+Единственный `CameraSessionGate` находится в main thread и принадлежит `Mediator`; второго generation gate/counter нет. Ownership при будущем camera reconnect или replacement экземпляра pipeline остаётся открытой частью полного reconnect work: monotonic generation semantics должны сохраниться, а единственный production owner будет выбран до/в E2E-4. См. [открытый вопрос о camera reconnect](../../architecture/problems.md#8-camera-reconnect-transitions-backoff).
 
 ### Production camera transport v1
 
@@ -135,10 +137,10 @@ Rectification/undistortion maps строятся при старте и живу
 
 ## Camera generation и barrier
 
-При каждом новом запуске/restart pipeline:
+В current accepted minimum каждый вызов `VisionPipeline.start()` для существующего экземпляра pipeline:
 
 ```text
-current_generation[camera] += 1
+pipeline-owned generation += 1
 frame_id = 0
 ```
 
@@ -158,7 +160,7 @@ CameraSessionStarted generation=N
 
 Generation защищает от запоздалых результатов старого worker и от повторного использования `track_id` после restart.
 
-При restart одновременно очищаются локальные latest/buffer state и stereo pairing state соответствующей camera.
+`VisionPipeline.start()` инвалидирует предыдущий latest result и сбрасывает processor state до публикации barrier. Полный reconnect/replacement lifecycle, включая сохранение monotonic generation при замене экземпляра pipeline, остаётся частью открытого reconnect work.
 
 ## `CameraSessionGate`
 
