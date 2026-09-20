@@ -16,6 +16,7 @@ UI:
 - принимает click-to-move только в RELATIVE;
 - предоставляет отдельный control `RELATIVE / TRACKING`;
 - предоставляет motor/Emergency controls и settings/recording menu actions;
+- предоставляет modeless Operator Window с runtime status и редкими административными действиями;
 - передаёт actions в Core.
 
 UI не выполняет VisionProcessor, calibration math, Aiming, PID или UART.
@@ -84,7 +85,18 @@ Baseline object overlay минимален: bbox всех текущих `Tracke
 
 ## Основной layout и menu bar
 
-Основное окно стартует fullscreen. Main video занимает основную область, preview находится в её правом нижнем углу, а нижняя operational bar остаётся отдельной постоянной полосой.
+Основное окно стартует fullscreen. `F11` неограниченно переключает fullscreen/windowed state. Main video занимает основную область, preview находится в её правом нижнем углу, а компактная нижняя operational bar остаётся отдельной постоянной полосой.
+
+`Esc` открывает или скрывает единственный `Operator Window`; fullscreen state при этом не меняется. Это отдельное modeless movable tool-window, принадлежащее `MainWindow`: оно остаётся поверх основного окна NavMin, но не использует global always-on-top и уходит назад вместе с приложением при переключении на другое приложение. Закрытие крестиком скрывает только Operator Window и не останавливает main window или workers.
+
+Operator Window показывает только уже существующее runtime state:
+
+- фактический `CameraStatus.state` для Overview и Stereo Left без смешивания с presentation freshness;
+- `TurretState.connection_state`;
+- applied и, при наличии, pending control mode по той же semantics, что operational bar;
+- подтверждённый `TurretState.motor_state`.
+
+Кнопка `Полноэкранный режим: ВКЛ/ВЫКЛ` выполняет тот же toggle, что `F11`, и синхронно отражает состояние main window. Кнопка `Выход` после стандартного confirmation `Выйти из NavMin?` закрывает MainWindow штатным UI lifecycle path. Operator Window не дублирует motor control или Emergency и не является полным Settings UI.
 
 Верхний menu bar содержит редко используемые действия, в том числе recording, view, diagnostics и settings. Motor control в menu bar не дублируется, потому что motor state/control постоянно доступен в нижней bar.
 
@@ -186,7 +198,7 @@ UI click on main working frame
 
 ## Operational bar / Emergency / Motor controls
 
-Нижняя operational bar всегда видима и использует fixed-size controls: изменение текста/состояния не меняет их ширину/высоту и не сдвигает соседние элементы. Минимальный набор:
+Нижняя operational bar всегда видима и использует компактные fixed-size controls: изменение текста/состояния не меняет их ширину/высоту и не сдвигает соседние элементы. Emergency остаётся визуально крупнейшим действием. Минимальный набор:
 
 - switch `RELATIVE / TRACKING`;
 - кликабельный motor state/control;
@@ -273,7 +285,7 @@ Per-frame queued Qt signals не используются: они могли б�
 
 Все QWidget/QPixmap/QPainter operations выполняются только в Qt main thread.
 
-`Esc` в fullscreen переводит окно в обычный window mode и не завершает приложение. В обычном window mode `Esc` не имеет специального действия.
+Открытый Operator Window не является pause state: main-thread pump, camera presentation, Turret state и уже активный tracking продолжают обновляться. Поскольку это отдельное окно, оно не меняет geometry или image-coordinate mapping main video.
 
 ## Границы
 
@@ -290,5 +302,6 @@ UI не:
 
 - детальный partial-failure UX для всех комбинаций availability;
 - future latest-live-frame mode.
+- FPS display: до реализации нужно разделить receive, accepted/displayed `VisionResult` и display FPS; предпочтительный обычный operator metric — accepted/displayed `VisionResult` FPS, а diagnostics сможет показывать несколько метрик. Существующий `ui.show-fps` не получает новую semantics в этом checkpoint.
 
 Полный список: [Открытые вопросы](../../architecture/problems.md).

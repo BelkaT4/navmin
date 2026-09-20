@@ -5,9 +5,10 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass
 
-from PyQt6.QtCore import QPointF, QRectF, QSize, Qt
+from PyQt6.QtCore import QEvent, QPointF, QRectF, QSize, Qt
 from PyQt6.QtGui import (
     QColor,
+    QEnterEvent,
     QFont,
     QImage,
     QMouseEvent,
@@ -138,14 +139,16 @@ class VideoView(QWidget):
         self.setMinimumSize(1, 1)
         self.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent)
 
+        self._preview_hovered = False
         self.swap_button: QPushButton | None = None
         if preview:
             button = QPushButton("⇄", self)
-            button.setFixedSize(42, 34)
+            button.setFixedSize(30, 26)
             button.setToolTip("Поменять main и preview")
             if on_swap is not None:
                 button.clicked.connect(on_swap)
             self.swap_button = button
+            self._apply_swap_button_style()
 
     @property
     def camera(self) -> CameraRole:
@@ -228,11 +231,44 @@ class VideoView(QWidget):
             )
         )
 
+    def enterEvent(self, event: QEnterEvent) -> None:
+        if self._preview:
+            self._preview_hovered = True
+            self._apply_swap_button_style()
+        super().enterEvent(event)
+
+    def leaveEvent(self, event: QEvent) -> None:
+        if self._preview:
+            self._preview_hovered = False
+            self._apply_swap_button_style()
+        super().leaveEvent(event)
+
     def resizeEvent(self, event: QResizeEvent) -> None:
         button = self.swap_button
         if button is not None:
             button.move(max(0, self.width() - button.width() - 8), 8)
         super().resizeEvent(event)
+
+    def _apply_swap_button_style(self) -> None:
+        button = self.swap_button
+        if button is None:
+            return
+        if self._preview_hovered:
+            button.setStyleSheet(
+                "QPushButton { background: rgba(45, 45, 45, 185); color: rgba(255, 255, 255, 225);"
+                " border: 1px solid rgba(255, 255, 255, 125); border-radius: 4px; font-size: 15px; }"
+                "QPushButton:hover { background: rgba(65, 65, 65, 220); color: white;"
+                " border-color: rgba(255, 255, 255, 175); }"
+                "QPushButton:pressed { background: rgba(20, 20, 20, 225); }"
+            )
+            return
+        button.setStyleSheet(
+            "QPushButton { background: rgba(35, 35, 35, 105); color: rgba(245, 245, 245, 135);"
+            " border: 1px solid rgba(245, 245, 245, 55); border-radius: 4px; font-size: 15px; }"
+            "QPushButton:hover { background: rgba(60, 60, 60, 205); color: white;"
+            " border-color: rgba(255, 255, 255, 160); }"
+            "QPushButton:pressed { background: rgba(20, 20, 20, 220); }"
+        )
 
     def mousePressEvent(self, event: QMouseEvent) -> None:
         if event.button() is not Qt.MouseButton.LeftButton:

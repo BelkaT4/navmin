@@ -17,6 +17,7 @@ flowchart TB
     end
 
     settings["Settings Window<br/>Vision / Aiming / Turret / UI"]
+    operator_window["Operator Window<br/>camera / Turret / mode / motor status<br/>fullscreen / Exit"]
     selection["TRACKING target request<br/>camera + generation + track_id"]
     click_move["Click-to-move<br/>confirmed RELATIVE + main only"]
     turret_controls["Turret controls<br/>mode / motor / Emergency"]
@@ -31,6 +32,8 @@ flowchart TB
   session_gate -.-> diagnostics
   session_gate -.-> recording
   flag_state_in --> state_view
+  state_view --> operator_window
+  main_window ---|"owner / Esc / F11"| operator_window
 
   main_view --> selection
   main_view --> click_move
@@ -46,6 +49,6 @@ flowchart TB
   settings --> flag_core_out
   flag_config_in -.-> settings
   state_view --> bottom_bar
-%% graph:positions {"ui":{"x":130,"y":110,"w":1100,"h":900},"main_window":{"x":157,"y":190,"w":726,"h":354},"flag_vision_in":{"x":456,"y":-36},"flag_session_in":{"x":664,"y":-36},"flag_state_in":{"x":1284,"y":401,"w":160,"h":93},"flag_core_out":{"x":624,"y":1092,"w":160,"h":114},"flag_config_in":{"x":1284,"y":732},"session_gate":{"x":430,"y":70},"main_view":{"x":273,"y":36},"preview_view":{"x":485,"y":36},"top_bar":{"x":529,"y":252},"bottom_bar":{"x":529,"y":120},"diagnostics":{"x":69,"y":36},"settings":{"x":854,"y":622},"selection":{"x":110,"y":598,"w":160,"h":78},"click_move":{"x":302,"y":622},"turret_controls":{"x":486,"y":598,"w":160,"h":78},"recording":{"x":166,"y":70},"state_view":{"x":914,"y":310}}
-%% graph:edges {"flag_session_in>session_gate":{"label":[60,-10]},"flag_vision_in>session_gate":{"label":[70,20]},"session_gate>main_view":{"label":[-20,-20]},"session_gate>preview_view":{"label":[25,-20]},"flag_state_in>state_view":{"label":[60,5]},"main_view>selection":{"label":[-30,55]},"main_view>click_move":{"label":[15,65]},"selection>flag_core_out":{"label":[80,10]},"click_move>flag_core_out":{"label":[70,25]},"turret_controls>flag_core_out":{"label":[45,-25]},"settings>flag_core_out":{"label":[85,45]}}
+%% graph:positions {"ui":{"x":130,"y":110,"w":1100,"h":900},"main_window":{"x":157,"y":190,"w":726,"h":354},"flag_vision_in":{"x":456,"y":-36},"flag_session_in":{"x":664,"y":-36},"flag_state_in":{"x":1284,"y":401,"w":160,"h":93},"flag_core_out":{"x":624,"y":1092,"w":160,"h":114},"flag_config_in":{"x":1284,"y":732},"session_gate":{"x":430,"y":70},"main_view":{"x":273,"y":36},"preview_view":{"x":485,"y":36},"top_bar":{"x":529,"y":252},"bottom_bar":{"x":529,"y":120},"diagnostics":{"x":69,"y":36},"settings":{"x":854,"y":622},"operator_window":{"x":886,"y":86,"w":220,"h":96},"selection":{"x":110,"y":598,"w":160,"h":78},"click_move":{"x":302,"y":622},"turret_controls":{"x":486,"y":598,"w":160,"h":78},"recording":{"x":166,"y":70},"state_view":{"x":914,"y":310}}
+%% graph:edges {"flag_session_in>session_gate":{"label":[60,-10]},"flag_vision_in>session_gate":{"label":[70,20]},"session_gate>main_view":{"label":[-20,-20]},"session_gate>preview_view":{"label":[25,-20]},"flag_state_in>state_view":{"label":[60,5]},"state_view>operator_window":{"label":[55,-15]},"main_window>operator_window":{"label":[42,-20]},"main_view>selection":{"label":[-30,55]},"main_view>click_move":{"label":[15,65]},"selection>flag_core_out":{"label":[80,10]},"click_move>flag_core_out":{"label":[70,25]},"turret_controls>flag_core_out":{"label":[45,-25]},"settings>flag_core_out":{"label":[85,45]}}
 %% graph:waypoints {"main_view>selection":[[346,428]],"selection>flag_core_out":[[320,847]],"click_move>flag_core_out":[[512,828]],"settings>flag_core_out":[[1064,867]]}

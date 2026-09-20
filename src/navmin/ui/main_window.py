@@ -5,12 +5,13 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping
 from time import monotonic_ns
 
-from PyQt6.QtCore import Qt
-from PyQt6.QtGui import QKeyEvent, QResizeEvent
+from PyQt6.QtCore import QEvent, Qt
+from PyQt6.QtGui import QCloseEvent, QKeyEvent, QResizeEvent
 from PyQt6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QMainWindow,
+    QMessageBox,
     QPushButton,
     QSizePolicy,
     QVBoxLayout,
@@ -31,6 +32,7 @@ from navmin.contracts import (
 from navmin.core import Mediator
 
 from .bridge import CameraUiBinding, UiStatePump
+from .operator_window import OperatorWindow
 from .video_view import PreparedVisionFrame, VideoView, prepare_vision_frame
 
 _NORMAL_CAMERAS = (CameraRole.OVERVIEW, CameraRole.STEREO_LEFT)
@@ -107,27 +109,27 @@ class MainWindow(QMainWindow):
         self.video_area = _VideoArea(self.main_view, self.preview_view)
 
         self.mode_button = QPushButton()
-        self.mode_button.setFixedSize(230, 54)
+        self.mode_button.setFixedSize(170, 40)
         self.mode_button.clicked.connect(self._request_other_mode)
         self.motor_button = QPushButton()
-        self.motor_button.setFixedSize(190, 54)
+        self.motor_button.setFixedSize(145, 40)
         self.motor_button.clicked.connect(self._toggle_motor)
         self.connection_label = QLabel()
         self.connection_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.connection_label.setFixedSize(210, 54)
+        self.connection_label.setFixedSize(170, 40)
         self.emergency_button = QPushButton("EMERGENCY")
-        self.emergency_button.setFixedSize(250, 64)
+        self.emergency_button.setFixedSize(190, 48)
         self.emergency_button.setStyleSheet(
-            "QPushButton { background: #a51616; color: white; font-size: 22px; font-weight: bold; }"
+            "QPushButton { background: #a51616; color: white; font-size: 18px; font-weight: bold; }"
             "QPushButton:pressed { background: #710d0d; }"
         )
         self.emergency_button.clicked.connect(self._mediator.emergency_stop)
 
-        operational_bar = QWidget()
-        operational_bar.setFixedHeight(84)
-        bar_layout = QHBoxLayout(operational_bar)
-        bar_layout.setContentsMargins(12, 10, 12, 10)
-        bar_layout.setSpacing(12)
+        self.operational_bar = QWidget()
+        self.operational_bar.setFixedHeight(62)
+        bar_layout = QHBoxLayout(self.operational_bar)
+        bar_layout.setContentsMargins(10, 7, 10, 7)
+        bar_layout.setSpacing(9)
         bar_layout.addWidget(self.mode_button)
         bar_layout.addWidget(self.motor_button)
         bar_layout.addWidget(self.connection_label)
@@ -139,10 +141,16 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
         layout.addWidget(self.video_area, 1)
-        layout.addWidget(operational_bar, 0)
+        layout.addWidget(self.operational_bar, 0)
         self.setCentralWidget(central)
         self.setWindowTitle("BelkaT4 / NavMin")
         self.resize(1280, 800)
+
+        self.operator_window = OperatorWindow(
+            owner=self,
+            on_toggle_fullscreen=self.toggle_fullscreen,
+            on_exit=self.request_exit,
+        )
 
         self.state_pump = UiStatePump(
             mediator=mediator,
@@ -161,14 +169,61 @@ class MainWindow(QMainWindow):
             self.state_pump.start()
         if start_fullscreen:
             self.showFullScreen()
+        self.operator_window.set_fullscreen_state(self.isFullScreen())
 
     def keyPressEvent(self, event: QKeyEvent) -> None:
         if event.key() == Qt.Key.Key_Escape:
-            if self.isFullScreen():
-                self.showNormal()
+            self.toggle_operator_window()
+            event.accept()
+            return
+        if event.key() == Qt.Key.Key_F11:
+            self.toggle_fullscreen()
             event.accept()
             return
         super().keyPressEvent(event)
+
+    def changeEvent(self, event: QEvent) -> None:
+        super().changeEvent(event)
+        if event.type() is QEvent.Type.WindowStateChange:
+            self.operator_window.set_fullscreen_state(self.isFullScreen())
+
+    def closeEvent(self, event: QCloseEvent) -> None:
+        self.operator_window.close()
+        super().closeEvent(event)
+
+    def toggle_fullscreen(self) -> None:
+        if self.isFullScreen():
+            self.showNormal()
+        else:
+            self.showFullScreen()
+        self.operator_window.set_fullscreen_state(self.isFullScreen())
+
+    def toggle_operator_window(self) -> None:
+        if self.operator_window.isVisible():
+            self.operator_window.hide()
+            return
+        self.operator_window.show()
+        self.operator_window.raise_()
+        self.operator_window.activateWindow()
+
+    def request_exit(self) -> None:
+        if self._confirm_exit():
+            self.close()
+
+    def _confirm_exit(self) -> bool:
+        dialog = QMessageBox(self.operator_window)
+        dialog.setWindowTitle("Выход")
+        dialog.setText("Выйти из NavMin?")
+        dialog.setIcon(QMessageBox.Icon.Question)
+        dialog.setStandardButtons(
+            QMessageBox.StandardButton.Cancel | QMessageBox.StandardButton.Yes
+        )
+        cancel_button = dialog.button(QMessageBox.StandardButton.Cancel)
+        exit_button = dialog.button(QMessageBox.StandardButton.Yes)
+        cancel_button.setText("Отмена")
+        exit_button.setText("Выйти")
+        dialog.setDefaultButton(QMessageBox.StandardButton.Cancel)
+        return dialog.exec() == QMessageBox.StandardButton.Yes
 
     def swap_main_preview(self) -> None:
         self._mediator.swap_main_preview()
@@ -199,6 +254,7 @@ class MainWindow(QMainWindow):
     def _camera_status_changed(self, status: CameraStatus) -> None:
         self._camera_statuses[status.camera] = status
         self._apply_camera_to_views(status.camera)
+        self.operator_window.set_camera_status(status.camera, status)
 
     def _turret_state_changed(self, _state: TurretState) -> None:
         self._refresh_turret_controls()
@@ -299,6 +355,7 @@ class MainWindow(QMainWindow):
         self.connection_label.setText(
             f"СВЯЗЬ: {state.connection_state.value.upper()}"
         )
+        self.operator_window.set_turret_state(state, pending)
 
     @staticmethod
     def _other_camera(camera: CameraRole) -> CameraRole:

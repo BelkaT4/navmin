@@ -9,7 +9,7 @@ import pytest
 from PyQt6.QtCore import QPoint, QPointF, QSize, Qt
 from PyQt6.QtGui import QPixmap
 from PyQt6.QtTest import QTest
-from PyQt6.QtWidgets import QApplication
+from PyQt6.QtWidgets import QApplication, QMessageBox
 
 from navmin.concurrency import CameraSessionBarrierChannel, LatestValue
 from navmin.config.models import AimingConfig, AimPointConfig, AimPointsConfig, UiConfig
@@ -357,9 +357,45 @@ def test_preview_click_and_action_swap_exactly_once_without_aiming(
 
     button = window.preview_view.swap_button
     assert button is not None
+    assert button.width() < 42
+    assert button.height() < 34
+
+    inactive_style = button.styleSheet()
+    QTest.mouseMove(window.preview_view, QPoint(50, 50))
+    qt_application.processEvents()
+    active_style = button.styleSheet()
+    assert active_style != inactive_style
+
     QTest.mouseClick(button, Qt.MouseButton.LeftButton)
     assert mediator.main_camera is CameraRole.OVERVIEW
     assert turret.relative_commands == []
+
+    QTest.mouseMove(window.main_view, QPoint(50, 50))
+    qt_application.processEvents()
+    assert button.styleSheet() == inactive_style
+    window.close()
+
+
+def test_operational_bar_is_compact_and_emergency_remains_largest(
+    qt_application: QApplication,
+) -> None:
+    window, _mediator_value, _turret, _bindings_value, _states = _window(
+        qt_application
+    )
+
+    assert window.operational_bar.height() < 84
+    ordinary_controls = (
+        window.mode_button,
+        window.motor_button,
+        window.connection_label,
+    )
+    assert all(control.height() <= 42 for control in ordinary_controls)
+    assert window.emergency_button.height() > max(
+        control.height() for control in ordinary_controls
+    )
+    assert window.emergency_button.width() > max(
+        control.width() for control in ordinary_controls
+    )
     window.close()
 
 
@@ -684,20 +720,131 @@ def test_no_frame_uses_placeholder_state(qt_application: QApplication) -> None:
     view.close()
 
 
-def test_fullscreen_escape_leaves_window_running(qt_application: QApplication) -> None:
+def test_f11_toggles_fullscreen_repeatedly(qt_application: QApplication) -> None:
     window, _mediator_value, _turret, _bindings_value, _states = _window(qt_application)
     window.showFullScreen()
     qt_application.processEvents()
     assert window.isFullScreen()
 
-    QTest.keyClick(window, Qt.Key.Key_Escape)
+    QTest.keyClick(window, Qt.Key.Key_F11)
     qt_application.processEvents()
     assert not window.isFullScreen()
     assert window.isVisible()
 
+    QTest.keyClick(window, Qt.Key.Key_F11)
+    qt_application.processEvents()
+    assert window.isFullScreen()
+    window.close()
+
+
+def test_escape_toggles_single_modeless_operator_window(
+    qt_application: QApplication,
+) -> None:
+    window, _mediator_value, _turret, _bindings_value, _states = _window(
+        qt_application
+    )
+    operator = window.operator_window
+    assert operator.parentWidget() is window
+    assert operator.windowModality() is Qt.WindowModality.NonModal
+    assert operator.windowFlags() & Qt.WindowType.Tool
+    assert not operator.windowFlags() & Qt.WindowType.WindowStaysOnTopHint
+
     QTest.keyClick(window, Qt.Key.Key_Escape)
+    qt_application.processEvents()
+    assert operator.isVisible()
+    assert window.operator_window is operator
+
+    QTest.keyClick(window, Qt.Key.Key_Escape)
+    qt_application.processEvents()
+    assert not operator.isVisible()
+    assert window.isVisible()
+
+    QTest.keyClick(window, Qt.Key.Key_Escape)
+    qt_application.processEvents()
+    assert operator.isVisible()
+    operator.close()
+    qt_application.processEvents()
+    assert not operator.isVisible()
     assert window.isVisible()
     window.close()
+
+
+def test_operator_window_statuses_follow_existing_ui_update_path(
+    qt_application: QApplication,
+) -> None:
+    window, _mediator_value, _turret, bindings, states = _window(qt_application)
+    operator = window.operator_window
+    overview = _status(CameraRole.OVERVIEW, 1, state=CameraState.ONLINE)
+    left = _status(CameraRole.STEREO_LEFT, 3, state=CameraState.RECONNECTING)
+    bindings[CameraRole.OVERVIEW].status.publish(overview)
+    bindings[CameraRole.STEREO_LEFT].status.publish(left)
+    states.publish(
+        _turret_state(
+            mode=TurretControlMode.TRACKING,
+            motor=MotorState.OFF,
+            connection=TurretConnectionState.CONNECTING,
+        )
+    )
+
+    window.state_pump.pump_once()
+
+    assert operator.camera_labels[CameraRole.OVERVIEW].text() == "Overview: ONLINE"
+    assert (
+        operator.camera_labels[CameraRole.STEREO_LEFT].text()
+        == "Stereo Left: RECONNECTING"
+    )
+    assert operator.controller_label.text() == "Контроллер: CONNECTING"
+    assert operator.mode_label.text() == "Режим: TRACKING"
+    assert operator.motor_label.text() == "Мотор: OFF"
+    window.close()
+
+
+def test_operator_fullscreen_button_and_f11_keep_text_synchronized(
+    qt_application: QApplication,
+) -> None:
+    window, _mediator_value, _turret, _bindings_value, _states = _window(
+        qt_application
+    )
+    button = window.operator_window.fullscreen_button
+    assert button.text() == "Полноэкранный режим: ВЫКЛ"
+
+    QTest.mouseClick(button, Qt.MouseButton.LeftButton)
+    qt_application.processEvents()
+    assert window.isFullScreen()
+    assert button.text() == "Полноэкранный режим: ВКЛ"
+
+    QTest.keyClick(window, Qt.Key.Key_F11)
+    qt_application.processEvents()
+    assert not window.isFullScreen()
+    assert button.text() == "Полноэкранный режим: ВЫКЛ"
+    window.close()
+
+
+def test_operator_exit_confirmation_controls_main_window_close(
+    qt_application: QApplication,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    window, _mediator_value, _turret, _bindings_value, _states = _window(
+        qt_application
+    )
+    operator = window.operator_window
+    operator.show()
+    monkeypatch.setattr(
+        QMessageBox,
+        "exec",
+        lambda _dialog: QMessageBox.StandardButton.Cancel,
+    )
+    QTest.mouseClick(operator.exit_button, Qt.MouseButton.LeftButton)
+    assert window.isVisible()
+
+    monkeypatch.setattr(
+        QMessageBox,
+        "exec",
+        lambda _dialog: QMessageBox.StandardButton.Yes,
+    )
+    QTest.mouseClick(operator.exit_button, Qt.MouseButton.LeftButton)
+    qt_application.processEvents()
+    assert not window.isVisible()
 
 
 def test_main_window_can_request_fullscreen_at_startup(qt_application: QApplication) -> None:
