@@ -136,7 +136,7 @@ class CameraStatus:
 `STALE` не является отдельным взаимоисключающим `CameraState`. Свежесть вычисляется consumer по `last_receive_timestamp_ns`:
 
 ```text
-is_stale = now_monotonic_ns - last_receive_timestamp_ns > stale_timeout_ns
+is_stale = now_monotonic_ns - last_receive_timestamp_ns >= stale_timeout_ns
 ```
 
 Это позволяет обнаружить stale даже если producer полностью перестал публиковать новые сообщения. `message` предназначен для UI/диагностики и не используется как machine-readable state.

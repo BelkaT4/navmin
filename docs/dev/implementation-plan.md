@@ -199,7 +199,7 @@ Stage 5 minimum: Legacy14VisionProcessor + SimpleTracker + рабочие Overvi
 - минимальная часть #10: общий stop/join contract;
 - минимальная часть #13: logging transport/setup.
 
-Qt notification coalescing (#5) остаётся до UI-этапа.
+Qt-specific notification bridge остаётся до UI-этапа.
 
 ### Критерий завершения
 
@@ -696,7 +696,7 @@ Rejection stale/unaccepted generation проверяется на реальны
 - `docs/dev/architecture/configuration.md`
 - `docs/dev/architecture/decisions.md`
 - `docs/dev/diagrams/ui-diagram.mmd`
-- `problems.md` #5, #11, #22
+- `problems.md` #11, #22
 
 ### Реализовать
 
@@ -728,7 +728,6 @@ Motor control выполняется одним click без confirmation dialog
 
 ### Открытые вопросы, которые должен закрыть этап
 
-- #5 Qt notification coalescing;
 - UI часть #11 partial failures.
 
 Future latest-live-frame mode (#22) остаётся deferred. Gesture/overlay/Stereo Right baseline UX уже закрыт управляющим чатом и не должен проектироваться заново внутри Stage 7.
@@ -863,7 +862,6 @@ Hardware tests остаются отдельным suite.
 | #1 RS485 half-duplex | deferred post-v1 / отдельная RS485 migration |
 | #2 capture_id / stereo pairing | deferred |
 | #3 DistanceResult stereo lifecycle | deferred / 5 только manual path |
-| #5 Qt coalescing | 7 |
 | #7 runtime config edge cases | 2 config infrastructure; processor-specific Vision part closed before 5; 6 target-loss-timeout checkpoint |
 | #8 camera reconnect | 5 |
 | #10 worker lifecycle | 1 foundation + Vision/integration stages + 8 final; Turret part closed before 3 |

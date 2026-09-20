@@ -37,7 +37,7 @@ Preview отображается небольшим отдельным окно�
 
 Пользователь может явно swap main/preview click'ом по preview либо кликабельным swap-icon внутри preview. Swap проходит через Core, потому что он влияет на selection и processing scope. Название камеры отображается прямо в соответствующем view; swap-icon означает действие, а не отдельный state indicator.
 
-При отказе main camera UI **не переключается автоматически** на preview. Текущий `main_camera` сохраняется, UI показывает stale/error/«Нет видеосигнала», а swap остаётся явным действием пользователя.
+При отказе main camera UI **не переключается автоматически** на preview. Текущий `main_camera` сохраняется, UI показывает реальный camera status и presentation-признак `НЕТ НОВЫХ КАДРОВ`, а swap остаётся явным действием пользователя.
 
 ## Данные и `CameraSessionGate`
 
@@ -249,18 +249,31 @@ UI может редактировать:
 UI хранит camera connection state отдельно от freshness.
 
 ```text
-ONLINE + fresh → обычный кадр
-ONLINE + stale → freeze last frame + «Нет видеосигнала»
-RECONNECTING / ERROR → соответствующий status
+frame ещё не принят → neutral placeholder + camera name + CameraStatus
+accepted frame + fresh → обычный кадр
+accepted frame + stale → frozen last frame + dim + «НЕТ НОВЫХ КАДРОВ»
+RECONNECTING / ERROR / STOPPED → реальный status поверх placeholder/frozen frame
 ```
 
-Freshness вычисляется в main thread по `last_receive_timestamp_ns`, а не только по bool от producer.
+Freshness вычисляется в main thread по monotonic `CameraStatus.last_receive_timestamp_ns`, а не по bool от producer. Threshold поступает в UI boundary из authoritative `vision.camera-stale-timeout-ms`: меньше configured timeout считается fresh, на границе и выше — stale. Это presentation state, а не новый `CameraState` и не новое config field.
+
+Frozen frame остаётся полезным для ориентации, но не является актуальной aiming surface. RELATIVE/TRACKING interaction разрешена только для accepted generation, fresh frame и `CameraStatus.state == ONLINE`. Preview swap, operational bar и Emergency остаются доступны независимо от camera freshness/state.
+
+Новый accepted `CameraSessionStarted` немедленно очищает displayed result прежней generation до принятия первого результата новой generation. Временное отсутствие кадров внутри той же accepted generation последний кадр не очищает.
 
 ## Производительность
 
-Latest-only VisionResult не должен превращаться в backlog Qt notifications. Concrete coalescing определяется при реализации.
+UI использует main-thread `QTimer` с interval `16 ms` (примерно `60 Hz`) как revision-aware pump. Это polling frequency, а не video FPS: если revision не изменилась, image/result повторно не обрабатывается и `QImage/QPixmap` не создаётся. При нескольких публикациях между ticks читается только freshest latest payload.
+
+В начале каждого tick UI сначала полностью draining'ит FIFO `CameraSessionStarted` каждой камеры, затем читает latest Vision/CameraStatus/TurretState snapshots. Успешно accepted revision помечается consumed; rejected result новой generation остаётся retryable, чтобы race `payload опубликован после drain, barrier будет принят на следующем tick` не терял кадр. Already accepted Vision/Turret revision повторно в Mediator не передаётся.
+
+Per-frame queued Qt signals не используются: они могли бы превратить latest-state в event backlog и накапливать video latency. Более сложный coalesced event-driven wakeup откладывается до измеренной необходимости.
 
 `CameraSessionStarted` — barrier event и не может быть потерян/coalesced как обычный latest notification.
+
+Все QWidget/QPixmap/QPainter operations выполняются только в Qt main thread.
+
+`Esc` в fullscreen переводит окно в обычный window mode и не завершает приложение. В обычном window mode `Esc` не имеет специального действия.
 
 ## Границы
 
@@ -275,7 +288,6 @@ UI не:
 
 ## Что ещё не определено
 
-- Qt notification coalescing primitives;
 - детальный partial-failure UX для всех комбинаций availability;
 - future latest-live-frame mode.
 

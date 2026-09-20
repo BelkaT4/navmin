@@ -605,6 +605,26 @@ Overview calibration schema v1 трактуется как OpenCV fisheye: `D` �
 
 ---
 
+## 30. UI использует revision-aware QTimer pump примерно 60 Hz
+
+### Решение
+
+Prototype UI в Qt main thread каждые `16 ms` сначала полностью обрабатывает доступные lossless `CameraSessionStarted` barriers, затем читает freshest revisions существующих latest-state containers Vision, CameraStatus и TurretState. Успешно принятые revisions больше не обрабатываются; result, опередивший свой barrier в пределах tick, остаётся retryable до следующего tick.
+
+Per-frame queued Qt signals не используются.
+
+### Почему
+
+Это минимальная concurrency model поверх уже существующих `LatestValue`, `InvalidatableLatest` и `CameraSessionBarrierChannel`. Pump добавляет не более примерно `16 ms` polling latency, но не превращает camera rate `15–20 FPS` в `60 FPS` image conversions: без новой revision tick почти ничего не делает. Lossless barriers сохраняют session ordering, а latest payloads естественно coalesce'ятся до freshest value без Qt event backlog.
+
+### Отвергнутые альтернативы
+
+- **Queued Qt signal на каждый frame/state update.** Отклонено: producer может накопить queued callbacks и тем самым вернуть video latency backlog поверх latest-only Vision boundary.
+- **Frame FIFO в UI.** Отклонено: UI нужен freshest accepted state, а не последовательное воспроизведение устаревших кадров.
+- **Сразу вводить coalesced event-driven wakeup.** Отложено до измеренной необходимости: оно сложнее, а `16 ms` pump уже даёт малую bounded polling latency при простой проверяемой ordering model.
+
+---
+
 ## Как использовать этот документ при реализации
 
 При разработке нового модуля сначала нужно следовать нормативным контрактам соответствующего документа. Если возникает желание вернуть ранее удалённый механизм, полезно проверить этот журнал: часто механизм был удалён не случайно, а потому что более простой инвариант закрывает тот же failure case.

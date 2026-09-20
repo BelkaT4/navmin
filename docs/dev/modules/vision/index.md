@@ -284,7 +284,7 @@ FramePacket
 
 UI отображает именно `VisionResult.frame` вместе с его bbox.
 
-Межпотоковая семантика `VisionResult` — latest-only per camera. Qt notification не должна превращать latest-state в backlog.
+Межпотоковая семантика `VisionResult` — latest-only per camera. UI читает revision-aware freshest snapshots через main-thread QTimer pump и не создаёт per-frame queued Qt callbacks.
 
 ## Overview
 
@@ -377,7 +377,7 @@ STOPPED
 
 Vision публикует latest-only `CameraStatus` per camera с `camera`, `state`, `generation`, `last_receive_timestamp_ns` и optional diagnostic error fields.
 
-Freshness не является отдельным state. UI/Core вычисляют stale по `CameraStatus.last_receive_timestamp_ns` и `camera-stale-timeout-ms`.
+Freshness не является отдельным state. UI вычисляет prototype presentation stale по `CameraStatus.last_receive_timestamp_ns` и authoritative `vision.camera-stale-timeout-ms`; это не меняет camera lifecycle state.
 
 Конкретная reconnect/backoff policy остаётся открытым вопросом реализации.
 
@@ -402,14 +402,13 @@ Vision логически публикует:
 - latest/invalidate-able `DistanceResult`;
 - latest-only `CameraStatus` per camera.
 
-Diagnostics/errors идут в logging, runtime state — через typed contracts. Generic event bus заранее не вводится. Конкретный thread-safe primitive и Qt notification coalescing остаются техническими вопросами реализации.
+Diagnostics/errors идут в logging, runtime state — через typed contracts. Generic event bus заранее не вводится. UI notification coalescing реализован revision-aware QTimer pump поверх существующих thread-safe containers; ordered session barriers обрабатываются до latest payloads.
 
 ## Что ещё не определено
 
 - механизм `capture_id` и stereo resync;
 - owner staleness `DistanceResult`;
 - camera reconnect/backoff;
-- concrete thread-safe primitives / notification coalescing;
 - адаптация нагрузки после profiling.
 
 Полный список: [Открытые вопросы](../../architecture/problems.md).

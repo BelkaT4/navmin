@@ -45,12 +45,6 @@ Generation уже не позволяет смешивать разные camera
 ## Во время первой реализации
 
 
-### 5. Qt notification coalescing
-
-Latest payload не должен создавать backlog queued Qt signals.
-
-Нужно определить единый notification/coalescing pattern для Vision, Turret и ConfigUpdate. `CameraSessionStarted` является barrier и не может быть потерян/coalesced как обычный latest notification.
-
 ### 7. Edge cases runtime config apply
 
 Базовая classification уже определена в `configuration.md`. Turret-specific PID apply semantics закрыты и перенесены в `configuration.md`, `modules/turret/index.md` и `decisions.md`.

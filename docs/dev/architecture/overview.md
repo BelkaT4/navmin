@@ -332,7 +332,7 @@ pending_motion       → one latest unsent motion intent
 Emergency Stop       → dedicated priority operation
 ```
 
-Типизированные состояния покрывают runtime state, диагностические сообщения идут в logging, а reconnect/recovery принадлежит owner-модулям Vision/Turret. Concrete thread-safe primitives и Qt notification coalescing остаются техническими вопросами реализации.
+Типизированные состояния покрывают runtime state, диагностические сообщения идут в logging, а reconnect/recovery принадлежит owner-модулям Vision/Turret. UI coalesce'ит latest-state через revision-aware main-thread QTimer pump; `CameraSessionStarted` остаётся отдельным lossless barrier.
 
 ## Конфигурация
 

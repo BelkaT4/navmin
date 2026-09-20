@@ -529,7 +529,6 @@ Wire `EVENTS` section STM32 зарезервирована, но пуста в v
 
 ## Что ещё не определено
 
-- Qt notification/coalescing details для доставки latest-state в main thread;
 - hardware upper limits step rate/acceleration/watchdog/static relative delta;
 - D-filter после измерений;
 - future position feedback/homing.
