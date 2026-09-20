@@ -27,7 +27,7 @@ from navmin.contracts import CameraRole
 from navmin.core import Mediator
 from navmin.lifecycle import StopToken
 from navmin.logging_setup import configure_logging
-from navmin.turret.worker import TurretWorker, WorkerShutdownError
+from navmin.turret.worker import TransportFactory, TurretWorker, WorkerShutdownError
 from navmin.vision.camera_worker import CameraWorker
 from navmin.vision.pipeline import (
     InMemoryFrameSource,
@@ -274,7 +274,11 @@ def _smoke_turret_config() -> TurretConfig:
 class SoftwareSmokeRuntime:
     """Smoke-only composition of existing production workers and boundaries."""
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        turret_transport_factory: TransportFactory | None = None,
+    ) -> None:
         self.overview_source = InMemoryFrameSource()
         self.stereo_left_source = InMemoryFrameSource()
 
@@ -307,7 +311,10 @@ class SoftwareSmokeRuntime:
             source=self.stereo_left_source,
         )
 
-        self.turret_worker = TurretWorker(_smoke_turret_config())
+        self.turret_worker = TurretWorker(
+            _smoke_turret_config(),
+            transport_factory=turret_transport_factory,
+        )
         self.mediator = Mediator(
             aiming_config=_smoke_aiming_config(),
             ui_config=_smoke_ui_config(),
