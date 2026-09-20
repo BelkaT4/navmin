@@ -130,7 +130,9 @@ PNG/SVG = export only
 
 Меняется ownership, module boundary, data/control flow или transport path → проверь `.mmd`.
 
-Не редактируй PNG/SVG вместо `.mmd`. Сохраняй используемые проектом metadata/position comments.
+Не редактируй PNG/SVG вместо `.mmd`. Если для изменённого `.mmd` в Git хранится PNG/SVG export, перед commit обнови export после окончательной версии source — в том числе после ручных изменений размеров, positions, waypoints или arrangement.
+
+Сохраняй используемые проектом metadata/position comments. Не выполняй automatic relayout существующей диаграммы без необходимости и не удаляй layout metadata только потому, что Mermaid умеет отрисовать diagram без неё. При rename node ID согласованно обновляй связанные `graph:positions`, waypoints, edge metadata и другие project-specific layout references.
 
 ## 6. Не дублировать контракты
 
