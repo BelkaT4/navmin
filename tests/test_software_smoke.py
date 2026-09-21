@@ -4,6 +4,7 @@ import os
 import runpy
 import subprocess
 import sys
+from itertools import pairwise
 from pathlib import Path
 from time import monotonic, monotonic_ns, sleep
 
@@ -12,12 +13,23 @@ import numpy as np
 from navmin.contracts import (
     CameraRole,
     CameraState,
+    FramePacket,
+    MotorState,
     TurretConnectionState,
     TurretControlMode,
 )
-from navmin.turret.protocol import CommandCode, MoveRelativePayload
+from navmin.turret.protocol import (
+    CommandCode,
+    MoveRelativePayload,
+    SetVelocityPayload,
+)
 from navmin.turret.simulator import FakeStm32Endpoint, FakeTransport
-from navmin.vision.pipeline import InMemoryFrameSource
+from navmin.vision.pipeline import (
+    InMemoryFrameSource,
+    overview_corrector,
+    stereo_left_corrector,
+)
+from navmin.vision.processors.legacy_14.processor import Legacy14VisionProcessor
 
 _SMOKE_TOOL = Path(__file__).resolve().parents[1] / "tools" / "run_software_smoke.py"
 _SMOKE = runpy.run_path(str(_SMOKE_TOOL), run_name="navmin_software_smoke")
@@ -25,6 +37,11 @@ FRAME_HEIGHT = _SMOKE["FRAME_HEIGHT"]
 FRAME_WIDTH = _SMOKE["FRAME_WIDTH"]
 SoftwareSmokeRuntime = _SMOKE["SoftwareSmokeRuntime"]
 SyntheticFrameProducer = _SMOKE["SyntheticFrameProducer"]
+_overview_frame = _SMOKE["_overview_frame"]
+_stereo_left_frame = _SMOKE["_stereo_left_frame"]
+_synthetic_target_center = _SMOKE["_synthetic_target_center"]
+synthetic_overview_calibration = _SMOKE["synthetic_overview_calibration"]
+synthetic_stereo_calibration = _SMOKE["synthetic_stereo_calibration"]
 
 
 def _wait_for_frame(source: InMemoryFrameSource, timeout: float = 1.0):
@@ -69,6 +86,65 @@ def test_synthetic_camera_producers_are_independent_and_stop_bounded() -> None:
 
     assert not overview.is_alive()
     assert not stereo.is_alive()
+
+
+def test_synthetic_scenes_produce_one_stable_real_track_per_camera() -> None:
+    cases = (
+        (
+            CameraRole.OVERVIEW,
+            _overview_frame,
+            overview_corrector(synthetic_overview_calibration()),
+            20.0,
+        ),
+        (
+            CameraRole.STEREO_LEFT,
+            _stereo_left_frame,
+            stereo_left_corrector(synthetic_stereo_calibration()),
+            15.0,
+        ),
+    )
+
+    for camera, make_frame, corrector, fps in cases:
+        processor = Legacy14VisionProcessor()
+        tracked_by_frame = []
+        for frame_id in range(240):
+            image = corrector.correct(make_frame(frame_id))
+            result = processor.process(
+                FramePacket(
+                    camera=camera,
+                    generation=1,
+                    frame_id=frame_id,
+                    capture_id=None,
+                    receive_timestamp_ns=round(frame_id * 1_000_000_000 / fps),
+                    image=image,
+                )
+            )
+            tracked_by_frame.append(result.tracked_objects)
+
+        settled_tracks = tracked_by_frame[12:]
+        assert all(len(tracked) == 1 for tracked in settled_tracks)
+        assert len({tracked[0].track_id for tracked in settled_tracks}) == 1
+        assert all(
+            current[0].age_frames > previous[0].age_frames
+            for previous, current in pairwise(settled_tracks)
+        )
+
+        stable_window = tracked_by_frame[12:32]
+        assert len(stable_window) == 20
+        assert all(len(tracked) == 1 for tracked in stable_window)
+        stable_tracks = [tracked[0] for tracked in stable_window]
+        assert len({tracked.track_id for tracked in stable_tracks}) == 1
+        assert all(
+            current.age_frames > previous.age_frames
+            for previous, current in pairwise(stable_tracks)
+        )
+        assert all(abs(tracked.velocity_x_px_s) > 5.0 for tracked in stable_tracks)
+
+        for frame_id, (tracked,) in enumerate(settled_tracks, start=12):
+            target_x, target_y = _synthetic_target_center(camera, frame_id)
+            bbox = tracked.bbox
+            assert bbox.x - 8 <= target_x <= bbox.x + bbox.width + 8
+            assert bbox.y - 8 <= target_y <= bbox.y + bbox.height + 8
 
 
 def _wait_until(predicate, *, timeout: float = 3.0, message: str) -> None:
@@ -309,6 +385,251 @@ def test_relative_ui_click_reaches_observable_fake_stm32_for_both_cameras() -> N
         assert second_payload.delta_y_steps < 0
         assert runtime.mediator.selected_target is None
         assert len(move_requests()) == 2
+    finally:
+        if window is not None:
+            window.state_pump.stop()
+            window.close()
+            application.processEvents()
+        runtime.shutdown(timeout=1.0)
+
+    assert not runtime.overview_producer.is_alive()
+    assert not runtime.stereo_left_producer.is_alive()
+    assert not runtime.overview_worker.is_alive()
+    assert not runtime.stereo_left_worker.is_alive()
+    assert not runtime.turret_worker.is_alive()
+
+
+def test_tracking_ui_selection_drives_real_velocity_loop_to_fake_stm32() -> None:
+    os.environ["QT_QPA_PLATFORM"] = "offscreen"
+
+    from PyQt6.QtCore import QPoint, Qt
+    from PyQt6.QtTest import QTest
+    from PyQt6.QtWidgets import QApplication
+
+    from navmin.ui import MainWindow
+
+    endpoint = FakeStm32Endpoint()
+
+    def transport_factory(
+        _port: str,
+        baudrate: int,
+        _emulate_stm32: bool,
+    ) -> FakeTransport:
+        return FakeTransport(endpoint, baudrate=baudrate)
+
+    runtime = SoftwareSmokeRuntime(turret_transport_factory=transport_factory)
+    application = QApplication.instance() or QApplication([])
+    window = None
+
+    def executed(command: CommandCode):
+        return [
+            request
+            for request in list(endpoint.executed_request_history)
+            if request.command is command
+        ]
+
+    try:
+        runtime.start()
+        window = MainWindow(
+            mediator=runtime.mediator,
+            camera_bindings=runtime.camera_bindings(),
+            turret_states=runtime.turret_worker.state_updates,
+            camera_stale_timeout_ms=500,
+            start_timer=False,
+            start_fullscreen=False,
+        )
+        window.resize(900, 650)
+        window.show()
+        application.processEvents()
+
+        def pump_until(predicate, *, timeout: float, message: str) -> None:
+            deadline = monotonic() + timeout
+            while monotonic() < deadline:
+                window.state_pump.pump_once()
+                application.processEvents()
+                if predicate():
+                    return
+                sleep(0.005)
+            raise AssertionError(message)
+
+        def stable_overview_track():
+            result = window.main_view.displayed_result
+            if result is None or len(result.tracked_objects) != 1:
+                return None
+            tracked = result.tracked_objects[0]
+            center_x = tracked.bbox.x + tracked.bbox.width / 2.0
+            center_y = tracked.bbox.y + tracked.bbox.height / 2.0
+            if (
+                abs(tracked.velocity_x_px_s) <= 5.0
+                or center_x <= FRAME_WIDTH / 2.0
+                or center_y >= FRAME_HEIGHT / 2.0
+            ):
+                return None
+            return tracked
+
+        pump_until(
+            lambda: (
+                runtime.mediator.turret_state.connection_state
+                is TurretConnectionState.READY
+                and runtime.mediator.turret_state.motor_state is MotorState.OFF
+                and runtime.mediator.session_gate.accepted_generation(
+                    CameraRole.OVERVIEW
+                )
+                is not None
+                and runtime.mediator.session_gate.accepted_generation(
+                    CameraRole.STEREO_LEFT
+                )
+                is not None
+                and window.main_view.camera is CameraRole.OVERVIEW
+                and stable_overview_track() is not None
+                and window.main_view.interaction_allowed(
+                    runtime.mediator.session_gate,
+                    monotonic_ns(),
+                )
+            ),
+            timeout=4.0,
+            message="UI did not accept a stable real Overview track",
+        )
+
+        QTest.mouseClick(window.mode_button, Qt.MouseButton.LeftButton)
+        pump_until(
+            lambda: (
+                runtime.mediator.turret_state.control_mode
+                is TurretControlMode.TRACKING
+                and runtime.mediator.pending_control_mode is None
+                and "TRACKING" in window.mode_button.text()
+                and "→" not in window.mode_button.text()
+            ),
+            timeout=1.0,
+            message="real mode button did not confirm TRACKING",
+        )
+
+        QTest.mouseClick(window.motor_button, Qt.MouseButton.LeftButton)
+        pump_until(
+            lambda: (
+                runtime.mediator.turret_state.motor_state is MotorState.ON
+                and "ON" in window.motor_button.text()
+                and len(executed(CommandCode.MOTOR_ON)) >= 1
+            ),
+            timeout=1.0,
+            message="real motor button did not confirm MOTOR_ON",
+        )
+
+        displayed = window.main_view.displayed_result
+        tracked = stable_overview_track()
+        assert displayed is not None
+        assert tracked is not None
+        bbox_center = (
+            tracked.bbox.x + tracked.bbox.width / 2.0,
+            tracked.bbox.y + tracked.bbox.height / 2.0,
+        )
+        assert runtime.mediator.aiming.config.lead_time_ms > 0
+        lead_point = runtime.mediator.aiming.lead_point(tracked)
+        assert lead_point[0] != bbox_center[0]
+
+        rendered = window.main_view.rendered_rect()
+        assert not rendered.isEmpty()
+        height, width = displayed.frame.image.shape[:2]
+        click = QPoint(
+            round(rendered.left() + bbox_center[0] * rendered.width() / width),
+            round(rendered.top() + bbox_center[1] * rendered.height() / height),
+        )
+        velocity_baseline = len(executed(CommandCode.SET_VELOCITY))
+        relative_baseline = len(executed(CommandCode.MOVE_RELATIVE))
+
+        QTest.mouseClick(
+            window.main_view,
+            Qt.MouseButton.LeftButton,
+            pos=click,
+        )
+        application.processEvents()
+        selected = runtime.mediator.selected_target
+        assert selected is not None
+        assert selected.camera is CameraRole.OVERVIEW
+        assert selected.generation == displayed.frame.generation
+        assert selected.track_id == tracked.track_id
+
+        pump_until(
+            lambda: (
+                runtime.mediator.selected_target == selected
+                and len(executed(CommandCode.SET_VELOCITY))
+                >= velocity_baseline + 2
+            ),
+            timeout=2.0,
+            message="ongoing tracking did not produce multiple SET_VELOCITY requests",
+        )
+
+        tracking_requests = executed(CommandCode.SET_VELOCITY)[velocity_baseline:]
+        assert len(tracking_requests) >= 2
+        tracking_payloads = [request.payload for request in tracking_requests]
+        assert all(isinstance(payload, SetVelocityPayload) for payload in tracking_payloads)
+        nonzero_payloads = [
+            payload
+            for payload in tracking_payloads
+            if isinstance(payload, SetVelocityPayload)
+            and (payload.velocity_x_steps_s or payload.velocity_y_steps_s)
+        ]
+        assert nonzero_payloads
+        assert all(payload.velocity_x_steps_s > 0 for payload in nonzero_payloads)
+        assert all(payload.velocity_y_steps_s > 0 for payload in nonzero_payloads)
+        assert len(executed(CommandCode.MOVE_RELATIVE)) == relative_baseline
+
+        next_right_edge_frame = 45 + 90 * max(
+            0,
+            (displayed.frame.frame_id - 45) // 90 + 1,
+        )
+        reversal_deadline = monotonic() + 6.0
+        last_checked_frame_id = displayed.frame.frame_id
+        while monotonic() < reversal_deadline:
+            window.state_pump.pump_once()
+            application.processEvents()
+            assert runtime.mediator.selected_target == selected
+            current = window.main_view.displayed_result
+            if current is None or current.frame.frame_id <= last_checked_frame_id:
+                sleep(0.005)
+                continue
+            assert any(
+                item.track_id == selected.track_id
+                for item in current.tracked_objects
+            ), (
+                f"selected track {selected.track_id} missing at Overview "
+                f"frame {current.frame.frame_id}: {current.tracked_objects!r}"
+            )
+            last_checked_frame_id = current.frame.frame_id
+            if last_checked_frame_id >= next_right_edge_frame + 5:
+                break
+            sleep(0.005)
+        else:
+            raise AssertionError(
+                "selected Overview track did not survive the right-edge reversal"
+            )
+
+        empty_source_point = (20.0, 20.0)
+        empty_click = QPoint(
+            round(rendered.left() + empty_source_point[0] * rendered.width() / width),
+            round(rendered.top() + empty_source_point[1] * rendered.height() / height),
+        )
+        deselect_velocity_baseline = len(executed(CommandCode.SET_VELOCITY))
+        QTest.mouseClick(
+            window.main_view,
+            Qt.MouseButton.LeftButton,
+            pos=empty_click,
+        )
+        application.processEvents()
+        assert runtime.mediator.selected_target is None
+        pump_until(
+            lambda: any(
+                isinstance(request.payload, SetVelocityPayload)
+                and request.payload.velocity_x_steps_s == 0
+                and request.payload.velocity_y_steps_s == 0
+                for request in executed(CommandCode.SET_VELOCITY)[
+                    deselect_velocity_baseline:
+                ]
+            ),
+            timeout=1.0,
+            message="deselect did not produce the normal zero-velocity boundary",
+        )
+        assert len(executed(CommandCode.MOVE_RELATIVE)) == relative_baseline
     finally:
         if window is not None:
             window.state_pump.stop()

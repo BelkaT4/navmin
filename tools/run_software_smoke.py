@@ -42,6 +42,8 @@ FRAME_WIDTH = 320
 FRAME_HEIGHT = 240
 _OVERVIEW_FPS = 20.0
 _STEREO_LEFT_FPS = 15.0
+_TARGET_RADIUS_PX = 6
+_TARGET_SPEED_PX_PER_FRAME = 2
 
 _IDENTITY_3X3 = (
     (1.0, 0.0, 0.0),
@@ -59,8 +61,8 @@ _Q_IDENTITY = (
 def synthetic_overview_calibration() -> OverviewCalibration:
     """Return deterministic tool-local calibration for the 320x240 source."""
     camera_matrix = (
-        (250.0, 0.0, (FRAME_WIDTH - 1) / 2.0),
-        (0.0, 250.0, (FRAME_HEIGHT - 1) / 2.0),
+        (1000.0, 0.0, (FRAME_WIDTH - 1) / 2.0),
+        (0.0, 1000.0, (FRAME_HEIGHT - 1) / 2.0),
         (0.0, 0.0, 1.0),
     )
     return OverviewCalibration(
@@ -103,49 +105,51 @@ def synthetic_stereo_calibration() -> StereoCalibration:
     )
 
 
+def _ping_pong_coordinate(frame_index: int, start: int, end: int) -> int:
+    span = end - start
+    phase = (frame_index * _TARGET_SPEED_PX_PER_FRAME) % (2 * span)
+    return start + (phase if phase <= span else 2 * span - phase)
+
+
+def _synthetic_target_center(
+    camera: CameraRole,
+    frame_index: int,
+) -> tuple[int, int]:
+    if camera is CameraRole.OVERVIEW:
+        return _ping_pong_coordinate(frame_index, 190, 280), 82
+    if camera is CameraRole.STEREO_LEFT:
+        return _ping_pong_coordinate(frame_index, 40, 130), 170
+    raise ValueError("software smoke only produces Overview and Stereo Left")
+
+
 def _overview_frame(frame_index: int) -> np.ndarray:
-    frame = np.empty((FRAME_HEIGHT, FRAME_WIDTH, 3), dtype=np.uint8)
-    x_gradient = np.linspace(25, 85, FRAME_WIDTH, dtype=np.uint8)
-    frame[:, :, 0] = x_gradient
-    frame[:, :, 1] = 35
-    frame[:, :, 2] = 18
-    for y in range(0, FRAME_HEIGHT, 24):
-        frame[y : y + 2, :, :] = (105, 55, 25)
-    x = 20 + (frame_index * 5) % (FRAME_WIDTH - 80)
-    cv2.rectangle(frame, (x, 130), (x + 46, 172), (40, 220, 240), -1)
-    cv2.putText(
+    frame = np.full(
+        (FRAME_HEIGHT, FRAME_WIDTH, 3),
+        (32, 48, 64),
+        dtype=np.uint8,
+    )
+    cv2.circle(
         frame,
-        "OVERVIEW",
-        (24, 58),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.9,
-        (255, 255, 255),
-        2,
-        cv2.LINE_AA,
+        _synthetic_target_center(CameraRole.OVERVIEW, frame_index),
+        _TARGET_RADIUS_PX,
+        (245, 245, 245),
+        -1,
     )
     return frame
 
 
 def _stereo_left_frame(frame_index: int) -> np.ndarray:
-    frame = np.empty((FRAME_HEIGHT, FRAME_WIDTH, 3), dtype=np.uint8)
-    y_gradient = np.linspace(35, 115, FRAME_HEIGHT, dtype=np.uint8)
-    frame[:, :, 0] = 22
-    frame[:, :, 1] = y_gradient[:, None]
-    frame[:, :, 2] = 78
-    for x in range(0, FRAME_WIDTH, 28):
-        frame[:, x : x + 2, :] = (25, 125, 95)
-    y = 92 + (frame_index * 4) % 92
-    x = FRAME_WIDTH - 52 - ((frame_index * 6) % (FRAME_WIDTH - 104))
-    cv2.circle(frame, (x, y), 20, (235, 80, 210), -1)
-    cv2.putText(
+    frame = np.full(
+        (FRAME_HEIGHT, FRAME_WIDTH, 3),
+        (70, 44, 30),
+        dtype=np.uint8,
+    )
+    cv2.circle(
         frame,
-        "STEREO LEFT",
-        (20, 58),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.78,
-        (255, 255, 255),
-        2,
-        cv2.LINE_AA,
+        _synthetic_target_center(CameraRole.STEREO_LEFT, frame_index),
+        _TARGET_RADIUS_PX,
+        (245, 245, 245),
+        -1,
     )
     return frame
 
