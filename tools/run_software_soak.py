@@ -8,7 +8,8 @@ import math
 import statistics
 import sys
 import threading
-from collections import Counter
+from collections import Counter, deque
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from itertools import pairwise
 from pathlib import Path
@@ -47,13 +48,114 @@ _HEARTBEAT_S = 30.0
 _SAMPLE_S = 2.0
 _DEFAULT_FAULT_CADENCE = (3, 6, 9, 12)  # stale, generation, disconnect, emergency
 _OWNED_THREAD_PREFIXES = ("smoke-producer-", "vision-", "turret-worker")
+_ENDPOINT_HISTORY_LIMIT = 32
+_TRANSPORT_HISTORY_LIMIT = 32
+_SAMPLE_WINDOW = 512
+_CYCLE_WINDOW = 4096
+_MIN_TRACK_AGE_FRAMES = 5
 
 
 class SoakFailure(RuntimeError):
     """Functional/lifecycle invariant failure with phase context."""
 
 
-class _FailOpenTransport(FakeTransport):
+def _trim_list(values: list[object], limit: int) -> None:
+    if len(values) > limit:
+        del values[:-limit]
+
+
+class _SoakEndpoint(FakeStm32Endpoint):
+    """Fake endpoint with full protocol fidelity and bounded soak diagnostics."""
+
+    def __init__(self, *, history_limit: int = _ENDPOINT_HISTORY_LIMIT) -> None:
+        if history_limit <= 0:
+            raise ValueError("history_limit must be > 0")
+        super().__init__()
+        self.history_limit = history_limit
+        self._observability_lock = threading.Lock()
+        self.command_counts: Counter[CommandCode] = Counter()
+        self.set_velocity_execution_count = 0
+        self.last_nonzero_velocity_sequence = 0
+        self.last_zero_velocity_sequence = 0
+
+    def handle_request(self, raw_frame: bytes) -> bytes | None:
+        before = len(self.executed_request_history)
+        response = super().handle_request(raw_frame)
+        if len(self.executed_request_history) > before:
+            request = self.executed_request_history[-1]
+            with self._observability_lock:
+                self.command_counts[request.command] += 1
+                if request.command is CommandCode.SET_VELOCITY:
+                    self.set_velocity_execution_count += 1
+                    payload = request.payload
+                    if isinstance(payload, SetVelocityPayload):
+                        if payload.velocity_x_steps_s == 0 and payload.velocity_y_steps_s == 0:
+                            self.last_zero_velocity_sequence = self.set_velocity_execution_count
+                        else:
+                            self.last_nonzero_velocity_sequence = self.set_velocity_execution_count
+        _trim_list(self.raw_request_history, self.history_limit)
+        _trim_list(self.request_history, self.history_limit)
+        _trim_list(self.executed_request_history, self.history_limit)
+        return response
+
+    def command_count(self, command: CommandCode) -> int:
+        with self._observability_lock:
+            return self.command_counts[command]
+
+    def has_nonzero_velocity_since(self, baseline: int) -> bool:
+        with self._observability_lock:
+            return self.last_nonzero_velocity_sequence > baseline
+
+    def has_zero_velocity_since(self, baseline: int) -> bool:
+        with self._observability_lock:
+            return self.last_zero_velocity_sequence > baseline
+
+
+class _BoundedFakeTransport(FakeTransport):
+    """Real FakeTransport behavior with bounded diagnostic histories for soak."""
+
+    def __init__(
+        self,
+        endpoint: FakeStm32Endpoint,
+        *,
+        baudrate: int,
+        history_limit: int = _TRANSPORT_HISTORY_LIMIT,
+    ) -> None:
+        if history_limit <= 0:
+            raise ValueError("history_limit must be > 0")
+        self.history_limit = history_limit
+        super().__init__(endpoint, baudrate=baudrate)
+        self._compact_histories()
+
+    def set_baudrate(self, baudrate: int) -> None:
+        super().set_baudrate(baudrate)
+        self._compact_histories()
+
+    def write_frame(self, frame: bytes, timeout_s: float) -> None:
+        try:
+            super().write_frame(frame, timeout_s)
+        finally:
+            self._compact_histories()
+
+    def read_frame(self, timeout_s: float) -> bytes:
+        try:
+            return super().read_frame(timeout_s)
+        finally:
+            self._compact_histories()
+
+    def _compact_histories(self) -> None:
+        for name in (
+            "baudrate_history",
+            "raw_write_history",
+            "raw_write_baudrate_history",
+            "event_history",
+        ):
+            history = getattr(self, name, None)
+            if history is not None:
+                _trim_list(history, self.history_limit)
+
+
+class _FailOpenTransport(_BoundedFakeTransport):
     def open(self) -> None:
         raise TransportDisconnectedError("software soak injected reconnect open failure")
 
@@ -62,16 +164,22 @@ class RecordingTransportFactory:
     """Soak-local observable FakeTransport factory used across reconnects."""
 
     def __init__(self) -> None:
-        self.endpoint = FakeStm32Endpoint()
-        self.transports: list[FakeTransport] = []
+        self.endpoint = _SoakEndpoint()
+        self.current_transport: _BoundedFakeTransport | None = None
+        self.total_transports_created = 0
         self.fail_open_count = 0
 
+    @property
+    def retained_transport_count(self) -> int:
+        return int(self.current_transport is not None)
+
     def __call__(self, _port: str, baudrate: int, _emulate: bool) -> FakeTransport:
-        transport_type = _FailOpenTransport if self.fail_open_count > 0 else FakeTransport
+        transport_type = _FailOpenTransport if self.fail_open_count > 0 else _BoundedFakeTransport
         if self.fail_open_count > 0:
             self.fail_open_count -= 1
         transport = transport_type(self.endpoint, baudrate=baudrate)
-        self.transports.append(transport)
+        self.current_transport = transport
+        self.total_transports_created += 1
         return transport
 
 
@@ -91,10 +199,18 @@ class _ProcessSample:
 class SoakMetrics:
     requested_s: float
     started_at: float = field(default_factory=monotonic)
-    cycle_durations_s: list[float] = field(default_factory=list)
-    samples: list[_ProcessSample] = field(default_factory=list)
-    cycle_rss_kib: list[int] = field(default_factory=list)
+    cycle_durations_s: deque[float] = field(
+        default_factory=lambda: deque(maxlen=_CYCLE_WINDOW)
+    )
+    samples: deque[_ProcessSample] = field(
+        default_factory=lambda: deque(maxlen=_SAMPLE_WINDOW)
+    )
+    cycle_rss_kib: deque[int] = field(
+        default_factory=lambda: deque(maxlen=_CYCLE_WINDOW)
+    )
     event_counts: Counter[str] = field(default_factory=Counter)
+    cycle_duration_min_s: float | None = None
+    cycle_duration_max_s: float | None = None
     thread_baseline: int = 0
     thread_warmup: int = 0
     thread_peak: int = 0
@@ -192,12 +308,24 @@ class SoftwareSoak:
                 self._phase = "nominal cycle"
                 cycle_started = monotonic()
                 self._nominal_cycle(self._cycle)
-                self.metrics.cycle_durations_s.append(monotonic() - cycle_started)
+                cycle_duration = monotonic() - cycle_started
+                self.metrics.cycle_durations_s.append(cycle_duration)
+                self.metrics.cycle_duration_min_s = (
+                    cycle_duration
+                    if self.metrics.cycle_duration_min_s is None
+                    else min(self.metrics.cycle_duration_min_s, cycle_duration)
+                )
+                self.metrics.cycle_duration_max_s = (
+                    cycle_duration
+                    if self.metrics.cycle_duration_max_s is None
+                    else max(self.metrics.cycle_duration_max_s, cycle_duration)
+                )
                 self.metrics.event_counts["nominal_cycles"] += 1
                 rss = _read_rss_kib()
                 if rss is not None:
                     self.metrics.cycle_rss_kib.append(rss)
-                self._observe_periodic(force=True)
+                    self._observe_rss_peak(rss)
+                self._observe_periodic()
                 if self._warmup_thread_limit is not None:
                     count = len(threading.enumerate())
                     if count > self._warmup_thread_limit:
@@ -230,11 +358,9 @@ class SoftwareSoak:
                 cleanup_failure = exc
                 result = "FAIL"
             self.metrics.rss_final_kib = _read_rss_kib()
-            rss_values = [s.rss_kib for s in self.metrics.samples if s.rss_kib is not None]
             for value in (self.metrics.rss_initial_kib, self.metrics.rss_warmup_kib, self.metrics.rss_final_kib):
                 if value is not None:
-                    rss_values.append(value)
-            self.metrics.rss_peak_kib = max(rss_values) if rss_values else None
+                    self._observe_rss_peak(value)
             self.metrics.thread_final = len(threading.enumerate())
             try:
                 self._assert_shutdown_threads()
@@ -389,7 +515,12 @@ class SoftwareSoak:
         tracked = result.tracked_objects[0]
         center_x = tracked.bbox.x + tracked.bbox.width / 2.0
         center_y = tracked.bbox.y + tracked.bbox.height / 2.0
-        if abs(tracked.velocity_x_px_s) <= 5.0 or center_x <= FRAME_WIDTH / 2.0 or center_y >= FRAME_HEIGHT / 2.0:
+        if (
+            tracked.age_frames < _MIN_TRACK_AGE_FRAMES
+            or abs(tracked.velocity_x_px_s) <= 5.0
+            or center_x <= FRAME_WIDTH / 2.0
+            or center_y >= FRAME_HEIGHT / 2.0
+        ):
             return None
         return tracked
 
@@ -518,9 +649,10 @@ class SoftwareSoak:
     def _turret_disconnect_recovery(self) -> None:
         self._phase = "turret disconnect/recovery"
         self.factory.fail_open_count = 1
-        if not self.factory.transports:
+        active_transport = self.factory.current_transport
+        if active_transport is None:
             raise SoakFailure("no active FakeTransport available for disconnect injection")
-        self.factory.transports[-1].queue_read_failure(FakeReadFailure.DISCONNECT)
+        active_transport.queue_read_failure(FakeReadFailure.DISCONNECT)
         self._wait_until(
             lambda: self.runtime.mediator.turret_state.connection_state is not TurretConnectionState.READY,
             1.5,
@@ -558,9 +690,9 @@ class SoftwareSoak:
         )
         self.metrics.event_counts["emergency"] += 1
 
-    def _observe_periodic(self, *, force: bool = False) -> None:
+    def _observe_periodic(self) -> None:
         now = monotonic()
-        if not force and now < self._next_sample_at:
+        if now < self._next_sample_at:
             return
         overview = self.runtime.overview_pipeline.latest_result.snapshot()
         stereo = self.runtime.stereo_left_pipeline.latest_result.snapshot()
@@ -595,6 +727,8 @@ class SoftwareSoak:
         self.metrics.samples.append(sample)
         self._last_sample = sample
         self.metrics.thread_peak = max(self.metrics.thread_peak, sample.thread_count)
+        if sample.rss_kib is not None:
+            self._observe_rss_peak(sample.rss_kib)
         self._next_sample_at = now + self.sample_seconds
         if now >= self._next_heartbeat_at:
             state = self.runtime.mediator.turret_state
@@ -608,6 +742,13 @@ class SoftwareSoak:
                 flush=True,
             )
             self._next_heartbeat_at = now + self.heartbeat_seconds
+
+    def _observe_rss_peak(self, value: int) -> None:
+        self.metrics.rss_peak_kib = (
+            value
+            if self.metrics.rss_peak_kib is None
+            else max(self.metrics.rss_peak_kib, value)
+        )
 
     def _assert_required_events(self) -> None:
         for key in ("nominal_cycles", "stale_resume", "generation_restart", "disconnect_recovery", "emergency"):
@@ -646,35 +787,20 @@ class SoftwareSoak:
             )
 
     def _command_count(self, command: CommandCode) -> int:
-        return sum(1 for request in list(self.factory.endpoint.executed_request_history) if request.command is command)
+        return self.factory.endpoint.command_count(command)
 
     def _has_nonzero_velocity_since(self, baseline: int) -> bool:
-        requests = [request for request in list(self.factory.endpoint.executed_request_history) if request.command is CommandCode.SET_VELOCITY]
-        return any(
-            isinstance(request.payload, SetVelocityPayload)
-            and (request.payload.velocity_x_steps_s != 0 or request.payload.velocity_y_steps_s != 0)
-            for request in requests[baseline:]
-        )
+        return self.factory.endpoint.has_nonzero_velocity_since(baseline)
 
     def _has_zero_velocity_since(self, baseline: int) -> bool:
-        requests = [request for request in list(self.factory.endpoint.executed_request_history) if request.command is CommandCode.SET_VELOCITY]
-        return any(
-            isinstance(request.payload, SetVelocityPayload)
-            and request.payload.velocity_x_steps_s == 0
-            and request.payload.velocity_y_steps_s == 0
-            for request in requests[baseline:]
-        )
+        return self.factory.endpoint.has_zero_velocity_since(baseline)
 
     def _has_any_nonzero_velocity(self) -> bool:
         return self._has_nonzero_velocity_since(0)
 
     def _memory_growth_suspect(self) -> bool:
-        values = self.metrics.cycle_rss_kib
-        if len(values) < 6:
-            return False
-        increases = sum(b > a for a, b in pairwise(values))
-        # Heuristic only: sustained cycle-correlated growth, not an architecture threshold.
-        return increases >= math.ceil((len(values) - 1) * 0.8) and values[-1] > values[len(values) // 2] > values[0]
+        values = [sample.rss_kib for sample in self.metrics.samples if sample.rss_kib is not None]
+        return _rss_growth_suspect(values)
 
 
 def _read_rss_kib() -> int | None:
@@ -688,7 +814,7 @@ def _read_rss_kib() -> int | None:
     return None
 
 
-def _linear_rss_trend_mib_per_minute(samples: list[_ProcessSample]) -> float | None:
+def _linear_rss_trend_mib_per_minute(samples: Sequence[_ProcessSample]) -> float | None:
     points = [(sample.elapsed_s, sample.rss_kib) for sample in samples if sample.rss_kib is not None]
     if len(points) < 2:
         return None
@@ -701,7 +827,46 @@ def _linear_rss_trend_mib_per_minute(samples: list[_ProcessSample]) -> float | N
     return slope_kib_s * 60.0 / 1024.0
 
 
-def _percentile95(values: list[float]) -> float:
+def _rss_growth_suspect(values: Sequence[int]) -> bool:
+    """Detect sustained post-warm-up RSS growth without an absolute threshold."""
+    if len(values) < 8:
+        return False
+
+    mean_x = (len(values) - 1) / 2.0
+    mean_y = statistics.fmean(values)
+    denominator = sum((index - mean_x) ** 2 for index in range(len(values)))
+    if denominator == 0.0:
+        return False
+    slope = sum(
+        (index - mean_x) * (value - mean_y)
+        for index, value in enumerate(values)
+    ) / denominator
+    if slope <= 0.0:
+        return False
+
+    segments: list[Sequence[int]] = []
+    for segment_index in range(4):
+        start = len(values) * segment_index // 4
+        end = len(values) * (segment_index + 1) // 4
+        segment = values[start:end]
+        if not segment:
+            return False
+        segments.append(segment)
+    medians = [statistics.median(segment) for segment in segments]
+    transitions = list(pairwise(medians))
+    strict_rises = sum(after > before for before, after in transitions)
+    regressions = sum(after < before for before, after in transitions)
+    first_half_median = statistics.median(values[: len(values) // 2])
+    second_half_median = statistics.median(values[len(values) // 2 :])
+    return (
+        strict_rises >= 2
+        and regressions <= 1
+        and second_half_median > first_half_median
+        and medians[-1] > medians[0]
+    )
+
+
+def _percentile95(values: Sequence[float]) -> float:
     if not values:
         return 0.0
     ordered = sorted(values)
@@ -760,7 +925,7 @@ def print_report(result: str, soak: SoftwareSoak) -> None:
     print(f"  final connection state: {state.connection_state.value}")
     print(f"  final motor state: {state.motor_state.value}")
     print(f"  final mode: {state.control_mode.value}")
-    print(f"  reconnect transports created: {max(0, len(soak.factory.transports) - 1)}")
+    print(f"  reconnect transports created: {max(0, soak.factory.total_transports_created - 1)}")
     print("Endpoint command counts:")
     for name, count in command_counts.items():
         print(f"  {name}: {count}")
@@ -789,12 +954,17 @@ def print_report(result: str, soak: SoftwareSoak) -> None:
     print(f"  final: {_format_mib(metrics.rss_final_kib)}")
     print(f"  peak: {_format_mib(metrics.rss_peak_kib)}")
     print(f"  warm-up→final delta: {'RSS measurement unavailable' if warm_to_final is None else f'{warm_to_final / 1024:.2f} MiB'}")
-    print(f"  approximate trend MiB/min: {'RSS measurement unavailable' if trend is None else f'{trend:.3f}'}")
+    print(
+        "  approximate trend MiB/min "
+        f"(recent <= {_SAMPLE_WINDOW} periodic samples): "
+        f"{'RSS measurement unavailable' if trend is None else f'{trend:.3f}'}"
+    )
     print("Cycle timing:")
-    print(f"  min: {min(cycle_durations, default=0.0):.3f}s")
+    print(f"  median/p95 window: recent <= {_CYCLE_WINDOW} cycles")
+    print(f"  min (full run): {metrics.cycle_duration_min_s or 0.0:.3f}s")
     print(f"  median: {statistics.median(cycle_durations) if cycle_durations else 0.0:.3f}s")
     print(f"  p95: {_percentile95(cycle_durations):.3f}s")
-    print(f"  max: {max(cycle_durations, default=0.0):.3f}s")
+    print(f"  max (full run): {metrics.cycle_duration_max_s or 0.0:.3f}s")
     print(f"RESULT: {result}")
 
 

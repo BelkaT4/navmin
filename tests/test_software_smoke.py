@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import gc
 import os
 import runpy
 import subprocess
 import sys
+import weakref
 from itertools import pairwise
 from pathlib import Path
 from time import monotonic, monotonic_ns, sleep
@@ -21,7 +23,9 @@ from navmin.contracts import (
 from navmin.turret.protocol import (
     CommandCode,
     MoveRelativePayload,
+    ProtocolRequest,
     SetVelocityPayload,
+    encode_request,
 )
 from navmin.turret.simulator import (
     FakeReadFailure,
@@ -1269,24 +1273,35 @@ def test_software_soak_short_mode_exercises_repeated_lifecycle_and_cleans_up(cap
     namespace = runpy.run_path(str(soak_tool), run_name="navmin_software_soak")
     run_soak = namespace["run_soak"]
 
-    # Compact deterministic cadence is test-only: every required lifecycle event
-    # executes within four cycles while production composition stays unchanged.
+    # Use the real acceptance cadence so cycle 1 must acquire TRACKING without
+    # relying on an earlier stale/resume event to mature the synthetic track.
     result, soak = run_soak(
         60.0,
-        max_cycles=4,
-        fault_cadence=(1, 2, 3, 4),
+        max_cycles=12,
         heartbeat_seconds=3600.0,
         sample_seconds=0.25,
     )
 
     assert result in {"PASS", "SOAK SUSPECT"}
-    assert soak.metrics.event_counts["nominal_cycles"] == 4
+    assert soak.metrics.event_counts["nominal_cycles"] == 12
     assert soak.metrics.event_counts["stale_resume"] >= 1
     assert soak.metrics.event_counts["generation_restart"] >= 1
     assert soak.metrics.event_counts["disconnect_recovery"] >= 1
     assert soak.metrics.event_counts["emergency"] >= 1
     assert soak.metrics.cycle_durations_s
-    assert soak.factory.transports
+    assert soak.factory.total_transports_created >= 1
+    assert soak.factory.current_transport is not None
+    assert soak._command_count(CommandCode.SET_VELOCITY) > 0
+    assert soak._has_any_nonzero_velocity()
+    assert soak.factory.endpoint.last_zero_velocity_sequence > 0
+    assert len(soak.factory.endpoint.raw_request_history) <= namespace["_ENDPOINT_HISTORY_LIMIT"]
+    assert len(soak.factory.endpoint.request_history) <= namespace["_ENDPOINT_HISTORY_LIMIT"]
+    assert len(soak.factory.endpoint.executed_request_history) <= namespace["_ENDPOINT_HISTORY_LIMIT"]
+    assert len(soak.factory.current_transport.raw_write_history) <= namespace["_TRANSPORT_HISTORY_LIMIT"]
+    assert len(soak.factory.current_transport.event_history) <= namespace["_TRANSPORT_HISTORY_LIMIT"]
+    assert len(soak.metrics.cycle_durations_s) <= namespace["_CYCLE_WINDOW"]
+    assert len(soak.metrics.cycle_rss_kib) <= namespace["_CYCLE_WINDOW"]
+    assert len(soak.metrics.samples) <= namespace["_SAMPLE_WINDOW"]
     assert not soak.runtime.overview_producer.is_alive()
     assert not soak.runtime.stereo_left_producer.is_alive()
     assert not soak.runtime.overview_worker.is_alive()
@@ -1298,3 +1313,187 @@ def test_software_soak_short_mode_exercises_repeated_lifecycle_and_cleans_up(cap
     assert "Endpoint command counts:" in output
     assert "Cycle timing:" in output
     assert f"RESULT: {result}" in output
+
+
+def test_software_soak_memory_heuristic_detects_stepwise_growth() -> None:
+    namespace = runpy.run_path(
+        str(Path(__file__).resolve().parents[1] / "tools" / "run_software_soak.py"),
+        run_name="navmin_software_soak_memory_step",
+    )
+    suspect = namespace["_rss_growth_suspect"]
+
+    page_step_growth = [
+        100,
+        100,
+        101,
+        101,
+        102,
+        102,
+        103,
+        103,
+        104,
+        104,
+        105,
+        105,
+        106,
+        106,
+        107,
+        107,
+    ]
+
+    assert suspect(page_step_growth)
+
+
+def test_software_soak_memory_heuristic_ignores_flat_noisy_plateau() -> None:
+    namespace = runpy.run_path(
+        str(Path(__file__).resolve().parents[1] / "tools" / "run_software_soak.py"),
+        run_name="navmin_software_soak_memory_flat",
+    )
+    suspect = namespace["_rss_growth_suspect"]
+
+    flat_noisy = [
+        100,
+        101,
+        100,
+        100,
+        101,
+        100,
+        101,
+        100,
+        100,
+        101,
+        100,
+        100,
+        101,
+        100,
+        101,
+        100,
+    ]
+
+    assert not suspect(flat_noisy)
+
+
+def test_software_soak_memory_heuristic_ignores_post_warmup_plateau() -> None:
+    namespace = runpy.run_path(
+        str(Path(__file__).resolve().parents[1] / "tools" / "run_software_soak.py"),
+        run_name="navmin_software_soak_memory_warmup",
+    )
+    suspect = namespace["_rss_growth_suspect"]
+
+    warmup_then_plateau = [
+        100,
+        110,
+        120,
+        120,
+        121,
+        120,
+        120,
+        121,
+        120,
+        120,
+        121,
+        120,
+        120,
+        121,
+        120,
+        120,
+    ]
+    post_warmup = warmup_then_plateau[2:]
+
+    assert not suspect(post_warmup)
+
+
+def test_software_soak_observability_stays_bounded_after_wraparound() -> None:
+    namespace = runpy.run_path(
+        str(Path(__file__).resolve().parents[1] / "tools" / "run_software_soak.py"),
+        run_name="navmin_software_soak_bounded_observability",
+    )
+    factory = namespace["RecordingTransportFactory"]()
+    endpoint_limit = namespace["_ENDPOINT_HISTORY_LIMIT"]
+    transport_limit = namespace["_TRANSPORT_HISTORY_LIMIT"]
+    cycle_window = namespace["_CYCLE_WINDOW"]
+    sample_window = namespace["_SAMPLE_WINDOW"]
+    soak = namespace["SoftwareSoak"](duration_seconds=1.0, max_cycles=1)
+    soak.factory = factory
+
+    transport = factory("fake", 9600, True)
+    transport.open()
+    request_id = 0
+
+    def execute_velocity(x: int, y: int) -> bytes:
+        nonlocal request_id
+        request = ProtocolRequest(
+            request_id=request_id,
+            command=CommandCode.SET_VELOCITY,
+            payload=SetVelocityPayload(x, y),
+        )
+        raw_request = encode_request(request)
+        transport.write_frame(raw_request, timeout_s=0.1)
+        transport.read_frame(timeout_s=0.1)
+        request_id = (request_id + 1) & 0xFFFF
+        return raw_request
+
+    last_request = b""
+    for index in range(endpoint_limit * 4):
+        last_request = (
+            execute_velocity(0, 0)
+            if index % 2 == 0
+            else execute_velocity(1, -1)
+        )
+
+    count_before_retry = soak._command_count(CommandCode.SET_VELOCITY)
+    transport.write_frame(last_request, timeout_s=0.1)
+    transport.read_frame(timeout_s=0.1)
+    assert soak._command_count(CommandCode.SET_VELOCITY) == count_before_retry
+
+    baseline = soak._command_count(CommandCode.SET_VELOCITY)
+    execute_velocity(7, -3)
+    for _ in range(endpoint_limit + 5):
+        execute_velocity(4, 2)
+    execute_velocity(0, 0)
+
+    expected_total = endpoint_limit * 4 + endpoint_limit + 7
+    assert soak._command_count(CommandCode.SET_VELOCITY) == expected_total
+    assert soak._has_nonzero_velocity_since(baseline)
+    assert soak._has_zero_velocity_since(baseline)
+    assert len(factory.endpoint.raw_request_history) <= endpoint_limit
+    assert len(factory.endpoint.request_history) <= endpoint_limit
+    assert len(factory.endpoint.executed_request_history) <= endpoint_limit
+    assert len(transport.raw_write_history) <= transport_limit
+    assert len(transport.raw_write_baudrate_history) <= transport_limit
+    assert len(transport.event_history) <= transport_limit
+
+    transport_refs = [weakref.ref(transport)]
+    reconnects = transport_limit + 5
+    for _ in range(reconnects):
+        transport = factory("fake", 9600, True)
+        transport_refs.append(weakref.ref(transport))
+    gc.collect()
+
+    assert factory.total_transports_created == reconnects + 1
+    assert factory.retained_transport_count == 1
+    assert factory.current_transport is transport
+    assert sum(reference() is not None for reference in transport_refs) <= 1
+
+    metrics = namespace["SoakMetrics"](requested_s=1.0)
+    sample_type = namespace["_ProcessSample"]
+    for index in range(cycle_window + 37):
+        metrics.cycle_durations_s.append(float(index))
+        metrics.cycle_rss_kib.append(index)
+    for index in range(sample_window + 37):
+        metrics.samples.append(
+            sample_type(
+                elapsed_s=float(index),
+                cycle=index,
+                rss_kib=index,
+                thread_count=1,
+                overview_revision=index,
+                overview_generation=1,
+                stereo_revision=index,
+                stereo_generation=1,
+            )
+        )
+
+    assert len(metrics.cycle_durations_s) == cycle_window
+    assert len(metrics.cycle_rss_kib) == cycle_window
+    assert len(metrics.samples) == sample_window
