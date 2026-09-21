@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import argparse
 import logging
-from threading import Lock, Thread
+from threading import Event, Lock, Thread
 from time import monotonic
 
 import cv2
@@ -180,6 +180,7 @@ class SyntheticFrameProducer:
         )
         self._counter_lock = Lock()
         self._frames_produced = 0
+        self._pause_event = Event()
 
     @property
     def frames_produced(self) -> int:
@@ -188,6 +189,18 @@ class SyntheticFrameProducer:
 
     def start(self) -> None:
         self._thread.start()
+
+    def pause(self) -> None:
+        """Temporarily stop publishing frames without stopping the producer thread."""
+        self._pause_event.set()
+
+    def resume(self) -> None:
+        """Resume latest-only frame publication after :meth:`pause`."""
+        self._pause_event.clear()
+
+    @property
+    def is_paused(self) -> bool:
+        return self._pause_event.is_set()
 
     def request_stop(self) -> None:
         self._stop_token.request_stop()
@@ -208,6 +221,12 @@ class SyntheticFrameProducer:
         next_deadline = monotonic()
         frame_index = 0
         while not self._stop_token.is_stop_requested():
+            if self._pause_event.is_set():
+                # Keep the producer thread alive while allowing bounded shutdown.
+                next_deadline = monotonic()
+                if self._stop_token.wait(min(period_s, 0.02)):
+                    break
+                continue
             frame = (
                 _overview_frame(frame_index)
                 if self.camera is CameraRole.OVERVIEW

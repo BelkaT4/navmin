@@ -23,7 +23,12 @@ from navmin.turret.protocol import (
     MoveRelativePayload,
     SetVelocityPayload,
 )
-from navmin.turret.simulator import FakeStm32Endpoint, FakeTransport
+from navmin.turret.simulator import (
+    FakeReadFailure,
+    FakeStm32Endpoint,
+    FakeTransport,
+)
+from navmin.turret.transport import TransportDisconnectedError
 from navmin.vision.pipeline import (
     InMemoryFrameSource,
     overview_corrector,
@@ -642,3 +647,615 @@ def test_tracking_ui_selection_drives_real_velocity_loop_to_fake_stm32() -> None
     assert not runtime.overview_worker.is_alive()
     assert not runtime.stereo_left_worker.is_alive()
     assert not runtime.turret_worker.is_alive()
+
+
+class _FailOpenTransport(FakeTransport):
+    def open(self) -> None:
+        raise TransportDisconnectedError("simulated missing serial device")
+
+
+class _RecordingTransportFactory:
+    def __init__(self, endpoint: FakeStm32Endpoint | None = None) -> None:
+        self.endpoint = endpoint or FakeStm32Endpoint()
+        self.transports: list[FakeTransport] = []
+        self.fail_open_count = 0
+        self.always_fail = False
+
+    def __call__(
+        self,
+        _port: str,
+        baudrate: int,
+        _emulate_stm32: bool,
+    ) -> FakeTransport:
+        fail_open = self.always_fail or self.fail_open_count > 0
+        if self.fail_open_count > 0:
+            self.fail_open_count -= 1
+        transport_type = _FailOpenTransport if fail_open else FakeTransport
+        transport = transport_type(self.endpoint, baudrate=baudrate)
+        self.transports.append(transport)
+        return transport
+
+
+def _executed(endpoint: FakeStm32Endpoint, command: CommandCode):
+    return [
+        request
+        for request in list(endpoint.executed_request_history)
+        if request.command is command
+    ]
+
+
+def _pump_qt_until(
+    window,
+    application,
+    predicate,
+    *,
+    timeout: float,
+    message: str,
+) -> None:
+    deadline = monotonic() + timeout
+    while monotonic() < deadline:
+        window.state_pump.pump_once()
+        application.processEvents()
+        if predicate():
+            return
+        sleep(0.005)
+    raise AssertionError(message)
+
+
+def _pump_qt_for(window, application, duration: float) -> None:
+    deadline = monotonic() + duration
+    while monotonic() < deadline:
+        window.state_pump.pump_once()
+        application.processEvents()
+        sleep(0.005)
+
+
+def _stable_overview_track(window):
+    result = window.main_view.displayed_result
+    if result is None or len(result.tracked_objects) != 1:
+        return None
+    tracked = result.tracked_objects[0]
+    center_x = tracked.bbox.x + tracked.bbox.width / 2.0
+    center_y = tracked.bbox.y + tracked.bbox.height / 2.0
+    if (
+        abs(tracked.velocity_x_px_s) <= 5.0
+        or center_x <= FRAME_WIDTH / 2.0
+        or center_y >= FRAME_HEIGHT / 2.0
+    ):
+        return None
+    return tracked
+
+
+def _activate_real_overview_tracking(runtime, window, application, endpoint):
+    from PyQt6.QtCore import QPoint, Qt
+    from PyQt6.QtTest import QTest
+
+    _pump_qt_until(
+        window,
+        application,
+        lambda: (
+            runtime.mediator.turret_state.connection_state
+            is TurretConnectionState.READY
+            and runtime.mediator.session_gate.accepted_generation(
+                CameraRole.OVERVIEW
+            )
+            is not None
+            and window.main_view.camera is CameraRole.OVERVIEW
+            and _stable_overview_track(window) is not None
+            and window.main_view.interaction_allowed(
+                runtime.mediator.session_gate,
+                monotonic_ns(),
+            )
+        ),
+        timeout=4.0,
+        message="UI did not reach a stable live Overview tracking fixture",
+    )
+
+    if runtime.mediator.turret_state.control_mode is TurretControlMode.RELATIVE:
+        QTest.mouseClick(window.mode_button, Qt.MouseButton.LeftButton)
+        _pump_qt_until(
+            window,
+            application,
+            lambda: (
+                runtime.mediator.turret_state.control_mode
+                is TurretControlMode.TRACKING
+                and runtime.mediator.pending_control_mode is None
+            ),
+            timeout=1.0,
+            message="real mode button did not confirm TRACKING",
+        )
+
+    if runtime.mediator.turret_state.motor_state is MotorState.OFF:
+        QTest.mouseClick(window.motor_button, Qt.MouseButton.LeftButton)
+        _pump_qt_until(
+            window,
+            application,
+            lambda: runtime.mediator.turret_state.motor_state is MotorState.ON,
+            timeout=1.0,
+            message="real motor button did not confirm MOTOR_ON",
+        )
+
+    displayed = window.main_view.displayed_result
+    tracked = _stable_overview_track(window)
+    assert displayed is not None
+    assert tracked is not None
+    rendered = window.main_view.rendered_rect()
+    assert not rendered.isEmpty()
+    height, width = displayed.frame.image.shape[:2]
+    center_x = tracked.bbox.x + tracked.bbox.width / 2.0
+    center_y = tracked.bbox.y + tracked.bbox.height / 2.0
+    click = QPoint(
+        round(rendered.left() + center_x * rendered.width() / width),
+        round(rendered.top() + center_y * rendered.height() / height),
+    )
+    velocity_baseline = len(_executed(endpoint, CommandCode.SET_VELOCITY))
+    QTest.mouseClick(window.main_view, Qt.MouseButton.LeftButton, pos=click)
+    application.processEvents()
+    selected = runtime.mediator.selected_target
+    assert selected is not None
+    _pump_qt_until(
+        window,
+        application,
+        lambda: any(
+            isinstance(request.payload, SetVelocityPayload)
+            and (request.payload.velocity_x_steps_s or request.payload.velocity_y_steps_s)
+            for request in _executed(endpoint, CommandCode.SET_VELOCITY)[
+                velocity_baseline:
+            ]
+        ),
+        timeout=2.0,
+        message="active TRACKING did not reach a nonzero SET_VELOCITY",
+    )
+    return selected
+
+
+def _assert_runtime_threads_stopped(runtime: SoftwareSmokeRuntime) -> None:
+    assert not runtime.overview_producer.is_alive()
+    assert not runtime.stereo_left_producer.is_alive()
+    assert not runtime.overview_worker.is_alive()
+    assert not runtime.stereo_left_worker.is_alive()
+    assert not runtime.turret_worker.is_alive()
+
+
+def test_camera_stale_resume_keeps_generation_and_recovers_interaction() -> None:
+    os.environ["QT_QPA_PLATFORM"] = "offscreen"
+
+    from PyQt6.QtWidgets import QApplication
+
+    from navmin.ui import MainWindow
+
+    runtime = SoftwareSmokeRuntime()
+    application = QApplication.instance() or QApplication([])
+    window = None
+    try:
+        runtime.start()
+        window = MainWindow(
+            mediator=runtime.mediator,
+            camera_bindings=runtime.camera_bindings(),
+            turret_states=runtime.turret_worker.state_updates,
+            camera_stale_timeout_ms=500,
+            start_timer=False,
+            start_fullscreen=False,
+        )
+        window.resize(900, 650)
+        window.show()
+        application.processEvents()
+
+        _pump_qt_until(
+            window,
+            application,
+            lambda: (
+                window.main_view.camera is CameraRole.OVERVIEW
+                and window.main_view.displayed_result is not None
+                and window.preview_view.displayed_result is not None
+                and window.main_view.interaction_allowed(
+                    runtime.mediator.session_gate,
+                    monotonic_ns(),
+                )
+            ),
+            timeout=3.0,
+            message="both cameras did not become fresh before stale test",
+        )
+        generation_before = window.main_view.displayed_result.frame.generation
+        overview_frame_before = window.main_view.displayed_result.frame.frame_id
+        stereo_frame_before = window.preview_view.displayed_result.frame.frame_id
+
+        runtime.overview_producer.pause()
+        assert runtime.overview_producer.is_alive()
+        assert runtime.overview_producer.is_paused
+        _pump_qt_until(
+            window,
+            application,
+            lambda: window.main_view.is_stale,
+            timeout=1.5,
+            message="Overview presentation did not become stale",
+        )
+
+        frozen = window.main_view.displayed_result
+        status = window.main_view.camera_status
+        assert frozen is not None
+        assert frozen.frame.frame_id >= overview_frame_before
+        assert frozen.frame.generation == generation_before
+        assert status is not None
+        assert status.state is CameraState.ONLINE
+        assert status.generation == generation_before
+        assert window.main_view.stale_overlay_text == "НЕТ НОВЫХ КАДРОВ"
+        assert not window.main_view.interaction_allowed(
+            runtime.mediator.session_gate,
+            monotonic_ns(),
+        )
+        assert window.preview_view.displayed_result is not None
+        assert window.preview_view.displayed_result.frame.frame_id > stereo_frame_before
+        assert runtime.stereo_left_producer.is_alive()
+
+        _pump_qt_for(window, application, 0.1)
+        assert window.main_view.displayed_result is frozen
+        assert runtime.overview_pipeline.generation == generation_before
+
+        runtime.overview_producer.resume()
+        assert not runtime.overview_producer.is_paused
+        _pump_qt_until(
+            window,
+            application,
+            lambda: (
+                window.main_view.displayed_result is not None
+                and window.main_view.displayed_result.frame.frame_id
+                > frozen.frame.frame_id
+                and not window.main_view.is_stale
+                and window.main_view.interaction_allowed(
+                    runtime.mediator.session_gate,
+                    monotonic_ns(),
+                )
+            ),
+            timeout=1.5,
+            message="Overview did not recover after producer resume",
+        )
+        assert window.main_view.displayed_result.frame.generation == generation_before
+        assert runtime.overview_pipeline.generation == generation_before
+    finally:
+        if window is not None:
+            window.state_pump.stop()
+            window.close()
+            application.processEvents()
+        runtime.shutdown(timeout=1.0)
+
+    _assert_runtime_threads_stopped(runtime)
+
+
+def test_generation_restart_and_preview_swap_clear_active_tracking() -> None:
+    os.environ["QT_QPA_PLATFORM"] = "offscreen"
+
+    from PyQt6.QtCore import Qt
+    from PyQt6.QtTest import QTest
+    from PyQt6.QtWidgets import QApplication
+
+    from navmin.ui import MainWindow
+
+    factory = _RecordingTransportFactory()
+    runtime = SoftwareSmokeRuntime(turret_transport_factory=factory)
+    application = QApplication.instance() or QApplication([])
+    window = None
+    try:
+        runtime.start()
+        window = MainWindow(
+            mediator=runtime.mediator,
+            camera_bindings=runtime.camera_bindings(),
+            turret_states=runtime.turret_worker.state_updates,
+            camera_stale_timeout_ms=500,
+            start_timer=False,
+            start_fullscreen=False,
+        )
+        window.resize(900, 650)
+        window.show()
+        application.processEvents()
+
+        selected = _activate_real_overview_tracking(
+            runtime, window, application, factory.endpoint
+        )
+        old_generation = selected.generation
+        zero_boundary = len(_executed(factory.endpoint, CommandCode.SET_VELOCITY))
+
+        runtime.overview_producer.pause()
+        _pump_qt_for(window, application, 0.1)
+        session = runtime.overview_pipeline.start()
+        assert session.generation == old_generation + 1
+        assert runtime.overview_pipeline.generation == old_generation + 1
+
+        window.state_pump.pump_once()
+        application.processEvents()
+        assert runtime.mediator.session_gate.accepted_generation(
+            CameraRole.OVERVIEW
+        ) == old_generation + 1
+        assert window.main_view.displayed_result is None
+        assert runtime.mediator.selected_target is None
+
+        _pump_qt_until(
+            window,
+            application,
+            lambda: any(
+                isinstance(request.payload, SetVelocityPayload)
+                and request.payload.velocity_x_steps_s == 0
+                and request.payload.velocity_y_steps_s == 0
+                for request in _executed(factory.endpoint, CommandCode.SET_VELOCITY)[
+                    zero_boundary:
+                ]
+            ),
+            timeout=1.0,
+            message="generation boundary did not drive the normal tracking stop",
+        )
+
+        runtime.overview_producer.resume()
+        _pump_qt_until(
+            window,
+            application,
+            lambda: (
+                window.main_view.displayed_result is not None
+                and window.main_view.displayed_result.frame.generation
+                == old_generation + 1
+            ),
+            timeout=1.5,
+            message="new Overview generation was not displayed",
+        )
+        _pump_qt_for(window, application, 0.1)
+        assert window.main_view.displayed_result is not None
+        assert window.main_view.displayed_result.frame.generation == old_generation + 1
+        assert runtime.mediator.selected_target is None
+
+        _activate_real_overview_tracking(runtime, window, application, factory.endpoint)
+        assert runtime.mediator.selected_target is not None
+        relative_before_swap = len(_executed(factory.endpoint, CommandCode.MOVE_RELATIVE))
+        zero_boundary = len(_executed(factory.endpoint, CommandCode.SET_VELOCITY))
+
+        QTest.mouseClick(
+            window.preview_view,
+            Qt.MouseButton.LeftButton,
+            pos=window.preview_view.rect().center(),
+        )
+        application.processEvents()
+        assert runtime.mediator.main_camera is CameraRole.STEREO_LEFT
+        assert runtime.mediator.selected_target is None
+        assert len(_executed(factory.endpoint, CommandCode.MOVE_RELATIVE)) == relative_before_swap
+        _pump_qt_until(
+            window,
+            application,
+            lambda: any(
+                isinstance(request.payload, SetVelocityPayload)
+                and request.payload.velocity_x_steps_s == 0
+                and request.payload.velocity_y_steps_s == 0
+                for request in _executed(factory.endpoint, CommandCode.SET_VELOCITY)[
+                    zero_boundary:
+                ]
+            ),
+            timeout=1.0,
+            message="preview swap did not drive the normal tracking stop",
+        )
+    finally:
+        runtime.overview_producer.resume()
+        if window is not None:
+            window.state_pump.stop()
+            window.close()
+            application.processEvents()
+        runtime.shutdown(timeout=1.0)
+
+    _assert_runtime_threads_stopped(runtime)
+
+
+def test_turret_disconnect_clears_tracking_recovers_off_and_remains_usable() -> None:
+    os.environ["QT_QPA_PLATFORM"] = "offscreen"
+
+    from PyQt6.QtCore import Qt
+    from PyQt6.QtTest import QTest
+    from PyQt6.QtWidgets import QApplication
+
+    from navmin.ui import MainWindow
+
+    factory = _RecordingTransportFactory()
+    runtime = SoftwareSmokeRuntime(turret_transport_factory=factory)
+    application = QApplication.instance() or QApplication([])
+    window = None
+    try:
+        runtime.start()
+        window = MainWindow(
+            mediator=runtime.mediator,
+            camera_bindings=runtime.camera_bindings(),
+            turret_states=runtime.turret_worker.state_updates,
+            camera_stale_timeout_ms=500,
+            start_timer=False,
+            start_fullscreen=False,
+        )
+        window.resize(900, 650)
+        window.show()
+        application.processEvents()
+
+        _activate_real_overview_tracking(runtime, window, application, factory.endpoint)
+        assert runtime.mediator.selected_target is not None
+        overview_before = runtime.overview_pipeline.latest_result.get().frame.frame_id
+        stereo_before = runtime.stereo_left_pipeline.latest_result.get().frame.frame_id
+
+        factory.fail_open_count = 1
+        active_transport = factory.transports[-1]
+        active_transport.queue_read_failure(FakeReadFailure.DISCONNECT)
+        _pump_qt_until(
+            window,
+            application,
+            lambda: runtime.mediator.turret_state.connection_state
+            is not TurretConnectionState.READY,
+            timeout=1.0,
+            message="Turret disconnect did not reach the UI/Core state pump",
+        )
+        lost_state = runtime.mediator.turret_state
+        assert lost_state.connection_state is TurretConnectionState.CONNECTING
+        assert lost_state.motor_state is MotorState.UNKNOWN
+        assert runtime.mediator.selected_target is None
+        assert runtime.mediator.pending_control_mode is None
+        assert window.isVisible()
+
+        _pump_qt_until(
+            window,
+            application,
+            lambda: (
+                runtime.overview_pipeline.latest_result.get() is not None
+                and runtime.overview_pipeline.latest_result.get().frame.frame_id
+                > overview_before
+                and runtime.stereo_left_pipeline.latest_result.get() is not None
+                and runtime.stereo_left_pipeline.latest_result.get().frame.frame_id
+                > stereo_before
+            ),
+            timeout=1.0,
+            message="camera streams did not continue during Turret recovery",
+        )
+        assert runtime.overview_pipeline.status.get().state is CameraState.ONLINE
+        assert runtime.stereo_left_pipeline.status.get().state is CameraState.ONLINE
+
+        _pump_qt_until(
+            window,
+            application,
+            lambda: (
+                runtime.mediator.turret_state.connection_state
+                is TurretConnectionState.READY
+                and runtime.mediator.turret_state.motor_state is MotorState.OFF
+            ),
+            timeout=2.0,
+            message="Turret did not recover to READY with motors OFF",
+        )
+        assert len(factory.transports) >= 3
+        assert runtime.mediator.selected_target is None
+
+        QTest.mouseClick(window.motor_button, Qt.MouseButton.LeftButton)
+        _pump_qt_until(
+            window,
+            application,
+            lambda: runtime.mediator.turret_state.motor_state is MotorState.ON,
+            timeout=1.0,
+            message="Turret was not usable after reconnect",
+        )
+    finally:
+        if window is not None:
+            window.state_pump.stop()
+            window.close()
+            application.processEvents()
+        runtime.shutdown(timeout=1.0)
+
+    _assert_runtime_threads_stopped(runtime)
+
+
+def test_emergency_click_during_tracking_crosses_full_stack_and_preserves_motor_on() -> None:
+    os.environ["QT_QPA_PLATFORM"] = "offscreen"
+
+    from PyQt6.QtCore import Qt
+    from PyQt6.QtTest import QTest
+    from PyQt6.QtWidgets import QApplication
+
+    from navmin.ui import MainWindow
+
+    factory = _RecordingTransportFactory()
+    runtime = SoftwareSmokeRuntime(turret_transport_factory=factory)
+    application = QApplication.instance() or QApplication([])
+    window = None
+    try:
+        runtime.start()
+        window = MainWindow(
+            mediator=runtime.mediator,
+            camera_bindings=runtime.camera_bindings(),
+            turret_states=runtime.turret_worker.state_updates,
+            camera_stale_timeout_ms=500,
+            start_timer=False,
+            start_fullscreen=False,
+        )
+        window.resize(900, 650)
+        window.show()
+        application.processEvents()
+
+        _activate_real_overview_tracking(runtime, window, application, factory.endpoint)
+        assert runtime.mediator.selected_target is not None
+        history_boundary = len(factory.endpoint.executed_request_history)
+
+        QTest.mouseClick(window.emergency_button, Qt.MouseButton.LeftButton)
+        application.processEvents()
+        assert runtime.mediator.selected_target is None
+
+        _pump_qt_until(
+            window,
+            application,
+            lambda: any(
+                request.command is CommandCode.EMERGENCY_STOP
+                for request in list(factory.endpoint.executed_request_history)[
+                    history_boundary:
+                ]
+            ),
+            timeout=1.0,
+            message="EMERGENCY_STOP did not reach FakeStm32Endpoint",
+        )
+        _pump_qt_until(
+            window,
+            application,
+            lambda: (
+                runtime.mediator.turret_state.connection_state
+                is TurretConnectionState.READY
+                and runtime.mediator.turret_state.motor_state is MotorState.ON
+            ),
+            timeout=1.0,
+            message="Emergency did not preserve confirmed MotorState.ON while READY",
+        )
+        assert runtime.mediator.selected_target is None
+    finally:
+        if window is not None:
+            window.state_pump.stop()
+            window.close()
+            application.processEvents()
+        runtime.shutdown(timeout=1.0)
+
+    _assert_runtime_threads_stopped(runtime)
+
+
+def test_partial_start_cleanup_and_shutdown_during_turret_backoff(monkeypatch) -> None:
+    partial = SoftwareSmokeRuntime()
+
+    def fail_second_camera_start() -> None:
+        raise RuntimeError("simulated Stereo Left start failure")
+
+    monkeypatch.setattr(partial.stereo_left_worker, "start", fail_second_camera_start)
+    start_failed = False
+    try:
+        partial.start()
+    except RuntimeError as exc:
+        start_failed = True
+        assert "Stereo Left start failure" in str(exc)
+    finally:
+        shutdown_started = monotonic()
+        partial.shutdown(timeout=0.5)
+        partial.shutdown(timeout=0.5)
+        partial_shutdown_elapsed = monotonic() - shutdown_started
+
+    assert start_failed
+    assert partial_shutdown_elapsed < 1.0
+    _assert_runtime_threads_stopped(partial)
+
+    factory = _RecordingTransportFactory()
+    factory.always_fail = True
+    reconnecting = SoftwareSmokeRuntime(turret_transport_factory=factory)
+    reconnecting.start()
+    try:
+        _wait_until(
+            lambda: (
+                reconnecting.turret_worker.current_state.connection_state
+                is TurretConnectionState.CONNECTING
+                and reconnecting.overview_pipeline.latest_result.get() is not None
+                and reconnecting.stereo_left_pipeline.latest_result.get() is not None
+            ),
+            timeout=1.5,
+            message="runtime did not enter Turret backoff with live cameras",
+        )
+        shutdown_started = monotonic()
+        reconnecting.shutdown(timeout=0.5)
+        backoff_shutdown_elapsed = monotonic() - shutdown_started
+    finally:
+        reconnecting.shutdown(timeout=0.5)
+
+    assert backoff_shutdown_elapsed < 1.0
+    assert (
+        reconnecting.turret_worker.current_state.connection_state
+        is TurretConnectionState.DISCONNECTED
+    )
+    assert reconnecting.turret_worker.current_state.motor_state is MotorState.UNKNOWN
+    _assert_runtime_threads_stopped(reconnecting)
