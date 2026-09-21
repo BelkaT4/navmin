@@ -1259,3 +1259,42 @@ def test_partial_start_cleanup_and_shutdown_during_turret_backoff(monkeypatch) -
     )
     assert reconnecting.turret_worker.current_state.motor_state is MotorState.UNKNOWN
     _assert_runtime_threads_stopped(reconnecting)
+
+
+def test_software_soak_short_mode_exercises_repeated_lifecycle_and_cleans_up(capsys) -> None:
+    """Keep the long acceptance soak out of pytest while validating its real harness."""
+    os.environ["QT_QPA_PLATFORM"] = "offscreen"
+
+    soak_tool = Path(__file__).resolve().parents[1] / "tools" / "run_software_soak.py"
+    namespace = runpy.run_path(str(soak_tool), run_name="navmin_software_soak")
+    run_soak = namespace["run_soak"]
+
+    # Compact deterministic cadence is test-only: every required lifecycle event
+    # executes within four cycles while production composition stays unchanged.
+    result, soak = run_soak(
+        60.0,
+        max_cycles=4,
+        fault_cadence=(1, 2, 3, 4),
+        heartbeat_seconds=3600.0,
+        sample_seconds=0.25,
+    )
+
+    assert result in {"PASS", "SOAK SUSPECT"}
+    assert soak.metrics.event_counts["nominal_cycles"] == 4
+    assert soak.metrics.event_counts["stale_resume"] >= 1
+    assert soak.metrics.event_counts["generation_restart"] >= 1
+    assert soak.metrics.event_counts["disconnect_recovery"] >= 1
+    assert soak.metrics.event_counts["emergency"] >= 1
+    assert soak.metrics.cycle_durations_s
+    assert soak.factory.transports
+    assert not soak.runtime.overview_producer.is_alive()
+    assert not soak.runtime.stereo_left_producer.is_alive()
+    assert not soak.runtime.overview_worker.is_alive()
+    assert not soak.runtime.stereo_left_worker.is_alive()
+    assert not soak.runtime.turret_worker.is_alive()
+
+    output = capsys.readouterr().out
+    assert "=== SOFTWARE SOAK REPORT ===" in output
+    assert "Endpoint command counts:" in output
+    assert "Cycle timing:" in output
+    assert f"RESULT: {result}" in output
