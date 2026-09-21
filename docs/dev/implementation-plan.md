@@ -141,6 +141,40 @@ Stage 5 minimum: Legacy14VisionProcessor + SimpleTracker + рабочие Overvi
 
 Рабочие чаты по-прежнему выполняются последовательно на одной ветке; этот checkpoint не разрешает параллельные конкурирующие реализации. Статус полного Stage меняется на `done` только после выполнения его полного критерия завершения.
 
+По состоянию на текущую реализацию software vertical slice уже подтверждён отдельными integration checkpoints:
+
+```text
+software smoke foundation                 accepted
+RELATIVE UI → Aiming → Turret → protocol  accepted
+TRACKING detector/tracker → UI → PID      accepted
+failures/lifecycle E2E                    next
+```
+
+Эти acceptance checkpoints не означают автоматического завершения Stage 5/6/7 и не переводят Stage 8 в `in-progress`. Они являются доказательством composability текущего prototype path перед закрытием оставшихся stage-specific criteria.
+
+### Текущий путь к автономному hardware day
+
+До первых офлайн-испытаний с реальными камерами и STM32 проект следует такому порядку:
+
+```text
+E2E failures/lifecycle
+→ software soak
+→ read-only full integration audit
+→ localhost RTP/JPEG diagnostic camera backend
+→ production SerialTransport через Linux PTY + software STM32 emulator
+→ shared application composition
+→ normal launcher + diagnostic launcher
+→ offline logging / preflight / runbook
+→ offline rehearsal без доступа к интернету
+→ real STM32-only smoke
+→ real cameras-only smoke
+→ combined prototype: RELATIVE / TRACKING / failure checks
+```
+
+`InMemoryFrameSource` и `FakeTransport/FakeStm32Endpoint` остаются быстрыми deterministic test boundaries и не заменяются более тяжёлыми transport emulators в обычном test suite. Localhost RTP/JPEG и PTY проверяют production transport paths, сохраняя hardware-independent воспроизводимость.
+
+ESP32-C3 HIL не входит в обязательный путь к первым hardware tests. Он остаётся optional post-hardware tool для serial/fault-injection scenarios, если реальные испытания покажут в нём практическую необходимость.
+
 ---
 
 ## 6. Этап 1 — Foundation
@@ -471,7 +505,7 @@ RS485 migration не входит в 4A–4C и возвращается отд�
 
 Host-side protocol tests из этапа 3 не дублировать в firmware как копию тех же Python cases. Firmware tests должны защищать firmware parser/control implementation; hardware suite — реальный boundary и timing/fault modes.
 
-Отложенный P2 из независимого аудита Stage 3: перед firmware/hardware integration повысить fidelity `FakeStm32Endpoint` для ordinary request sequence — `expected REQUEST_ID` и exact retry cache. Это simulator hardening, а не незакрытый production blocker Stage 3.
+Ранее отложенный P2 из независимого аудита Stage 3 закрыт: `FakeStm32Endpoint` уже моделирует firmware-like `expected REQUEST_ID`, exact retry cache и Emergency-resync ordering; соответствующие protocol tests защищают этот simulator contract.
 
 ### Критерий завершения
 
@@ -775,7 +809,10 @@ Future latest-live-frame mode (#22) остаётся deferred. Gesture/overlay/S
 
 ### Реализовать/проверить
 
-- application composition root;
+- один shared application composition root для normal и diagnostic launchers;
+- normal launcher использует только real RTP cameras + real STM32 через production `SerialTransport` и не имеет silent fake fallback;
+- diagnostic launcher запускает то же приложение, но явно выбирает внешние backends: независимо для камер (`localhost RTP/JPEG` или real RTP) и для controller (`Linux PTY STM32 emulator` или real STM32); `InMemoryFrameSource`/`FakeTransport` остаются test-harness boundaries;
+- backend selection явный и воспроизводимый (primary interface — command-line arguments), без auto-detection, способного незаметно подменить real hardware;
 - startup order;
 - shutdown order;
 - prohibition of new motion during shutdown;
@@ -795,9 +832,12 @@ Future latest-live-frame mode (#22) остаётся deferred. Gesture/overlay/S
   - resolution/calibration mismatch rejection;
   - basic real-stream frame latency/FPS measurement;
 - simulated end-to-end tracking/relative flows;
-- recording/logging/diagnostics sufficient for field debugging;
+- localhost RTP/JPEG smoke через production GStreamer receiver;
+- production `SerialTransport` smoke через Linux PTY и software STM32 protocol emulator до доступа к физическому controller;
+- normal runtime всегда сохраняет per-session INFO file log;
+- diagnostic runtime дополнительно сохраняет подробный DEBUG log, manifest/environment/preflight results и effective config/calibration inputs, достаточные для последующего offline разбора;
 - performance measurement of tracking pipeline;
-- reproducible run instructions/dependencies/packaging required by deployment target.
+- reproducible offline runbook/dependencies/packaging и rehearsal без доступа к интернету перед hardware day.
 
 ### Timing and tuning
 

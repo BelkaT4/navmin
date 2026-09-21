@@ -88,6 +88,8 @@ Foundation уже определил общий cooperative `StopToken` и ми�
 
 - детали общего startup/shutdown orchestration нескольких workers и main-thread компонентов.
 
+Направление composition уже зафиксировано: normal и diagnostic launchers должны использовать один shared application composition, а diagnostic mode меняет только явно выбранные внешние camera/controller backends. Это не закрывает вопрос порядка startup/shutdown и partial-start cleanup до его реализации/проверки.
+
 Для текущего GStreamer RTP/JPEG source blocking read не используется: appsink callback публикует latest frame, worker делает cancellable idle wait, а source stop переводит Gst pipeline в NULL. Reconnect/backoff (#8) остаётся отдельным открытым вопросом.
 
 Reconnect/recovery принадлежит owner-модулям; отдельный orchestration component без concrete v1 responsibility не вводится.
@@ -112,10 +114,17 @@ Foundation уже имеет единый idempotent bootstrap стандарт�
 
 Turret-specific policy закрыта: в v1 остаётся обычный Python logging без `QueueHandler/QueueListener`; INFO содержит lifecycle/connection/recovery/baud boundaries и значимые failures, transaction/retry details доступны для diagnostics, а high-rate PID/setpoint traffic не логируется на INFO. Queue-based logging возвращается только при измеренной contention/blocking problem.
 
-Остаются общие integration/UI details, которые нужно решать только при реальной потребности:
+Для подготовки автономного hardware day уже принято направление:
 
-- rotation / file limits;
-- production levels/config source;
+- normal launcher всегда сохраняет per-session INFO log в файл;
+- diagnostic launcher запускает то же приложение, но дополнительно собирает подробный DEBUG log, manifest/preflight и effective config/calibration inputs;
+- logging остаётся diagnostics output, а typed runtime state по-прежнему не заменяется парсингом логов.
+
+Остаются integration details, которые нужно определить при реализации:
+
+- rotation / file limits и retention;
+- exact session-directory/export-bundle format;
+- production level/config source beyond fixed normal-vs-diagnostic baseline;
 - как UI показывает последние важные ошибки без превращения logging в machine-readable state.
 
 ### 14. Будущие STM32 hardware events

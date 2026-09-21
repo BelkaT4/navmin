@@ -629,6 +629,51 @@ Per-frame queued Qt signals не используются.
 
 ---
 
+## 31. Normal и diagnostic launchers используют один application composition и явно выбирают только внешние backends
+
+### Решение
+
+NavMin не получает две независимые реализации приложения для production и diagnostics. Оба launcher используют один shared application composition и те же production UI, Core/Aiming, Vision и Turret components.
+
+Normal launcher предназначен только для реального железа:
+
+```text
+real RTP cameras
++
+production SerialTransport → real STM32
+```
+
+Он не выполняет silent fallback на synthetic cameras, `FakeTransport` или software STM32 emulator.
+
+Diagnostic launcher запускает то же приложение, но разрешает явно выбирать внешние boundaries. Camera source выбирается независимо для каждой роли, чтобы можно было смешивать real RTP и localhost RTP/JPEG synthetic sender при локализации hardware problems. Controller backend выбирается между production `SerialTransport` к Linux PTY software STM32 emulator и real STM32.
+
+`InMemoryFrameSource` и `FakeTransport/FakeStm32Endpoint` остаются deterministic automated-test boundaries и не становятся пользовательскими diagnostic runtime modes. Localhost RTP/JPEG нужен именно для проверки production GStreamer receiver без Raspberry Pi, а Linux PTY — для проверки production `SerialTransport`/pyserial byte path без физического controller.
+
+Backend selection должен быть явным и воспроизводимым; primary interface — command-line arguments. Runtime не угадывает автоматически, какой fake/real backend использовать. Выбранные backends записываются в session diagnostics.
+
+Normal launcher всегда сохраняет per-session INFO log. Diagnostic launcher добавляет подробный DEBUG log и offline-support artifacts: manifest/environment/preflight results и effective config/calibration inputs. Точная session-directory/retention policy остаётся implementation detail до integration checkpoint.
+
+ESP32-C3 HIL не является prerequisite первых реальных hardware tests. Если после hardware day понадобится отдельный physical serial/fault-injection stand, он может быть реализован как optional post-hardware tool без изменения application composition.
+
+### Почему
+
+Один composition path предотвращает drift между «боевым» и диагностическим приложением: проверяется ровно тот же UI/Core/Vision/Turret stack, а меняется только физическая boundary. При этом тяжёлые transport emulators не ухудшают быстрые deterministic E2E tests.
+
+Localhost RTP и PTY закрывают два крупных PC-side риска до поездки без дополнительного hardware: production camera transport и production serial byte transport. Явный backend selection исключает опасную ситуацию, когда оператор считает, что работает с реальным устройством, а приложение незаметно использует fake.
+
+Файловый INFO log нужен и normal runtime, потому что отказ на реальном prototype должен оставлять материал для последующего разбора даже без diagnostic mode. Расширенный diagnostic bundle нужен для автономного hardware day без интернета и доступа к рабочему чату.
+
+### Отвергнутые альтернативы
+
+- **Две отдельные application compositions: production и diagnostics.** Отклонено из-за риска semantic drift и двойного integration surface.
+- **Заменить быстрые InMemory/FakeTransport tests на localhost RTP/PTY.** Отклонено: transport layers добавляют timing/system dependencies и ухудшают детерминированность обычного suite.
+- **Использовать InMemory synthetic как пользовательский diagnostic camera mode.** Отклонено: для diagnostic launcher полезнее localhost RTP/JPEG, который дополнительно проверяет production GStreamer boundary; InMemory остаётся test harness.
+- **Автоматически выбирать fake/real backend по доступности devices/ports.** Отклонено как неоднозначное и потенциально опасное поведение.
+- **Писать файлы логов только в diagnostic mode.** Отклонено: сбой обычного hardware запуска тоже должен оставлять session evidence.
+- **Сделать ESP32-C3 обязательным HIL gate до STM32.** Отклонено ради экономии времени; PTY закрывает PC-side serial semantics, а необходимость отдельного physical emulator оценивается после реальных tests.
+
+---
+
 ## Как использовать этот документ при реализации
 
 При разработке нового модуля сначала нужно следовать нормативным контрактам соответствующего документа. Если возникает желание вернуть ранее удалённый механизм, полезно проверить этот журнал: часто механизм был удалён не случайно, а потому что более простой инвариант закрывает тот же failure case.
