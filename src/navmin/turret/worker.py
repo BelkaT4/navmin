@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum
@@ -129,7 +130,7 @@ class TurretWorker:
         self._next_request_id = 0
 
         self._motion_inputs: InvalidatableLatest[MotionInput] = InvalidatableLatest()
-        self._control_inputs: LatestValue[_ControlIntent] = LatestValue()
+        self._control_mailbox: deque[_ControlIntent] = deque()
         self._config_updates: LatestValue[ConfigUpdate[TurretConfig]] = LatestValue()
         self._config_updates.publish(ConfigUpdate(0, config))
         self._emergency_signal = Event()
@@ -137,7 +138,6 @@ class TurretWorker:
         self._normal_ingress_lock = Lock()
         self._normal_ingress_open = False
         self._last_motion_revision = 0
-        self._last_control_revision = 0
         self._last_config_revision = 0
 
         self._state_updates: LatestValue[TurretState] = LatestValue()
@@ -185,7 +185,7 @@ class TurretWorker:
             f"Turret worker did not stop within {timeout:.3f} seconds"
         )
 
-    # Cross-thread ingress. These methods only publish typed intent/state.
+    # Cross-thread ingress. These methods only accept typed intent/state.
     def submit_move_relative(self, command: MoveRelativeCommand) -> None:
         if not isinstance(command, MoveRelativeCommand):
             raise TypeError("command must be MoveRelativeCommand")
@@ -205,29 +205,35 @@ class TurretWorker:
             if self._normal_ingress_open:
                 self._motion_inputs.invalidate()
 
-    def set_control_mode(self, mode: TurretControlMode) -> None:
+    def set_control_mode(self, mode: TurretControlMode) -> bool:
         if not isinstance(mode, TurretControlMode):
             raise TypeError("mode must be TurretControlMode")
         with self._normal_ingress_lock:
-            if self._normal_ingress_open:
-                self._control_inputs.publish(
-                    _ControlIntent(_ControlKind.SET_MODE, mode)
-                )
+            if not self._normal_ingress_open:
+                return False
+            self._control_mailbox.append(_ControlIntent(_ControlKind.SET_MODE, mode))
+            return True
 
-    def stop_motion(self) -> None:
+    def stop_motion(self) -> bool:
         with self._normal_ingress_lock:
-            if self._normal_ingress_open:
-                self._control_inputs.publish(_ControlIntent(_ControlKind.STOP_MOTION))
+            if not self._normal_ingress_open:
+                return False
+            self._control_mailbox.append(_ControlIntent(_ControlKind.STOP_MOTION))
+            return True
 
-    def motor_on(self) -> None:
+    def motor_on(self) -> bool:
         with self._normal_ingress_lock:
-            if self._normal_ingress_open:
-                self._control_inputs.publish(_ControlIntent(_ControlKind.MOTOR_ON))
+            if not self._normal_ingress_open:
+                return False
+            self._control_mailbox.append(_ControlIntent(_ControlKind.MOTOR_ON))
+            return True
 
-    def motor_off(self) -> None:
+    def motor_off(self) -> bool:
         with self._normal_ingress_lock:
-            if self._normal_ingress_open:
-                self._control_inputs.publish(_ControlIntent(_ControlKind.MOTOR_OFF))
+            if not self._normal_ingress_open:
+                return False
+            self._control_mailbox.append(_ControlIntent(_ControlKind.MOTOR_OFF))
+            return True
 
     def request_emergency(self) -> None:
         """Signal Emergency without performing UART I/O in the caller thread."""
@@ -484,11 +490,12 @@ class TurretWorker:
                 self._handle_config_update(update)
             return True
 
-        control_snapshot = self._control_inputs.snapshot()
-        if control_snapshot.revision > self._last_control_revision:
-            self._last_control_revision = control_snapshot.revision
-            if control_snapshot.value is not None:
-                self._handle_control(control_snapshot.value)
+        with self._normal_ingress_lock:
+            control_intent = (
+                self._control_mailbox.popleft() if self._control_mailbox else None
+            )
+        if control_intent is not None:
+            self._handle_control(control_intent)
             return True
 
         motion_snapshot = self._motion_inputs.snapshot()
@@ -644,7 +651,7 @@ class TurretWorker:
             self._normal_ingress_open = False
             self._motion_inputs.invalidate()
             self._last_motion_revision = self._motion_inputs.snapshot().revision
-            self._last_control_revision = self._control_inputs.snapshot().revision
+            self._control_mailbox.clear()
 
     def _bind_stack(self, session: TurretSession) -> None:
         if self._hal is None or self._controller is None:

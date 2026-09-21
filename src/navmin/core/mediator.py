@@ -37,13 +37,13 @@ class TurretPort(Protocol):
 
     def invalidate_tracking_error(self) -> None: ...
 
-    def set_control_mode(self, mode: TurretControlMode) -> None: ...
+    def set_control_mode(self, mode: TurretControlMode) -> bool: ...
 
-    def stop_motion(self) -> None: ...
+    def stop_motion(self) -> bool: ...
 
-    def motor_on(self) -> None: ...
+    def motor_on(self) -> bool: ...
 
-    def motor_off(self) -> None: ...
+    def motor_off(self) -> bool: ...
 
     def request_emergency(self) -> None: ...
 
@@ -209,31 +209,33 @@ class Mediator:
             self._clear_tracking_intent(stop_motion=True)
         return self._main_camera
 
-    def request_control_mode(self, mode: TurretControlMode) -> None:
+    def request_control_mode(self, mode: TurretControlMode) -> bool:
         if not isinstance(mode, TurretControlMode):
             raise TypeError("mode must be TurretControlMode")
+        if not self._turret.set_control_mode(mode):
+            return False
         if (
             self._turret_state.control_mode is TurretControlMode.TRACKING
             and mode is TurretControlMode.RELATIVE
         ):
             self._clear_tracking_intent(stop_motion=False)
         self._pending_control_mode = mode
-        self._turret.set_control_mode(mode)
+        return True
 
-    def stop_motion(self) -> None:
+    def stop_motion(self) -> bool:
         if self._turret_state.control_mode is TurretControlMode.TRACKING:
             self._clear_tracking_intent(stop_motion=False)
-        self._turret.stop_motion()
+        return self._turret.stop_motion()
 
     def emergency_stop(self) -> None:
         self._clear_tracking_intent(stop_motion=False)
         self._turret.request_emergency()
 
-    def motor_on(self) -> None:
-        self._turret.motor_on()
+    def motor_on(self) -> bool:
+        return self._turret.motor_on()
 
-    def motor_off(self) -> None:
-        self._turret.motor_off()
+    def motor_off(self) -> bool:
+        return self._turret.motor_off()
 
     def _update_tracking_from_result(self, result: VisionResult) -> None:
         target = self._selected_target

@@ -280,6 +280,180 @@ def test_invalid_request_id_resyncs_with_emergency_without_reconnect() -> None:
         _shutdown(worker)
 
 
+def test_control_mailbox_preserves_set_mode_then_motor_on_order() -> None:
+    endpoint = FakeStm32Endpoint()
+    factory = _RecordingFactory(endpoint)
+    factory.transport_type = _BlockingFakeTransport
+    worker = TurretWorker(
+        _config(response_timeout_ms=1_000),
+        transport_factory=factory,
+    )
+    worker.start()
+    try:
+        _wait_state(worker, TurretConnectionState.READY)
+        transport = factory.transports[-1]
+        assert isinstance(transport, _BlockingFakeTransport)
+        changed = replace(
+            worker._desired_config,
+            stm32=replace(worker._desired_config.stm32, max_speed_x_deg_s=71.0),
+        )
+        transport.block_next(CommandCode.SET_CONFIG)
+        history_start = len(endpoint.request_history)
+        worker.submit_config_update(ConfigUpdate(1, changed))
+        assert transport.write_seen.wait(0.5)
+
+        assert worker.set_control_mode(TurretControlMode.TRACKING)
+        assert worker.motor_on()
+        transport.release_read.set()
+
+        deadline = monotonic() + 1.0
+        while not (
+            worker.current_state.control_mode is TurretControlMode.TRACKING
+            and worker.current_state.motor_state is MotorState.ON
+        ):
+            assert monotonic() < deadline
+            Event().wait(0.002)
+
+        assert [
+            request.command for request in endpoint.request_history[history_start:]
+        ] == [
+            CommandCode.SET_CONFIG,
+            CommandCode.MOTOR_ON,
+        ]
+    finally:
+        _shutdown(worker)
+
+
+def test_control_mailbox_preserves_motor_off_then_set_mode_order() -> None:
+    endpoint = FakeStm32Endpoint()
+    factory = _RecordingFactory(endpoint)
+    factory.transport_type = _BlockingFakeTransport
+    worker = TurretWorker(
+        _config(response_timeout_ms=1_000),
+        transport_factory=factory,
+    )
+    worker.start()
+    try:
+        _wait_state(worker, TurretConnectionState.READY)
+        assert worker.motor_on()
+        deadline = monotonic() + 0.5
+        while worker.current_state.motor_state is not MotorState.ON:
+            assert monotonic() < deadline
+            Event().wait(0.002)
+
+        transport = factory.transports[-1]
+        assert isinstance(transport, _BlockingFakeTransport)
+        transport.block_next(CommandCode.MOVE_RELATIVE)
+        history_start = len(endpoint.request_history)
+        worker.submit_move_relative(MoveRelativeCommand(1.0, 0.0))
+        assert transport.write_seen.wait(0.5)
+
+        assert worker.motor_off()
+        assert worker.set_control_mode(TurretControlMode.TRACKING)
+        transport.release_read.set()
+
+        deadline = monotonic() + 1.0
+        while not (
+            worker.current_state.motor_state is MotorState.OFF
+            and worker.current_state.control_mode is TurretControlMode.TRACKING
+        ):
+            assert monotonic() < deadline
+            Event().wait(0.002)
+
+        assert [
+            request.command for request in endpoint.request_history[history_start:]
+        ] == [
+            CommandCode.MOVE_RELATIVE,
+            CommandCode.MOTOR_OFF,
+        ]
+    finally:
+        _shutdown(worker)
+
+
+def test_control_mailbox_preserves_stop_motion_before_mode_request() -> None:
+    endpoint = FakeStm32Endpoint()
+    factory = _RecordingFactory(endpoint)
+    factory.transport_type = _BlockingFakeTransport
+    worker = TurretWorker(
+        _config(response_timeout_ms=1_000),
+        transport_factory=factory,
+    )
+    worker.start()
+    try:
+        _wait_state(worker, TurretConnectionState.READY)
+        assert worker.motor_on()
+        deadline = monotonic() + 0.5
+        while worker.current_state.motor_state is not MotorState.ON:
+            assert monotonic() < deadline
+            Event().wait(0.002)
+
+        transport = factory.transports[-1]
+        assert isinstance(transport, _BlockingFakeTransport)
+        transport.block_next(CommandCode.MOVE_RELATIVE)
+        history_start = len(endpoint.request_history)
+        worker.submit_move_relative(MoveRelativeCommand(1.0, 0.0))
+        assert transport.write_seen.wait(0.5)
+
+        assert worker.stop_motion()
+        assert worker.set_control_mode(TurretControlMode.TRACKING)
+        transport.release_read.set()
+
+        deadline = monotonic() + 1.0
+        while worker.current_state.control_mode is not TurretControlMode.TRACKING:
+            assert monotonic() < deadline
+            Event().wait(0.002)
+
+        assert [
+            request.command for request in endpoint.request_history[history_start:]
+        ] == [
+            CommandCode.MOVE_RELATIVE,
+            CommandCode.SET_VELOCITY,
+            CommandCode.SET_VELOCITY,
+        ]
+        assert worker.current_state.motor_state is MotorState.ON
+    finally:
+        _shutdown(worker)
+
+
+def test_accepted_control_mailbox_is_discarded_when_recovery_begins() -> None:
+    endpoint = FakeStm32Endpoint()
+    factory = _RecordingFactory(endpoint)
+    factory.transport_type = _BlockingFakeTransport
+    worker = TurretWorker(
+        _config(response_timeout_ms=1_000),
+        transport_factory=factory,
+    )
+    worker.start()
+    try:
+        _wait_state(worker, TurretConnectionState.READY)
+        transport = factory.transports[-1]
+        assert isinstance(transport, _BlockingFakeTransport)
+        transport.block_next(CommandCode.MOVE_RELATIVE)
+        history_start = len(endpoint.request_history)
+        factory_calls = len(factory.calls)
+        worker.submit_move_relative(MoveRelativeCommand(1.0, 0.0))
+        assert transport.write_seen.wait(0.5)
+
+        assert worker.set_control_mode(TurretControlMode.TRACKING)
+        assert worker.motor_on()
+        transport.queue_read_failure(FakeReadFailure.DISCONNECT)
+        transport.release_read.set()
+
+        _wait_factory_calls(factory, factory_calls + 1)
+        state = _wait_state(worker, TurretConnectionState.READY)
+        Event().wait(0.03)
+
+        commands = [
+            request.command for request in endpoint.request_history[history_start:]
+        ]
+        assert CommandCode.MOTOR_ON not in commands
+        assert CommandCode.SET_VELOCITY not in commands
+        assert state.motor_state is MotorState.OFF
+        assert state.control_mode is TurretControlMode.RELATIVE
+    finally:
+        _shutdown(worker)
+
+
 def test_invalid_request_id_failed_emergency_resync_enters_recovery() -> None:
     endpoint = FakeStm32Endpoint()
     factory = _RecordingFactory(endpoint)
@@ -901,7 +1075,8 @@ def test_normal_ingress_during_active_recovery_is_not_replayed_after_ready() -> 
         assert blocked.write_seen.wait(0.5)
         assert worker.current_state.connection_state is TurretConnectionState.CONNECTING
 
-        worker.motor_on()
+        assert not worker.set_control_mode(TurretControlMode.TRACKING)
+        assert not worker.motor_on()
         worker.submit_move_relative(MoveRelativeCommand(10.0, 0.0))
 
         blocked.release_read.set()
@@ -919,6 +1094,7 @@ def test_normal_ingress_during_active_recovery_is_not_replayed_after_ready() -> 
         assert CommandCode.MOTOR_ON not in commands
         assert CommandCode.MOVE_RELATIVE not in commands
         assert worker.current_state.motor_state is MotorState.OFF
+        assert worker.current_state.control_mode is TurretControlMode.RELATIVE
     finally:
         _shutdown(worker)
 

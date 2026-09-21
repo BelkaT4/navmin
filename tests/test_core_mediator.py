@@ -45,6 +45,7 @@ class _FakeTurret:
         self.motor_on_requests = 0
         self.motor_off_requests = 0
         self.emergency_requests = 0
+        self.control_ingress_open = True
 
     @property
     def current_state(self) -> TurretState:
@@ -59,17 +60,29 @@ class _FakeTurret:
     def invalidate_tracking_error(self) -> None:
         self.invalidations += 1
 
-    def set_control_mode(self, mode: TurretControlMode) -> None:
+    def set_control_mode(self, mode: TurretControlMode) -> bool:
+        if not self.control_ingress_open:
+            return False
         self.mode_requests.append(mode)
+        return True
 
-    def stop_motion(self) -> None:
+    def stop_motion(self) -> bool:
+        if not self.control_ingress_open:
+            return False
         self.stop_requests += 1
+        return True
 
-    def motor_on(self) -> None:
+    def motor_on(self) -> bool:
+        if not self.control_ingress_open:
+            return False
         self.motor_on_requests += 1
+        return True
 
-    def motor_off(self) -> None:
+    def motor_off(self) -> bool:
+        if not self.control_ingress_open:
+            return False
         self.motor_off_requests += 1
+        return True
 
     def request_emergency(self) -> None:
         self.emergency_requests += 1
@@ -246,12 +259,23 @@ def test_tracking_request_is_not_optimistic_and_selection_is_rejected_in_relativ
     assert not mediator.select_target(target)
 
 
+def test_rejected_mode_request_does_not_create_pending_control_mode() -> None:
+    mediator, turret = _mediator()
+    turret.control_ingress_open = False
+
+    assert not mediator.request_control_mode(TurretControlMode.TRACKING)
+    assert turret.mode_requests == []
+    assert mediator.pending_control_mode is None
+    assert mediator.turret_state.control_mode is TurretControlMode.RELATIVE
+
+
 def test_confirmed_tracking_validates_target_and_invalid_request_preserves_selection(
 ) -> None:
     mediator, _turret = _mediator()
     _accept_main(mediator)
-    mediator.request_control_mode(TurretControlMode.TRACKING)
+    assert mediator.request_control_mode(TurretControlMode.TRACKING)
     _confirm_mode(mediator, TurretControlMode.TRACKING)
+    assert mediator.pending_control_mode is None
     first = TargetRef(CameraRole.OVERVIEW, 1, 7)
 
     assert mediator.select_target(first)
@@ -342,7 +366,7 @@ def test_stop_emergency_motor_forwarding_and_connection_loss_boundaries() -> Non
     target = TargetRef(CameraRole.OVERVIEW, 1, 7)
     assert mediator.select_target(target)
 
-    mediator.stop_motion()
+    assert mediator.stop_motion()
     assert mediator.selected_target is None
     assert turret.stop_requests == 1
 
@@ -351,8 +375,8 @@ def test_stop_emergency_motor_forwarding_and_connection_loss_boundaries() -> Non
     assert mediator.selected_target is None
     assert turret.emergency_requests == 1
 
-    mediator.motor_on()
-    mediator.motor_off()
+    assert mediator.motor_on()
+    assert mediator.motor_off()
     assert turret.motor_on_requests == 1
     assert turret.motor_off_requests == 1
 
@@ -406,7 +430,7 @@ def test_startup_main_camera_comes_from_ui_config_and_stereo_right_is_rejected(
 def test_relative_stop_only_forwards_without_tracking_invalidation() -> None:
     mediator, turret = _mediator()
 
-    mediator.stop_motion()
+    assert mediator.stop_motion()
 
     assert turret.stop_requests == 1
     assert turret.invalidations == 0

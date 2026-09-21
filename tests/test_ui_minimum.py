@@ -83,17 +83,21 @@ class _FakeTurret:
     def invalidate_tracking_error(self) -> None:
         self.invalidations += 1
 
-    def set_control_mode(self, mode: TurretControlMode) -> None:
+    def set_control_mode(self, mode: TurretControlMode) -> bool:
         self.mode_requests.append(mode)
+        return True
 
-    def stop_motion(self) -> None:
+    def stop_motion(self) -> bool:
         self.stop_requests += 1
+        return True
 
-    def motor_on(self) -> None:
+    def motor_on(self) -> bool:
         self.motor_on_requests += 1
+        return True
 
-    def motor_off(self) -> None:
+    def motor_off(self) -> bool:
         self.motor_off_requests += 1
+        return True
 
     def request_emergency(self) -> None:
         self.emergency_requests += 1
