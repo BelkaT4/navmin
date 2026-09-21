@@ -147,8 +147,14 @@ Stage 5 minimum: Legacy14VisionProcessor + SimpleTracker + рабочие Overvi
 software smoke foundation                 accepted
 RELATIVE UI → Aiming → Turret → protocol  accepted
 TRACKING detector/tracker → UI → PID      accepted
-failures/lifecycle E2E                    next
+failures/lifecycle E2E                    accepted
+software soak                             accepted as functional/stability harness
+full read-only integration audit          completed
+INT-P1-01 Turret ordinary control ingress closed
+INT-P1-02 bounded soak observability      closed
 ```
+
+После INT-P1-02 повторный soak корректно пометил residual RSS growth как `SOAK SUSPECT`. Targeted read-only memory diagnosis не нашёл unbounded Python-level retention и показал ранний Vision/OpenCV native-allocation step с последующим plateau, в том числе при repeated detector reset. На текущем synthetic уровне это считается bounded allocator/cache behaviour и не является blocker следующего transport checkpoint; новый production memory fix без дополнительных evidence не оправдан.
 
 Эти acceptance checkpoints не означают автоматического завершения Stage 5/6/7 и не переводят Stage 8 в `in-progress`. Они являются доказательством composability текущего prototype path перед закрытием оставшихся stage-specific criteria.
 
@@ -157,10 +163,7 @@ failures/lifecycle E2E                    next
 До первых офлайн-испытаний с реальными камерами и STM32 проект следует такому порядку:
 
 ```text
-E2E failures/lifecycle
-→ software soak
-→ read-only full integration audit
-→ localhost RTP/JPEG diagnostic camera backend
+localhost RTP/JPEG diagnostic camera backend
 → production SerialTransport через Linux PTY + software STM32 emulator
 → shared application composition
 → normal launcher + diagnostic launcher

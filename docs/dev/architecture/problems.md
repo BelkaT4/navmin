@@ -196,7 +196,9 @@ Aim point уже per-camera. После prototype проверить, доста
 
 ### 25. Diagnostics / profiling
 
-Минимальные candidates:
+Software soak уже получил bounded observability для command/transport histories, reconnect count, thread count, RSS и cycle timing. Targeted memory diagnosis на synthetic `InMemoryFrameSource + FakeTransport` path не нашёл unbounded Python-level retention: nominal, generation-restart, reconnect и stale/resume runs показали ранний RSS allocation step с последующим plateau, а Legacy14/OpenCV microbench подтвердил bounded native allocator/cache behaviour. Это не закрывает profiling на production RTP/SerialTransport и real hardware.
+
+Минимальные candidates для следующих transport/hardware checkpoints:
 
 - camera FPS;
 - Vision processing time;
@@ -207,7 +209,8 @@ Aim point уже per-camera. После prototype проверить, доста
 - UART timeout/error count;
 - command latency;
 - TrackingError/SET_VELOCITY frequency;
-- watchdog stops.
+- watchdog stops;
+- RSS/allocator behaviour на production RTP/GStreamer и SerialTransport paths.
 
 ### 26. Режим «Самая быстрая»
 
