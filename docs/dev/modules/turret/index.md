@@ -527,6 +527,43 @@ Wire `EVENTS` section STM32 зарезервирована, но пуста в v
 
 Физический STM32 должен быть заменяем эмулятором через тот же HAL interface.
 
+Для hardware-independent проверки production serial boundary существует Linux PTY
+diagnostic:
+
+```text
+TurretWorker / TurretSession
+→ production SerialTransport
+→ real pyserial
+→ stable symlink на PTY slave
+⇄ PTY master
+→ diagnostics byte-stream bridge
+→ FakeStm32Endpoint
+```
+
+Diagnostic запускается командой:
+
+```bash
+python tools/run_pty_stm32_diagnostic.py
+```
+
+`FakeTransport` в этом acceptance path не используется. PTY bridge владеет только
+byte-stream framing, fragment/garbage/delay/drop/CRC fault injection, заменой PTY
+pair и lifecycle; decode, `REQUEST_ID`, exact-retry cache, Emergency resync и
+логическое состояние `SET_BAUDRATE` остаются в существующем
+`FakeStm32Endpoint`.
+
+Стабильный временный путь `/tmp/navmin-pty-*/stm32` атомарно перенаправляется на
+новый `/dev/pts/*` при hard disconnect. Поэтому production worker продолжает
+открывать один configured port, но reconnect создаёт новый `SerialTransport` и
+реально открывает новый PTY slave через pyserial.
+
+Эта проверка подтверждает OS byte stream, partial reads, response framing,
+timeouts, CRC/exact retry, garbage resync, исчезновение device и automatic
+reconnect. PTY не подтверждает физическое UART bit timing, электрические свойства
+UART/USB-RS485, half-duplex direction control, кабель/grounding или поведение
+реального STM32. В частности `SET_BAUDRATE` здесь проверяет production state
+machine и настройку pyserial, но не реальную скорость передачи битов.
+
 ## Что ещё не определено
 
 - hardware upper limits step rate/acceleration/watchdog/static relative delta;
