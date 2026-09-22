@@ -2,11 +2,8 @@
 
 from __future__ import annotations
 
-import logging
-from collections.abc import Callable, Iterator, Sequence
-from contextlib import contextmanager
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -17,7 +14,7 @@ from navmin.calibration import (
     load_stereo_calibration,
 )
 from navmin.config import AppConfig, load_config
-from navmin.logging_setup import configure_logging
+from navmin.logging_setup import session_file_logging
 
 if TYPE_CHECKING:
     from navmin.application import ApplicationRuntime
@@ -61,40 +58,6 @@ def load_application_inputs(paths: LauncherPaths) -> LoadedApplicationInputs:
     return LoadedApplicationInputs(config, overview, stereo)
 
 
-def make_session_log_path(
-    log_dir: Path,
-    *,
-    mode: str,
-    now: datetime | None = None,
-) -> Path:
-    """Return one collision-resistant per-process log path under ``logs/``."""
-    if not mode or any(character.isspace() for character in mode):
-        raise ValueError("mode must be one non-empty token")
-    timestamp = (now or datetime.now(UTC)).strftime("%Y%m%d-%H%M%S-%f")
-    return log_dir / f"navmin-{mode}-{timestamp}.log"
-
-
-@contextmanager
-def session_file_logging(path: Path, *, level: int) -> Iterator[Path]:
-    """Add one scoped file handler while retaining the standard console handler."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    logger = configure_logging(logging.INFO)
-    logger.setLevel(level)
-    handler = logging.FileHandler(path, mode="a", encoding="utf-8")
-    handler.setLevel(level)
-    handler.setFormatter(
-        logging.Formatter(
-            "%(asctime)s %(levelname)s %(threadName)s %(name)s: %(message)s"
-        )
-    )
-    logger.addHandler(handler)
-    try:
-        yield path
-    finally:
-        logger.removeHandler(handler)
-        handler.close()
-
-
 def run_loaded_application(
     inputs: LoadedApplicationInputs,
     *,
@@ -135,7 +98,6 @@ __all__ = [
     "LauncherPaths",
     "LoadedApplicationInputs",
     "load_application_inputs",
-    "make_session_log_path",
     "run_loaded_application",
     "session_file_logging",
     "validate_normal_hardware_config",

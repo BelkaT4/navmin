@@ -677,7 +677,17 @@ session artifacts не принадлежат `ApplicationRuntime` и управ
 
 Backend selection должен быть явным и воспроизводимым; primary interface — command-line arguments. Runtime не угадывает автоматически, какой fake/real backend использовать. Выбранные backends записываются в session diagnostics. Для полностью software-only сочетания `localhost + localhost + pty` launcher может дополнительно получить явный `--synthetic-inputs`: тогда только launcher создаёт встроенные typed 320×240 diagnostic config/calibrations в памяти. Это не fallback по отсутствию файлов и не меняет normal startup rule: mixed/real diagnostics и normal launcher остаются file-backed, а `--synthetic-inputs` с любым real endpoint отклоняется.
 
-Normal launcher всегда сохраняет per-session INFO log. Diagnostic launcher добавляет подробный DEBUG log и offline-support artifacts: manifest/environment/preflight results и effective config/calibration inputs. Точная session-directory/retention policy остаётся implementation detail до integration checkpoint.
+Normal и diagnostic launcher до загрузки inputs создают отдельный launcher-owned
+session directory `navmin-<mode>-YYYYMMDD-HHMMSS-ffffff/`. В нём находятся bounded
+rotating `runtime.log`, machine-readable `manifest.json` и `inputs/` с реально
+переданными в shared composition effective config/calibrations. Для file-backed
+inputs сохраняются SHA-256 исходных files, а synthetic profile маркируется как
+synthetic без фиктивного hash. Manifest собирает только allowlisted platform/runtime
+metadata и optional local Git commit/branch/dirty evidence; environment dump,
+credentials и filesystem inventory не собираются. Normal file log остаётся INFO,
+diagnostic — DEBUG; каждый log file ограничен 10 MiB и пятью backups. Старые
+session directories launcher автоматически не удаляет: cross-session retention
+manual. Backend-aware preflight остаётся следующим отдельным checkpoint.
 
 ESP32-C3 HIL не является prerequisite первых реальных hardware tests. Если после hardware day понадобится отдельный physical serial/fault-injection stand, он может быть реализован как optional post-hardware tool без изменения application composition.
 

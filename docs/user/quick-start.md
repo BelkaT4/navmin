@@ -75,5 +75,28 @@ python tools/run_diagnostic_app.py \
 STM32 endpoint через Linux PTY, но приложение продолжает использовать production
 `SerialTransport`/pyserial.
 
-Оба режима пишут session log в `logs/`; normal использует INFO, diagnostic — DEBUG.
-Расширенный offline bundle, preflight и runbook добавляются отдельным checkpoint.
+Оба режима создают отдельный session directory в `logs/` (или в parent directory,
+заданном через `--log-dir`):
+
+```text
+logs/
+└── navmin-<mode>-YYYYMMDD-HHMMSS-ffffff/
+    ├── runtime.log
+    ├── manifest.json
+    └── inputs/
+        ├── effective-config.json
+        ├── overview-calibration.json
+        ├── stereo-calibration.json
+        └── source-hashes.json
+```
+
+Normal пишет в session file на уровне INFO, diagnostic — DEBUG. `runtime.log`
+rotates при 10 MiB и хранит до пяти backup files; старые session directories
+автоматически не удаляются. Manifest содержит outcome запуска, выбранные backends и
+ограниченный набор runtime/platform evidence. Environment variables, credentials и
+полный filesystem inventory не собираются. Effective inputs всё равно могут содержать
+операционные параметры, поэтому session directory не следует считать автоматически
+безопасным для публичной публикации.
+
+Backend-aware preflight и offline hardware runbook добавляются следующими отдельными
+checkpoint.

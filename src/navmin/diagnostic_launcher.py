@@ -41,9 +41,13 @@ from navmin.launcher import (
     LauncherPaths,
     LoadedApplicationInputs,
     load_application_inputs,
-    make_session_log_path,
     run_loaded_application,
     session_file_logging,
+)
+from navmin.session_artifacts import (
+    SessionArtifacts,
+    SessionStatus,
+    SourceInputPaths,
 )
 
 LOGGER = logging.getLogger(__name__)
@@ -282,7 +286,12 @@ def _parser() -> argparse.ArgumentParser:
         type=Path,
         default=Path("calibration/stereo.json"),
     )
-    parser.add_argument("--log-dir", type=Path, default=Path("logs"))
+    parser.add_argument(
+        "--log-dir",
+        type=Path,
+        default=Path("logs"),
+        help="Parent directory for per-session NavMin artifact directories.",
+    )
     parser.add_argument(
         "--synthetic-inputs",
         action="store_true",
@@ -333,13 +342,28 @@ def main(argv: Sequence[str] | None = None) -> int:
             "--synthetic-inputs requires --overview localhost "
             "--stereo-left localhost --turret pty"
         )
-    log_path = make_session_log_path(paths.log_dir, mode="diagnostic")
 
-    with session_file_logging(log_path, level=logging.DEBUG):
+    artifacts = SessionArtifacts.create(
+        paths.log_dir,
+        mode="diagnostic",
+        overview_backend=selection.overview.value,
+        stereo_left_backend=selection.stereo_left.value,
+        turret_backend=selection.turret.value,
+        input_mode="synthetic" if args.synthetic_inputs else "files",
+    )
+    source_paths = None
+    if not args.synthetic_inputs:
+        source_paths = SourceInputPaths(
+            config=paths.config,
+            overview_calibration=paths.overview_calibration,
+            stereo_calibration=paths.stereo_calibration,
+        )
+
+    with session_file_logging(artifacts.runtime_log_path, level=logging.DEBUG):
         LOGGER.info(
             "Diagnostic launcher selected overview=%s stereo_left=%s turret=%s; "
             "inputs=%s config=%s overview_calibration=%s "
-            "stereo_calibration=%s log=%s",
+            "stereo_calibration=%s session=%s",
             selection.overview.value,
             selection.stereo_left.value,
             selection.turret.value,
@@ -347,28 +371,82 @@ def main(argv: Sequence[str] | None = None) -> int:
             paths.config,
             paths.overview_calibration,
             paths.stereo_calibration,
-            log_path,
+            artifacts.session_dir,
         )
-        endpoints: DiagnosticEndpoints | None = None
-        exit_code = 2
+
         try:
             inputs = (
                 _synthetic_diagnostic_inputs()
                 if args.synthetic_inputs
                 else load_application_inputs(paths)
             )
+        except (OSError, ValueError) as exc:
+            LOGGER.exception("NavMin diagnostic input loading failed")
+            artifacts.finalize(
+                status=SessionStatus.INPUT_FAILED,
+                exit_code=2,
+                failure=exc,
+            )
+            return 2
+
+        endpoints: DiagnosticEndpoints | None = None
+        primary_failure: BaseException | None = None
+        cleanup_failure: RuntimeError | None = None
+        status = SessionStatus.RUNTIME_FAILED
+        exit_code = 2
+        try:
             endpoints = DiagnosticEndpoints(selection=selection, inputs=inputs)
             effective_inputs = endpoints.start()
+            artifacts.write_effective_inputs(
+                config=effective_inputs.config,
+                overview_calibration=effective_inputs.overview_calibration,
+                stereo_calibration=effective_inputs.stereo_calibration,
+                source_paths=source_paths,
+            )
             exit_code = run_loaded_application(effective_inputs)
-        except (RuntimeError, ValueError) as exc:
-            LOGGER.error("NavMin diagnostic startup/runtime failed: %s", exc)
+            if exit_code == 0:
+                status = SessionStatus.COMPLETED
+            else:
+                primary_failure = RuntimeError(
+                    f"application returned nonzero exit code {exit_code}"
+                )
+                LOGGER.error("%s", primary_failure)
+        except KeyboardInterrupt as exc:
+            LOGGER.warning("NavMin diagnostic run interrupted by operator")
+            primary_failure = exc
+            status = SessionStatus.INTERRUPTED
+            exit_code = 130
+        except (ImportError, OSError, RuntimeError, ValueError) as exc:
+            LOGGER.exception("NavMin diagnostic startup/runtime failed")
+            primary_failure = exc
+            status = SessionStatus.RUNTIME_FAILED
+            exit_code = 2
         finally:
             if endpoints is not None:
                 try:
                     endpoints.stop()
                 except RuntimeError as exc:
-                    LOGGER.error("Diagnostic endpoint cleanup failed: %s", exc)
-                    exit_code = 2
+                    LOGGER.exception("Diagnostic endpoint cleanup failed")
+                    cleanup_failure = exc
+                    if exit_code == 0:
+                        exit_code = 2
+
+            final_status = (
+                SessionStatus.CLEANUP_FAILED
+                if cleanup_failure is not None
+                else status
+            )
+            failure = primary_failure
+            cleanup_evidence = cleanup_failure
+            if failure is None and cleanup_failure is not None:
+                failure = cleanup_failure
+                cleanup_evidence = None
+            artifacts.finalize(
+                status=final_status,
+                exit_code=exit_code,
+                failure=failure,
+                cleanup_failure=cleanup_evidence,
+            )
         return exit_code
 
 

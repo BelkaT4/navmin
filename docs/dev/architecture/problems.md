@@ -100,16 +100,21 @@ Foundation уже имеет единый idempotent bootstrap стандарт�
 
 Turret-specific policy закрыта: в v1 остаётся обычный Python logging без `QueueHandler/QueueListener`; INFO содержит lifecycle/connection/recovery/baud boundaries и значимые failures, transaction/retry details доступны для diagnostics, а high-rate PID/setpoint traffic не логируется на INFO. Queue-based logging возвращается только при измеренной contention/blocking problem.
 
-Для подготовки автономного hardware day уже принято направление:
+Для подготовки автономного hardware day launcher-side session evidence уже имеет:
 
-- normal launcher всегда сохраняет per-session INFO log в файл;
-- diagnostic launcher запускает то же приложение, но дополнительно собирает подробный DEBUG log, manifest/preflight и effective config/calibration inputs;
-- logging остаётся diagnostics output, а typed runtime state по-прежнему не заменяется парсингом логов.
+- отдельный per-run session directory для normal и diagnostic;
+- bounded rotating file logging (normal INFO, diagnostic DEBUG);
+- `manifest.json` с lifecycle outcome, backend/input mode и allowlisted runtime/Git metadata;
+- effective config/calibration copies и file-backed SHA-256 либо явную synthetic provenance;
+- manual cross-session retention без automatic deletion.
 
-Остаются integration details, которые нужно определить при реализации:
+Logging остаётся diagnostics output, а typed runtime state по-прежнему не заменяется
+парсингом логов.
 
-- rotation / file limits и retention;
-- exact session-directory/export-bundle format;
+Остаются следующие integration details:
+
+- backend-aware preflight и `preflight.json`;
+- offline export/runbook workflow поверх уже существующего session directory;
 - production level/config source beyond fixed normal-vs-diagnostic baseline;
 - как UI показывает последние важные ошибки без превращения logging в machine-readable state.
 

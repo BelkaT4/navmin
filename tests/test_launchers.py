@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import json
 import logging
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
+from navmin.__main__ import main as normal_main
 from navmin.calibration import OverviewCalibration, StereoCalibration
 from navmin.config.models import (
     AimingConfig,
@@ -33,12 +36,9 @@ from navmin.diagnostic_launcher import (
     DiagnosticSelection,
     TurretEndpoint,
 )
-from navmin.diagnostic_launcher import (
-    main as diagnostic_main,
-)
+from navmin.diagnostic_launcher import main as diagnostic_main
 from navmin.launcher import (
     LoadedApplicationInputs,
-    make_session_log_path,
     run_loaded_application,
     session_file_logging,
     validate_normal_hardware_config,
@@ -303,13 +303,6 @@ def test_diagnostic_real_selection_still_disables_fake_transport() -> None:
         endpoints.stop()
 
 
-def test_session_log_path_stays_under_requested_directory() -> None:
-    path = make_session_log_path(Path("logs"), mode="diagnostic")
-    assert path.parent == Path("logs")
-    assert path.name.startswith("navmin-diagnostic-")
-    assert path.suffix == ".log"
-
-
 def test_session_file_logging_writes_diagnostic_detail(tmp_path) -> None:
     path = tmp_path / "logs" / "diagnostic.log"
     logger = logging.getLogger("navmin.launcher-test")
@@ -339,7 +332,22 @@ def test_diagnostic_synthetic_inputs_run_without_config_files(
             captured_inputs.append(inputs)
 
         def start(self):
-            return captured_inputs[-1]
+            base = captured_inputs[-1]
+            effective = replace(
+                base,
+                config=replace(
+                    base.config,
+                    turret=replace(
+                        base.config.turret,
+                        serial=replace(
+                            base.config.turret.serial,
+                            port="/tmp/navmin-test-pty/stm32",
+                        ),
+                        emulate_stm32=False,
+                    ),
+                ),
+            )
+            return effective
 
         def stop(self) -> None:
             return None
@@ -384,6 +392,25 @@ def test_diagnostic_synthetic_inputs_run_without_config_files(
     assert inputs.config.vision.cameras.overview.port == 8888
     assert inputs.config.vision.cameras.stereo_left.port == 8889
 
+    session = _single_session(tmp_path / "logs")
+    effective_config = json.loads(
+        (session / "inputs" / "effective-config.json").read_text(encoding="utf-8")
+    )
+    assert effective_config["turret"]["serial"]["port"] == "/tmp/navmin-test-pty/stm32"
+    assert effective_config["turret"]["emulate-stm32"] is False
+    assert (session / "inputs" / "overview-calibration.json").is_file()
+    assert (session / "inputs" / "stereo-calibration.json").is_file()
+    source_hashes = json.loads(
+        (session / "inputs" / "source-hashes.json").read_text(encoding="utf-8")
+    )
+    assert all(item["source"] == "synthetic" for item in source_hashes.values())
+    manifest = json.loads((session / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["status"] == "completed"
+    assert manifest["overview_backend"] == "localhost"
+    assert manifest["stereo_left_backend"] == "localhost"
+    assert manifest["turret_backend"] == "pty"
+    assert manifest["input_mode"] == "synthetic"
+
 
 def test_diagnostic_synthetic_inputs_reject_mixed_real_endpoints(tmp_path) -> None:
     with pytest.raises(SystemExit) as exc_info:
@@ -401,3 +428,149 @@ def test_diagnostic_synthetic_inputs_reject_mixed_real_endpoints(tmp_path) -> No
             ]
         )
     assert exc_info.value.code == 2
+
+
+def _single_session(log_dir: Path) -> Path:
+    sessions = [path for path in log_dir.iterdir() if path.is_dir()]
+    assert len(sessions) == 1
+    return sessions[0]
+
+
+def _write_source_placeholders(tmp_path: Path) -> tuple[Path, Path, Path]:
+    config_path = tmp_path / "config.json"
+    overview_path = tmp_path / "overview.json"
+    stereo_path = tmp_path / "stereo.json"
+    config_path.write_text("{}", encoding="utf-8")
+    overview_path.write_text("{}", encoding="utf-8")
+    stereo_path.write_text("{}", encoding="utf-8")
+    return config_path, overview_path, stereo_path
+
+
+def test_normal_missing_config_keeps_input_failure_session_evidence(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    monkeypatch.setattr(
+        "navmin.__main__.run_loaded_application",
+        lambda _inputs: pytest.fail("runtime must not start after input failure"),
+    )
+    log_dir = tmp_path / "logs"
+    exit_code = normal_main(
+        [
+            "--config",
+            str(tmp_path / "missing-config.json"),
+            "--overview-calibration",
+            str(tmp_path / "missing-overview.json"),
+            "--stereo-calibration",
+            str(tmp_path / "missing-stereo.json"),
+            "--log-dir",
+            str(log_dir),
+        ]
+    )
+
+    assert exit_code == 2
+    session = _single_session(log_dir)
+    assert (session / "runtime.log").is_file()
+    manifest = json.loads((session / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["status"] == "input-failed"
+    assert manifest["exit_code"] == 2
+    assert not (session / "inputs" / "effective-config.json").exists()
+
+
+def test_normal_runtime_failure_and_clean_run_finalize_manifest(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    config_path, overview_path, stereo_path = _write_source_placeholders(tmp_path)
+    inputs = _inputs()
+    monkeypatch.setattr("navmin.__main__.load_application_inputs", lambda _paths: inputs)
+
+    def run_failure(_inputs) -> int:
+        raise RuntimeError("runtime-boom")
+
+    monkeypatch.setattr("navmin.__main__.run_loaded_application", run_failure)
+    failed_logs = tmp_path / "failed-logs"
+    assert normal_main(
+        [
+            "--config",
+            str(config_path),
+            "--overview-calibration",
+            str(overview_path),
+            "--stereo-calibration",
+            str(stereo_path),
+            "--log-dir",
+            str(failed_logs),
+        ]
+    ) == 2
+    failed_session = _single_session(failed_logs)
+    failed_manifest = json.loads(
+        (failed_session / "manifest.json").read_text(encoding="utf-8")
+    )
+    assert failed_manifest["status"] == "runtime-failed"
+    assert failed_manifest["failure_message"] == "runtime-boom"
+    runtime_log = (failed_session / "runtime.log").read_text(encoding="utf-8")
+    assert "runtime-boom" in runtime_log
+    assert "Traceback (most recent call last)" in runtime_log
+
+    monkeypatch.setattr("navmin.__main__.run_loaded_application", lambda _inputs: 0)
+    clean_logs = tmp_path / "clean-logs"
+    assert normal_main(
+        [
+            "--config",
+            str(config_path),
+            "--overview-calibration",
+            str(overview_path),
+            "--stereo-calibration",
+            str(stereo_path),
+            "--log-dir",
+            str(clean_logs),
+        ]
+    ) == 0
+    clean_manifest = json.loads(
+        (_single_session(clean_logs) / "manifest.json").read_text(encoding="utf-8")
+    )
+    assert clean_manifest["status"] == "completed"
+    assert clean_manifest["exit_code"] == 0
+
+
+def test_diagnostic_cleanup_failure_preserves_primary_runtime_failure(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    class FakeEndpoints:
+        def __init__(self, *, selection, inputs) -> None:
+            self.inputs = inputs
+
+        def start(self):
+            return self.inputs
+
+        def stop(self) -> None:
+            raise RuntimeError("cleanup-boom")
+
+    monkeypatch.setattr("navmin.diagnostic_launcher.DiagnosticEndpoints", FakeEndpoints)
+
+    def fail_runtime(_inputs) -> int:
+        raise RuntimeError("runtime-boom")
+
+    monkeypatch.setattr("navmin.diagnostic_launcher.run_loaded_application", fail_runtime)
+    log_dir = tmp_path / "logs"
+    assert diagnostic_main(
+        [
+            "--overview",
+            "localhost",
+            "--stereo-left",
+            "localhost",
+            "--turret",
+            "pty",
+            "--synthetic-inputs",
+            "--log-dir",
+            str(log_dir),
+        ]
+    ) == 2
+
+    manifest = json.loads(
+        (_single_session(log_dir) / "manifest.json").read_text(encoding="utf-8")
+    )
+    assert manifest["status"] == "cleanup-failed"
+    assert manifest["failure_message"] == "runtime-boom"
+    assert manifest["cleanup_failure_message"] == "cleanup-boom"

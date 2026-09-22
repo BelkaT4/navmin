@@ -340,9 +340,15 @@ camera role, а PTY selection формирует effective Turret config со st
 mixed/real endpoint selections; normal launcher и mixed/real diagnostics
 по-прежнему используют file-backed typed inputs.
 
-Оба launcher создают per-session file log под `logs/`: normal — INFO, diagnostic
-— DEBUG. Manifest/environment/preflight и копии effective inputs относятся к
-следующему offline-diagnostics checkpoint, а не к `ApplicationRuntime`.
+Оба launcher создают отдельный UTC-timestamped session directory под `logs/`
+(или под parent directory из `--log-dir`) до загрузки config/calibration. Session
+owner остаётся launcher-side и хранит bounded rotating `runtime.log`, `manifest.json`
+и `inputs/` с effective config/calibration и provenance/hash evidence. Normal file
+log имеет INFO level, diagnostic — DEBUG; console logging сохраняется. Один runtime
+log ограничен 10 MiB с пятью backup files, а старые session directories автоматически
+не удаляются: cross-session retention остаётся ручной ответственностью оператора.
+Preflight остаётся отдельным следующим checkpoint и не принадлежит
+`ApplicationRuntime`.
 `SoftwareSmokeRuntime` также делегирует общую worker/Mediator/lifecycle wiring
 `ApplicationRuntime`, но сохраняет ownership своих `InMemoryFrameSource` и
 synthetic producers.
