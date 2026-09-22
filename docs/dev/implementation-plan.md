@@ -160,19 +160,43 @@ INT-P1-02 bounded soak observability      closed
 
 ### Текущий путь к автономному hardware day
 
-До первых офлайн-испытаний с реальными камерами и STM32 проект следует такому порядку:
+Software-only transport/application preparation уже последовательно принята:
 
 ```text
-localhost RTP/JPEG diagnostic camera backend
-→ production SerialTransport через Linux PTY + software STM32 emulator
-→ shared application composition
-→ normal launcher + diagnostic launcher
-→ offline logging / preflight / runbook
-→ offline rehearsal без доступа к интернету
-→ real STM32-only smoke
-→ real cameras-only smoke
-→ combined prototype: RELATIVE / TRACKING / failure checks
+localhost RTP/JPEG diagnostic camera backend              accepted
+production SerialTransport через Linux PTY                accepted
+shared application composition                            accepted
+normal launcher + diagnostic launcher                     accepted
+offline session artifacts + bounded logging               accepted
+backend-aware preflight + --preflight-only                accepted
 ```
+
+Следующий immutable порядок:
+
+```text
+Prompt 3/3: offline hardware runbook + targeted docs sync
+→ offline rehearsal без доступа к интернету
+→ documentation cleanup + root README sync
+→ merge feat/first-implementation into main
+→ full validation on main
+→ annotated pre-hardware stable tag
+→ selected external-development checkpoints (VT11 / STM32)
+→ relevant regressions/rehearsal
+→ REAL HARDWARE DAY:
+     controlled STM32-only boundary
+     → cameras-only smoke
+     → combined RELATIVE / TRACKING / failure checks
+```
+
+Два внешних READ-ONLY аудита уже завершены, но их implementation намеренно не
+начинается до stable tag:
+
+- **VT11 vision backend:** current Vision contract adapter feasible with limited
+  backend changes; далее `VT11-V2 adapter → V3 A/B benchmark → V4 decision gate`,
+  а расширение Vision contract допускается только позже по evidence.
+- **STM32 Stage8.2 / protocol 0.4:** current NavMin protocol/control остаётся base;
+  сначала measured hardware contract, затем limits/IWDG и bench validation, и лишь
+  потом optional capabilities/status/ARM evolution.
 
 `InMemoryFrameSource` и `FakeTransport/FakeStm32Endpoint` остаются быстрыми deterministic test boundaries и не заменяются более тяжёлыми transport emulators в обычном test suite. Localhost RTP/JPEG и PTY проверяют production transport paths, сохраняя hardware-independent воспроизводимость.
 
@@ -574,7 +598,7 @@ Host-side protocol tests из этапа 3 не дублировать в firmwa
 - target handoff;
 - load adaptation;
 - future latest-live-frame optimization;
-- `AdvancedVisionProcessor` на базе VT11 identity/reference/reacquisition до получения baseline measurements.
+- VT11 vision backend implementation до post-tag `VT11-V2`; READ-ONLY `VT11-V1` audit уже завершён и не требует изменения текущего public Vision contract.
 
 Stereo Right pipeline должен существовать настолько, насколько это требуется rectification/session/diagnostics architecture, но отсутствие production stereo distance не блокирует v1.
 
@@ -587,7 +611,7 @@ Stereo Right pipeline должен существовать настолько, 
 - legacy detector algorithms переносятся чисто, без legacy UI/application glue и без копирования legacy tracker как есть;
 - tracker публикует track после 2 confirmations, удаляет после 3 consecutive misses, использует history=5 matched observations и real-time robust median velocity; prediction используется только внутри association, predicted bbox без detection наружу не публикуется;
 - internal detector/tracker tuning хранится рядом с owner code в `settings.py` как module-level constants и не входит в `config.json`/UI v1;
-- full VT11 identity/reacquisition остаётся будущим `AdvancedVisionProcessor`, не blocker baseline Stage 5.
+- VT11 остаётся отдельным future vision backend, а не detector для обязательного `SimpleTracker`; `VT11-V1` audit подтвердил feasibility адаптации к текущему `VisionResult / TrackedObject` contract с ограниченными внутренними изменениями backend.
 
 ### Открытые вопросы, которые должен закрыть этап
 
@@ -841,6 +865,12 @@ Future latest-live-frame mode (#22) остаётся deferred. Gesture/overlay/S
 - diagnostic runtime дополнительно сохраняет подробный DEBUG log, manifest/environment/preflight results и effective config/calibration inputs, достаточные для последующего offline разбора;
 - performance measurement of tracking pipeline;
 - reproducible offline runbook/dependencies/packaging и rehearsal без доступа к интернету перед hardware day.
+
+Некоторые software-only prerequisites этого этапа уже выполнены заранее и не
+меняют формальный статус полного Stage 8: shared composition, normal/diagnostic
+launchers, localhost RTP/JPEG, PTY production-transport check, session artifacts,
+bounded logging и backend-aware static preflight. Следующий infrastructure checkpoint
+до rehearsal — offline hardware runbook.
 
 ### Timing and tuning
 

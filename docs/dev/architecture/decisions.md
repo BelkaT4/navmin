@@ -543,13 +543,13 @@ Legacy14VisionProcessor   # default
 Legacy11VisionProcessor
 ```
 
-Они используют detector-алгоритмы legacy Variant 1.4 / Variant 1.1 и один общий внутренний `SimpleTracker`. Legacy tracker целиком не переносится. `SimpleTracker` использует короткую robust motion history, внутреннее prediction и one-to-one association; полноценный appearance identity/reacquisition остаётся будущей реализацией `AdvancedVisionProcessor`.
+Они используют detector-алгоритмы legacy Variant 1.4 / Variant 1.1 и один общий внутренний `SimpleTracker`. Legacy tracker целиком не переносится. `SimpleTracker` использует короткую robust motion history, внутреннее prediction и one-to-one association; полноценный appearance identity/reacquisition остаётся возможностью отдельного будущего vision backend.
 
 Processor-specific tuning в v1 является implementation detail: owner-local `settings.py` с module-level constants. Эти параметры не входят в `config.json`, не persistятся Config Manager и не показываются UI.
 
 ### Почему
 
-Такой boundary позволяет сначала получить простой измеримый baseline на двух detector variants, сравнивая их на одном tracker, а затем заменить внутренний algorithm на более сложный VT11-подобный processor без изменения Core, UI, Aiming или публичных Vision contracts.
+Такой boundary позволяет сначала получить простой измеримый baseline на двух detector variants, сравнивая их на одном tracker, а затем заменить весь vision backend на более сложную интегрированную реализацию без изменения Core, UI, Aiming или публичных Vision contracts.
 
 Локальные tuning constants не являются пользовательской политикой системы. Если преждевременно включить их в строгий `config.json`, экспериментальные thresholds становятся долгоживущим публичным schema/API и требуют validation, persistence и runtime apply semantics без доказанной необходимости.
 
@@ -728,6 +728,118 @@ Localhost RTP и PTY закрывают два крупных PC-side риска
 - **Делать static preflight внутри `ApplicationRuntime`.** Отклонено: capability checking зависит от launcher-selected external backend и должно завершиться до создания endpoints/workers/UI.
 - **Открывать real serial device или ждать RTP frames в static preflight.** Отклонено: это уже runtime/hardware smoke и может иметь side effects (включая DTR/RTS/reset).
 - **Сделать ESP32-C3 обязательным HIL gate до STM32.** Отклонено ради экономии времени; PTY закрывает PC-side serial semantics, а необходимость отдельного physical emulator оценивается после реальных tests.
+
+---
+
+## 32. `vision backend` — фиксированный термин заменяемого блока; VT11 сначала адаптируется к текущему Vision contract
+
+### Решение
+
+Во всех новых документах, аудитах и implementation checkpoints используется термин
+**vision backend** для целиком заменяемого блока:
+
+```text
+corrected FramePacket
+→ VisionProcessor implementation / vision backend
+→ VisionResult / TrackedObject
+→ Core / Aiming / UI
+```
+
+Текущий baseline называется **Legacy14 vision backend** (и, где применимо,
+**Legacy11 vision backend**). Кандидат из внешней разработки называется
+**VT11 vision backend**. `VisionProcessor` остаётся публичным Python contract;
+`SimpleTracker` является только внутренней частью Legacy14/Legacy11 и не является
+обязательным компонентом других backend implementations.
+
+READ-ONLY VT11-V1 audit завершён с выводом: **current contract adapter feasible
+with limited VT11 changes**. Для первого implementation checkpoint VT11 должен
+сохранить текущий `VisionResult / TrackedObject` contract и не требовать изменений
+Core/Aiming/UI/Turret. Внутренние SEARCHING/TENTATIVE/CONFIRMED, reference bank,
+tracklets, scale continuity и другие rich states остаются private.
+
+До интеграции требуется адаптировать research implementation к production boundary:
+
+- finite-video/random-access loop → bounded incremental `process(FramePacket)` state;
+- unbounded whole-session result/event histories → bounded или offline diagnostics;
+- внутреннюю velocity в px/frame → публичную bbox-center velocity в px/s по
+  `FramePacket.receive_timestamp_ns`;
+- отдельный generation-local NavMin `track_id` namespace без reuse другой identity;
+- полный reset backend state при новой camera generation.
+
+V1/V2 не добавляет callback `Mediator/UI → vision backend` для seed/reference click.
+VT11 может публиковать валидированную identity как обычный `TrackedObject`, но turret
+по-прежнему начинает TRACKING только после явного выбора пользователем опубликованного
+bbox. Предложение backend не равно автоматическому выбору цели.
+
+### Post-tag roadmap
+
+```text
+VT11-V1  READ-ONLY integration audit                         completed
+VT11-V2  Vt11VisionProcessor adapter → current contract     after stable tag
+VT11-V3  deterministic A/B: Legacy14 vs VT11 vision backend
+VT11-V4  decision gate по quality/stability/CPU/memory evidence
+VT11-V5  optional Vision contract extension, только если нужен evidence
+VT11-V6  optional Core use of richer TRACK/REACQ/confidence semantics
+```
+
+### Почему
+
+Так сохраняется уже доказанная downstream architecture и появляется честная A/B
+boundary на одинаковых corrected frames/timestamps. Rich VT11 semantics не становятся
+публичным API без конкретного consumer requirement.
+
+### Отвергнутые альтернативы
+
+- **Разобрать VT11 на detector и обязательно подать его в `SimpleTracker`.** Отклонено: это разрушает свойства integrated identity/reacquisition backend и противоречит существующей `VisionProcessor` boundary.
+- **Сразу расширить `TrackedObject` confidence/reacquisition metadata.** Отклонено до A/B evidence.
+- **Разрешить VT11 автоматически выбирать turret target.** Отклонено: explicit user selection остаётся safety boundary.
+
+## 33. External STM32 Stage8.2 / protocol 0.4 не заменяют текущий NavMin firmware stack; перенос только выборочных идей после measured hardware facts
+
+### Решение
+
+READ-ONLY сравнительный аудит завершён. Текущие NavMin protocol/control contracts
+остаются authoritative: global `REQUEST_ID`, exact-retry cache, Emergency
+resynchronization, explicit `MOTOR_ON/OFF`, `SET_CONFIG`, `MOVE_RELATIVE`,
+`SET_VELOCITY`, velocity watchdog, acceleration limiter и существующий
+PC `TurretSession`/`SerialTransport`/recovery path.
+
+Stage8.2 — другая firmware lineage с несовместимым wire framing/command map и
+другим safety model. Protocol 0.4 — проект будущих требований, а не готовая firmware,
+и его exact wire mapping также не является drop-in extension current NavMin.
+Оба источника используются как engineering input, но не переносятся wholesale.
+
+До unrestricted/high-rate hardware movement должны быть измерены/подтверждены:
+
+- реальные STEP pulses / output revolution для каждой оси;
+- exact DM860 variant/settings и direction signs;
+- допустимые STEP high/low и DIR setup timings на установленном driver;
+- physical limit polarity/bounce и safe recovery behavior.
+
+Physical limit handling и IWDG считаются важными hardware-safety additions вокруг
+первого controlled hardware boundary, но должны быть реализованы внутри текущего
+NavMin ownership/state model: directional blocking, latched fault, explicit recovery,
+Emergency/Motor/reconnect compatibility. Candidate `20 000 STEP/output rev` и
+`5000 STEP/s` не считаются проверенными operational values до bench measurements.
+
+### Post-tag roadmap
+
+```text
+STM32-V1  hardware contract freeze: pins/driver/scale/reset/STEP-DIR timing
+STM32-V2  physical safety boundary: limits + latched fault + recovery + IWDG
+STM32-V3  controlled hardware bench validation
+STM32-V4  optional NavMin-native capabilities/status/config-generation design
+STM32-V5  optional ARM/lease/soft-limit/backlash evolution if evidence requires
+```
+
+Exact migration на external protocol 4.0 остаётся отдельным architecture decision и
+не должна появляться скрыто по частям.
+
+### Отвергнутые альтернативы
+
+- **Заменить NavMin firmware целиком Stage8.2 `main.c`.** Отклонено: теряются принятые transaction/recovery/Emergency semantics.
+- **Перенести exact protocol 4.0 как текущий NavMin protocol.** Отклонено: wire/command collisions требуют breaking PC+MCU migration без доказанной необходимости.
+- **Принять 20 000 STEP/rev или 5000 STEP/s как готовую настройку.** Отклонено до hardware measurements.
 
 ---
 

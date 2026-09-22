@@ -225,7 +225,22 @@ Video Source / camera pipeline:
 
 Полный контракт: [FramePacket](../../architecture/contracts.md#framepacket).
 
-## `VisionProcessor`
+## `VisionProcessor` и vision backend
+
+Терминология проекта: **vision backend** — целиком заменяемый блок обработки
+исправленного working frame:
+
+```text
+corrected FramePacket
+→ VisionProcessor implementation / vision backend
+→ VisionResult / TrackedObject
+→ Core / Aiming / UI
+```
+
+`VisionProcessor` — публичный Python contract этой boundary. Внутренняя
+архитектура vision backend не фиксируется и может содержать detector, tracker,
+identity, reacquisition, appearance/reference bank, motion/scale models и другие
+собственные модули. Core/Aiming/UI зависят только от публичного результата.
 
 Выбирается настройкой:
 
@@ -250,9 +265,9 @@ integrated tracker
 - velocity центра bbox;
 - `age_frames`.
 
-### Processor implementations v1
+### Vision backends v1
 
-Первая реализация содержит два взаимозаменяемых processor class:
+Baseline v1 использует взаимозаменяемые processor class:
 
 ```text
 Legacy14VisionProcessor   # default
@@ -261,7 +276,16 @@ Legacy11VisionProcessor
 
 Оба используют чисто перенесённую detector-логику соответствующих legacy Variant 1.4 / Variant 1.1, без старой UI/application-обвязки и без переноса legacy tracker как публичной архитектуры. Оба processor используют один общий внутренний `SimpleTracker`, поэтому сравнение 1.1 и 1.4 не смешивает качество detector с разными tracker algorithms.
 
-`AdvancedVisionProcessor` на базе VT11/identity/reacquisition рассматривается как отдельная будущая реализация той же `VisionProcessor` boundary и не блокирует baseline Stage 5.
+В документации и последующих задачах реализация `Legacy14VisionProcessor` вместе с
+её внутренним detector + `SimpleTracker` называется **Legacy14 vision backend**.
+Аналогично используется термин **Legacy11 vision backend**.
+
+READ-ONLY аудит VT11-V1 подтвердил другой допустимый вариант той же boundary:
+**VT11 vision backend** может сохранить собственные candidate detection, identity,
+appearance/reference bank, motion, tracking, reacquisition, scale continuity и
+другие внутренние модули. Его первая интеграция должна адаптироваться к текущему
+`VisionResult / TrackedObject` contract без обязательного `SimpleTracker` и без
+предварительного расширения публичного Vision contract.
 
 ### `SimpleTracker` v1
 
