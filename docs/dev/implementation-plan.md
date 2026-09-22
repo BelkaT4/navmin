@@ -169,21 +169,27 @@ shared application composition                            accepted
 normal launcher + diagnostic launcher                     accepted
 offline session artifacts + bounded logging               accepted
 backend-aware preflight + --preflight-only                accepted
+offline hardware runbook + targeted docs sync             accepted
 ```
 
 Следующий immutable порядок:
 
 ```text
-Prompt 3/3: offline hardware runbook + targeted docs sync
-→ offline rehearsal без доступа к интернету
+offline rehearsal без доступа к интернету
+→ fixes if required
 → documentation cleanup + root README sync
 → merge feat/first-implementation into main
 → full validation on main
 → annotated pre-hardware stable tag
-→ selected external-development checkpoints (VT11 / STM32)
+→ selected external-development checkpoints (VT11 / STM32), но без STM32 implementation,
+  которое требует ещё не измеренных hardware facts
 → relevant regressions/rehearsal
-→ REAL HARDWARE DAY:
-     controlled STM32-only boundary
+→ hardware measurement/validation boundaries:
+     H1 identify / measure / very-low-energy boundary
+     → actual hardware facts
+     → STM32-V1/V2 implementation if required
+     → regression/rehearsal
+     → H2 safety-boundary validation
      → cameras-only smoke
      → combined RELATIVE / TRACKING / failure checks
 ```
@@ -869,8 +875,8 @@ Future latest-live-frame mode (#22) остаётся deferred. Gesture/overlay/S
 Некоторые software-only prerequisites этого этапа уже выполнены заранее и не
 меняют формальный статус полного Stage 8: shared composition, normal/diagnostic
 launchers, localhost RTP/JPEG, PTY production-transport check, session artifacts,
-bounded logging и backend-aware static preflight. Следующий infrastructure checkpoint
-до rehearsal — offline hardware runbook.
+bounded logging, backend-aware static preflight и operator-facing offline hardware
+runbook. Следующий operational checkpoint — offline rehearsal без доступа к интернету.
 
 ### Timing and tuning
 

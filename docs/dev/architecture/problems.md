@@ -116,9 +116,11 @@ Backend-aware startup preflight, `preflight.json`, `preflight-failed` и
 endpoints/workers/UI, а static checks выбираются по real/localhost и real/PTY
 backend.
 
+Operator-facing offline runbook/evidence-review workflow поверх существующего session directory закрыт отдельным documentation checkpoint. Он не вводит automatic export subsystem и сам по себе не является evidence успешной offline rehearsal.
+
 Остаются следующие integration details:
 
-- offline export/runbook workflow поверх уже существующего session directory;
+- фактическая offline rehearsal и review её evidence;
 - production level/config source beyond fixed normal-vs-diagnostic baseline;
 - как UI показывает последние важные ошибки без превращения logging в machine-readable state.
 

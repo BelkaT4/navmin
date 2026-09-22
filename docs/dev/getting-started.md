@@ -142,3 +142,7 @@ gst-inspect-1.0 udpsrc rtpjpegdepay jpegdec videoconvert appsink
 ```
 
 Production receiver v1 слушает RTP/JPEG over UDP. Рекомендуемые значения config: local bind `0.0.0.0`, Overview port `8888`, Stereo Left `8889`, Stereo Right `8890`, `rtp-enabled=true`, `buffer-size=1`. Raspberry Pi source IP настраивается sender-side и не является `CameraConfig.address` PC receiver.
+
+# Offline rehearsal и hardware day
+
+Этот документ описывает первоначальную установку окружения и поэтому содержит online setup steps. Для автономной проверки уже подготовленной машины network не должен требоваться. Operator procedure, четыре рекомендуемых profiles, preflight gates и hardware measurement boundaries описаны в [Offline Hardware Runbook](../user/offline-hardware-runbook.md).

@@ -122,4 +122,4 @@ python tools/run_diagnostic_app.py \
 prerequisites выбранных backends: он не ждёт RTP packets, не ping'ует Raspberry Pi,
 не открывает real serial device и не делает STM32 protocol probe.
 
-Offline hardware runbook остаётся следующим отдельным checkpoint.
+Для автономной репетиции, четырёх рекомендуемых operator profiles и controlled hardware-day gates см. [Offline Hardware Runbook](./offline-hardware-runbook.md).
