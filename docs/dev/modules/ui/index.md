@@ -8,13 +8,15 @@
 
 UI:
 
+- запускает основной интерфейс fullscreen;
 - показывает Overview и Stereo Left как main + preview;
 - рисует overlays поверх working frame;
 - показывает camera/Turret/distance state и diagnostics;
 - принимает target selection только на main image;
 - принимает click-to-move только в RELATIVE;
 - предоставляет отдельный control `RELATIVE / TRACKING`;
-- предоставляет settings и motor/stop controls;
+- предоставляет motor/Emergency controls и settings/recording menu actions;
+- предоставляет modeless Operator Window с runtime status и редкими административными действиями;
 - передаёт actions в Core.
 
 UI не выполняет VisionProcessor, calibration math, Aiming, PID или UART.
@@ -32,9 +34,11 @@ STEREO_LEFT
 
 Startup `main_camera` берётся из `ui.default-camera`. `STEREO_RIGHT` обычной main camera не является.
 
-Пользователь может явно swap main/preview. Swap проходит через Core, потому что он влияет на selection и processing scope.
+Preview отображается небольшим отдельным окном в правом нижнем углу области main video, выше нижней operational bar. Оно не участвует в target selection/click-to-move.
 
-При отказе main camera UI **не переключается автоматически** на preview. Текущий `main_camera` сохраняется, UI показывает stale/error/«Нет видеосигнала», а swap остаётся явным действием пользователя.
+Пользователь может явно swap main/preview click'ом по preview либо кликабельным swap-icon внутри preview. Swap проходит через Core, потому что он влияет на selection и processing scope. Название камеры отображается прямо в соответствующем view; swap-icon означает действие, а не отдельный state indicator.
+
+При отказе main camera UI **не переключается автоматически** на preview. Текущий `main_camera` сохраняется, UI показывает реальный camera status и presentation-признак `НЕТ НОВЫХ КАДРОВ`, а swap остаётся явным действием пользователя.
 
 ## Данные и `CameraSessionGate`
 
@@ -77,6 +81,33 @@ VisionResult.tracked_objects
 
 Overlays не изменяют сам `FramePacket.image`.
 
+Baseline object overlay минимален: bbox всех текущих `TrackedObject` и явное выделение selected target. Постоянные `track_id`, distance, velocity и `age_frames` рядом с каждым bbox не показываются; расширенный diagnostic overlay может быть добавлен отдельно без изменения общего `TrackedObject` contract.
+
+## Основной layout и menu bar
+
+Основное окно стартует fullscreen. `F11` неограниченно переключает fullscreen/windowed state. Main video занимает основную область, preview находится в её правом нижнем углу, а компактная нижняя operational bar остаётся отдельной постоянной полосой.
+
+Diagnostic launcher при наличии localhost camera явно включает в operational bar
+`NOW HH:MM:SS.mmm`; normal production launcher этот debug clock не показывает.
+Clock не заменяет mode/motor/connection controls, а Emergency остаётся самым
+крупным и постоянно доступным элементом bar. В VIRTUAL это локальный companion
+для sender-side `SOURCE` pixels, не real-camera latency telemetry.
+
+`Esc` открывает или скрывает единственный `Operator Window`; fullscreen state при этом не меняется. Это отдельное modeless movable tool-window, принадлежащее `MainWindow`: оно остаётся поверх основного окна NavMin, но не использует global always-on-top и уходит назад вместе с приложением при переключении на другое приложение. Закрытие крестиком скрывает только Operator Window и не останавливает main window или workers.
+
+Operator Window показывает только уже существующее runtime state:
+
+- фактический `CameraStatus.state` для Overview и Stereo Left без смешивания с presentation freshness;
+- `TurretState.connection_state`;
+- applied и, при наличии, pending control mode по той же semantics, что operational bar;
+- подтверждённый `TurretState.motor_state`.
+
+Кнопка `Полноэкранный режим: ВКЛ/ВЫКЛ` выполняет тот же toggle, что `F11`, и синхронно отражает состояние main window. Кнопка `Выход` после стандартного confirmation `Выйти из NavMin?` закрывает MainWindow штатным UI lifecycle path. Operator Window не дублирует motor control или Emergency и не является полным Settings UI.
+
+Верхний menu bar содержит редко используемые действия, в том числе recording, view, diagnostics и settings. Motor control в menu bar не дублируется, потому что motor state/control постоянно доступен в нижней bar.
+
+Stereo Right не входит в normal main/preview pair. Он открывается через Diagnostics как отдельный diagnostic view и не меняет `main_camera`, selection или обычный swap contract.
+
 ## Запись видео
 
 Основная camera recording сохраняет чистый working frame без UI overlays.
@@ -91,6 +122,8 @@ Overlays не изменяют сам `FramePacket.image`.
 - FPS.
 
 Это нужно для повторного запуска detector/tracker на записи.
+
+Start/stop записи доступен из верхнего menu bar. Пока запись активна, в левом верхнем углу main view показывается индикатор фиксированной геометрии: мигающий красный круг и немигающая белая надпись `Запись`. При выключенной записи индикатор полностью скрыт.
 
 ## Vision processing main / preview
 
@@ -123,6 +156,14 @@ Core остаётся authoritative source и принимает selection то�
 - track_id всё ещё существует в latest `VisionResult` этой camera/generation.
 
 Если объект уже исчез, новый selection не применяется.
+
+Baseline gestures:
+
+- в подтверждённом TRACKING левый click внутри bbox запрашивает selection этого объекта;
+- левый click по пустому месту выполняет explicit deselect;
+- если точку click содержат несколько bbox, выбирается bbox, центр которого ближе к click;
+- bbox, не содержащие click, не участвуют в выборе; отдельный nearest-object helper в v1 не используется;
+- preview click всегда означает swap и не является selection gesture.
 
 При swap current selection сбрасывается только если она существует, то есть в TRACKING. В RELATIVE уже сформированный manual `MOVE_RELATIVE` swap не отменяет.
 
@@ -159,17 +200,20 @@ UI click on main working frame
 → MoveRelativeCommand
 ```
 
-В `TRACKING` click-to-move disabled/ignored в первой реализации.
+В `TRACKING` click-to-move disabled/ignored в первой реализации. В `RELATIVE` левый click по main working frame является click-to-move; preview click не создаёт manual motion intent.
 
-## Stop / Emergency / Motor controls
+## Operational bar / Emergency / Motor controls
 
-UI может инициировать:
+Нижняя operational bar всегда видима и использует компактные fixed-size controls: изменение текста/состояния не меняет их ширину/высоту и не сдвигает соседние элементы. Emergency остаётся визуально крупнейшим действием. Минимальный набор:
 
 - switch `RELATIVE / TRACKING`;
-- `StopMotion`;
-- `EMERGENCY_STOP`;
-- `MOTOR_ON`;
-- `MOTOR_OFF`.
+- кликабельный motor state/control;
+- connection state;
+- крупный `EMERGENCY` в правом нижнем углу.
+
+Motor control выполняет `MOTOR_ON` / `MOTOR_OFF` одним click без confirmation dialog. Отображаемое состояние меняется по подтверждённому `TurretState.motor_state`, а не optimistic UI state.
+
+Dedicated ordinary `StopMotion` button в первом prototype отсутствует. Сам `StopMotion` остаётся control operation Core/Turret и используется автоматическими control boundaries, где это требует архитектура.
 
 `StopMotion` — штатная остановка с acceleration limit.
 
@@ -184,8 +228,9 @@ UI может редактировать:
 - source/network settings;
 - `processing-scope`;
 - optional per-camera `processing-enabled` master switch;
-- `vision-processor-class`;
-- processor-specific settings после определения schema.
+- `vision-processor-class`.
+
+В v1 внутренние detector/tracker tuning constants конкретного `VisionProcessor` в UI не редактируются и не являются полями `config.json`.
 
 Calibration data не является обычной UI-настройкой `config.json`; она хранится отдельными calibration files.
 
@@ -211,7 +256,7 @@ UI может редактировать:
 - axis inversion (restart-only);
 - full steps per revolution (restart-only);
 - microstep divider (restart-only);
-- max relative move per axis;
+- max relative move per axis (restart-only);
 - desired serial baudrate/port;
 - simulation mode.
 
@@ -222,18 +267,31 @@ UI может редактировать:
 UI хранит camera connection state отдельно от freshness.
 
 ```text
-ONLINE + fresh → обычный кадр
-ONLINE + stale → freeze last frame + «Нет видеосигнала»
-RECONNECTING / ERROR → соответствующий status
+frame ещё не принят → neutral placeholder + camera name + CameraStatus
+accepted frame + fresh → обычный кадр
+accepted frame + stale → frozen last frame + dim + «НЕТ НОВЫХ КАДРОВ»
+RECONNECTING / ERROR / STOPPED → реальный status поверх placeholder/frozen frame
 ```
 
-Freshness вычисляется в main thread по `last_receive_timestamp_ns`, а не только по bool от producer.
+Freshness вычисляется в main thread по monotonic `CameraStatus.last_receive_timestamp_ns`, а не по bool от producer. Threshold поступает в UI boundary из authoritative `vision.camera-stale-timeout-ms`: меньше configured timeout считается fresh, на границе и выше — stale. Это presentation state, а не новый `CameraState` и не новое config field.
+
+Frozen frame остаётся полезным для ориентации, но не является актуальной aiming surface. RELATIVE/TRACKING interaction разрешена только для accepted generation, fresh frame и `CameraStatus.state == ONLINE`. Preview swap, operational bar и Emergency остаются доступны независимо от camera freshness/state.
+
+Новый accepted `CameraSessionStarted` немедленно очищает displayed result прежней generation до принятия первого результата новой generation. Временное отсутствие кадров внутри той же accepted generation последний кадр не очищает.
 
 ## Производительность
 
-Latest-only VisionResult не должен превращаться в backlog Qt notifications. Concrete coalescing определяется при реализации.
+UI использует main-thread `QTimer` с interval `16 ms` (примерно `60 Hz`) как revision-aware pump. Это polling frequency, а не video FPS: если revision не изменилась, image/result повторно не обрабатывается и `QImage/QPixmap` не создаётся. При нескольких публикациях между ticks читается только freshest latest payload.
+
+В начале каждого tick UI сначала полностью draining'ит FIFO `CameraSessionStarted` каждой камеры, затем читает latest Vision/CameraStatus/TurretState snapshots. Успешно accepted revision помечается consumed; rejected result новой generation остаётся retryable, чтобы race `payload опубликован после drain, barrier будет принят на следующем tick` не терял кадр. Already accepted Vision/Turret revision повторно в Mediator не передаётся.
+
+Per-frame queued Qt signals не используются: они могли бы превратить latest-state в event backlog и накапливать video latency. Более сложный coalesced event-driven wakeup откладывается до измеренной необходимости.
 
 `CameraSessionStarted` — barrier event и не может быть потерян/coalesced как обычный latest notification.
+
+Все QWidget/QPixmap/QPainter operations выполняются только в Qt main thread.
+
+Открытый Operator Window не является pause state: main-thread pump, camera presentation, Turret state и уже активный tracking продолжают обновляться. Поскольку это отдельное окно, оно не меняет geometry или image-coordinate mapping main video.
 
 ## Границы
 
@@ -248,11 +306,8 @@ UI не:
 
 ## Что ещё не определено
 
-- точные mouse/key gestures selection/deselect;
-- overlap/empty-click UX;
-- состав object overlay;
-- Stereo Right diagnostic layout;
-- Qt notification coalescing primitives;
+- детальный partial-failure UX для всех комбинаций availability;
 - future latest-live-frame mode.
+- FPS display: до реализации нужно разделить receive, accepted/displayed `VisionResult` и display FPS; предпочтительный обычный operator metric — accepted/displayed `VisionResult` FPS, а diagnostics сможет показывать несколько метрик. Существующий `ui.show-fps` не получает новую semantics в этом checkpoint.
 
 Полный список: [Открытые вопросы](../../architecture/problems.md).

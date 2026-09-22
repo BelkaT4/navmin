@@ -8,7 +8,9 @@
 
 ### 1. Физическое управление полудуплексным RS485
 
-Логическая request/response-модель, framing, CRC, `REQUEST_ID`, Emergency-resync, retry и baudrate уже определены. Остаются hardware-dependent детали:
+RS485 перенесён за пределы обязательной первой реализации: Stage 4 и v1 используют обычный UART. Этот вопрос **не блокирует** UART-first firmware или завершение v1 и возвращается при отдельной RS485 migration.
+
+Логическая request/response-модель, framing, CRC, `REQUEST_ID`, Emergency-resync, retry и baudrate уже определены и должны сохраниться без protocol fork. Для будущей RS485 physical layer остаются hardware-dependent детали:
 
 - управляет ли STM32 `DE/RE` или transceiver/adapter делает это автоматически;
 - момент освобождения шины после последнего TX byte;
@@ -42,56 +44,16 @@ Generation уже не позволяет смешивать разные camera
 
 ## Во время первой реализации
 
-### 4. Concrete latest-state / thread-safe primitives
-
-Логическая семантика уже определена:
-
-```text
-VisionResult        latest-only per camera
-DistanceResult      latest-only / invalidatable
-TrackingError       latest-only + monotonic revision
-TurretState          latest-only
-CameraStatus         latest-only per camera
-ConfigUpdate         latest-only
-CameraSessionStarted ordered/barrier
-pending_motion       one latest unsent motion intent
-```
-
-Нужно выбрать concrete primitives:
-
-- one-slot/latest store;
-- lock/atomic reference;
-- notification mechanism;
-- `clear()/invalidate()`;
-- revision handling `TrackingError`;
-- barrier order `CameraSessionStarted → data generation=N` для Core и UI.
-
-### 5. Qt notification coalescing
-
-Latest payload не должен создавать backlog queued Qt signals.
-
-Нужно определить единый notification/coalescing pattern для Vision, Turret и ConfigUpdate. `CameraSessionStarted` является barrier и не может быть потерян/coalesced как обычный latest notification.
-
-### 6. Processor-specific configuration
-
-Нужно определить:
-
-- формат settings конкретного `VisionProcessor`;
-- schema validation;
-- какие поля доступны UI;
-- persistence;
-- какие changes dynamic, а какие требуют pipeline restart/new generation.
 
 ### 7. Edge cases runtime config apply
 
-Базовая classification уже определена в `configuration.md`. Остаются детали:
+Базовая classification уже определена в `configuration.md`. Turret-specific PID apply semantics закрыты и перенесены в `configuration.md`, `modules/turret/index.md` и `decisions.md`.
 
-- что делать с текущим PID state при изменении `Kp/Ki/Kd` во время TRACKING;
-- I-term при уменьшении application-side PID output limit;
+Остаются детали:
+
 - изменение `target-lost-timeout-ms` для уже временно потерянной цели;
-- processor-specific dynamic/restart policy.
 
-STM32 max speed / acceleration / velocity watchdog уже применяются dynamic полным атомарным `SET_CONFIG` snapshot. Mechanical conversion (`invert`, steps/rev, microstep) — restart-only и safe-point semantics для них не нужна.
+STM32 max speed / acceleration / velocity watchdog уже применяются dynamic полным атомарным `SET_CONFIG` snapshot. Axis mechanics (`invert`, steps/rev, microstep, `max-relative-move-deg`) — restart-only и safe-point semantics для них не нужна.
 
 ### 8. Camera reconnect transitions / backoff
 
@@ -113,45 +75,10 @@ Freshness вычисляется отдельно по timestamp.
 - reconnect/backoff;
 - критерий устойчивого ERROR;
 - restart/reset `VisionProcessor`;
+- единственный production owner monotonic generation при reconnect или replacement экземпляра pipeline; current prototype владеет generation внутри существующего `VisionPipeline`, без отдельного `Camera Registry` или второго counter;
 - reconnect history/logging.
 
-При каждом новом pipeline start создаётся новая `generation`.
-
-### 9. UART/STM32 reconnect/backoff policy
-
-Safety/resync sequence уже определена:
-
-```text
-find physical connection / actual baud
-→ EMERGENCY_STOP → sequence resync
-→ MOTOR_OFF
-→ SET_BAUDRATE при необходимости
-→ SET_CONFIG(full snapshot)
-→ READY
-```
-
-Auto `MOTOR_ON` отсутствует. Отдельная transport-reset command в v1 не нужна: confirmed Emergency сама пересинхронизирует sequence.
-
-Остаётся определить:
-
-- какие transport errors запускают auto reconnect;
-- backoff / limit attempts;
-- временный reconnect vs fatal ERROR;
-- logging/diagnostics;
-- точный набор baud candidates в обычном reconnect и после uncertain `SET_BAUDRATE`.
-
-### 10. Worker lifecycle
-
-Нужно определить concrete lifecycle:
-
-- кто создаёт workers;
-- stop token/event;
-- прерывание GStreamer/UART wait;
-- join timeout;
-- worker, который не завершился штатно;
-- детали startup/shutdown orchestration.
-
-Reconnect/recovery принадлежит owner-модулям; отдельный orchestration component без concrete v1 responsibility не вводится.
+При каждом новом pipeline start создаётся новая `generation`; replacement не должен сбрасывать или дублировать monotonic sequence соответствующей camera role.
 
 ### 11. Частичные отказы
 
@@ -166,31 +93,32 @@ Reconnect/recovery принадлежит owner-модулям; отдельны
 
 `main_camera` автоматически на другую камеру не переключается.
 
-### 12. `config.json`: отсутствующий файл и future migrations
-
-Уже принято:
-
-```text
-schema-version = 1
-atomic save via temporary file + replace
-corrupted existing JSON не перезаписывается молча
-```
-
-Остаётся определить:
-
-- полностью отсутствующий config: defaults или startup error;
-- migration mechanism после schema v1;
-- UX reporting invalid field/range.
 
 ### 13. Logging
 
-Runtime state передаётся typed contracts, transient diagnostics — logging. Generic event-bus infrastructure заранее не вводится.
+Foundation уже имеет единый idempotent bootstrap стандартного Python logging для `navmin` logger tree. Runtime state передаётся typed contracts, transient diagnostics — logging; generic event bus не вводится.
 
-Нужно определить:
+Turret-specific policy закрыта: в v1 остаётся обычный Python logging без `QueueHandler/QueueListener`; INFO содержит lifecycle/connection/recovery/baud boundaries и значимые failures, transaction/retry details доступны для diagnostics, а high-rate PID/setpoint traffic не логируется на INFO. Queue-based logging возвращается только при измеренной contention/blocking problem.
 
-- обычный logging vs QueueHandler/QueueListener;
-- rotation / file limits;
-- levels;
+Для подготовки автономного hardware day launcher-side session evidence уже имеет:
+
+- отдельный per-run session directory для normal и diagnostic;
+- bounded rotating file logging (normal INFO, diagnostic DEBUG);
+- `manifest.json` с lifecycle outcome, backend/input mode и allowlisted runtime/Git metadata;
+- effective config/calibration copies и file-backed SHA-256 либо явную synthetic provenance;
+- manual cross-session retention без automatic deletion.
+
+Logging остаётся diagnostics output, а typed runtime state по-прежнему не заменяется
+парсингом логов.
+
+Backend-aware startup preflight, `preflight.json`, `preflight-failed` и
+`--preflight-only` закрыты launcher-side: mandatory FAIL происходит до external
+endpoints/workers/UI, а static checks выбираются по real/localhost и real/PTY
+backend.
+
+Остаются следующие integration details:
+
+- production level/config source beyond fixed normal-vs-diagnostic baseline;
 - как UI показывает последние важные ошибки без превращения logging в machine-readable state.
 
 ### 14. Будущие STM32 hardware events
@@ -246,32 +174,6 @@ inter-request-delay-ms = 2
 
 Будущий Target Handoff/Reacquisition должен сопоставлять один физический объект между независимыми VisionProcessors и учитывать latency streams.
 
-### 19. UI gestures selection / deselect
-
-Уже определено:
-
-- target выбирается только на main image и только в confirmed TRACKING;
-- в RELATIVE selection отсутствует;
-- click-to-move разрешён только в confirmed RELATIVE;
-- invalid/stale selection не создаёт target;
-- swap в TRACKING сбрасывает selection.
-
-Остаётся UX:
-
-- mouse/key gesture выбора bbox;
-- explicit deselect;
-- click empty area;
-- overlapping bbox;
-- нужен ли nearest-object helper.
-
-### 20. Object overlay content
-
-Определить, какие данные показывать рядом с bbox: ID, distance, velocity, selection status, diagnostics. `confidence` не является обязательным полем общего `TrackedObject`.
-
-### 21. Stereo Right diagnostics
-
-Определить layout/activation diagnostic view и processor-specific overlays. Stereo Right не становится обычной `main_camera`.
-
 ### 22. Future latest-live-frame UI
 
 Сейчас UI показывает `VisionResult.frame`, поэтому frame+bbox синхронизированы.
@@ -288,7 +190,17 @@ Aim point уже per-camera. После prototype проверить, доста
 
 ### 25. Diagnostics / profiling
 
-Минимальные candidates:
+Software soak уже получил bounded observability для command/transport histories, reconnect count, thread count, RSS и cycle timing. Targeted memory diagnosis на synthetic `InMemoryFrameSource + FakeTransport` path не нашёл unbounded Python-level retention: nominal, generation-restart, reconnect и stale/resume runs показали ранний RSS allocation step с последующим plateau, а Legacy14/OpenCV microbench подтвердил bounded native allocator/cache behaviour. Это не закрывает profiling на production RTP/SerialTransport и real hardware.
+
+Для localhost/VIRTUAL добавлена только визуальная наблюдаемость camera latency:
+sender наносит `SOURCE HH:MM:SS.mmm` и `FRAME n` до JPEG/RTP/UDP, а diagnostic
+UI показывает `NOW HH:MM:SS.mmm` в том же clock domain одного PC. Это позволяет
+заметить frozen frame и визуально проверить, что gap не растёт, но не является
+калиброванным benchmark. Real Raspberry Pi camera end-to-end latency остаётся
+открытой: отдельные clocks, их synchronization, network path и sender scheduling
+этим механизмом не измеряются.
+
+Минимальные candidates для следующих transport/hardware checkpoints:
 
 - camera FPS;
 - Vision processing time;
@@ -299,7 +211,8 @@ Aim point уже per-camera. После prototype проверить, доста
 - UART timeout/error count;
 - command latency;
 - TrackingError/SET_VELOCITY frequency;
-- watchdog stops.
+- watchdog stops;
+- RSS/allocator behaviour на production RTP/GStreamer и SerialTransport paths.
 
 ### 26. Режим «Самая быстрая»
 

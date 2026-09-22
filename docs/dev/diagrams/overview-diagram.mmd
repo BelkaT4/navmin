@@ -1,38 +1,36 @@
 flowchart TB
+  cameras["Камеры x3<br>(Overview / Stereo Left / Stereo Right)"]
+  stm32["STM32"]
+  config_file[("config.json")]
+  calibration[("calibration/<br>overview.json / stereo.json")]
+  n1[/"MoveRelative / mode / TrackingError | StopMotion / motor / Emergency"/]
+  n1_2[\"TurretState"\]
+  subgraph vision ["Vision"]
+    vision_module["3 camera pipelines<br>decode + correction + VisionProcessor<br>generation + CameraModel + Distance Provider"]
+  end
+  subgraph main_thread ["Главный поток приложения"]
+    session_gate["CameraSessionGate<br>generation + CameraModel"]
+    ui["UI<br>main + preview"]
+    core["Core<br>Mediator + Aiming<br>Config Manager"]
+  end
+  subgraph turret ["Turret"]
+    turret_module["Turret Controller + HAL<br>one pending_motion / RELATIVE / TRACKING"]
+  end
 
-cameras["Камеры x3<br/>(Overview / Stereo Left / Stereo Right)"]
-stm32["STM32"]
-config_file[("config.json")]
-calibration[("calibration/<br/>overview.json / stereo.json")]
-
-subgraph vision["Vision"]
-    vision_module["3 camera pipelines<br/>decode + correction + VisionProcessor<br/>generation + CameraModel + Distance Provider"]
-end
-
-subgraph main_thread["Главный поток приложения"]
-    direction TB
-    session_gate["CameraSessionGate<br/>generation + CameraModel"]
-    ui["UI<br/>main + preview"]
-    core["Core<br/>Mediator + Aiming<br/>Config Manager"]
-end
-
-subgraph turret["Turret"]
-    turret_module["Turret Controller + HAL<br/>one pending_motion / RELATIVE / TRACKING"]
-end
-
-cameras -->|"video stream"| vision_module
-calibration -->|"camera geometry"| vision_module
-vision_module -->|"CameraSessionStarted barrier"| session_gate
-vision_module -->|"VisionResult / DistanceResult / CameraStatus"| core
-vision_module -->|"VisionResult working frame"| ui
-session_gate --> core
-session_gate --> ui
-ui <-->|"actions / typed state<br/>main_camera + TRACKING selection"| core
-core -->|"MoveRelative / mode / TrackingError<br/>StopMotion / motor / Emergency"| turret_module
-turret_module -->|"TurretState"| core
-turret_module <-->|"RS485 / UART<br/>strict request ↔ response"| stm32
-config_file <-->|"atomic load / save"| core
-
-%% graph:positions {"vision":{"x":-380,"y":420,"w":240,"h":170},"main_thread":{"x":80,"y":240,"w":390,"h":350},"turret":{"x":620,"y":420,"w":250,"h":170},"cameras":{"x":-360,"y":260},"stm32":{"x":650,"y":260},"config_file":{"x":210,"y":690},"calibration":{"x":-350,"y":670},"vision_module":{"x":15,"y":50},"session_gate":{"x":110,"y":40},"ui":{"x":110,"y":135},"core":{"x":110,"y":250},"turret_module":{"x":20,"y":50}}
-%% graph:edges {"cameras>vision_module":{"label":[1,-23]},"vision_module>session_gate":{"label":[-15,-20]},"vision_module>core":{"label":[-25,26]},"vision_module>ui":{"label":[-1,-90]},"session_gate>core":{"label":[-35,5]},"session_gate>ui":{"label":[35,5]},"ui>core":{"label":[-40,0]},"core>ui":{"label":[40,0]},"core>turret_module":{"label":[22,1]},"turret_module>core":{"label":[20,25]},"config_file>core":{"label":[0,16]}}
-%% graph:waypoints {}
+  cameras -->|"video stream"| vision_module
+  calibration -->|"camera geometry"| vision_module
+  vision_module -->|"CameraSessionStarted barrier"| session_gate
+  vision_module -->|"VisionResult / DistanceResult / CameraStatus"| core
+  vision_module -->|"VisionResult working frame"| ui
+  session_gate --> core
+  session_gate --> ui
+  ui <-->|"actions / typed state | main_camera + TRACKING selection"| core
+  turret_module <-->|"UART v1 | strict request -- response"| stm32
+  config_file <-->|"atomic load / save"| core
+  turret_module --> n1_2
+  n1_2 --> core
+  core --> n1
+  n1 --> turret_module
+%% graph:positions {"vision":{"x":-576,"y":358,"w":324,"h":230},"main_thread":{"x":56,"y":180,"w":414,"h":422},"turret":{"x":912,"y":418,"w":250,"h":170},"cameras":{"x":-495,"y":199,"w":172,"h":59},"stm32":{"x":945,"y":258,"w":172,"h":54},"config_file":{"x":240,"y":732},"calibration":{"x":-495,"y":706,"w":172,"h":90},"n1":{"x":588,"y":418,"w":208,"h":78},"n1_2":{"x":588,"y":510,"w":208,"h":78},"vision_module":{"x":75,"y":66,"w":184,"h":98},"session_gate":{"x":184,"y":60},"ui":{"x":52,"y":178},"core":{"x":184,"y":312},"turret_module":{"x":33,"y":58,"w":172,"h":59}}
+%% graph:waypoints {"vision_module>session_gate":[[-119,453]]}
+%% graph:edges {"cameras>vision_module":{"label":[1,-23]},"vision_module>session_gate":{"label":[58,-101]},"vision_module>core":{"label":[-41,38]},"vision_module>ui":{"label":[79,-77]},"session_gate>core":{"label":[-35,5]},"session_gate>ui":{"label":[35,5]},"ui>core":{"label":[133,-86]},"turret_module>stm32":{"label":[1,-24]},"config_file>core":{"label":[0,16]}}

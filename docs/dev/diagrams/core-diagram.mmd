@@ -1,10 +1,10 @@
 flowchart TB
-  flag_vision_in>"IN: CameraSessionStarted / VisionResult<br/>DistanceResult / CameraStatus"
-  flag_turret_out>"OUT: MoveRelative / mode / motor<br/>TrackingError / StopMotion / EMERGENCY_STOP"
-  flag_turret_in>"IN: TurretState"
-  flag_ui_in>"IN: selection / swap / click / mode<br/>stop / motor / config"
-  flag_ui_out>"OUT: main_camera / selected_target<br/>typed state / distance"
-  flag_config_out>"OUT: ConfigUpdate<br/>в Vision / Turret / UI"
+  flag_vision_in["IN: CameraSessionStarted / VisionResult<br/>DistanceResult / CameraStatus"]
+  flag_turret_out["OUT: MoveRelative / mode / motor<br/>TrackingError / StopMotion / EMERGENCY_STOP"]
+  flag_turret_in["IN: TurretState"]
+  flag_ui_in["IN: selection / swap / click / mode<br/>stop / motor / config"]
+  flag_ui_out["OUT: main_camera / selected_target<br/>typed state / distance"]
+  flag_config_out["OUT: ConfigUpdate<br/>в Vision / Turret / UI"]
 
   config_file[("config.json")]
 
@@ -25,9 +25,8 @@ flowchart TB
 
   session_gate --> mediator
   mediator --> selected_target
-  mediator --> main_camera
+  mediator <--> main_camera
   selected_target --> aiming
-  main_camera --> mediator
   flag_vision_in --> aiming
   session_gate --> aiming
   aiming -->|"TrackingError / relative angle"| mediator
@@ -43,7 +42,6 @@ flowchart TB
   mediator -->|"изменение настроек"| config_manager
   config_manager -.-> flag_config_out
   config_manager -.-> aiming
-
-%% graph:positions {"core":{"x":350,"y":230,"w":1180,"h":700},"flag_vision_in":{"x":30,"y":470},"flag_turret_out":{"x":1580,"y":500},"flag_turret_in":{"x":1580,"y":690},"flag_ui_in":{"x":640,"y":1000},"flag_ui_out":{"x":1040,"y":1000},"flag_config_out":{"x":1530,"y":220},"config_file":{"x":1110,"y":70},"session_gate":{"x":430,"y":330},"mediator":{"x":720,"y":420},"aiming":{"x":470,"y":650},"selected_target":{"x":760,"y":650},"main_camera":{"x":980,"y":650},"system_state":{"x":1110,"y":430},"config_manager":{"x":900,"y":120}}
-%% graph:edges {"flag_vision_in>session_gate":{"label":[-30,-15]},"flag_vision_in>mediator":{"label":[-30,25]},"session_gate>mediator":{"label":[15,-15]},"mediator>selected_target":{"label":[10,10]},"mediator>main_camera":{"label":[35,10]},"selected_target>aiming":{"label":[-25,20]},"session_gate>aiming":{"label":[-30,10]},"aiming>mediator":{"label":[40,-10]},"mediator>flag_turret_out":{"label":[80,-15]},"system_state>flag_ui_out":{"label":[30,40]}}
-%% graph:waypoints {"flag_vision_in>mediator":[[620,500]],"flag_vision_in>aiming":[[360,700]],"mediator>flag_turret_out":[[1270,520]],"system_state>flag_ui_out":[[1220,840]]}
+%% graph:positions {"core":{"x":348,"y":228,"w":1180,"h":700},"flag_vision_in":{"x":72,"y":318,"w":172,"h":114},"flag_turret_out":{"x":420,"y":1068,"w":148,"h":102},"flag_turret_in":{"x":984,"y":1092},"flag_ui_in":{"x":600,"y":1068,"w":148,"h":102},"flag_ui_out":{"x":1716,"y":564},"flag_config_out":{"x":1716,"y":264},"config_file":{"x":1284,"y":72},"session_gate":{"x":274,"y":280},"mediator":{"x":274,"y":478,"w":160,"h":78},"aiming":{"x":934,"y":190},"selected_target":{"x":934,"y":358},"main_camera":{"x":922,"y":478,"w":160,"h":54},"system_state":{"x":922,"y":576},"config_manager":{"x":934,"y":34}}
+%% graph:edges {"flag_vision_in>session_gate":{"label":[87,82]},"flag_vision_in>mediator":{"label":[-30,25]},"session_gate>mediator":{"label":[15,-15]},"mediator>selected_target":{"label":[10,10]},"mediator>main_camera":{"label":[35,10]},"selected_target>aiming":{"label":[-25,20]},"session_gate>aiming":{"label":[-30,10]},"aiming>mediator":{"label":[107,-151]},"mediator>flag_turret_out":{"label":[80,-15]},"system_state>flag_ui_out":{"label":[30,40]},"mediator>config_manager":{"label":[106,-449]}}
+%% graph:waypoints {"flag_vision_in>mediator":[[294,440]],"flag_ui_in>mediator":[[711,860]],"flag_turret_in>mediator":[[766,954]],"mediator>selected_target":[[894,763]],"flag_vision_in>aiming":[[1181,365]],"session_gate>aiming":[[1169,436]],"aiming>mediator":[[884,454]],"mediator>flag_turret_out":[[703,846]],"mediator>system_state":[[878,754]],"flag_turret_in>system_state":[[1147,952]],"mediator>config_manager":[[866,736]]}

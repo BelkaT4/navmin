@@ -31,10 +31,10 @@ stereo-right
 
 ```text
 Overview:
-receive/decode → undistort → FramePacket → VisionProcessor → VisionResult
+RTP/JPEG UDP → GStreamer decode → fisheye undistort → FramePacket → VisionProcessor → VisionResult
 
 Stereo Left / Right:
-receive/decode → rectify → FramePacket → VisionProcessor → VisionResult
+RTP/JPEG UDP → GStreamer decode → rectify → FramePacket → VisionProcessor → VisionResult
 ```
 
 `FramePacket.image` — working frame. Raw image наружу как обычный `FramePacket` не публикуется.
@@ -63,7 +63,7 @@ calibration/
   stereo.json
 ```
 
-Overview использует mono calibration и undistortion. Stereo Left/Right используют единый stereo calibration и rectification.
+Overview использует OpenCV fisheye calibration (`K`, ровно 4 коэффициента `D`, `new_camera_matrix`) и fisheye-undistortion. Геометрия исправленного working frame строится по `new_camera_matrix`. Stereo Left/Right сохраняют отдельную pinhole/stereo OpenCV calibration и rectification.
 
 Публичный геометрический контракт:
 
@@ -73,7 +73,7 @@ CameraModel.pixel_to_ray(x, y) → normalized CameraRay
 
 `CameraRay` использует `+Y вниз`, как image/OpenCV geometry. Aiming преобразует результат в логическую систему Turret, где `+Y вверх`.
 
-При несовпадении calibration image size и camera image size pipeline не считается ready. Автоматический crop/resize/scaling calibration в первой реализации не выполняется.
+При несовпадении calibration image size и фактического decoded camera image size pipeline не считается ready. Размер берётся из decoded sample, а не из requested sender resolution. Автоматический crop/resize/scaling calibration в первой реализации не выполняется.
 
 ## UI: main / preview
 
@@ -236,9 +236,11 @@ PID работает с угловой ошибкой:
 
 Первый sample после reset: P-only, `I=0`, `D=0`.
 
-## STM32 / RS485
+## STM32 / serial transport
 
-Обмен строго последовательный:
+Первая реализация использует обычный full-duplex UART. Production RS485 half-duplex отложен и позднее должен заменить только physical byte transport без изменения binary protocol или PC-side semantics.
+
+Обмен на уровне protocol строго последовательный:
 
 ```text
 1 request → 1 response
@@ -290,31 +292,120 @@ UI overlays рисуются только для отображения. Осн�
 
 Внутренние потоки Qt/GStreamer/OpenCV сюда не входят.
 
+## Shared application composition
+
+Production composition имеет один owner: `ApplicationRuntime`, создаваемый
+`build_application_runtime(...)` из уже загруженных typed `AppConfig`,
+`OverviewCalibration` и `StereoCalibration`. Загрузка файлов, разбор CLI и
+создание `QApplication` этой boundary не принадлежат.
+
+Текущий prototype runtime собирает ровно:
+
+```text
+Overview CameraWorker ─┐
+Stereo Left CameraWorker ─┼→ один Mediator / один CameraSessionGate
+TurretWorker ───────────┘
+```
+
+Оба camera worker создаются существующим `build_camera_worker(...)` с реальными
+corrector из переданных calibration. Production defaults используют
+`GStreamerRtpJpegSource`, а Turret создаётся через существующий
+`TurretWorker(config.turret)` и его production transport policy. Узкие factories
+для двух camera sources и physical Turret transport существуют только как
+explicit dependency-injection seams; silent fallback на InMemory/Fake отсутствует.
+
+Runtime сразу предоставляет полную UI dependency surface: один `Mediator`,
+bindings pipeline-owned barrier/result/status каналов Overview и Stereo Left,
+`TurretWorker.state_updates` и `camera-stale-timeout-ms`. `Stereo Right` в текущий
+normal UI/application flow не входит.
+
+Normal и diagnostic launchers передают сюда effective typed inputs и вызывают
+одну и ту же composition. Normal entrypoint — `python -m navmin` (или root
+`main.py`): он принимает пути к `config.json`, `calibration/overview.json` и
+`calibration/stereo.json`, использует только production RTP receivers и запрещает
+`turret.emulate-stm32=true`, чтобы normal запуск не мог молча перейти на
+`FakeTransport`.
+
+Diagnostic entrypoint — `python tools/run_diagnostic_app.py`. Он требует явного
+выбора `--overview real|localhost`, `--stereo-left real|localhost` и
+`--turret real|pty`. Localhost RTP senders и PTY STM32 emulator остаются внешними
+diagnostic endpoints и не принадлежат `ApplicationRuntime`; внутренними
+production boundaries остаются `GStreamerRtpJpegSource` и `SerialTransport`.
+Localhost sender использует resolution загруженной calibration соответствующей
+camera role, а PTY selection формирует effective Turret config со stable PTY path
+и `emulate-stm32=false`. Для полностью software-only сочетания
+`localhost + localhost + pty` diagnostic launcher также поддерживает явный
+`--synthetic-inputs`: launcher-owned 320×240 diagnostic config/calibrations
+создаются в памяти и не требуют локальных files. Этот режим запрещён для любых
+mixed/real endpoint selections; normal launcher и mixed/real diagnostics
+по-прежнему используют file-backed typed inputs.
+
+Оба launcher создают отдельный UTC-timestamped session directory под `logs/`
+(или под parent directory из `--log-dir`) до загрузки config/calibration. Session
+owner остаётся launcher-side и хранит bounded rotating `runtime.log`, `manifest.json`,
+`preflight.json` и `inputs/` с effective config/calibration и provenance/hash evidence. Normal file
+log имеет INFO level, diagnostic — DEBUG; console logging сохраняется. Один runtime
+log ограничен 10 MiB с пятью backup files, а старые session directories автоматически
+не удаляются: cross-session retention остаётся ручной ответственностью оператора.
+Backend-aware static preflight также остаётся launcher-side и не принадлежит
+`ApplicationRuntime`. После typed input loading normal launcher проверяет real
+receiver + real serial prerequisites; diagnostic launcher проверяет именно выбранные
+`real|localhost` camera и `real|pty` Turret backends до запуска внешних endpoints.
+`FAIL` записывает `preflight.json`, завершает manifest как `preflight-failed` и не
+создаёт `ApplicationRuntime`, `QApplication`, camera/turret workers, localhost sender
+или PTY service. `WARN` startup не блокирует. `--preflight-only` выполняет ту же
+static boundary и завершает session без runtime-specific effective PTY path.
+`SoftwareSmokeRuntime` также делегирует общую worker/Mediator/lifecycle wiring
+`ApplicationRuntime`, но сохраняет ownership своих `InMemoryFrameSource` и
+synthetic producers.
+
 ## Startup / shutdown order
 
-Базовый startup order:
+После того как launcher загрузил/проверил inputs и построил runtime, deterministic
+startup order текущей composition:
 
 ```text
-1. Config Manager: load + validate initial config
-2. создать shared latest-state stores и CameraSessionGate
-3. создать Core и UI, подключить consumers session/data notifications
-4. запустить Turret worker
-5. запустить Vision workers
+1. TurretWorker
+2. Overview CameraWorker
+3. Stereo Left CameraWorker
 ```
 
-Критический invariant: ни один Vision worker не может опубликовать первый `CameraSessionStarted`, пока `CameraSessionGate` и все consumers этого barrier event ещё не готовы его принять.
+Критический invariant: до запуска Vision workers уже существуют единственный
+`CameraSessionGate` и pipeline-owned lossless barrier channels, связанные с
+готовыми UI bindings. `run_ui()` вызывается только после `runtime.start()` и
+сначала drain'ит накопленные barriers, поэтому данные generation не принимаются
+раньше соответствующего `CameraSessionStarted`.
 
-Базовый shutdown order:
+Успешный запуск потока не означает готовность hardware: camera ERROR после
+успешного `CameraWorker.start()` и Turret reconnecting остаются обычными worker
+states и не завершают весь runtime. Если синхронный `start()` очередного worker
+падает, runtime автоматически останавливает уже запущенные components в обратном
+порядке и повторно поднимает исходную startup exception.
+
+Bounded application shutdown сначала сохраняет safety boundary Turret:
 
 ```text
-1. запретить новые user motion actions
-2. штатно остановить motion при необходимости
-3. MOTOR_OFF
-4. остановить Vision / Turret workers
-5. сохранить config и завершить Core/UI
+если Turret READY и Motor ON:
+STOP_MOTION
+→ MOTOR_OFF
+→ дождаться подтверждённого MotorState.OFF в пределах shutdown timeout
 ```
 
-Concrete stop tokens, join timeout и обработка зависшего worker остаются implementation questions.
+Если Turret уже недоступен, runtime не зависает на недостижимом подтверждении и
+переходит к bounded cleanup. После safety boundary owned workers останавливаются:
+
+```text
+1. Stereo Left CameraWorker
+2. Overview CameraWorker
+3. TurretWorker
+```
+
+Shutdown idempotent и безопасен после полного start, partial-start rollback и
+самостоятельного завершения worker. Ошибка остановки одного component не
+прерывает cleanup остальных; после всех попыток runtime сообщает aggregate
+failure. Timeout применяется к каждой из трёх bounded worker boundaries, поэтому
+общая верхняя граница также конечна. Runtime one-shot и не перезапускается;
+camera/Turret reconnect остаётся responsibility соответствующего worker.
 
 ## Межпотоковая семантика
 
@@ -330,7 +421,7 @@ pending_motion       → one latest unsent motion intent
 Emergency Stop       → dedicated priority operation
 ```
 
-Типизированные состояния покрывают runtime state, диагностические сообщения идут в logging, а reconnect/recovery принадлежит owner-модулям Vision/Turret. Concrete thread-safe primitives и Qt notification coalescing остаются техническими вопросами реализации.
+Типизированные состояния покрывают runtime state, диагностические сообщения идут в logging, а reconnect/recovery принадлежит owner-модулям Vision/Turret. UI coalesce'ит latest-state через revision-aware main-thread QTimer pump; `CameraSessionStarted` остаётся отдельным lossless barrier.
 
 ## Конфигурация
 

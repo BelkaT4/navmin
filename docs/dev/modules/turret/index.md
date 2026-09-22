@@ -22,6 +22,8 @@ Turret worker
 
 Turret worker — единственный owner UART/RS485.
 
+Cross-thread ingress не выполняет UART I/O. В частности Emergency request из Core/UI/application thread является только thread-safe signal: если ordinary physical attempt уже идёт, signal подавляет его будущие retries, но actual `EMERGENCY_STOP` frame передаёт только Turret worker после response/timeout текущей попытки; при idle UART worker делает Emergency следующей physical operation.
+
 ## Authoritative applied mode
 
 Turret Controller владеет applied:
@@ -167,6 +169,18 @@ Controller reset'ит PID при domain/control boundaries, которые ви�
 Первый sample после reset: P-only, `I=0`, `D=0`.
 
 PID работает в градусах по X/Y, отдельные `Kp/Ki/Kd`, real monotonic `dt`, conditional anti-windup и I-term clamp по `±max_speed`.
+
+Runtime PID config применяется по осям независимо:
+
+- если во время TRACKING меняется любой `Kp/Ki/Kd` оси, Controller полностью reset'ит PID state этой оси перед следующим новым `TrackingError`;
+- первый sample после такого reset использует новые gains и остаётся P-only (`I=0`, `D=0`);
+- gain change вне TRACKING не требует отдельного действия: следующий вход в TRACKING уже является reset boundary;
+- уменьшение `max_speed` оси не делает full PID reset, но сразу clamp'ит сохранённый I-term в новый `±max_speed`;
+- увеличение `max_speed` сохраняет текущий I-term без масштабирования;
+- при одновременном изменении gains и `max_speed` gain-change reset имеет приоритет;
+- config update не создаёт motion command и не меняет `control_mode` сам по себе.
+
+Внешнего `PID_RESET` contract нет: это внутреннее состояние Turret Controller.
 
 D-filter добавляется только после измерений, если нужен.
 
@@ -321,7 +335,7 @@ effective_steps_per_revolution =
 
 `invert`, steps/rev и microstep divider не передаются STM32.
 
-В v1 эти mechanical conversion settings restart-only: сохранённое изменение применяется только после Turret/application restart, не посреди active motion.
+В v1 `invert`, steps/rev, microstep divider и `max-relative-move-deg` restart-only: сохранённое изменение применяется только после Turret/application restart, не посреди active motion. Уже работающий HAL продолжает использовать startup snapshot, включая прежний relative-move safety envelope.
 
 ## STM32 config
 
@@ -345,6 +359,10 @@ STM32 проверяет hardware-supported ranges и применяет вес�
 - изменение watchdog timeout не refresh'ит watchdog.
 
 HAL хранит applied/pending STM32 config state. Pending config — latest-only. Если во время in-flight exchange появился более новый snapshot, после завершения transaction отправляется freshest pending snapshot.
+
+Serial `response-timeout-ms`, `max-retries` и `inter-request-delay-ms` принадлежат concrete `TurretSession`; runtime изменение требует Turret reconnect и построения новой session boundary с freshest values. `emulate-stm32` в v1 application-restart-only и reconnect не переключает real ↔ fake transport.
+
+Desired baud latest-only: config update не выполняет hidden `MOTOR_OFF`. При confirmed motors OFF worker может выполнить controlled `SET_BAUDRATE`; при motors ON/UNKNOWN переход откладывается. После confirmed `MOTOR_OFF` pending desired baud применяется, а перед новым `MOTOR_ON` при motors OFF baud transition завершается первым.
 
 ## Config exchange во время TRACKING
 
@@ -378,9 +396,11 @@ Auto `MOTOR_ON` после reconnect отсутствует.
 
 ## Serial recovery
 
-Подробный wire contract: [Протокол STM32](../../architecture/serial-protocol.md).
+Подробный transport/wire contract: [Протокол STM32](../../architecture/serial-protocol.md).
 
-При ordinary retry exhaustion transport считается LOST. На PC:
+Auto-reconnect запускается после исчерпания ordinary retries, physical serial I/O/disconnect failure, исчерпания Emergency retries или неуспешного bounded baud-recovery attempt. CRC-valid matching command-level error сам по себе не означает transport loss; `INVALID_REQUEST_ID` требует Emergency-based sequence resync.
+
+При признанной потере transport session на PC:
 
 ```text
 pending_motion → None
@@ -392,6 +412,14 @@ new normal motion blocked
 ```
 
 Уже принятый limited `MOVE_RELATIVE` может закончиться; velocity control останавливается по watchdog.
+
+Отсутствие STM32/serial device не считается fatal `ERROR`: worker продолжает reconnect cycles без конечного лимита попыток. Между cycles используется interruptible capped backoff `0.25 → 0.5 → 1 → 2 → 2 ... s`, который сбрасывается после `READY`.
+
+Обычный baud search проверяет без дубликатов:
+
+```text
+last-known → desired → 9600
+```
 
 После обнаружения physical connection/baud:
 
@@ -414,7 +442,52 @@ Runtime command сохраняется, потому что требуется �
 
 STM32 разрешает `SET_BAUDRATE` только при фактическом motors OFF.
 
-При uncertain baud transition сначала определяется рабочий old/new baud, затем запускается обычный Emergency-based recovery. Не нужны отдельные baud generation/ID state.
+При lost/uncertain response рабочий baud ищется без дубликатов в порядке `new → old → 9600`, после чего запускается обычный Emergency-based recovery. Не нужны отдельные baud generation/ID state.
+
+## Worker lifecycle
+
+Turret worker создаётся и останавливается application orchestration; отдельный Supervisor для него не вводится.
+
+Все ожидания serial transport должны быть bounded или cooperative-cancellable. Reconnect/backoff ожидается через общий `StopToken.wait(timeout)`, а не через неконтролируемый `sleep`, чтобы `request_stop()` быстро прерывал ожидание. Concrete serial adapter не должен держать worker в бесконечном blocking read.
+
+Shutdown boundary:
+
+```text
+request_stop()
+→ interrupt/cancel bounded serial wait or backoff
+→ join(bounded timeout)
+→ verify !is_alive()
+```
+
+Точный numeric join timeout остаётся внутренним implementation tuning, а не новым `config.json` field. Если worker не завершился в bounded timeout, это явная shutdown error: её нужно залогировать и нельзя молча считать shutdown успешным.
+
+## STM32 hardware baseline первой реализации
+
+Firmware target Stage 4:
+
+```text
+MCU: STM32F103C8T6, LQFP48
+framework: STM32 HAL / CubeIDE-compatible project
+USART3 TX: PB10
+USART3 RX: PB11
+startup serial: 9600 8N1, full-duplex UART
+```
+
+Hardware mapping, восстановленный из старой рабочей прошивки и используемый как baseline:
+
+```text
+X / azimuth:   STEP PB7, DIR PB8, ENABLE PB9
+Y / elevation: STEP PB4, DIR PB5, ENABLE PB6
+ENABLE: active-low
+X DIR: 0 = right, 1 = left
+Y DIR: 0 = up,    1 = down
+```
+
+Legacy firmware использовал TIM2 periodic control tick (Prescaler 71, Period 49 при его clock setup). Эти timer numbers являются implementation reference, а не архитектурным timing contract: Stage 4 обязан вывести реальные firmware bounds из нового STEP generator.
+
+На legacy board также были входы PB12..PB15 для концевиков, но текущая v1 архитектура **не** использует limit switches как safety/position contract. Их наличие не меняет раздел «Ограничения механики» ниже.
+
+Старый firmware protocol не переносится. Единственный wire contract — [`serial-protocol.md`](../../architecture/serial-protocol.md). Будущий RS485 должен заменить только physical byte transport этого же protocol.
 
 ## Ограничения механики
 
@@ -440,7 +513,13 @@ Turret публикует latest-only `TurretState` с:
 - authoritative applied `control_mode`;
 - подтверждёнными speed/acceleration limits.
 
-Transient diagnostics/errors в v1 идут в logging; обязательные runtime состояния имеют typed contracts. Generic event bus заранее не вводится.
+Если `HAL.applied_stm32_config is None`, четыре поля speed/acceleration в `TurretState` равны `None`; desired config не подменяет подтверждённое applied state. После successful `SET_CONFIG` публикуется именно подтверждённый snapshot, а после transport loss поля снова становятся `None`.
+
+Transient diagnostics/errors в v1 идут в стандартный Python logging; обязательные runtime состояния имеют typed contracts. Generic event bus заранее не вводится.
+
+Для Turret в INFO достаточно lifecycle/connection/recovery/baud-transition boundaries и значимых failures. `REQUEST_ID`, command code, retry/attempt/candidate details должны быть доступны для диагностики на более подробном уровне, но high-rate PID samples и обычные velocity setpoints не логируются на INFO.
+
+`QueueHandler/QueueListener` в v1 заранее не вводятся: сначала используется существующий logging bootstrap, а queue-based logging добавляется только при измеренной проблеме blocking/contention.
 
 Wire `EVENTS` section STM32 зарезервирована, но пуста в v1. Hardware event queue проектируется только вместе с первым реальным hardware event.
 
@@ -448,10 +527,45 @@ Wire `EVENTS` section STM32 зарезервирована, но пуста в v
 
 Физический STM32 должен быть заменяем эмулятором через тот же HAL interface.
 
+Для hardware-independent проверки production serial boundary существует Linux PTY
+diagnostic:
+
+```text
+TurretWorker / TurretSession
+→ production SerialTransport
+→ real pyserial
+→ stable symlink на PTY slave
+⇄ PTY master
+→ diagnostics byte-stream bridge
+→ FakeStm32Endpoint
+```
+
+Diagnostic запускается командой:
+
+```bash
+python tools/run_pty_stm32_diagnostic.py
+```
+
+`FakeTransport` в этом acceptance path не используется. PTY bridge владеет только
+byte-stream framing, fragment/garbage/delay/drop/CRC fault injection, заменой PTY
+pair и lifecycle; decode, `REQUEST_ID`, exact-retry cache, Emergency resync и
+логическое состояние `SET_BAUDRATE` остаются в существующем
+`FakeStm32Endpoint`.
+
+Стабильный временный путь `/tmp/navmin-pty-*/stm32` атомарно перенаправляется на
+новый `/dev/pts/*` при hard disconnect. Поэтому production worker продолжает
+открывать один configured port, но reconnect создаёт новый `SerialTransport` и
+реально открывает новый PTY slave через pyserial.
+
+Эта проверка подтверждает OS byte stream, partial reads, response framing,
+timeouts, CRC/exact retry, garbage resync, исчезновение device и automatic
+reconnect. PTY не подтверждает физическое UART bit timing, электрические свойства
+UART/USB-RS485, half-duplex direction control, кабель/grounding или поведение
+реального STM32. В частности `SET_BAUDRATE` здесь проверяет production state
+machine и настройку pyserial, но не реальную скорость передачи битов.
+
 ## Что ещё не определено
 
-- concrete thread-safe latest-state/notification primitives;
-- detailed UART reconnect/backoff policy;
 - hardware upper limits step rate/acceleration/watchdog/static relative delta;
 - D-filter после измерений;
 - future position feedback/homing.

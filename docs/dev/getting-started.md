@@ -110,3 +110,39 @@ source .venv/bin/activate
 uv pip install -e .[dev,docs]
 ```
 Откройте новый терминал в IDE. Если окружение не активируеся автоматически, проверьте, есть ли в проекте диреткория `.vscode/`, в ней настройки для автоматического запуска окружения. Без нее вы сможете активировать окружение только вручную.
+
+## 4. Camera runtime: GStreamer
+
+`PyGObject` является Python dependency проекта и устанавливается через `uv`. Сам GStreamer и typelibs/plugins являются **system runtime dependencies Debian**, а не Python packages.
+
+Для текущего RTP/JPEG camera source нужны:
+
+```text
+GStreamer runtime/tools
+GStreamer GstApp typelib
+base plugins
+good plugins
+```
+
+На Debian соответствующий минимальный runtime набор:
+
+```bash
+sudo apt install \
+  gstreamer1.0-tools \
+  gstreamer1.0-plugins-base \
+  gstreamer1.0-plugins-good \
+  gir1.2-gstreamer-1.0 \
+  gir1.2-gst-plugins-base-1.0
+```
+
+`plugins-bad` текущему pipeline не требуется. Проверка нужных элементов:
+
+```bash
+gst-inspect-1.0 udpsrc rtpjpegdepay jpegdec videoconvert appsink
+```
+
+Production receiver v1 слушает RTP/JPEG over UDP. Рекомендуемые значения config: local bind `0.0.0.0`, Overview port `8888`, Stereo Left `8889`, Stereo Right `8890`, `rtp-enabled=true`, `buffer-size=1`. Raspberry Pi source IP настраивается sender-side и не является `CameraConfig.address` PC receiver.
+
+# Offline rehearsal и hardware day
+
+Этот документ описывает первоначальную установку окружения и поэтому содержит online setup steps. Для автономной проверки уже подготовленной машины network не должен требоваться. Operator procedure, четыре рекомендуемых profiles, preflight gates и hardware measurement boundaries описаны в [Offline Hardware Runbook](../user/offline-hardware-runbook.md).

@@ -308,15 +308,15 @@ STM32 стартует на фиксированном startup baud, а рабо
 
 ### Решение
 
-`invert`, `full_steps_per_revolution`, `microstep_divider` в v1 не меняют active Turret mechanical conversion на лету. Сохранённое изменение требует Turret/application restart.
+`invert`, `full_steps_per_revolution`, `microstep_divider` и `max-relative-move-deg` в v1 не меняют active Turret mechanical conversion или relative-move safety envelope на лету. Сохранённое изменение требует Turret/application restart.
 
 ### Почему
 
-Runtime изменение преобразования degrees ↔ steps посреди active motion создаёт safe-point и consistency cases, которых текущие требования не требуют.
+Runtime изменение преобразования degrees ↔ steps или relative-move safety envelope посреди active motion создаёт safe-point и consistency cases, которых текущие требования не требуют.
 
 ### Отвергнутая альтернатива
 
-**Dynamic apply mechanical conversion.** Отклонено как ненужная сложность v1.
+**Dynamic apply mechanical conversion или `max-relative-move-deg`.** Отклонено как ненужная сложность v1.
 
 ---
 
@@ -386,6 +386,460 @@ Stereo pairing — отдельная сложная задача синхрон
 ### Отвергнутая альтернатива
 
 **Обязательная extrinsic calibration с первой версии.** Отклонено до появления измеренной потребности.
+
+---
+
+## 20. `config.json` v1 валидируется строго и не чинится молча
+
+### Решение
+
+`config.json` обязателен для normal startup. Отсутствующий файл, malformed JSON, unknown fields, missing required fields, invalid values и unsupported `schema-version` дают явную config/startup error. Только заранее документированные optional fields получают in-memory defaults; loader не дописывает их в файл автоматически. Invalid runtime update не заменяет последний полностью валидный snapshot.
+
+Schema v1 использует `schema-version = 1`; automatic migration не проектируется до появления реальной schema v2.
+
+### Почему
+
+Конфигурация содержит camera sources и параметры, влияющие на физическое движение Turret. Silent fallback/default repair может скрыть опечатку или аппаратно неверное значение и запустить систему не с теми настройками, которые считает активными пользователь. Строгая schema также делает typo в имени поля наблюдаемой ошибкой вместо молчаливого ignore.
+
+### Отвергнутые альтернативы
+
+- **Автоматически создавать полный default config при отсутствующем файле.** Отклонено: безопасные универсальные hardware defaults неизвестны, а примерные числа в документации не являются аппаратными пределами.
+- **Игнорировать unknown fields.** Отклонено: опечатка превращается в скрытый fallback/неприменённую настройку.
+- **Исправлять invalid values defaults и продолжать startup.** Отклонено: скрывает проблему и создаёт неочевидный effective config.
+- **Проектировать migration framework заранее.** Отклонено до появления второй реальной schema; требования migration пока неизвестны.
+
+---
+
+## 21. Runtime PID config reset'ит changed gains по оси, а уменьшение output limit только clamp'ит I-term
+
+### Решение
+
+PID config остаётся dynamic и полностью принадлежит Turret Controller. Если во время TRACKING меняется любой `Kp/Ki/Kd` конкретной оси, Controller полностью сбрасывает PID state только этой оси перед обработкой следующего нового `TrackingError`. Первый sample после reset использует новые gains и остаётся P-only: `I=0`, `D=0`.
+
+Изменение только application-side output limit (`max-speed-*-deg-s`) full PID reset не вызывает. При уменьшении limit сохранённый I-term соответствующей оси сразу clamp'ится в новый диапазон `±max_speed`; при увеличении limit текущий I-term сохраняется без масштабирования. Если gains и output limit одной оси меняются в одном config revision, gain-change reset имеет приоритет. Config update сам по себе не создаёт motion command и не меняет `control_mode`.
+
+### Почему
+
+Сохранение integral/derivative history после замены gains связывает новый controller tuning со state, накопленным при другой динамике, и делает переход плохо предсказуемым. Полный per-axis reset при смене gains даёт простой детерминированный boundary и согласуется с уже существующими Turret-owned PID reset rules.
+
+Для одного лишь уменьшения output limit полный reset избыточен: проблема состоит только в том, что накопленный I-term может оказаться вне нового допустимого диапазона. Clamp устраняет это состояние, сохраняя полезную историю controller там, где сами gains не менялись.
+
+### Отвергнутые альтернативы
+
+- **Сохранять PID state без изменений при смене `Kp/Ki/Kd`.** Отклонено: history была накоплена при других gains и может дать неочевидный transient на следующем sample.
+- **Масштабировать integral state при смене `Ki`, чтобы сохранить прежний I-output.** Отклонено для v1: это скрытая трансформация внутреннего state, усложняет сочетание с изменениями `Kp/Kd` и не даёт преимущества перед явным reset boundary.
+- **Полностью reset'ить PID при любом изменении max speed/output limit.** Отклонено: при неизменных gains достаточно clamp I-term к новому limit; потеря всей controller history не нужна.
+- **Посылать внешний `PID_RESET` из Core/Config Manager.** Отклонено по уже принятому ownership: PID state и его apply/reset policy принадлежат Turret Controller.
+
+---
+
+## 22. Turret reconnect бесконечный с capped backoff; отсутствие STM32 не является fatal `ERROR`
+
+### Решение
+
+Turret сам владеет automatic serial reconnect. Transport loss признаётся после исчерпания ordinary/Emergency retries, physical I/O/disconnect failure или неуспешного bounded baud-recovery attempt. Matching command-level error сам по себе не означает physical transport loss; `INVALID_REQUEST_ID` переводит normal traffic в Emergency-based sequence resync.
+
+Reconnect cycles не имеют конечного лимита попыток. Между ними используется interruptible capped exponential backoff `0.25 → 0.5 → 1 → 2 → 2 ... s`, который сбрасывается после полного `READY`. Обычный baud search проверяет без дубликатов `last-known → desired → 9600`; после uncertain `SET_BAUDRATE` — `new → old → 9600`.
+
+Пока owner способен продолжать reconnect, отсутствие STM32/serial device отражается как `DISCONNECTED/CONNECTING`, а не `ERROR`. `ERROR` зарезервирован для действительно невосстановимой локальной ошибки/invariant failure, при которой automatic recovery нельзя корректно продолжить.
+
+### Почему
+
+Физическое отсутствие устройства — ожидаемый recoverable condition, а не причина завершать приложение. Бесконечный reconnect делает unplug/replug штатным сценарием, а capped backoff не создаёт busy loop. Явный порядок baud candidates делает recovery детерминированным и покрывает hardware reset на 9600 и lost response после `SET_BAUDRATE`.
+
+### Отвергнутые альтернативы
+
+- **Конечное число reconnect attempts с переходом в ERROR.** Отклонено: временно отсутствующий STM32 не должен требовать restart приложения.
+- **Постоянный короткий polling без backoff.** Отклонено: создаёт лишнюю нагрузку и log spam.
+- **Случайный/неопределённый порядок baud candidates.** Отклонено: усложняет тестирование и диагностику uncertain baud transition.
+
+---
+
+## 23. Turret worker останавливается cooperative через `StopToken`; отдельный Supervisor не нужен
+
+### Решение
+
+Turret worker создаётся/останавливается application orchestration. Serial waits должны быть bounded или cancellable, reconnect/backoff ожидается через `StopToken`, а shutdown выполняет `request_stop() → bounded join() → is_alive()` check. Numeric join timeout остаётся внутренним implementation tuning и не добавляется в `config.json`. Незавершившийся после bounded join worker является явной shutdown error и логируется; успешный shutdown в таком случае не объявляется.
+
+### Почему
+
+Это использует уже существующий Foundation lifecycle contract и не создаёт второй orchestration owner. Interruptible waits гарантируют, что бесконечный auto-reconnect не мешает остановке приложения.
+
+### Отвергнутые альтернативы
+
+- **Supervisor только ради остановки/restart Turret worker.** Отклонено как дублирование owner/application orchestration.
+- **Unbounded blocking UART read или `sleep()` в backoff.** Отклонено: `request_stop()` не смог бы гарантированно прервать ожидание.
+- **Новый user-configurable join timeout.** Отклонено: это implementation tuning без пользовательской domain-семантики.
+
+---
+
+## 24. Turret diagnostics остаются logging, без queue/event infrastructure в v1
+
+### Решение
+
+Turret использует существующий стандартный Python logging bootstrap. `QueueHandler/QueueListener` и generic diagnostic event bus в v1 не добавляются. INFO предназначен для lifecycle/connection/recovery/baud boundaries и значимых failures; `REQUEST_ID`, command/retry/candidate details доступны для более подробной диагностики. High-rate PID samples и обычные velocity setpoints не логируются на INFO.
+
+### Почему
+
+Typed state уже несёт machine-readable runtime состояние, а logging нужен для transient diagnostics. Queue-based logging без измеренной blocking/contention проблемы добавляет отдельную concurrency infrastructure, а INFO на частоте tracking loop создавал бы шум и потенциально влиял на timing.
+
+### Отвергнутые альтернативы
+
+- **`QueueHandler/QueueListener` с первой реализации.** Отклонено до profiling/измеренной contention problem.
+- **Логировать каждый PID/setpoint на INFO.** Отклонено из-за высокой частоты, шума и риска влияния на timing.
+- **Generic machine-readable diagnostic event bus.** Отклонено: обязательное runtime состояние уже выражено typed contracts.
+
+---
+
+
+## 25. Serial timing reconnect, deferred desired baud и restart-only emulation
+
+### Решение
+
+`response-timeout-ms`, `max-retries` и `inter-request-delay-ms` применяются через новую Turret session boundary после reconnect. `emulate-stm32` не переключается runtime и требует application restart. Desired baud остаётся latest-only: при confirmed motors OFF переход допустим, при motors ON/UNKNOWN он откладывается без hidden `MOTOR_OFF`; перед последующим `MOTOR_ON` pending baud применяется первым.
+
+### Почему
+
+Serial timing является свойством bounded transaction/session и не должен меняться посреди committed in-flight exchange. Runtime real ↔ fake switching создало бы второй transport lifecycle внутри одного процесса без v1-потребности. Отложенный baud сохраняет safety ownership: config change не должен сам выключать motors.
+
+### Отвергнутые альтернативы
+
+- **Mutate timing активной session.** Отклонено из-за неоднозначной семантики текущей transaction.
+- **Config baud update автоматически делает MOTOR_OFF.** Отклонено: motor state меняется только явной control operation/recovery.
+- **Runtime real ↔ fake switch.** Отклонено как лишний lifecycle mechanism для v1.
+
+---
+
+## 26. Первая STM32 реализация использует UART; RS485 переносится в отдельную post-v1 migration
+
+### Решение
+
+Первый firmware target — `STM32F103C8T6` с STM32 HAL/CubeIDE-compatible project. Physical transport первой реализации — обычный full-duplex `USART3` (`PB10 TX`, `PB11 RX`, startup `9600 8N1`).
+
+Текущий binary protocol считается окончательным относительно physical transport: UART и будущий RS485 не получают разных frame/request/retry/state semantics. RS485 half-duplex, выбор transceiver, `DE/RE` или auto-direction, termination/biasing, electrical reference/isolation и turnaround measurements переносятся в отдельную migration после обязательной первой реализации.
+
+Старый firmware-проект используется только как hardware reference для MCU/pin mapping/polarity/timer baseline. Его старый serial protocol не является compatibility target и не переносится.
+
+### Почему
+
+Старая турель уже работала через обычный UART, а доступа к физической STM32/RS485 сборке сейчас нет. Protocol/control firmware можно реализовать и полноценно тестировать без смешивания новых RS485 electrical/timing unknowns с parser, request sequence, Emergency, motor planner и watchdog. Изоляция physical byte transport делает последующий переход на RS485 ограниченным hardware change.
+
+### Отвергнутые альтернативы
+
+- **Блокировать Stage 4 до выбора и проверки RS485 transceiver.** Отклонено: это связывает независимые protocol/control задачи с недоступным сейчас железом.
+- **Сделать отдельные UART и RS485 версии протокола.** Отклонено: physical medium не требует второго framing/request/state contract.
+- **Перенести старый UART protocol из legacy firmware.** Отклонено: authoritative v1 protocol уже определён в `serial-protocol.md`, а legacy firmware нужен только как hardware reference.
+
+## 27. `VisionProcessor` остаётся единственной processing boundary; baseline v1 использует legacy 1.4/1.1 + общий `SimpleTracker`
+
+### Решение
+
+Публичная архитектура не разбивает Vision processing на обязательные `Detector` и `Tracker` модули. Конкретный `VisionProcessor` может быть detector+tracker, integrated algorithm или другой схемой, пока он соблюдает `TrackedObject` contract.
+
+Для baseline v1 реализуются:
+
+```text
+Legacy14VisionProcessor   # default
+Legacy11VisionProcessor
+```
+
+Они используют detector-алгоритмы legacy Variant 1.4 / Variant 1.1 и один общий внутренний `SimpleTracker`. Legacy tracker целиком не переносится. `SimpleTracker` использует короткую robust motion history, внутреннее prediction и one-to-one association; полноценный appearance identity/reacquisition остаётся возможностью отдельного будущего vision backend.
+
+Processor-specific tuning в v1 является implementation detail: owner-local `settings.py` с module-level constants. Эти параметры не входят в `config.json`, не persistятся Config Manager и не показываются UI.
+
+### Почему
+
+Такой boundary позволяет сначала получить простой измеримый baseline на двух detector variants, сравнивая их на одном tracker, а затем заменить весь vision backend на более сложную интегрированную реализацию без изменения Core, UI, Aiming или публичных Vision contracts.
+
+Локальные tuning constants не являются пользовательской политикой системы. Если преждевременно включить их в строгий `config.json`, экспериментальные thresholds становятся долгоживущим публичным schema/API и требуют validation, persistence и runtime apply semantics без доказанной необходимости.
+
+### Отвергнутые альтернативы
+
+- **Сделать `Detector` и `Tracker` отдельными архитектурными модулями.** Отклонено: это преждевременно фиксирует внутреннюю структуру всех будущих `VisionProcessor` implementations.
+- **Перенести legacy tracker как есть.** Отклонено: он несёт историческую application/reacquisition complexity, которая не нужна baseline multi-object tracking и мешает чисто сравнивать detector 1.1/1.4.
+- **Сразу использовать полный VT11 pipeline как обязательный Stage 5 processor.** Отклонено как blocker первой реализации; advanced identity/reacquisition должен сравниваться с простым baseline после первых измерений.
+- **Хранить все detector/tracker thresholds в общем `config.json` или UI.** Отклонено: внутренний tuning не должен становиться публичным config contract без реальной operator/runtime потребности.
+
+## 28. UI v1 prioritizes a fixed operational bar and minimal main/preview interaction
+
+### Решение
+
+Основной UI стартует fullscreen. `F11` переключает fullscreen/windowed state, а `Esc` открывает или скрывает отдельный modeless movable Operator Window, принадлежащий MainWindow без global always-on-top. Overview и Stereo Left образуют pair `main + preview`; preview — небольшое окно в правом нижнем углу области видео, swap выполняется click'ом по preview или его небольшому вторичному action-icon внутри preview.
+
+Постоянная нижняя operational bar содержит fixed-size controls для `RELATIVE / TRACKING`, подтверждённого motor state/control, connection state и крупного `EMERGENCY` в правом нижнем углу. Motor toggle выполняется одним click без confirmation dialog. Dedicated ordinary Stop button в первом prototype не показывается.
+
+Редко используемое runtime/status/admin presentation доступно через лёгкий Operator Window. Сейчас оно показывает существующие camera/Turret/mode/motor states, содержит синхронизированную fullscreen-кнопку и подтверждаемый Exit. Оно не дублирует motor/Emergency controls и не заменяет будущую полную settings/menu architecture.
+
+В TRACKING левый click по bbox выбирает target, empty click снимает selection, overlap разрешается ближайшим к click центром среди bbox, содержащих точку. В RELATIVE левый click по main image выполняет click-to-move. Preview click только выполняет swap.
+
+Baseline overlay показывает bbox и selection highlight без постоянных ID/distance/velocity/age labels. Stereo Right доступен только как отдельный diagnostic view. Recording запускается из верхнего menu bar; активная запись обозначается в левом верхнем углу main view мигающим красным кругом и статической белой надписью `Запись`.
+
+### Почему
+
+Первая цель проекта — быстро получить runnable prototype для относительного движения и TRACKING. Поэтому постоянно видимыми остаются только действия и states, нужные оператору во время управления, а редко используемые функции уходят в menu/diagnostics или modeless Operator Window. Fixed geometry исключает смещение кнопок при изменении текста состояния, компактная bar сохраняет больше высоты для видео, а Emergency остаётся быстро достижимым и визуально крупнейшим действием. Отдельное owned tool-window не меняет video geometry и не блокирует main-thread state pump.
+
+### Отвергнутые альтернативы
+
+- **Постоянные Motor/Recording/Settings buttons в отдельной панели.** Отклонено как лишнее загромождение; motor остаётся в operational bar, recording/settings доступны из menu.
+- **Global always-on-top для Operator Window.** Отклонено: панель должна оставаться над MainWindow, но не перекрывать terminal/browser после переключения на другое приложение.
+- **Operator Window как modal dialog или overlay поверх video.** Отклонено: runtime presentation не должно ставить работу на pause или менять image-coordinate mapping.
+- **Dedicated ordinary Stop button в первом prototype.** Отложен: архитектурный `StopMotion` остаётся, но отдельная пользовательская кнопка пока не нужна.
+- **Выбор nearest object вне bbox.** Отклонён для v1 как неочевидное действие; click должен попадать в отображаемый bbox.
+- **Постоянные diagnostic labels возле каждого bbox.** Отклонены ради читаемого основного изображения; расширенная диагностика может включаться отдельно.
+- **Stereo Right как обычная main/preview camera.** Отклонено: её роль остаётся diagnostic/stereo и не должна менять обычный two-camera interaction contract.
+
+## 29. Camera transport v1 — RTP/JPEG через GStreamer; Overview correction — OpenCV fisheye без silent scaling
+
+### Решение
+
+Production camera source v1 использует фактически подтверждённый sender/receiver path RTP/JPEG over UDP. PC receiver декодирует через GStreamer в raw BGR и хранит только freshest frame; geometric correction остаётся единственной responsibility `VisionPipeline`. `appsink` работает bounded/latest-oriented (`drop=true`, `sync=false`, prototype `max-buffers=1`).
+
+Overview calibration schema v1 трактуется как OpenCV fisheye: `D` содержит ровно четыре коэффициента, maps строятся через `cv2.fisheye.initUndistortRectifyMap`, а исправленная geometry использует `new_camera_matrix`. Source size обязан точно совпадать с calibration size; автоматическое scaling `K/new_camera_matrix` не выполняется.
+
+### Почему
+
+Этот RTP/JPEG sender/receiver path уже реально работает на camera setup и GStreamer appsink даёт прямой low-latency latest-frame boundary без отдельной display loop architecture. Fisheye API обязателен, потому что фактическая Overview calibration была получена через OpenCV fisheye model; обычный pinhole `initUndistortRectifyMap` описывает другую camera model. Exact-size validation сохраняет явную геометрическую ошибку вместо скрытого изменения calibration.
+
+### Отвергнутые альтернативы
+
+- **Выполнять fisheye correction внутри camera source.** Отклонено: это дублировало бы correction path и смешало transport с geometry.
+- **Автоматически масштабировать `K`/`new_camera_matrix` под любой decoded size.** Отклонено: silent scaling скрывает geometry mismatch; NavMin требует exact calibration resolution.
+- **Использовать Raspberry Pi IP как `CameraConfig.address` receiver-side correlation.** Отклонено: UDP sender уже направляет stream на PC; receiver bind address и local listen port являются достаточной source boundary.
+- **Копировать process-global `GLib.MainLoop` из reference viewer.** Отклонено: appsink callback и polling bus достаточны owner-local source и не создают новый application-global manager.
+
+---
+
+## 30. UI использует revision-aware QTimer pump примерно 60 Hz
+
+### Решение
+
+Prototype UI в Qt main thread каждые `16 ms` сначала полностью обрабатывает доступные lossless `CameraSessionStarted` barriers, затем читает freshest revisions существующих latest-state containers Vision, CameraStatus и TurretState. Успешно принятые revisions больше не обрабатываются; result, опередивший свой barrier в пределах tick, остаётся retryable до следующего tick.
+
+Per-frame queued Qt signals не используются.
+
+### Почему
+
+Это минимальная concurrency model поверх уже существующих `LatestValue`, `InvalidatableLatest` и `CameraSessionBarrierChannel`. Pump добавляет не более примерно `16 ms` polling latency, но не превращает camera rate `15–20 FPS` в `60 FPS` image conversions: без новой revision tick почти ничего не делает. Lossless barriers сохраняют session ordering, а latest payloads естественно coalesce'ятся до freshest value без Qt event backlog.
+
+### Отвергнутые альтернативы
+
+- **Queued Qt signal на каждый frame/state update.** Отклонено: producer может накопить queued callbacks и тем самым вернуть video latency backlog поверх latest-only Vision boundary.
+- **Frame FIFO в UI.** Отклонено: UI нужен freshest accepted state, а не последовательное воспроизведение устаревших кадров.
+- **Сразу вводить coalesced event-driven wakeup.** Отложено до измеренной необходимости: оно сложнее, а `16 ms` pump уже даёт малую bounded polling latency при простой проверяемой ordering model.
+
+---
+
+## 31. Normal и diagnostic launchers используют один application composition и явно выбирают только внешние backends
+
+### Решение
+
+NavMin не получает две независимые реализации приложения для production и diagnostics. Оба launcher используют один shared application composition и те же production UI, Core/Aiming, Vision и Turret components.
+
+Shared composition реализована как one-shot `ApplicationRuntime`, создаваемый из
+уже загруженных typed config/calibration objects. Она строит Overview и Stereo
+Left через production `build_camera_worker(...)`, один `TurretWorker`, один
+`Mediator` и готовые UI bindings, а также владеет deterministic start,
+partial-start rollback и aggregate bounded shutdown. Перед остановкой workers
+shared runtime при READY/ON выполняет safety boundary `STOP_MOTION → MOTOR_OFF`
+и bounded ждёт подтверждённый `MotorState.OFF`; при уже недоступном Turret cleanup
+остаётся bounded. `SoftwareSmokeRuntime`
+делегирует ей эту общую wiring/lifecycle ответственность и владеет только
+synthetic external producers/sources.
+
+Production GStreamer/PyGObject runtime инициализируется один раз до старта camera
+worker threads и дополнительно защищён process-local lock/cache в receiver backend.
+Это исключает concurrent first-import race между Overview и Stereo Left, не создавая
+отдельный camera backend.
+
+Normal launcher предназначен только для реального железа:
+
+```text
+real RTP cameras
++
+production SerialTransport → real STM32
+```
+
+Он не выполняет silent fallback на synthetic cameras, `FakeTransport` или software STM32 emulator.
+
+Diagnostic launcher запускает то же приложение, но разрешает явно выбирать
+внешние endpoints. Для каждой camera role он выбирает real Raspberry Pi RTP
+sender или localhost RTP/JPEG sender и передаёт соответствующую effective
+listen-конфигурацию; receiver внутри composition в обоих случаях остаётся
+`GStreamerRtpJpegSource`. Для controller он выбирает реальный serial device или
+stable PTY path; physical transport внутри composition в обоих случаях остаётся
+production `SerialTransport`.
+
+Localhost senders, PTY emulator, `QApplication`, file/CLI loading и diagnostic
+session artifacts не принадлежат `ApplicationRuntime` и управляются launcher на
+внешней стороне shared composition.
+
+`InMemoryFrameSource` и `FakeTransport/FakeStm32Endpoint` остаются deterministic automated-test boundaries и не становятся пользовательскими diagnostic runtime modes. Localhost RTP/JPEG нужен именно для проверки production GStreamer receiver без Raspberry Pi, а Linux PTY — для проверки production `SerialTransport`/pyserial byte path без физического controller.
+
+Backend selection должен быть явным и воспроизводимым; primary interface — command-line arguments. Runtime не угадывает автоматически, какой fake/real backend использовать. Выбранные backends записываются в session diagnostics. Для полностью software-only сочетания `localhost + localhost + pty` launcher может дополнительно получить явный `--synthetic-inputs`: тогда только launcher создаёт встроенные typed 320×240 diagnostic config/calibrations в памяти. Это не fallback по отсутствию файлов и не меняет normal startup rule: mixed/real diagnostics и normal launcher остаются file-backed, а `--synthetic-inputs` с любым real endpoint отклоняется.
+
+Normal и diagnostic launcher до загрузки inputs создают отдельный launcher-owned
+session directory `navmin-<mode>-YYYYMMDD-HHMMSS-ffffff/`. В нём находятся bounded
+rotating `runtime.log`, machine-readable `manifest.json` и `inputs/` с реально
+переданными в shared composition effective config/calibrations. Для file-backed
+inputs сохраняются SHA-256 исходных files, а synthetic profile маркируется как
+synthetic без фиктивного hash. Manifest собирает только allowlisted platform/runtime
+metadata и optional local Git commit/branch/dirty evidence; environment dump,
+credentials и filesystem inventory не собираются. Normal file log остаётся INFO,
+diagnostic — DEBUG; каждый log file ограничен 10 MiB и пятью backups. Старые
+session directories launcher автоматически не удаляет: cross-session retention
+manual.
+
+До запуска runtime оба launcher выполняют typed backend-aware static preflight и
+атомарно сохраняют `preflight.json`. Production receiver capability проверяется
+через тот же process-local GStreamer initialization boundary, который использует
+`ApplicationRuntime`; real-camera profile не зависит от localhost sender tools.
+Localhost profile дополнительно требует `gst-launch-1.0`, `gst-inspect-1.0` и
+`GST_SENDER_ELEMENTS`. Real Turret проверяет pyserial и filesystem accessibility
+configured serial path без открытия устройства; PTY profile проверяет Linux/
+`os.openpty`/pyserial и игнорирует physical serial path. Planned camera UDP listen
+endpoints должны быть bindable и не совпадать друг с другом.
+
+Mandatory preflight `FAIL` запрещает создание external diagnostic endpoints и shared
+runtime; `WARN` разрешает startup. `--preflight-only` использует ту же boundary, но
+не создаёт `QApplication`, workers, localhost sender или PTY emulator. Static
+preflight сознательно не заменяет hardware smoke: он не ждёт camera packets, не
+проверяет Raspberry Pi reachability и не открывает STM32 protocol.
+
+ESP32-C3 HIL не является prerequisite первых реальных hardware tests. Если после hardware day понадобится отдельный physical serial/fault-injection stand, он может быть реализован как optional post-hardware tool без изменения application composition.
+
+### Почему
+
+Один composition path предотвращает drift между «боевым» и диагностическим приложением: проверяется ровно тот же UI/Core/Vision/Turret stack, а меняется только физическая boundary. При этом тяжёлые transport emulators не ухудшают быстрые deterministic E2E tests.
+
+Localhost RTP и PTY закрывают два крупных PC-side риска до поездки без дополнительного hardware: production camera transport и production serial byte transport. Явный backend selection исключает опасную ситуацию, когда оператор считает, что работает с реальным устройством, а приложение незаметно использует fake.
+
+Файловый INFO log нужен и normal runtime, потому что отказ на реальном prototype должен оставлять материал для последующего разбора даже без diagnostic mode. Расширенный diagnostic bundle нужен для автономного hardware day без интернета и доступа к рабочему чату.
+
+### Отвергнутые альтернативы
+
+- **Две отдельные application compositions: production и diagnostics.** Отклонено из-за риска semantic drift и двойного integration surface.
+- **Импортировать localhost/PTY diagnostics внутрь shared composition.**
+  Отклонено: diagnostics меняют внешний endpoint, а не production receiver или
+  serial transport implementation.
+- **Заменить быстрые InMemory/FakeTransport tests на localhost RTP/PTY.** Отклонено: transport layers добавляют timing/system dependencies и ухудшают детерминированность обычного suite.
+- **Использовать InMemory synthetic как пользовательский diagnostic camera mode.** Отклонено: для diagnostic launcher полезнее localhost RTP/JPEG, который дополнительно проверяет production GStreamer boundary; InMemory остаётся test harness.
+- **Автоматически выбирать fake/real backend по доступности devices/ports.** Отклонено как неоднозначное и потенциально опасное поведение.
+- **Писать файлы логов только в diagnostic mode.** Отклонено: сбой обычного hardware запуска тоже должен оставлять session evidence.
+- **Делать static preflight внутри `ApplicationRuntime`.** Отклонено: capability checking зависит от launcher-selected external backend и должно завершиться до создания endpoints/workers/UI.
+- **Открывать real serial device или ждать RTP frames в static preflight.** Отклонено: это уже runtime/hardware smoke и может иметь side effects (включая DTR/RTS/reset).
+- **Сделать ESP32-C3 обязательным HIL gate до STM32.** Отклонено ради экономии времени; PTY закрывает PC-side serial semantics, а необходимость отдельного physical emulator оценивается после реальных tests.
+
+---
+
+## 32. `vision backend` — фиксированный термин заменяемого блока; VT11 сначала адаптируется к текущему Vision contract
+
+### Решение
+
+Во всех новых документах, аудитах и implementation checkpoints используется термин
+**vision backend** для целиком заменяемого блока:
+
+```text
+corrected FramePacket
+→ VisionProcessor implementation / vision backend
+→ VisionResult / TrackedObject
+→ Core / Aiming / UI
+```
+
+Текущий baseline называется **Legacy14 vision backend** (и, где применимо,
+**Legacy11 vision backend**). Кандидат из внешней разработки называется
+**VT11 vision backend**. `VisionProcessor` остаётся публичным Python contract;
+`SimpleTracker` является только внутренней частью Legacy14/Legacy11 и не является
+обязательным компонентом других backend implementations.
+
+READ-ONLY VT11-V1 audit завершён с выводом: **current contract adapter feasible
+with limited VT11 changes**. Для первого implementation checkpoint VT11 должен
+сохранить текущий `VisionResult / TrackedObject` contract и не требовать изменений
+Core/Aiming/UI/Turret. Внутренние SEARCHING/TENTATIVE/CONFIRMED, reference bank,
+tracklets, scale continuity и другие rich states остаются private.
+
+До интеграции требуется адаптировать research implementation к production boundary:
+
+- finite-video/random-access loop → bounded incremental `process(FramePacket)` state;
+- unbounded whole-session result/event histories → bounded или offline diagnostics;
+- внутреннюю velocity в px/frame → публичную bbox-center velocity в px/s по
+  `FramePacket.receive_timestamp_ns`;
+- отдельный generation-local NavMin `track_id` namespace без reuse другой identity;
+- полный reset backend state при новой camera generation.
+
+V1/V2 не добавляет callback `Mediator/UI → vision backend` для seed/reference click.
+VT11 может публиковать валидированную identity как обычный `TrackedObject`, но turret
+по-прежнему начинает TRACKING только после явного выбора пользователем опубликованного
+bbox. Предложение backend не равно автоматическому выбору цели.
+
+### Post-tag roadmap
+
+```text
+VT11-V1  READ-ONLY integration audit                         completed
+VT11-V2  Vt11VisionProcessor adapter → current contract     after stable tag
+VT11-V3  deterministic A/B: Legacy14 vs VT11 vision backend
+VT11-V4  decision gate по quality/stability/CPU/memory evidence
+VT11-V5  optional Vision contract extension, только если нужен evidence
+VT11-V6  optional Core use of richer TRACK/REACQ/confidence semantics
+```
+
+### Почему
+
+Так сохраняется уже доказанная downstream architecture и появляется честная A/B
+boundary на одинаковых corrected frames/timestamps. Rich VT11 semantics не становятся
+публичным API без конкретного consumer requirement.
+
+### Отвергнутые альтернативы
+
+- **Разобрать VT11 на detector и обязательно подать его в `SimpleTracker`.** Отклонено: это разрушает свойства integrated identity/reacquisition backend и противоречит существующей `VisionProcessor` boundary.
+- **Сразу расширить `TrackedObject` confidence/reacquisition metadata.** Отклонено до A/B evidence.
+- **Разрешить VT11 автоматически выбирать turret target.** Отклонено: explicit user selection остаётся safety boundary.
+
+## 33. External STM32 Stage8.2 / protocol 0.4 не заменяют текущий NavMin firmware stack; перенос только выборочных идей после measured hardware facts
+
+### Решение
+
+READ-ONLY сравнительный аудит завершён. Текущие NavMin protocol/control contracts
+остаются authoritative: global `REQUEST_ID`, exact-retry cache, Emergency
+resynchronization, explicit `MOTOR_ON/OFF`, `SET_CONFIG`, `MOVE_RELATIVE`,
+`SET_VELOCITY`, velocity watchdog, acceleration limiter и существующий
+PC `TurretSession`/`SerialTransport`/recovery path.
+
+Stage8.2 — другая firmware lineage с несовместимым wire framing/command map и
+другим safety model. Protocol 0.4 — проект будущих требований, а не готовая firmware,
+и его exact wire mapping также не является drop-in extension current NavMin.
+Оба источника используются как engineering input, но не переносятся wholesale.
+
+До unrestricted/high-rate hardware movement должны быть измерены/подтверждены:
+
+- реальные STEP pulses / output revolution для каждой оси;
+- exact DM860 variant/settings и direction signs;
+- допустимые STEP high/low и DIR setup timings на установленном driver;
+- physical limit polarity/bounce и safe recovery behavior.
+
+Physical limit handling и IWDG считаются важными hardware-safety additions вокруг
+первого controlled hardware boundary, но должны быть реализованы внутри текущего
+NavMin ownership/state model: directional blocking, latched fault, explicit recovery,
+Emergency/Motor/reconnect compatibility. Candidate `20 000 STEP/output rev` и
+`5000 STEP/s` не считаются проверенными operational values до bench measurements.
+
+### Post-tag roadmap
+
+```text
+STM32-V1  hardware contract freeze: pins/driver/scale/reset/STEP-DIR timing
+STM32-V2  physical safety boundary: limits + latched fault + recovery + IWDG
+STM32-V3  controlled hardware bench validation
+STM32-V4  optional NavMin-native capabilities/status/config-generation design
+STM32-V5  optional ARM/lease/soft-limit/backlash evolution if evidence requires
+```
+
+Exact migration на external protocol 4.0 остаётся отдельным architecture decision и
+не должна появляться скрыто по частям.
+
+### Отвергнутые альтернативы
+
+- **Заменить NavMin firmware целиком Stage8.2 `main.c`.** Отклонено: теряются принятые transaction/recovery/Emergency semantics.
+- **Перенести exact protocol 4.0 как текущий NavMin protocol.** Отклонено: wire/command collisions требуют breaking PC+MCU migration без доказанной необходимости.
+- **Принять 20 000 STEP/rev или 5000 STEP/s как готовую настройку.** Отклонено до hardware measurements.
 
 ---
 

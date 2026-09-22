@@ -30,7 +30,71 @@ Stereo Left worker + Stereo / Distance Provider
 Stereo Right worker
 ```
 
-Vision хранит постоянный camera registry с `current_generation[camera]`.
+В current accepted minimum отдельного постоянного production `Camera Registry` нет. Каждый `VisionPipeline` является фактическим owner своей generation в пределах lifetime экземпляра и предоставляет собственные `session_barriers`, `latest_result` и `status`. E2E-1 использует эти pipeline-owned boundaries напрямую.
+
+Единственный `CameraSessionGate` находится в main thread и принадлежит `Mediator`; второго generation gate/counter нет. Ownership при будущем camera reconnect или replacement экземпляра pipeline остаётся открытой частью полного reconnect work: monotonic generation semantics должны сохраниться, а единственный production owner будет выбран до/в E2E-4. См. [открытый вопрос о camera reconnect](../../architecture/problems.md#8-camera-reconnect-transitions-backoff).
+
+### Production camera transport v1
+
+Текущий production source — `GStreamerRtpJpegSource`: RTP/JPEG (MJPEG) over UDP → `rtpjpegdepay` → `jpegdec` → `videoconvert` → BGR `appsink`. Source владеет Gst pipeline, получает фактические width/height из sample caps и копирует Gst buffer в независимый NumPy frame до `unmap()`.
+
+Low-latency boundary:
+
+```text
+appsink emit-signals=true max-buffers=<CameraConfig.buffer-size> drop=true sync=false
+```
+
+Для prototype `buffer-size = 1`; source и `VisionPipeline` оба latest-only и не образуют processing FIFO. `receive_timestamp_ns` ставится monotonic clock в момент application-side получения decoded frame. Текущий RTP transport не несёт согласованный cross-camera `capture_id`, поэтому Overview/Stereo Left/Stereo Right source публикуют `capture_id = None` до отдельного stereo-pairing решения.
+
+`CameraConfig.address` — local bind address PC receiver, `port` — local listen UDP port, `rtp-enabled=true` обязателен. Рабочая mapping: Overview `8888`, Stereo Left `8889`, Stereo Right `8890`.
+
+Appsink callback выполняется GStreamer streaming thread; process-global `GLib.MainLoop` для source не требуется. Один application `CameraWorker` на camera соединяет source с существующим `VisionPipeline.submit_decoded_frame() → process_latest()`, использует cooperative stop и bounded join. Reconnect/backoff policy в этом checkpoint не вводится.
+
+### Localhost RTP/JPEG diagnostic boundary
+
+`tools/run_localhost_rtp_diagnostic.py` поднимает diagnostics-only внешние
+GStreamer senders для Overview и Stereo Left:
+
+```text
+Python/OpenCV detector-friendly scene 320x240 @ 20 FPS
+→ SOURCE HH:MM:SS.mmm + FRAME n rendered into source pixels
+→ OpenCV JPEG encode
+→ GStreamer fdsrc → jpegparse
+→ rtpjpegpay payload=26
+→ udpsink 127.0.0.1:8888/8889
+→ существующий production GStreamerRtpJpegSource
+→ CameraWorker
+→ VisionPipeline
+```
+
+Overview и Stereo Left используют различимые спокойные backgrounds и один
+high-contrast target с принятой synthetic geometry: radius 6 px при 320×240 и
+ping-pong motion 2 px/source frame. Diagnostic text находится у нижней границы,
+а target остаётся detector-friendly после JPEG и соответствующей synthetic
+correction. Timestamp и frame counter формируются sender-side до JPEG/RTP/UDP;
+они не добавляют fields в `FramePacket` или `VisionResult`.
+
+Sender ownership и preflight реализованы в `navmin.diagnostics.localhost_rtp`,
+чтобы будущий diagnostic launcher мог переиспользовать boundary без импорта из
+`tools/`. Это не второй receiver и не альтернативный camera source: UDP/RTP/JPEG
+всегда принимает существующий production `GStreamerRtpJpegSource`, а correction
+выполняется существующим `VisionPipeline` через tool-local exact-size fisheye и
+stereo calibration.
+
+Diagnostic runner проверяет оба startup ordering, одновременный progress двух
+потоков, silence/resume одного UDP sender на том же работающем receiver,
+отклонение wrong-resolution кадра без raw fallback, stable moving Legacy14 track
+для обеих camera roles и bounded cleanup. Он не
+является общей application composition, не запускает UI/Turret и не заменяет
+быстрые `InMemoryFrameSource` tests. Silence/resume сохраняет текущую generation,
+но не закрывает production camera reconnect/backoff: source recreation, hard
+GStreamer ERROR/EOS recovery и ownership новой generation остаются вопросом #8.
+
+Ручной transport check запускается одной командой из project root:
+
+```bash
+python tools/run_localhost_rtp_diagnostic.py --duration-seconds 30
+```
 
 ## Working frame
 
@@ -38,15 +102,17 @@ Vision хранит постоянный camera registry с `current_generation[
 
 ```text
 Overview:
-receive/decode
-→ undistort
+RTP/JPEG over UDP
+→ GStreamer decode to raw BGR
+→ OpenCV fisheye undistort
 → FramePacket
 → VisionProcessor
 → VisionResult
 
 Stereo Left / Right:
-receive/decode
-→ rectify
+RTP/JPEG over UDP
+→ GStreamer decode to raw BGR
+→ pinhole/stereo rectify
 → FramePacket
 → VisionProcessor
 → VisionResult
@@ -62,7 +128,7 @@ Raw frame может существовать внутри pipeline, но нар
 - lead point;
 - UI click.
 
-Geometric correction выполняется до `VisionProcessor`, потому что одна и та же geometry нужна Vision, UI, Aiming, stereo и recording.
+Geometric correction выполняется ровно один раз в `VisionPipeline` до `VisionProcessor`, потому что одна и та же geometry нужна Vision, UI, Aiming, stereo и recording. Camera source публикует только raw decoded BGR и не выполняет undistort/rectify.
 
 ## Calibration и `CameraModel`
 
@@ -76,18 +142,20 @@ calibration/
 
 ### Overview
 
-Минимально:
+Overview calibration использует именно OpenCV fisheye model:
 
 ```text
 schema_version
 image_width
 image_height
-K
-D
-new_camera_matrix
+K: 3x3 finite
+D: ровно 4 finite fisheye coefficients
+new_camera_matrix: 3x3 finite
 ```
 
-Working frame сохраняет исходное разрешение. Автоматического crop/resize в первой реализации нет.
+Maps строятся через `cv2.fisheye.initUndistortRectifyMap(K, D, I, new_camera_matrix, ...)`. Исправленный working-frame `CameraModel` использует `new_camera_matrix`.
+
+Working frame сохраняет точное calibration resolution. Автоматического crop/resize или scaling `K/new_camera_matrix` в NavMin нет. Фактически наблюдавшийся Overview sender request `1296x972` может декодироваться как `1296x976`; source обязан брать размер из GStreamer sample caps, и calibration должна совпасть именно с фактическим размером.
 
 ### Stereo
 
@@ -115,10 +183,10 @@ Rectification/undistortion maps строятся при старте и живу
 
 ## Camera generation и barrier
 
-При каждом новом запуске/restart pipeline:
+В current accepted minimum каждый вызов `VisionPipeline.start()` для существующего экземпляра pipeline:
 
 ```text
-current_generation[camera] += 1
+pipeline-owned generation += 1
 frame_id = 0
 ```
 
@@ -138,7 +206,7 @@ CameraSessionStarted generation=N
 
 Generation защищает от запоздалых результатов старого worker и от повторного использования `track_id` после restart.
 
-При restart одновременно очищаются локальные latest/buffer state и stereo pairing state соответствующей camera.
+`VisionPipeline.start()` инвалидирует предыдущий latest result и сбрасывает processor state до публикации barrier. Полный reconnect/replacement lifecycle, включая сохранение monotonic generation при замене экземпляра pipeline, остаётся частью открытого reconnect work.
 
 ## `CameraSessionGate`
 
@@ -165,7 +233,22 @@ Video Source / camera pipeline:
 
 Полный контракт: [FramePacket](../../architecture/contracts.md#framepacket).
 
-## `VisionProcessor`
+## `VisionProcessor` и vision backend
+
+Терминология проекта: **vision backend** — целиком заменяемый блок обработки
+исправленного working frame:
+
+```text
+corrected FramePacket
+→ VisionProcessor implementation / vision backend
+→ VisionResult / TrackedObject
+→ Core / Aiming / UI
+```
+
+`VisionProcessor` — публичный Python contract этой boundary. Внутренняя
+архитектура vision backend не фиксируется и может содержать detector, tracker,
+identity, reacquisition, appearance/reference bank, motion/scale models и другие
+собственные модули. Core/Aiming/UI зависят только от публичного результата.
 
 Выбирается настройкой:
 
@@ -173,7 +256,7 @@ Video Source / camera pipeline:
 vision-processor-class
 ```
 
-Внутренняя реализация не фиксируется:
+`VisionProcessor` является единственной архитектурной boundary обработки изображения. Его внутренняя реализация не фиксируется:
 
 ```text
 Detector → Tracker
@@ -181,12 +264,66 @@ integrated tracker
 другой алгоритм
 ```
 
+Внутренние detector/tracker/components не являются публичными модулями NavMin и не должны импортироваться Core/UI как отдельные архитектурные зависимости.
+
 Публичный результат обязан содержать `TrackedObject`:
 
 - устойчивый `track_id` внутри generation;
 - `bbox`;
 - velocity центра bbox;
 - `age_frames`.
+
+### Vision backends v1
+
+Baseline v1 использует взаимозаменяемые processor class:
+
+```text
+Legacy14VisionProcessor   # default
+Legacy11VisionProcessor
+```
+
+Оба используют чисто перенесённую detector-логику соответствующих legacy Variant 1.4 / Variant 1.1, без старой UI/application-обвязки и без переноса legacy tracker как публичной архитектуры. Оба processor используют один общий внутренний `SimpleTracker`, поэтому сравнение 1.1 и 1.4 не смешивает качество detector с разными tracker algorithms.
+
+В документации и последующих задачах реализация `Legacy14VisionProcessor` вместе с
+её внутренним detector + `SimpleTracker` называется **Legacy14 vision backend**.
+Аналогично используется термин **Legacy11 vision backend**.
+
+READ-ONLY аудит VT11-V1 подтвердил другой допустимый вариант той же boundary:
+**VT11 vision backend** может сохранить собственные candidate detection, identity,
+appearance/reference bank, motion, tracking, reacquisition, scale continuity и
+другие внутренние модули. Его первая интеграция должна адаптироваться к текущему
+`VisionResult / TrackedObject` contract без обязательного `SimpleTracker` и без
+предварительного расширения публичного Vision contract.
+
+### `SimpleTracker` v1
+
+`SimpleTracker` — внутренняя переиспользуемая часть первых processor implementations, а не отдельный межмодульный контракт. Для v1 фиксируются следующие semantics:
+
+- tentative track публикуется как `TrackedObject` после двух последовательных matched observations;
+- track после публикации хранится внутренне при кратком пропуске, но predicted bbox наружу не публикуется без нового detection;
+- после трёх последовательных misses track удаляется;
+- последние пять matched observations используются для motion history;
+- velocity центра оценивается по реальным monotonic timestamps как robust median последовательных `dx/dt`, `dy/dt`, а не из предполагаемого FPS;
+- association использует predicted center, жёсткий distance gate, consistency размера bbox и IoU, затем one-to-one matching;
+- prediction используется только для внутренней association; Aiming/lead остаётся ответственностью Core;
+- полноценный appearance identity/reacquisition в baseline tracker отсутствует; после окончательного удаления повторно найденный объект получает новый `track_id`;
+- `track_id` монотонно выделяется и не переиспользуется для другого объекта внутри одной camera generation; processor state очищается при новой generation.
+
+Точная cost formula, gates и numeric tuning являются внутренней настройкой processor/tracker и могут уточняться по измерениям без изменения публичного `VisionProcessor` contract.
+
+### Внутренние настройки processor/tracker
+
+В v1 algorithm tuning не входит в пользовательский `config.json` и не показывается в UI. Настройки хранятся рядом с owner-кодом как module-level constants:
+
+```text
+src/navmin/vision/processors/legacy_11/settings.py
+src/navmin/vision/processors/legacy_14/settings.py
+src/navmin/vision/tracking/settings.py
+```
+
+У processor-specific `settings.py` нет общей обязательной schema: Variant 1.1, Variant 1.4 и будущие processor implementations могут иметь разные поля. Общие настройки `SimpleTracker` не дублируются в processor directories. Runtime-derived/adaptive state хранится в экземпляре processor/tracker и не мутирует module constants.
+
+Если позже конкретный tuning-параметр действительно потребуется менять пользователю, per-camera или runtime, он переносится в основной config отдельным архитектурным решением с явной validation/apply policy; заранее такой compatibility/config layer не создаётся.
 
 Если processing для камеры выключен effective policy, pipeline всё равно публикует working `VisionResult` с пустым `tracked_objects`.
 
@@ -219,7 +356,7 @@ FramePacket
 
 UI отображает именно `VisionResult.frame` вместе с его bbox.
 
-Межпотоковая семантика `VisionResult` — latest-only per camera. Qt notification не должна превращать latest-state в backlog.
+Межпотоковая семантика `VisionResult` — latest-only per camera. UI читает revision-aware freshest snapshots через main-thread QTimer pump и не создаёт per-frame queued Qt callbacks.
 
 ## Overview
 
@@ -312,7 +449,7 @@ STOPPED
 
 Vision публикует latest-only `CameraStatus` per camera с `camera`, `state`, `generation`, `last_receive_timestamp_ns` и optional diagnostic error fields.
 
-Freshness не является отдельным state. UI/Core вычисляют stale по `CameraStatus.last_receive_timestamp_ns` и `camera-stale-timeout-ms`.
+Freshness не является отдельным state. UI вычисляет prototype presentation stale по `CameraStatus.last_receive_timestamp_ns` и authoritative `vision.camera-stale-timeout-ms`; это не меняет camera lifecycle state.
 
 Конкретная reconnect/backoff policy остаётся открытым вопросом реализации.
 
@@ -337,15 +474,13 @@ Vision логически публикует:
 - latest/invalidate-able `DistanceResult`;
 - latest-only `CameraStatus` per camera.
 
-Diagnostics/errors идут в logging, runtime state — через typed contracts. Generic event bus заранее не вводится. Конкретный thread-safe primitive и Qt notification coalescing остаются техническими вопросами реализации.
+Diagnostics/errors идут в logging, runtime state — через typed contracts. Generic event bus заранее не вводится. UI notification coalescing реализован revision-aware QTimer pump поверх существующих thread-safe containers; ordered session barriers обрабатываются до latest payloads.
 
 ## Что ещё не определено
 
 - механизм `capture_id` и stereo resync;
 - owner staleness `DistanceResult`;
-- processor-specific config;
 - camera reconnect/backoff;
-- concrete thread-safe primitives / notification coalescing;
 - адаптация нагрузки после profiling.
 
 Полный список: [Открытые вопросы](../../architecture/problems.md).

@@ -114,22 +114,109 @@ Normal test run не должен требовать hardware.
 
 | Этап | Статус | Основной результат | Зависит от |
 |---|---|---|---|
-| 1. Foundation | not-started | package/test skeleton, contracts, runtime primitives | — |
-| 2. Config + Calibration foundation | not-started | typed config, persistence, calibration loading/model boundary | 1 |
-| 3. Turret PC stack | not-started | PC protocol/transport/controller/HAL + simulator | 1, 2 |
-| 4. STM32 firmware + RS485 | not-started | firmware protocol/control + real link validation | 3 |
-| 5. Vision | not-started | camera pipelines, generations, working frame, manual distance | 1, 2 |
-| 6. Core + Aiming | not-started | mediator/state transitions/aiming/tracking error | 2, 3, 5 |
-| 7. UI | not-started | PyQt6 main/preview, controls, overlays, settings | 2, 3, 5, 6 |
+| 1. Foundation | done | package/test skeleton, contracts, runtime primitives | — |
+| 2. Config + Calibration foundation | done | typed config, persistence, calibration loading/model boundary | 1 |
+| 3. Turret PC stack | done | PC protocol/transport/controller/HAL + simulator | 1, 2 |
+| 4. STM32 firmware + UART | done | firmware protocol/control + UART integration boundary | 3 |
+| 5. Vision | in-progress — prototype minimum accepted | camera pipelines, generations, working frame, manual distance | 1, 2 |
+| 6. Core + Aiming | in-progress — prototype minimum accepted | mediator/state transitions/aiming/tracking error | 2, 3, 5 |
+| 7. UI | in-progress — prototype minimum accepted | PyQt6 main/preview, controls, overlays, settings | 2, 3, 5, 6 |
 | 8. System integration and v1 hardening | not-started | startup/shutdown, failure paths, E2E, hardware smoke/performance | 4, 5, 6, 7 |
 
 Полноценный stereo distance, camera-to-turret rotational extrinsic, target handoff и другие явно отложенные возможности не являются условиями завершения v1, если архитектурные документы не будут изменены отдельным решением.
+
+### Prototype-first checkpoint для этапов 5–7
+
+После Stage 4 первая цель — как можно раньше получить запускаемый end-to-end prototype и проверить реальные относительные перемещения и TRACKING. Для этапов 5–7 разрешён один последовательный vertical-slice checkpoint до полного завершения каждого этапа:
+
+```text
+Stage 5 minimum: Legacy14VisionProcessor + SimpleTracker + рабочие Overview/Stereo Left frames
+→ Stage 6 minimum: RELATIVE click-to-move + TRACKING selection/error path
+→ Stage 7 minimum: fullscreen main/preview + mode/motor/link/Emergency + bbox/selection
+→ первый runnable relative/tracking smoke
+→ затем завершение оставшегося scope Stage 5/6/7
+```
+
+Это не создаёт временную параллельную архитектуру: prototype использует те же `VisionProcessor`, Core/Aiming, Turret и UI contracts, которые остаются production path. Упрощается только набор реализованных функций. Recording, расширенная диагностика, Stereo Right diagnostic view, второй baseline processor 1.1, полный settings UI и presentation polish не должны блокировать первый runnable prototype, если их отсутствие не нарушает используемый contract.
+
+Рабочие чаты по-прежнему выполняются последовательно на одной ветке; этот checkpoint не разрешает параллельные конкурирующие реализации. Статус полного Stage меняется на `done` только после выполнения его полного критерия завершения.
+
+По состоянию на текущую реализацию software vertical slice уже подтверждён отдельными integration checkpoints:
+
+```text
+software smoke foundation                 accepted
+RELATIVE UI → Aiming → Turret → protocol  accepted
+TRACKING detector/tracker → UI → PID      accepted
+failures/lifecycle E2E                    accepted
+software soak                             accepted as functional/stability harness
+full read-only integration audit          completed
+INT-P1-01 Turret ordinary control ingress closed
+INT-P1-02 bounded soak observability      closed
+```
+
+После INT-P1-02 повторный soak корректно пометил residual RSS growth как `SOAK SUSPECT`. Targeted read-only memory diagnosis не нашёл unbounded Python-level retention и показал ранний Vision/OpenCV native-allocation step с последующим plateau, в том числе при repeated detector reset. На текущем synthetic уровне это считается bounded allocator/cache behaviour и не является blocker следующего transport checkpoint; новый production memory fix без дополнительных evidence не оправдан.
+
+Эти acceptance checkpoints не означают автоматического завершения Stage 5/6/7 и не переводят Stage 8 в `in-progress`. Они являются доказательством composability текущего prototype path перед закрытием оставшихся stage-specific criteria.
+
+### Текущий путь к автономному hardware day
+
+Software-only transport/application preparation уже последовательно принята:
+
+```text
+localhost RTP/JPEG diagnostic camera backend              accepted
+production SerialTransport через Linux PTY                accepted
+shared application composition                            accepted
+normal launcher + diagnostic launcher                     accepted
+offline session artifacts + bounded logging               accepted
+backend-aware preflight + --preflight-only                accepted
+offline hardware runbook + targeted docs sync             accepted
+VIRTUAL diagnostic scene + latency observability          accepted
+offline rehearsal без доступа к интернету                 accepted
+```
+
+Текущий checkpoint и следующий immutable порядок:
+
+```text
+documentation cleanup + root README sync
+→ merge feat/first-implementation into main
+→ full validation on main
+→ GLOBAL PRE-HARDWARE INTEGRATION AUDIT (read-only)
+→ fixes only if audit finds blockers
+→ annotated pre-hardware stable tag
+→ selected external-development checkpoints (VT11 / STM32), но без STM32 implementation,
+  которое требует ещё не измеренных hardware facts
+→ relevant regressions/rehearsal
+→ hardware measurement/validation boundaries:
+     H1 identify / measure / very-low-energy boundary
+     → actual hardware facts
+     → STM32-V1/V2 implementation if required
+     → regression/rehearsal / targeted audit if changed
+     → H2 safety-boundary validation
+     → cameras-only smoke
+     → controlled REAL RELATIVE
+     → TRACKING
+     → selected failure checks
+```
+
+Два внешних READ-ONLY аудита уже завершены, но их implementation намеренно не
+начинается до stable tag:
+
+- **VT11 vision backend:** current Vision contract adapter feasible with limited
+  backend changes; далее `VT11-V2 adapter → V3 A/B benchmark → V4 decision gate`,
+  а расширение Vision contract допускается только позже по evidence.
+- **STM32 Stage8.2 / protocol 0.4:** current NavMin protocol/control остаётся base;
+  сначала measured hardware contract, затем limits/IWDG и bench validation, и лишь
+  потом optional capabilities/status/ARM evolution.
+
+`InMemoryFrameSource` и `FakeTransport/FakeStm32Endpoint` остаются быстрыми deterministic test boundaries и не заменяются более тяжёлыми transport emulators в обычном test suite. Localhost RTP/JPEG и PTY проверяют production transport paths, сохраняя hardware-independent воспроизводимость.
+
+ESP32-C3 HIL не входит в обязательный путь к первым hardware tests. Он остаётся optional post-hardware tool для serial/fault-injection scenarios, если реальные испытания покажут в нём практическую необходимость.
 
 ---
 
 ## 6. Этап 1 — Foundation
 
-**Статус:** `not-started`
+**Статус:** `done`
 
 ### Цель
 
@@ -177,13 +264,13 @@ Normal test run не должен требовать hardware.
 
 Не дублировать тест каждого concrete store для каждого будущего domain type, если один generic primitive уже покрыт и domain type не добавляет своей логики.
 
-### Открытые вопросы, которые должен закрыть этап
+### Закрытые prerequisites и открытые вопросы этапа
 
-- `problems.md` #4: concrete latest-state / thread-safe primitives;
+- concrete latest-state / thread-safe primitives закрыты в Foundation;
 - минимальная часть #10: общий stop/join contract;
 - минимальная часть #13: logging transport/setup.
 
-Qt notification coalescing (#5) остаётся до UI-этапа.
+Qt-specific notification bridge остаётся до UI-этапа.
 
 ### Критерий завершения
 
@@ -197,7 +284,7 @@ Qt notification coalescing (#5) остаётся до UI-этапа.
 
 ## 7. Этап 2 — Config + Calibration foundation
 
-**Статус:** `not-started`
+**Статус:** `done`
 
 ### Цель
 
@@ -212,7 +299,7 @@ Qt notification coalescing (#5) остаётся до UI-этапа.
 - `docs/dev/modules/core/aiming.md`
 - `docs/dev/modules/vision/index.md`
 - `docs/dev/modules/turret/index.md`
-- релевантные пункты `problems.md` #7 и #12
+- релевантный пункт `problems.md` #7; базовая v1 persistence/schema policy уже закрыта в `configuration.md`
 
 ### Реализовать
 
@@ -228,14 +315,21 @@ Qt notification coalescing (#5) остаётся до UI-этапа.
 - immutable `CameraModel`/calibration data boundary, достаточный для Aiming/Vision;
 - validation errors, пригодные для UI/logging без generic event bus.
 
-### Decision checkpoint до кодирования соответствующей ветки
+### Закрытый decision checkpoint перед Stage 2
 
-В управляющем чате нужно закрыть текущую v1-часть `problems.md` #12:
+До начала реализации зафиксирована v1-policy:
 
-- поведение при полностью отсутствующем `config.json`;
-- поведение при неподдерживаемом `schema-version`.
+- полностью отсутствующий `config.json` — startup/config error; файл автоматически не создаётся;
+- malformed/corrupted JSON — startup/config error; исходный файл не изменяется;
+- отсутствующий/неверного типа `schema-version` — invalid config;
+- `schema-version != 1` — unsupported schema error без автоматической migration;
+- неизвестные поля — validation error;
+- отсутствующие required fields — validation error;
+- optional fields получают только явно документированные in-memory defaults;
+- invalid type/range/non-finite number — validation error без silent fallback;
+- невалидный runtime update не заменяет последний валидный snapshot и не записывается как частично применённая конфигурация.
 
-Это user-visible startup/persistence semantics, поэтому рабочий чат не должен выбирать её молча. Автоматический migration mechanism `v1 -> v2` в Stage 2 не проектируется: он deferred до появления реальной schema v2.
+Автоматический migration mechanism проектируется только после появления реальной schema v2. Базовая схема required/optional и validation rules закреплены в `configuration.md`; рабочий чат Stage 2 их реализует, а не выбирает заново.
 
 ### Тестовый фокус
 
@@ -259,7 +353,7 @@ Qt notification coalescing (#5) остаётся до UI-этапа.
 
 ## 8. Этап 3 — Turret PC stack
 
-**Статус:** `not-started`
+**Статус:** `done`
 
 ### Цель
 
@@ -273,7 +367,6 @@ Qt notification coalescing (#5) остаётся до UI-этапа.
 - `docs/dev/architecture/decisions.md`
 - `docs/dev/modules/turret/index.md`
 - `docs/dev/diagrams/turret-diagram.mmd`
-- `problems.md` #9 и Turret-related часть #7/#10/#13
 
 ### Реализовать
 
@@ -298,7 +391,9 @@ Qt notification coalescing (#5) остаётся до UI-этапа.
   - StopMotion;
   - motor state;
   - config application;
-- reconnect/recovery state machine;
+- reconnect/recovery state machine с agreed baud-candidate order и capped interruptible backoff;
+- cooperative Turret worker lifecycle поверх Foundation `StopToken`;
+- Turret diagnostics/logging policy без high-rate INFO spam;
 - Turret simulator/fake endpoint для integration tests без STM32.
 
 ### Не делать
@@ -311,14 +406,32 @@ Qt notification coalescing (#5) остаётся до UI-этапа.
 - автоматический MOTOR_ON после recovery;
 - absolute position/soft limits, которых нет в hardware model.
 
-### Decision checkpoint до config/PID runtime-ветки
+### Закрытый decision checkpoint перед config/PID runtime-веткой
 
-До реализации runtime-применения PID config в Stage 3 управляющий чат должен закрыть Turret-часть `problems.md` #7:
+До начала Stage 3 управляющий чат зафиксировал Turret-семантику runtime PID config:
 
-- что происходит с текущим PID state при изменении `Kp/Ki/Kd` во время TRACKING;
-- что происходит с I-term при уменьшении application-side PID output limit.
+- изменение `Kp/Ki/Kd` конкретной оси в TRACKING полностью reset'ит PID state только этой оси перед обработкой следующего нового `TrackingError`;
+- первый sample этой оси после reset использует новые gains и остаётся P-only: `I=0`, `D=0`;
+- если gains меняются вне TRACKING, отдельный runtime reset не нужен: при следующем входе в TRACKING срабатывает уже существующий reset boundary;
+- уменьшение application-side output limit (`max-speed-*-deg-s`) не reset'ит PID целиком, но немедленно clamp'ит сохранённый I-term соответствующей оси в новый диапазон `±max_speed`;
+- увеличение output limit сохраняет текущий I-term без искусственного масштабирования;
+- если в одном config revision меняются и gains, и output limit одной оси, gain-change reset имеет приоритет, поэтому новый I-term начинается с zero уже под новым limit;
+- config change сам по себе не создаёт motion command, не меняет `control_mode` и не вводит внешний `PID_RESET` contract.
 
-Рабочий чат не должен выбирать эти observable control semantics самостоятельно. Processor-specific часть #7 остаётся Stage 5, а `target-lost-timeout-ms` — checkpoint Stage 6.
+Processor-specific runtime policy для Vision закрыта decision checkpoint перед Stage 5: внутренний tuning не входит в `config.json` v1. `target-lost-timeout-ms` остаётся checkpoint Stage 6.
+
+### Закрытый decision checkpoint перед transport/recovery веткой
+
+До начала Stage 3 управляющий чат также зафиксировал Turret transport/lifecycle/logging semantics:
+
+- auto-reconnect запускается после retry exhaustion, physical serial I/O/disconnect failure, exhausted Emergency retries или неуспешного bounded baud recovery;
+- matching command-level result сам по себе не означает transport loss; `INVALID_REQUEST_ID` требует Emergency-based resync;
+- обычный baud search: `last-known → desired → 9600`, без дубликатов; uncertain `SET_BAUDRATE`: `new → old → 9600`, без дубликатов;
+- reconnect attempts не имеют конечного лимита; backoff `0.25 → 0.5 → 1 → 2 → 2 ... s`, reset после `READY`;
+- отсутствие STM32/device не является fatal `ERROR`, пока automatic reconnect может продолжаться;
+- Turret worker создаёт/останавливает application orchestration, serial waits bounded/cancellable, backoff interruptible через `StopToken`, shutdown использует bounded join;
+- numeric join timeout — implementation tuning, не config field; незавершившийся worker является явной shutdown error;
+- Turret использует обычный Python logging; INFO — lifecycle/connection/recovery/baud/failures, high-rate PID/setpoint traffic на INFO не идёт; `QueueHandler/QueueListener` не вводится без измеренной необходимости.
 
 ### Тестовый фокус
 
@@ -334,23 +447,29 @@ Qt notification coalescing (#5) остаётся до UI-этапа.
 - recovery sequence;
 - mode transition zero handshake;
 - PID reset boundaries;
+- runtime gain change reset по оси и P-only first sample;
+- output-limit decrease clamp I-term без полного PID reset, increase сохраняет I-term;
 - HAL conversion/inversion;
 - dynamic STM32 config snapshot semantics на PC-side;
 - `MOTOR_OFF` invalidates unsent `pending_motion`;
 - `MOTOR_ON` не replay'ит старый motion intent;
 - StopMotion invalidates несовместимый unsent pending intent;
 - wire conversion/encoding явно отклоняет значения вне encodable `int32`/`uint32` range;
-- `SET_BAUDRATE` success/lost-response/old-new uncertainty/recovery на fake transport.
+- `SET_BAUDRATE` success/lost-response/old-new uncertainty/recovery на fake transport;
+- ordinary reconnect baud candidates `last-known → desired → 9600` с deduplication;
+- uncertain baud candidates `new → old → 9600` с deduplication;
+- reconnect backoff progression/cap/reset и отсутствие finite attempt limit;
+- `request_stop()` прерывает reconnect/backoff и worker завершается через bounded join;
+- matching command-level errors не ошибочно классифицируются как physical transport loss, а `INVALID_REQUEST_ID` ведёт в Emergency resync;
+- lifecycle/recovery logging не требует generic event bus и не пишет high-rate PID/setpoint traffic на INFO.
 
 Эти cases расширяют существующие protocol/state-machine matrices; отдельный test file для каждого case не требуется.
 
-### Открытые вопросы, которые должен закрыть этап
+### Открытые вопросы этапа
 
-- `problems.md` #9: reconnect/backoff policy;
-- Turret часть #10: worker wait/cancel lifecycle;
-- Turret часть #13: diagnostics/logging.
+Turret-specific архитектурные вопросы reconnect/backoff, worker lifecycle и logging закрыты до начала реализации. Stage 3 не должен заново выбирать эти semantics.
 
-Выбранные значения timeout/backoff, если они являются tuning parameters, должны оставаться config/tuning detail и не превращаться в новый architecture state.
+Точный numeric join timeout и другие чисто внутренние bounded timing constants можно выбрать как implementation tuning при условии сохранения зафиксированных cancellation/shutdown invariants; они не становятся новым architecture state или `config.json` field без отдельной причины.
 
 ### Критерий завершения
 
@@ -362,13 +481,15 @@ Qt notification coalescing (#5) остаётся до UI-этапа.
 
 ---
 
-## 9. Этап 4 — STM32 firmware + реальный RS485
+## 9. Этап 4 — STM32 firmware + UART
 
-**Статус:** `not-started`
+**Статус:** `done`
 
 ### Цель
 
-Реализовать firmware counterpart существующего protocol contract и проверить его на реальном полудуплексном RS485 без изменения PC-side semantics ради особенностей конкретного адаптера.
+Реализовать firmware counterpart существующего protocol contract на STM32F103C8T6. Первая реализация использует обычный full-duplex UART как development/integration physical transport. Binary protocol, request/response, retry, Emergency, request-sequence и baud semantics остаются окончательными и не зависят от будущего перехода на RS485.
+
+Production RS485 half-duplex переносится за пределы обязательной первой реализации и должен позднее заменить только physical byte transport, не создавая вторую версию протокола.
 
 ### Читать перед началом
 
@@ -376,7 +497,7 @@ Qt notification coalescing (#5) остаётся до UI-этапа.
 - `docs/dev/architecture/configuration.md`
 - `docs/dev/modules/turret/index.md`
 - `docs/dev/architecture/decisions.md`
-- `problems.md` #1
+- `problems.md` #1 — только как явно deferred RS485 hardware question; он не блокирует UART-first Stage 4
 
 ### Реализовать firmware
 
@@ -392,41 +513,52 @@ Qt notification coalescing (#5) остаётся до UI-этапа.
 - atomic full `SET_CONFIG` snapshot;
 - bounded firmware sanity limits;
 - runtime `SET_BAUDRATE` semantics;
-- half-duplex TX/RX direction control для выбранного hardware.
+- serial byte I/O boundary поверх USART3 full-duplex UART;
+- firmware target и pin mapping, зафиксированные в Turret module docs.
 
-### Hardware integration
+### UART integration boundary
 
-- PC↔adapter↔RS485↔STM32 framing;
-- reconnect после физического разрыва;
-- реальный `SET_BAUDRATE` и uncertain baud transition подтверждают уже реализованный Stage 3 PC-side path;
-- Emergency under active motion;
-- motor off/on;
-- bounded relative motion;
-- watchdog stop velocity mode.
+- production binary frames должны передаваться через обычный USART3 TX/RX без protocol fork;
+- firmware build и host-side tests не требуют физической STM32-платы;
+- реальный PC↔USB-UART↔STM32 smoke переносится в Stage 8 user-side hardware checkpoint;
+- будущий RS485 transport не должен менять framing, request IDs, retry, Emergency или command semantics.
+
+### Durable checkpoints
+
+- **4A — Firmware foundation:** project skeleton, byte parser/resynchronization/inter-byte timeout, CRC, request sequence, exact retry cache, command/result framing, Emergency resync.
+- **4B — Motor/control:** STEP generation, relative planner, velocity target + acceleration limiter, watchdog, motor state, atomic `SET_CONFIG`, firmware bounds.
+- **4C — UART integration:** USART3 byte transport, runtime `SET_BAUDRATE`, reproducible firmware build, host-side integration tests and final Stage 4 verification.
+
+RS485 migration не входит в 4A–4C и возвращается отдельным post-v1 hardware change.
 
 ### Открытые вопросы, которые должен закрыть этап
 
-- `problems.md` #1: конкретное управление полудуплексом/DE-RE/адаптером;
 - фактические firmware bounds из `serial-protocol.md`;
-- реальные timing limits транспорта, если они влияют на protocol tuning.
+- software timing limits parser/control loop, если они влияют на protocol tuning.
+
+`problems.md` #1 про RS485 half-duplex остаётся открытым, но намеренно deferred и не блокирует завершение UART-first Stage 4.
 
 ### Тестовый фокус
 
 Host-side protocol tests из этапа 3 не дублировать в firmware как копию тех же Python cases. Firmware tests должны защищать firmware parser/control implementation; hardware suite — реальный boundary и timing/fault modes.
 
+Ранее отложенный P2 из независимого аудита Stage 3 закрыт: `FakeStm32Endpoint` уже моделирует firmware-like `expected REQUEST_ID`, exact retry cache и Emergency-resync ordering; соответствующие protocol tests защищают этот simulator contract.
+
 ### Критерий завершения
 
 - PC simulator tests всё ещё проходят;
 - firmware build воспроизводим;
-- hardware smoke подтверждает key safety/recovery paths;
+- firmware parser/protocol/control имеют hardware-independent tests;
+- USART3 transport реализует тот же production protocol без отдельной UART-версии;
 - normal Python suite остаётся hardware-independent;
-- найденные hardware-specific корректировки не меняют архитектуру молча.
+- отсутствие физической STM32-платы не блокирует Stage 4 acceptance; реальный UART hardware smoke остаётся обязательным Stage 8 checkpoint;
+- RS485-specific код/DE-RE/turnaround не добавляются до отдельного решения.
 
 ---
 
 ## 10. Этап 5 — Vision
 
-**Статус:** `not-started`
+**Статус:** `in-progress` — prototype minimum accepted
 
 ### Цель
 
@@ -440,20 +572,24 @@ Host-side protocol tests из этапа 3 не дублировать в firmwa
 - `docs/dev/architecture/decisions.md`
 - `docs/dev/modules/vision/index.md`
 - `docs/dev/diagrams/vision-diagram.mmd`
-- `problems.md` #6, #8, Vision часть #10/#13
+- `problems.md` #8, Vision часть #10/#13
 
 ### Реализовать
 
-- camera registry по `CameraRole`;
+- camera pipelines по `CameraRole` без отдельного production `Camera Registry`;
 - по одному pipeline worker на роль;
-- generation lifecycle;
-- `CameraSessionStarted` до generation data;
+- в current accepted minimum каждый `VisionPipeline` владеет своей monotonic generation в пределах lifetime экземпляра, а `VisionPipeline.start()` публикует `CameraSessionStarted` до данных новой generation;
+- E2E-1 использует напрямую pipeline-owned `VisionPipeline.session_barriers`, `VisionPipeline.latest_result` и `VisionPipeline.status`;
 - `FramePacket` stamping;
 - receive timestamp/freshness;
 - Overview undistort → working frame;
 - Stereo Left/Right rectify → working frame;
 - immutable `CameraModel` binding к generation;
-- `VisionProcessor` interface;
+- `VisionProcessor` interface как единственную внешнюю boundary processing;
+- `Legacy14VisionProcessor` как default и `Legacy11VisionProcessor` как альтернативную baseline implementation;
+- чистый перенос detector-алгоритмов legacy Variant 1.4 / 1.1 без старой UI/application обвязки;
+- общий внутренний `SimpleTracker` для обоих processors: 2-hit confirmation, delete после 3 consecutive misses, 5 matched observations history, real-time robust median velocity, predicted-center/distance/size/IoU one-to-one association, без публикации predicted bbox и без полноценного reacquisition;
+- processor/tracker internal tuning через owner-local `settings.py` module constants, без processor-specific fields в `config.json`/UI v1;
 - per-camera processing config + processing scope;
 - `VisionResult` latest-only per camera;
 - camera reconnect/state transitions/backoff;
@@ -461,23 +597,37 @@ Host-side protocol tests из этапа 3 не дублировать в firmwa
 - manual `DistanceResult` source как полноценный v1 path;
 - camera/pipeline simulation suitable for tests and UI development.
 
+Для первого runnable vertical slice достаточно сначала реализовать `Legacy14VisionProcessor` (default) + общий `SimpleTracker` и working-frame path Overview/Stereo Left. `Legacy11VisionProcessor` остаётся обязательным для полного завершения Stage 5, но не блокирует первый end-to-end smoke.
+
+Этот current minimum не принимает окончательного решения об ownership при будущем camera reconnect или replacement экземпляра pipeline. До/в E2E-4 и полном Stage 5 reconnect work нужно сохранить monotonic generation semantics и выбрать одного production owner; отдельный registry или второй generation counter не являются требованием E2E-1.
+
 ### Отложить
 
 - полноценный `capture_id` pairing algorithm;
 - production stereo depth;
 - target handoff;
 - load adaptation;
-- future latest-live-frame optimization.
+- future latest-live-frame optimization;
+- VT11 vision backend implementation до post-tag `VT11-V2`; READ-ONLY `VT11-V1` audit уже завершён и не требует изменения текущего public Vision contract.
 
 Stereo Right pipeline должен существовать настолько, насколько это требуется rectification/session/diagnostics architecture, но отсутствие production stereo distance не блокирует v1.
 
+### Закрытый decision checkpoint перед Vision implementation
+
+До начала Stage 5 управляющий чат зафиксировал baseline processing semantics:
+
+- `VisionProcessor` остаётся единственной архитектурной processing boundary; detector/tracker decomposition является private implementation detail;
+- baseline processors: `Legacy14VisionProcessor` (default) и `Legacy11VisionProcessor`, оба используют один `SimpleTracker`;
+- legacy detector algorithms переносятся чисто, без legacy UI/application glue и без копирования legacy tracker как есть;
+- tracker публикует track после 2 confirmations, удаляет после 3 consecutive misses, использует history=5 matched observations и real-time robust median velocity; prediction используется только внутри association, predicted bbox без detection наружу не публикуется;
+- internal detector/tracker tuning хранится рядом с owner code в `settings.py` как module-level constants и не входит в `config.json`/UI v1;
+- VT11 остаётся отдельным future vision backend, а не detector для обязательного `SimpleTracker`; `VT11-V1` audit подтвердил feasibility адаптации к текущему `VisionResult / TrackedObject` contract с ограниченными внутренними изменениями backend.
+
 ### Открытые вопросы, которые должен закрыть этап
 
-- #6 processor-specific configuration;
 - #8 camera reconnect transitions/backoff;
 - Vision часть #10 worker lifecycle;
-- Vision часть #13 logging;
-- processor-specific часть `problems.md` #7: какие processor fields dynamic, а какие требуют pipeline restart/new generation.
+- Vision часть #13 logging.
 
 `problems.md` #2/#3 остаются deferred до полноценного stereo distance, если manual source достаточен для v1.
 
@@ -489,6 +639,10 @@ Stereo Right pipeline должен существовать настолько, 
 - corrected clean working frame contract без overlays;
 - reconnect state transitions;
 - processing scope;
+- both baseline processor classes produce the same public `TrackedObject` contract;
+- SimpleTracker confirmation/miss/ID non-reuse/real-time velocity/one-to-one association behavior;
+- no predicted `TrackedObject` publication on detector miss;
+- default processor selection is `Legacy14VisionProcessor`;
 - manual distance target binding/invalidation where defined.
 
 Rejection stale/unaccepted generation проверяется на реальных consumer boundaries в Stage 6/7, а не искусственным consumer внутри Vision.
@@ -509,7 +663,7 @@ Rejection stale/unaccepted generation проверяется на реальны
 
 ## 11. Этап 6 — Core + Aiming
 
-**Статус:** `not-started`
+**Статус:** `in-progress` — prototype minimum accepted
 
 ### Цель
 
@@ -550,6 +704,8 @@ Rejection stale/unaccepted generation проверяется на реальны
 - tracking error;
 - lead computation согласно текущим contracts/config;
 - Core хранит/передаёт только актуальный target-bound `DistanceResult` по существующему контракту; Stage 6 не придумывает новое влияние distance на Aiming/ballistics.
+
+Для первого runnable vertical slice приоритетны только подтверждённый `RELATIVE` click-to-move и минимальный `TRACKING` path `selection → TrackingError → Turret`. Остальные loss/config/diagnostic edge cases закрываются до полного `done` Stage 6.
 
 ### Decision checkpoint до target-loss runtime-ветки
 
@@ -599,7 +755,7 @@ Rejection stale/unaccepted generation проверяется на реальны
 
 ## 12. Этап 7 — UI
 
-**Статус:** `not-started`
+**Статус:** `in-progress` — prototype minimum accepted
 
 ### Цель
 
@@ -613,33 +769,41 @@ Rejection stale/unaccepted generation проверяется на реальны
 - `docs/dev/architecture/configuration.md`
 - `docs/dev/architecture/decisions.md`
 - `docs/dev/diagrams/ui-diagram.mmd`
-- `problems.md` #5, #11, #19–#21
+- `problems.md` #11, #22
 
 ### Реализовать
 
-- main window / main + preview;
-- explicit swap;
-- selection/click только main view согласно mode;
-- overlays как presentation layer;
+Для первого runnable vertical slice:
+
+- приложение стартует fullscreen;
+- Overview / Stereo Left отображаются как large main + небольшой preview в правом нижнем углу области видео; preview не перекрывает нижнюю operational bar;
+- click по preview и отдельный кликабельный swap-icon в preview выполняют explicit swap;
+- нижняя operational bar имеет fixed-size controls и не меняет геометрию из-за текста/состояния;
+- нижняя bar содержит `RELATIVE / TRACKING`, кликабельный confirmed motor state, connection state и крупный `EMERGENCY` в правом нижнем углу; dedicated ordinary Stop button в первом prototype отсутствует;
+- в TRACKING левый click по bbox выбирает target, empty click выполняет deselect; при overlapping bbox выбирается содержащий click bbox с ближайшим центром; nearest-object helper вне bbox не используется;
+- в RELATIVE левый click по main working frame означает click-to-move; preview click не выполняет selection/click-to-move;
+- baseline overlay показывает bbox всех текущих объектов и явно выделяет selected target, без постоянных ID/distance/velocity/age labels;
+- camera/turret status presentation достаточна для запуска prototype.
+
+До полного завершения Stage 7 также реализовать:
+
 - stale/error overlay с сохранением последнего кадра;
-- controls для mode, Stop, Emergency, motors;
+- top menu bar для recording/view/diagnostics/settings;
+- clean recording implementation + controls в main-thread/UI-side path: только accepted через `CameraSessionGate` `FramePacket.image`, без overlays; при активной записи в левом верхнем углу main view мигает красный круг и постоянно отображается белая надпись `Запись`;
 - settings UI поверх Config Manager, без прямой записи module internals;
-- camera/turret status presentation;
-- clean recording implementation + controls в main-thread/UI-side path: только accepted через `CameraSessionGate` `FramePacket.image`, без overlays;
+- Stereo Right открывается только из Diagnostics как отдельный diagnostic view и не участвует в main/preview swap;
 - recording lifecycle/file I/O остаются вне Vision worker;
 - Qt notification bridge/coalescing для latest-state;
 - ordered handling `CameraSessionStarted` отдельно от coalesced latest payloads;
 - partial-failure UX для доступных v1 сценариев.
 
+Motor control выполняется одним click без confirmation dialog. Текст/индикатор motor control отражает подтверждённый `TurretState.motor_state`, а не optimistic UI state.
+
 ### Открытые вопросы, которые должен закрыть этап
 
-- #5 Qt notification coalescing;
-- UI часть #11 partial failures;
-- #19 selection/deselect gestures;
-- #20 overlay content;
-- минимальный v1 scope #21 Stereo Right diagnostics.
+- UI часть #11 partial failures.
 
-Если решение этих пунктов меняет user-visible architecture contract, вернуть вопрос в управляющий чат; чистое presentation решение можно принять внутри этапа.
+Future latest-live-frame mode (#22) остаётся deferred. Gesture/overlay/Stereo Right baseline UX уже закрыт управляющим чатом и не должен проектироваться заново внутри Stage 7.
 
 ### Тестовый фокус
 
@@ -682,7 +846,10 @@ Rejection stale/unaccepted generation проверяется на реальны
 
 ### Реализовать/проверить
 
-- application composition root;
+- один shared application composition root для normal и diagnostic launchers;
+- normal launcher использует только real RTP cameras + real STM32 через production `SerialTransport` и не имеет silent fake fallback;
+- diagnostic launcher запускает то же приложение, но явно выбирает внешние backends: независимо для камер (`localhost RTP/JPEG` или real RTP) и для controller (`Linux PTY STM32 emulator` или real STM32); `InMemoryFrameSource`/`FakeTransport` остаются test-harness boundaries;
+- backend selection явный и воспроизводимый (primary interface — command-line arguments), без auto-detection, способного незаметно подменить real hardware;
 - startup order;
 - shutdown order;
 - prohibition of new motion during shutdown;
@@ -702,9 +869,20 @@ Rejection stale/unaccepted generation проверяется на реальны
   - resolution/calibration mismatch rejection;
   - basic real-stream frame latency/FPS measurement;
 - simulated end-to-end tracking/relative flows;
-- recording/logging/diagnostics sufficient for field debugging;
+- localhost RTP/JPEG smoke через production GStreamer receiver;
+- production `SerialTransport` smoke через Linux PTY и software STM32 protocol emulator до доступа к физическому controller;
+- normal runtime всегда сохраняет per-session INFO file log;
+- diagnostic runtime дополнительно сохраняет подробный DEBUG log, manifest/environment/preflight results и effective config/calibration inputs, достаточные для последующего offline разбора;
 - performance measurement of tracking pipeline;
-- reproducible run instructions/dependencies/packaging required by deployment target.
+- reproducible offline runbook/dependencies/packaging и rehearsal без доступа к интернету перед hardware day.
+
+Некоторые software-only prerequisites этого этапа уже выполнены заранее и не
+меняют формальный статус полного Stage 8: shared composition, normal/diagnostic
+launchers, localhost RTP/JPEG, PTY production-transport check, session artifacts,
+bounded logging, backend-aware static preflight, operator-facing offline hardware
+runbook и VIRTUAL latency observability. Offline rehearsal без доступа к интернету
+принята; текущий project checkpoint — documentation cleanup + root README sync перед
+merge в `main` и последующим global pre-hardware integration audit.
 
 ### Timing and tuning
 
@@ -736,7 +914,7 @@ Hardware tests остаются отдельным suite.
 
 - все этапы 1–7 приняты;
 - normal test suite green без hardware;
-- обязательные STM32/RS485 и Raspberry Pi/camera hardware smoke scenarios выполнены и результаты зафиксированы;
+- обязательные STM32/UART и Raspberry Pi/camera hardware smoke scenarios выполнены и результаты зафиксированы;
 - нет известных P0/P1 противоречий между реализацией и архитектурой;
 - открытые deferred вопросы явно остаются в `problems.md`, а не скрываются временным кодом;
 - приложение проходит startup/shutdown/recovery paths;
@@ -758,6 +936,7 @@ Hardware tests остаются отдельным suite.
 - future latest-live-frame UI path;
 - режим «Самая быстрая»;
 - automatic Vision load adaptation;
+- production RS485 half-duplex migration (transceiver, DE/RE или auto-direction, termination/biasing, isolation/reference и turnaround measurements);
 - generic STM32 hardware event queue до появления конкретного event use case;
 - автоматический config migration mechanism за пределами `schema-version = 1` до появления реальной schema v2.
 
@@ -767,27 +946,19 @@ Hardware tests остаются отдельным suite.
 
 | Вопрос | Этап |
 |---|---|
-| #1 RS485 half-duplex | 4 |
+| #1 RS485 half-duplex | deferred post-v1 / отдельная RS485 migration |
 | #2 capture_id / stereo pairing | deferred |
 | #3 DistanceResult stereo lifecycle | deferred / 5 только manual path |
-| #4 latest-state primitives | 1 |
-| #5 Qt coalescing | 7 |
-| #6 processor-specific config | 5 |
-| #7 runtime config edge cases | 2 только config infrastructure; 3 PID runtime checkpoint; 5 processor policy; 6 target-loss-timeout checkpoint |
+| #7 runtime config edge cases | 2 config infrastructure; processor-specific Vision part closed before 5; 6 target-loss-timeout checkpoint |
 | #8 camera reconnect | 5 |
-| #9 UART reconnect | 3, hardware validation 4 |
-| #10 worker lifecycle | 1 foundation + owner stages + 8 final |
+| #10 worker lifecycle | 1 foundation + Vision/integration stages + 8 final; Turret part closed before 3 |
 | #11 partial failures | 7 + 8 |
-| #12 missing config / migrations | 2: missing config + unsupported schema behavior; automatic v1→v2 migration deferred до появления v2 |
-| #13 logging | 1 foundation + owner stages + 8 final |
+| #13 logging | 1 foundation + UI/integration + 8 final; Turret part closed before 3 |
 | #14 future STM32 events | deferred |
 | #15 tracking timing budget | 8 после измерений |
 | #16 backlash | deferred |
 | #17 camera-to-turret extrinsic | deferred |
 | #18 target handoff | deferred |
-| #19 UI gestures | 7 |
-| #20 overlay content | 7 |
-| #21 Stereo Right diagnostics | 7 minimal / later expansion |
 | #22 latest-live-frame UI | deferred |
 | #23 D-filter / PID tuning | 8 tuning, D-filter deferred unless evidence |
 | #24 per-camera Aiming parameters | deferred |

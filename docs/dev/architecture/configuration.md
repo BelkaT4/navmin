@@ -28,7 +28,39 @@ write temporary file
 
 Повреждённый существующий JSON не должен молча перезаписываться defaults: Config Manager сообщает startup/config error и сохраняет исходный файл для диагностики.
 
-Поведение при полностью отсутствующем `config.json` допускается определить при реализации Config Manager (создание defaults либо явная startup error).
+Полностью отсутствующий `config.json` — startup/config error. Config Manager не создаёт файл автоматически и не запускает normal runtime на неявных defaults.
+
+### Строгая validation policy v1
+
+`config.json` schema v1 валидируется строго и атомарно до публикации typed snapshots.
+
+```text
+parse JSON
+→ schema-version check
+→ required/unknown-field check
+→ type/value validation
+→ cross-field validation
+→ typed immutable snapshot
+→ publish
+```
+
+Правила:
+
+- `schema-version` обязателен, имеет тип integer (не `bool`) и в v1 равен ровно `1`;
+- отсутствующий или неверного типа `schema-version` — invalid config;
+- любое другое значение `schema-version` — unsupported schema error;
+- автоматической migration для неизвестной schema нет; migration проектируется только после появления реальной schema v2;
+- неизвестное поле на любом уровне schema — validation error, а не warning/ignore;
+- все поля v1 обязательны, кроме тех, которые ниже явно отмечены optional;
+- отсутствующий required field — validation error;
+- optional field получает только документированный in-memory default; Config Manager не дописывает его в файл только из-за загрузки;
+- неверный тип, значение вне допустимой области, `NaN`, `+Inf` или `-Inf` — validation error;
+- `bool` не принимается как integer/number;
+- invalid config не исправляется молча и не заменяется defaults;
+- ошибка по возможности содержит точный path поля и причину;
+- при invalid runtime update остаётся активным последний полностью валидный snapshot; partial apply/publication запрещены.
+
+После того как schema v1 реализована и считается опубликованной, добавление/удаление/переименование persisted fields требует нового `schema-version`, если старый v1 parser не сможет строго принять новый файл.
 
 ## Calibration отдельно от `config.json`
 
@@ -40,9 +72,40 @@ calibration/
   stereo.json
 ```
 
-Calibration содержит measured camera/stereo geometry и собственный `schema_version`.
+Calibration содержит measured camera/stereo geometry и собственный `schema_version`. Для первой реализации `schema_version = 1`.
+
+Calibration files также валидируются строго: malformed JSON, неизвестное поле, неверный тип/shape, non-finite matrix value или несовпадение `image_width/image_height` с source resolution дают calibration error. Config Manager/Vision не исправляют и не перезаписывают calibration автоматически.
+
+Отсутствующая/невалидная calibration не обязана останавливать всё приложение, но соответствующий camera pipeline не считается ready и не публикует raw frame как fallback.
 
 `config.json` не дублирует `K/D/R/T/P/Q`.
+
+### Минимальная validation boundary calibration v1
+
+Overview `calibration/overview.json`:
+
+```text
+schema_version = 1
+image_width / image_height: integer > 0
+K: 3x3 finite matrix
+D: ровно 4 finite коэффициента OpenCV fisheye
+new_camera_matrix: 3x3 finite matrix
+```
+
+Stereo `calibration/stereo.json`:
+
+```text
+schema_version = 1
+image_width / image_height: integer > 0
+K_left / K_right: 3x3 finite matrices
+D_left / D_right: finite coefficient vectors, non-empty
+R / R1 / R2: 3x3 finite matrices
+T: finite vector length 3
+P1 / P2: 3x4 finite matrices
+Q: 4x4 finite matrix
+```
+
+Overview использует fisheye vector длины 4. Stereo `D_left/D_right` используют поддерживаемые OpenCV pinhole lengths `{4, 5, 8, 12, 14}`. Loader не должен молча truncate/pad coefficients. Maps в JSON не сохраняются.
 
 ## Структура верхнего уровня
 
@@ -54,6 +117,39 @@ config
 ├── turret
 └── ui
 ```
+
+## Required и optional fields schema v1
+
+Базовое правило v1: **все перечисленные ниже поля required**, если явно не указано обратное. Это сделано намеренно: hardware/control параметры не получают скрытых аппаратных defaults.
+
+Единственные optional fields базовой schema v1:
+
+```text
+aiming.aim-points.overview.x-px
+aiming.aim-points.overview.y-px
+aiming.aim-points.stereo-left.x-px
+aiming.aim-points.stereo-left.y-px
+```
+
+Для каждого из них отсутствие поля или JSON `null` означает center соответствующего working frame. Если значение задано, это integer `>= 0`; проверка попадания в фактическое разрешение выполняется относительно принятого `CameraModel`/working frame.
+
+Все остальные поля в описанной ниже v1-схеме, включая booleans simulation/emulation и camera processing switches, должны присутствовать явно.
+
+### Общие ограничения значений
+
+- `address`, serial `port` path и `vision-processor-class` — непустые строки;
+- UDP/TCP camera `port` — integer `1..65535`;
+- buffer sizes — integer `>= 1`;
+- timeout/delay fields — integer `> 0`, кроме `lead-time-ms >= 0` и `max-retries >= 0`;
+- `manual-distance-m` — finite number `> 0`;
+- PID `Kp/Ki/Kd` — finite number `>= 0`;
+- `full-steps-per-revolution`, `microstep-divider` — integer `> 0`;
+- `max-relative-move-deg`, max speed и acceleration — finite number `> 0`;
+- `baudrate` — только значение из зафиксированного whitelist;
+- enum-like strings принимают только явно перечисленные значения;
+- booleans принимают только JSON `true/false`.
+
+Hardware-specific upper bounds, которых пока нет в архитектуре, не придумываются Config Manager: их owner проверяет на своей границе (например STM32 проверяет свои допустимые пределы `SET_CONFIG`).
 
 ## Vision
 
@@ -75,9 +171,19 @@ address: str
 port: int
 rtp-enabled: bool
 buffer-size: int
-processing-enabled: bool          # optional per-camera master switch
+processing-enabled: bool          # per-camera master switch
 vision-processor-class: str
 ```
+
+Для production camera source v1 эти существующие поля имеют следующую operational semantics:
+
+- `address` — local bind/listen address PC receiver для `udpsrc`; portable default для обычного listen — `0.0.0.0`; это не Raspberry Pi source IP;
+- `port` — local UDP listen port на PC; role→port не hardcode'ится production source;
+- `rtp-enabled = true` обязателен для текущего RTP/JPEG source; non-RTP transport этим source не реализуется;
+- `buffer-size` — bounded `appsink max-buffers`; для low-latency prototype используется `1`; `drop=true` и `sync=false` не допускают накопления FIFO старых кадров;
+- `processing-enabled` и `vision-processor-class` сохраняют существующую processing semantics.
+
+Фактически подтверждённая v1 deployment mapping: Overview `8888`, Stereo Left `8889`, Stereo Right `8890`. Raspberry Pi IP относится к sender-side/service configuration и не используется PC receiver для correlation.
 
 `processing-enabled = false` полностью запрещает VisionProcessor для этой камеры, но pipeline продолжает публиковать corrected working frame через `VisionResult` с пустым `tracked_objects`.
 
@@ -102,7 +208,7 @@ AND
 
 `Stereo Right` не подчиняется main/preview selection и используется по diagnostic/stereo policy.
 
-Processor-specific settings остаются отдельным открытым вопросом.
+В v1 processor-specific tuning не входит в `config.json`: detector/tracker constants принадлежат реализации выбранного `VisionProcessor`, не persistятся Config Manager и не показываются UI. Публичным config contract остаётся выбор `vision-processor-class`. Если позднее конкретный processor parameter потребуется менять per-camera/runtime, он добавляется в schema только вместе с явной validation/apply policy.
 
 ### Distance
 
@@ -167,7 +273,7 @@ turret.serial.max-retries
 turret.serial.inter-request-delay-ms
 ```
 
-Стартовые protocol defaults:
+Рекомендованные начальные protocol values (поля остаются required в `config.json`):
 
 ```text
 STM32 startup baudrate               = 9600
@@ -179,6 +285,8 @@ inter-request-delay-ms               = 2
 `max-retries = 2` означает две повторные передачи после initial request, то есть максимум три attempts.
 
 `baudrate` в `config.json` — желаемая рабочая скорость ПК. STM32 после hardware reset всегда стартует на 9600 и при необходимости переключается через `SET_BAUDRATE`.
+
+Runtime update desired baud не выполняет hidden `MOTOR_OFF`: при confirmed motors OFF controlled transition может выполняться сразу; при motors ON/UNKNOWN worker сохраняет только freshest desired baud и применяет его после последующего confirmed `MOTOR_OFF` либо в safe recovery. Если затем запрошен `MOTOR_ON`, pending desired baud при confirmed OFF применяется первым.
 
 Поддерживаемый первый whitelist:
 
@@ -212,7 +320,7 @@ effective_steps_per_revolution =
 
 `max-relative-move-deg` проверяется на ПК до перевода degrees → steps.
 
-`invert`, `full-steps-per-revolution` и `microstep-divider` в v1 считаются restart-only: изменение сохраняется в config, но не меняет уже работающую mechanical conversion до Turret/application restart. Это исключает safe-point semantics посреди active motion.
+`invert`, `full-steps-per-revolution`, `microstep-divider` и `max-relative-move-deg` в v1 считаются restart-only: изменение сохраняется в config, но не меняет уже работающую mechanical conversion или relative-move safety envelope до Turret/application restart. Это исключает safe-point semantics посреди active motion.
 
 STM32 имеет отдельный compile-time/static sanity bound по `abs(delta_steps)` для защиты от аномального payload; он не является пользовательской настройкой и не дублирует `max-relative-move-deg`.
 
@@ -227,6 +335,18 @@ pid-kd
 ```
 
 I-term ограничивается `±max_speed` соответствующей оси. Отдельного `integral-limit` в прототипе нет.
+
+Runtime apply policy принадлежит Turret Controller и применяется по осям независимо:
+
+- изменение любого из `Kp/Ki/Kd` оси в TRACKING полностью сбрасывает PID state этой оси перед обработкой следующего нового `TrackingError`;
+- первый sample после такого reset использует новые gains и остаётся P-only: `I=0`, `D=0`;
+- изменение gains вне TRACKING не создаёт дополнительного действия: при следующем входе в TRACKING действует обычный reset boundary;
+- уменьшение соответствующего `max-speed-*-deg-s` не сбрасывает PID целиком, но сразу clamp'ит сохранённый I-term в новый диапазон `±max_speed`;
+- увеличение `max-speed-*-deg-s` сохраняет накопленный I-term без масштабирования;
+- если один config revision меняет и gains, и output limit одной оси, gain-change reset имеет приоритет, поэтому I-term становится zero уже под новым limit;
+- config update сам по себе не создаёт motion command и не меняет `control_mode`.
+
+Core/Config Manager не посылает отдельный `PID_RESET`: внутреннее PID state и его reset/apply semantics остаются ответственностью Turret Controller.
 
 ### STM32 config
 
@@ -275,6 +395,8 @@ velocity-watchdog-timeout-ms < aiming.target-lost-timeout-ms
 turret.emulate-stm32: bool
 ```
 
+В v1 `emulate-stm32` — application-restart setting: runtime сохранение допустимо, но уже работающий Turret worker не переключает real ↔ fake transport до application restart.
+
 ### Backlash
 
 Backlash compensation пока не входит в обязательную конфигурацию. Добавлять параметры следует только после механических измерений и отдельного решения о месте компенсации.
@@ -299,7 +421,7 @@ UI overlays не являются частью recorded working frame.
 
 | Настройка | Policy |
 |---|---|
-| PID `Kp/Ki/Kd` | dynamic |
+| PID `Kp/Ki/Kd` | dynamic; изменение gains reset'ит PID state только соответствующей оси перед следующим новым sample в TRACKING |
 | `lead-time-ms` | dynamic |
 | aim point | dynamic |
 | `target-lost-timeout-ms` | dynamic, точная семантика для уже потерянной цели уточняется при реализации |
@@ -309,16 +431,18 @@ UI overlays не являются частью recorded working frame.
 | camera source/address/port/GStreamer settings | camera pipeline restart / new generation |
 | calibration file/content | camera pipeline restart / new generation |
 | serial port | Turret reconnect |
-| desired serial baudrate | controlled `SET_BAUDRATE` / reconnect path |
-| max speed / acceleration / velocity watchdog | dynamic full STM32 `SET_CONFIG` snapshot |
-| `invert`, steps/rev, microstep | restart-only; применяются только после Turret/application restart, не dynamic |
+| `response-timeout-ms`, `max-retries`, `inter-request-delay-ms` | Turret reconnect; новая session использует freshest accepted values, active in-flight transaction не перенастраивается |
+| desired serial baudrate | controlled `SET_BAUDRATE` / reconnect path; при motors ON/UNKNOWN сохраняется latest desired baud и physical transition откладывается до confirmed motors OFF или recovery |
+| max speed / acceleration / velocity watchdog | dynamic full STM32 `SET_CONFIG` snapshot; уменьшение max speed также clamp'ит application-side PID I-term соответствующей оси без полного reset |
+| `invert`, steps/rev, microstep, `max-relative-move-deg` | restart-only; применяются только после Turret/application restart, не dynamic |
+| `emulate-stm32` | application restart; runtime real ↔ fake transport switching в v1 отсутствует |
 | UI-only display settings | dynamic |
 
-Processor-specific settings классифицируются вместе со схемой конкретного `VisionProcessor`.
+Processor-specific tuning в v1 не является частью config schema и поэтому не имеет runtime apply policy. Смена `vision-processor-class` остаётся restart/new-generation boundary.
 
 ## Пример `config.json`
 
-Все числа ниже демонстрационные и не являются аппаратными пределами.
+Все числа ниже демонстрационные и не являются аппаратными пределами. Пример показывает полную required schema v1; optional aim-point coordinates приведены как `null` для явности.
 
 ```json
 {
@@ -328,30 +452,30 @@ Processor-specific settings классифицируются вместе со �
     "cameras": {
       "overview": {
         "enabled": true,
-        "address": "192.168.1.101",
-        "port": 5001,
-        "rtp-enabled": false,
+        "address": "0.0.0.0",
+        "port": 8888,
+        "rtp-enabled": true,
         "buffer-size": 1,
         "processing-enabled": true,
-        "vision-processor-class": "DefaultVisionProcessor"
+        "vision-processor-class": "Legacy14VisionProcessor"
       },
       "stereo-left": {
         "enabled": true,
-        "address": "192.168.1.102",
-        "port": 5002,
-        "rtp-enabled": false,
+        "address": "0.0.0.0",
+        "port": 8889,
+        "rtp-enabled": true,
         "buffer-size": 1,
         "processing-enabled": true,
-        "vision-processor-class": "DefaultVisionProcessor"
+        "vision-processor-class": "Legacy14VisionProcessor"
       },
       "stereo-right": {
         "enabled": true,
-        "address": "192.168.1.103",
-        "port": 5003,
-        "rtp-enabled": false,
+        "address": "0.0.0.0",
+        "port": 8890,
+        "rtp-enabled": true,
         "buffer-size": 1,
         "processing-enabled": false,
-        "vision-processor-class": "DefaultVisionProcessor"
+        "vision-processor-class": "Legacy14VisionProcessor"
       }
     },
     "distance": {
@@ -436,4 +560,4 @@ UI
 
 STM32-dependent config синхронизируется Turret HAL по правилам [Turret](../modules/turret/index.md) и [Serial Protocol](./serial-protocol.md).
 
-Concrete thread-safe primitive, processor-specific schemas и часть edge-case semantics runtime changes остаются открытыми.
+Concrete foundation primitives уже реализованы. Внутренний tuning `VisionProcessor` в v1 не является config schema; остальные runtime edge cases из `problems.md` остаются owner-specific/open. Базовая persistence/validation policy schema v1 закрыта.
