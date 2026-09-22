@@ -50,6 +50,44 @@ appsink emit-signals=true max-buffers=<CameraConfig.buffer-size> drop=true sync=
 
 Appsink callback выполняется GStreamer streaming thread; process-global `GLib.MainLoop` для source не требуется. Один application `CameraWorker` на camera соединяет source с существующим `VisionPipeline.submit_decoded_frame() → process_latest()`, использует cooperative stop и bounded join. Reconnect/backoff policy в этом checkpoint не вводится.
 
+### Localhost RTP/JPEG diagnostic boundary
+
+`tools/run_localhost_rtp_diagnostic.py` поднимает diagnostics-only внешние
+GStreamer senders для Overview и Stereo Left:
+
+```text
+videotestsrc is-live=true
+→ raw video caps 320x240 @ 20 FPS
+→ videoconvert
+→ jpegenc
+→ rtpjpegpay payload=26
+→ udpsink 127.0.0.1:8888/8889
+→ существующий production GStreamerRtpJpegSource
+→ CameraWorker
+→ VisionPipeline
+```
+
+Sender ownership и preflight реализованы в `navmin.diagnostics.localhost_rtp`,
+чтобы будущий diagnostic launcher мог переиспользовать boundary без импорта из
+`tools/`. Это не второй receiver и не альтернативный camera source: UDP/RTP/JPEG
+всегда принимает существующий production `GStreamerRtpJpegSource`, а correction
+выполняется существующим `VisionPipeline` через tool-local exact-size fisheye и
+stereo calibration.
+
+Diagnostic runner проверяет оба startup ordering, одновременный progress двух
+потоков, silence/resume одного UDP sender на том же работающем receiver,
+отклонение wrong-resolution кадра без raw fallback и bounded cleanup. Он не
+является общей application composition, не запускает UI/Turret и не заменяет
+быстрые `InMemoryFrameSource` tests. Silence/resume сохраняет текущую generation,
+но не закрывает production camera reconnect/backoff: source recreation, hard
+GStreamer ERROR/EOS recovery и ownership новой generation остаются вопросом #8.
+
+Ручной transport check запускается одной командой из project root:
+
+```bash
+python tools/run_localhost_rtp_diagnostic.py --duration-seconds 30
+```
+
 ## Working frame
 
 Публичный `FramePacket.image` всегда содержит кадр с исправленной геометрией.
