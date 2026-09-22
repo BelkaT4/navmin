@@ -635,6 +635,17 @@ Per-frame queued Qt signals не используются.
 
 NavMin не получает две независимые реализации приложения для production и diagnostics. Оба launcher используют один shared application composition и те же production UI, Core/Aiming, Vision и Turret components.
 
+Shared composition реализована как one-shot `ApplicationRuntime`, создаваемый из
+уже загруженных typed config/calibration objects. Она строит Overview и Stereo
+Left через production `build_camera_worker(...)`, один `TurretWorker`, один
+`Mediator` и готовые UI bindings, а также владеет deterministic start,
+partial-start rollback и aggregate bounded shutdown. Перед остановкой workers
+shared runtime при READY/ON выполняет safety boundary `STOP_MOTION → MOTOR_OFF`
+и bounded ждёт подтверждённый `MotorState.OFF`; при уже недоступном Turret cleanup
+остаётся bounded. `SoftwareSmokeRuntime`
+делегирует ей эту общую wiring/lifecycle ответственность и владеет только
+synthetic external producers/sources.
+
 Normal launcher предназначен только для реального железа:
 
 ```text
@@ -645,7 +656,17 @@ production SerialTransport → real STM32
 
 Он не выполняет silent fallback на synthetic cameras, `FakeTransport` или software STM32 emulator.
 
-Diagnostic launcher запускает то же приложение, но разрешает явно выбирать внешние boundaries. Camera source выбирается независимо для каждой роли, чтобы можно было смешивать real RTP и localhost RTP/JPEG synthetic sender при локализации hardware problems. Controller backend выбирается между production `SerialTransport` к Linux PTY software STM32 emulator и real STM32.
+Diagnostic launcher запускает то же приложение, но разрешает явно выбирать
+внешние endpoints. Для каждой camera role он выбирает real Raspberry Pi RTP
+sender или localhost RTP/JPEG sender и передаёт соответствующую effective
+listen-конфигурацию; receiver внутри composition в обоих случаях остаётся
+`GStreamerRtpJpegSource`. Для controller он выбирает реальный serial device или
+stable PTY path; physical transport внутри composition в обоих случаях остаётся
+production `SerialTransport`.
+
+Localhost senders, PTY emulator, `QApplication`, file/CLI loading и diagnostic
+session artifacts не принадлежат `ApplicationRuntime` и управляются launcher на
+внешней стороне shared composition.
 
 `InMemoryFrameSource` и `FakeTransport/FakeStm32Endpoint` остаются deterministic automated-test boundaries и не становятся пользовательскими diagnostic runtime modes. Localhost RTP/JPEG нужен именно для проверки production GStreamer receiver без Raspberry Pi, а Linux PTY — для проверки production `SerialTransport`/pyserial byte path без физического controller.
 
@@ -666,6 +687,9 @@ Localhost RTP и PTY закрывают два крупных PC-side риска
 ### Отвергнутые альтернативы
 
 - **Две отдельные application compositions: production и diagnostics.** Отклонено из-за риска semantic drift и двойного integration surface.
+- **Импортировать localhost/PTY diagnostics внутрь shared composition.**
+  Отклонено: diagnostics меняют внешний endpoint, а не production receiver или
+  serial transport implementation.
 - **Заменить быстрые InMemory/FakeTransport tests на localhost RTP/PTY.** Отклонено: transport layers добавляют timing/system dependencies и ухудшают детерминированность обычного suite.
 - **Использовать InMemory synthetic как пользовательский diagnostic camera mode.** Отклонено: для diagnostic launcher полезнее localhost RTP/JPEG, который дополнительно проверяет production GStreamer boundary; InMemory остаётся test harness.
 - **Автоматически выбирать fake/real backend по доступности devices/ports.** Отклонено как неоднозначное и потенциально опасное поведение.

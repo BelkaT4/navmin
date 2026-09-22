@@ -10,31 +10,37 @@ from time import monotonic
 import cv2
 import numpy as np
 
+from navmin.application import (
+    ApplicationFactories,
+    ApplicationRuntime,
+    ApplicationShutdownError,
+    build_application_runtime,
+)
 from navmin.calibration import OverviewCalibration, StereoCalibration
 from navmin.config.models import (
     AimingConfig,
     AimPointConfig,
     AimPointsConfig,
+    AppConfig,
     AxesConfig,
     AxisMechanicsConfig,
+    CameraConfig,
+    CamerasConfig,
     PidControllerConfig,
+    ProcessingScope,
     SerialConfig,
+    StereoDistanceConfig,
     Stm32Config,
     TurretConfig,
     UiConfig,
+    VisionConfig,
+    VisionDistanceConfig,
 )
-from navmin.contracts import CameraRole
-from navmin.core import Mediator
+from navmin.contracts import CameraRole, DistanceSource
 from navmin.lifecycle import StopToken
 from navmin.logging_setup import configure_logging
-from navmin.turret.worker import TransportFactory, TurretWorker, WorkerShutdownError
-from navmin.vision.camera_worker import CameraWorker
-from navmin.vision.pipeline import (
-    InMemoryFrameSource,
-    VisionPipeline,
-    overview_corrector,
-    stereo_left_corrector,
-)
+from navmin.turret.worker import TransportFactory
+from navmin.vision.pipeline import InMemoryFrameSource
 
 LOGGER = logging.getLogger("navmin.software_smoke")
 
@@ -294,8 +300,49 @@ def _smoke_turret_config() -> TurretConfig:
     )
 
 
+def _smoke_camera_config(port: int, *, processing_enabled: bool) -> CameraConfig:
+    return CameraConfig(
+        enabled=True,
+        address="127.0.0.1",
+        port=port,
+        rtp_enabled=True,
+        buffer_size=1,
+        processing_enabled=processing_enabled,
+        vision_processor_class="Legacy14VisionProcessor",
+    )
+
+
+def _smoke_app_config() -> AppConfig:
+    return AppConfig(
+        schema_version=1,
+        vision=VisionConfig(
+            processing_scope=ProcessingScope.MAIN_AND_PREVIEW,
+            cameras=CamerasConfig(
+                overview=_smoke_camera_config(8888, processing_enabled=True),
+                stereo_left=_smoke_camera_config(8889, processing_enabled=True),
+                stereo_right=_smoke_camera_config(8890, processing_enabled=False),
+            ),
+            distance=VisionDistanceConfig(
+                source=DistanceSource.MANUAL,
+                manual_distance_m=100.0,
+                distance_stale_timeout_ms=300,
+                stereo=StereoDistanceConfig(
+                    stereo_enabled=False,
+                    right_frame_buffer_size=4,
+                    pair_timeout_ms=100,
+                ),
+            ),
+            camera_stale_timeout_ms=500,
+            simulation_mode=True,
+        ),
+        aiming=_smoke_aiming_config(),
+        turret=_smoke_turret_config(),
+        ui=_smoke_ui_config(),
+    )
+
+
 class SoftwareSmokeRuntime:
-    """Smoke-only composition of existing production workers and boundaries."""
+    """Synthetic producers around the shared production application runtime."""
 
     def __init__(
         self,
@@ -305,26 +352,28 @@ class SoftwareSmokeRuntime:
         self.overview_source = InMemoryFrameSource()
         self.stereo_left_source = InMemoryFrameSource()
 
-        self.overview_pipeline = VisionPipeline(
-            camera=CameraRole.OVERVIEW,
-            corrector=overview_corrector(synthetic_overview_calibration()),
-            processing_enabled=True,
+        def overview_source_factory(_config: CameraConfig) -> InMemoryFrameSource:
+            return self.overview_source
+
+        def stereo_left_source_factory(_config: CameraConfig) -> InMemoryFrameSource:
+            return self.stereo_left_source
+
+        self.application: ApplicationRuntime = build_application_runtime(
+            config=_smoke_app_config(),
+            overview_calibration=synthetic_overview_calibration(),
+            stereo_calibration=synthetic_stereo_calibration(),
+            factories=ApplicationFactories(
+                overview_source_factory=overview_source_factory,
+                stereo_left_source_factory=stereo_left_source_factory,
+                turret_transport_factory=turret_transport_factory,
+            ),
         )
-        self.stereo_left_pipeline = VisionPipeline(
-            camera=CameraRole.STEREO_LEFT,
-            corrector=stereo_left_corrector(synthetic_stereo_calibration()),
-            processing_enabled=True,
-        )
-        self.overview_worker = CameraWorker(
-            source=self.overview_source,
-            pipeline=self.overview_pipeline,
-            idle_wait_s=0.005,
-        )
-        self.stereo_left_worker = CameraWorker(
-            source=self.stereo_left_source,
-            pipeline=self.stereo_left_pipeline,
-            idle_wait_s=0.005,
-        )
+        self.overview_worker = self.application.overview_worker
+        self.stereo_left_worker = self.application.stereo_left_worker
+        self.overview_pipeline = self.overview_worker.pipeline
+        self.stereo_left_pipeline = self.stereo_left_worker.pipeline
+        self.turret_worker = self.application.turret_worker
+        self.mediator = self.application.mediator
         self.overview_producer = SyntheticFrameProducer(
             camera=CameraRole.OVERVIEW,
             source=self.overview_source,
@@ -334,86 +383,53 @@ class SoftwareSmokeRuntime:
             source=self.stereo_left_source,
         )
 
-        self.turret_worker = TurretWorker(
-            _smoke_turret_config(),
-            transport_factory=turret_transport_factory,
-        )
-        self.mediator = Mediator(
-            aiming_config=_smoke_aiming_config(),
-            ui_config=_smoke_ui_config(),
-            turret=self.turret_worker,
-        )
-
-        self._started_camera_workers: list[CameraWorker] = []
         self._started_producers: list[SyntheticFrameProducer] = []
-        self._turret_started = False
+        self._start_attempted = False
         self._shutdown_complete = False
 
     def start(self) -> None:
-        """Start Turret, then camera workers, then synthetic hardware producers."""
-        if self._turret_started or self._started_camera_workers or self._started_producers:
+        """Start the shared runtime, then its synthetic external producers."""
+        if self._start_attempted:
             raise RuntimeError("software smoke runtime is one-shot")
+        self._start_attempted = True
 
-        self.turret_worker.start()
-        self._turret_started = True
-
-        for worker in (self.overview_worker, self.stereo_left_worker):
-            worker.start()
-            self._started_camera_workers.append(worker)
-
-        self._wait_for_camera_sessions(timeout=2.0)
-
-        for producer in (self.overview_producer, self.stereo_left_producer):
-            producer.start()
-            self._started_producers.append(producer)
+        try:
+            self.application.start()
+            self._wait_for_camera_sessions(timeout=2.0)
+            for producer in (self.overview_producer, self.stereo_left_producer):
+                producer.start()
+                self._started_producers.append(producer)
+        except RuntimeError as startup_error:
+            failures = self._stop_producers(timeout=2.0)
+            try:
+                self.application.shutdown(timeout=2.0)
+            except ApplicationShutdownError as error:
+                failures.append(f"ApplicationRuntime: {error}")
+            if failures:
+                startup_error.add_note(
+                    "software smoke rollback failures: " + "; ".join(failures)
+                )
+            raise
 
         LOGGER.info("Overview started")
         LOGGER.info("Stereo Left started")
 
     def camera_bindings(self):
-        """Build the real UI binding map lazily so non-UI smoke stays headless."""
-        from navmin.ui.bridge import CameraUiBinding
-
-        return {
-            CameraRole.OVERVIEW: CameraUiBinding(
-                camera=CameraRole.OVERVIEW,
-                session_barriers=self.overview_pipeline.session_barriers,
-                latest_result=self.overview_pipeline.latest_result,
-                status=self.overview_pipeline.status,
-            ),
-            CameraRole.STEREO_LEFT: CameraUiBinding(
-                camera=CameraRole.STEREO_LEFT,
-                session_barriers=self.stereo_left_pipeline.session_barriers,
-                latest_result=self.stereo_left_pipeline.latest_result,
-                status=self.stereo_left_pipeline.status,
-            ),
-        }
+        """Return the shared runtime's ready-to-use UI camera bindings."""
+        return self.application.camera_bindings
 
     def shutdown(self, timeout: float = 2.0) -> None:
         """Stop only started components in smoke ownership order, bounded."""
         if self._shutdown_complete:
             return
         LOGGER.info("software smoke shutdown starting")
-        failures: list[str] = []
+        failures = self._stop_producers(timeout)
+        try:
+            self.application.shutdown(timeout=timeout)
+        except ApplicationShutdownError as error:
+            failures.append(f"ApplicationRuntime: {error}")
 
-        for producer in reversed(self._started_producers):
-            if not producer.stop(timeout=timeout):
-                failures.append(f"{producer.camera.value} synthetic producer")
-        self._started_producers.clear()
-
-        for worker in reversed(self._started_camera_workers):
-            if not worker.stop(timeout=timeout):
-                failures.append(f"{worker.pipeline.camera.value} CameraWorker")
-        self._started_camera_workers.clear()
-
-        if self._turret_started:
-            try:
-                self.turret_worker.shutdown(timeout=timeout)
-            except WorkerShutdownError as exc:
-                failures.append(f"TurretWorker: {exc}")
-            self._turret_started = False
-
-        self._shutdown_complete = True
+        self._shutdown_complete = not failures
         LOGGER.info(
             "software smoke frames produced Overview=%d Stereo Left=%d",
             self.overview_producer.frames_produced,
@@ -422,6 +438,23 @@ class SoftwareSmokeRuntime:
         if failures:
             raise RuntimeError("software smoke shutdown failed: " + "; ".join(failures))
         LOGGER.info("software smoke shutdown complete")
+
+    def _stop_producers(self, timeout: float) -> list[str]:
+        failures: list[str] = []
+        remaining: list[SyntheticFrameProducer] = []
+        for producer in reversed(self._started_producers):
+            try:
+                stopped = producer.stop(timeout=timeout)
+            except RuntimeError as error:
+                failures.append(f"{producer.camera.value} synthetic producer: {error}")
+                remaining.append(producer)
+            else:
+                if stopped:
+                    continue
+                failures.append(f"{producer.camera.value} synthetic producer")
+                remaining.append(producer)
+        self._started_producers = list(reversed(remaining))
+        return failures
 
     def _wait_for_camera_sessions(self, timeout: float) -> None:
         deadline = monotonic() + timeout
@@ -465,16 +498,16 @@ def _run_qt_smoke(runtime: SoftwareSmokeRuntime, auto_close_seconds: float | Non
     application = QApplication.instance()
     if application is None:
         application = QApplication([])
-    bindings = runtime.camera_bindings()
+    ui = runtime.application.ui_dependencies
     if auto_close_seconds is not None:
         QTimer.singleShot(round(auto_close_seconds * 1000.0), application.quit)
 
     LOGGER.info("UI starting")
     return run_ui(
-        mediator=runtime.mediator,
-        camera_bindings=bindings,
-        turret_states=runtime.turret_worker.state_updates,
-        camera_stale_timeout_ms=500,
+        mediator=ui.mediator,
+        camera_bindings=ui.camera_bindings,
+        turret_states=ui.turret_states,
+        camera_stale_timeout_ms=ui.camera_stale_timeout_ms,
     )
 
 

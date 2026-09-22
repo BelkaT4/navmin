@@ -292,31 +292,88 @@ UI overlays рисуются только для отображения. Осн�
 
 Внутренние потоки Qt/GStreamer/OpenCV сюда не входят.
 
+## Shared application composition
+
+Production composition имеет один owner: `ApplicationRuntime`, создаваемый
+`build_application_runtime(...)` из уже загруженных typed `AppConfig`,
+`OverviewCalibration` и `StereoCalibration`. Загрузка файлов, разбор CLI и
+создание `QApplication` этой boundary не принадлежат.
+
+Текущий prototype runtime собирает ровно:
+
+```text
+Overview CameraWorker ─┐
+Stereo Left CameraWorker ─┼→ один Mediator / один CameraSessionGate
+TurretWorker ───────────┘
+```
+
+Оба camera worker создаются существующим `build_camera_worker(...)` с реальными
+corrector из переданных calibration. Production defaults используют
+`GStreamerRtpJpegSource`, а Turret создаётся через существующий
+`TurretWorker(config.turret)` и его production transport policy. Узкие factories
+для двух camera sources и physical Turret transport существуют только как
+explicit dependency-injection seams; silent fallback на InMemory/Fake отсутствует.
+
+Runtime сразу предоставляет полную UI dependency surface: один `Mediator`,
+bindings pipeline-owned barrier/result/status каналов Overview и Stereo Left,
+`TurretWorker.state_updates` и `camera-stale-timeout-ms`. `Stereo Right` в текущий
+normal UI/application flow не входит.
+
+Normal и diagnostic launchers должны передавать сюда effective typed inputs и
+вызывать одну и ту же composition. Localhost RTP senders и PTY STM32 emulator —
+внешние diagnostic endpoints и не принадлежат `ApplicationRuntime`; внутренними
+production boundaries остаются `GStreamerRtpJpegSource` и `SerialTransport`.
+`SoftwareSmokeRuntime` также делегирует общую worker/Mediator/lifecycle wiring
+`ApplicationRuntime`, но сохраняет ownership своих `InMemoryFrameSource` и
+synthetic producers.
+
 ## Startup / shutdown order
 
-Базовый startup order:
+После того как launcher загрузил/проверил inputs и построил runtime, deterministic
+startup order текущей composition:
 
 ```text
-1. Config Manager: load + validate initial config
-2. создать shared latest-state stores и CameraSessionGate
-3. создать Core и UI, подключить consumers session/data notifications
-4. запустить Turret worker
-5. запустить Vision workers
+1. TurretWorker
+2. Overview CameraWorker
+3. Stereo Left CameraWorker
 ```
 
-Критический invariant: ни один Vision worker не может опубликовать первый `CameraSessionStarted`, пока `CameraSessionGate` и все consumers этого barrier event ещё не готовы его принять.
+Критический invariant: до запуска Vision workers уже существуют единственный
+`CameraSessionGate` и pipeline-owned lossless barrier channels, связанные с
+готовыми UI bindings. `run_ui()` вызывается только после `runtime.start()` и
+сначала drain'ит накопленные barriers, поэтому данные generation не принимаются
+раньше соответствующего `CameraSessionStarted`.
 
-Базовый shutdown order:
+Успешный запуск потока не означает готовность hardware: camera ERROR после
+успешного `CameraWorker.start()` и Turret reconnecting остаются обычными worker
+states и не завершают весь runtime. Если синхронный `start()` очередного worker
+падает, runtime автоматически останавливает уже запущенные components в обратном
+порядке и повторно поднимает исходную startup exception.
+
+Bounded application shutdown сначала сохраняет safety boundary Turret:
 
 ```text
-1. запретить новые user motion actions
-2. штатно остановить motion при необходимости
-3. MOTOR_OFF
-4. остановить Vision / Turret workers
-5. сохранить config и завершить Core/UI
+если Turret READY и Motor ON:
+STOP_MOTION
+→ MOTOR_OFF
+→ дождаться подтверждённого MotorState.OFF в пределах shutdown timeout
 ```
 
-Общий `StopToken`, boundary `request_stop() / join()` и bounded stop для `CameraWorker`/`TurretWorker` уже определены. Открытыми остаются application-wide startup/shutdown orchestration, aggregate handling зависших workers и cleanup после partial startup.
+Если Turret уже недоступен, runtime не зависает на недостижимом подтверждении и
+переходит к bounded cleanup. После safety boundary owned workers останавливаются:
+
+```text
+1. Stereo Left CameraWorker
+2. Overview CameraWorker
+3. TurretWorker
+```
+
+Shutdown idempotent и безопасен после полного start, partial-start rollback и
+самостоятельного завершения worker. Ошибка остановки одного component не
+прерывает cleanup остальных; после всех попыток runtime сообщает aggregate
+failure. Timeout применяется к каждой из трёх bounded worker boundaries, поэтому
+общая верхняя граница также конечна. Runtime one-shot и не перезапускается;
+camera/Turret reconnect остаётся responsibility соответствующего worker.
 
 ## Межпотоковая семантика
 

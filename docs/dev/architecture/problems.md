@@ -80,20 +80,6 @@ Freshness вычисляется отдельно по timestamp.
 
 При каждом новом pipeline start создаётся новая `generation`; replacement не должен сбрасывать или дублировать monotonic sequence соответствующей camera role.
 
-### 10. Worker lifecycle
-
-Foundation уже определил общий cooperative `StopToken` и минимальную `request_stop() / join() / is_alive()` boundary. Turret-specific lifecycle закрыт: Turret worker создаёт/останавливает application orchestration, serial waits bounded/cancellable, reconnect backoff использует `StopToken`, join bounded, а незавершившийся worker считается явной shutdown error. Numeric join timeout остаётся implementation tuning, а не config field.
-
-Для будущих owner/integration stages остаётся определить только:
-
-- детали общего startup/shutdown orchestration нескольких workers и main-thread компонентов.
-
-Направление composition уже зафиксировано: normal и diagnostic launchers должны использовать один shared application composition, а diagnostic mode меняет только явно выбранные внешние camera/controller backends. Это не закрывает вопрос порядка startup/shutdown и partial-start cleanup до его реализации/проверки.
-
-Для текущего GStreamer RTP/JPEG source blocking read не используется: appsink callback публикует latest frame, worker делает cancellable idle wait, а source stop переводит Gst pipeline в NULL. Reconnect/backoff (#8) остаётся отдельным открытым вопросом.
-
-Reconnect/recovery принадлежит owner-модулям; отдельный orchestration component без concrete v1 responsibility не вводится.
-
 ### 11. Частичные отказы
 
 Нужно определить доступность функций/UI в сценариях:
