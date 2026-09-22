@@ -319,10 +319,30 @@ bindings pipeline-owned barrier/result/status каналов Overview и Stereo 
 `TurretWorker.state_updates` и `camera-stale-timeout-ms`. `Stereo Right` в текущий
 normal UI/application flow не входит.
 
-Normal и diagnostic launchers должны передавать сюда effective typed inputs и
-вызывать одну и ту же composition. Localhost RTP senders и PTY STM32 emulator —
-внешние diagnostic endpoints и не принадлежат `ApplicationRuntime`; внутренними
+Normal и diagnostic launchers передают сюда effective typed inputs и вызывают
+одну и ту же composition. Normal entrypoint — `python -m navmin` (или root
+`main.py`): он принимает пути к `config.json`, `calibration/overview.json` и
+`calibration/stereo.json`, использует только production RTP receivers и запрещает
+`turret.emulate-stm32=true`, чтобы normal запуск не мог молча перейти на
+`FakeTransport`.
+
+Diagnostic entrypoint — `python tools/run_diagnostic_app.py`. Он требует явного
+выбора `--overview real|localhost`, `--stereo-left real|localhost` и
+`--turret real|pty`. Localhost RTP senders и PTY STM32 emulator остаются внешними
+diagnostic endpoints и не принадлежат `ApplicationRuntime`; внутренними
 production boundaries остаются `GStreamerRtpJpegSource` и `SerialTransport`.
+Localhost sender использует resolution загруженной calibration соответствующей
+camera role, а PTY selection формирует effective Turret config со stable PTY path
+и `emulate-stm32=false`. Для полностью software-only сочетания
+`localhost + localhost + pty` diagnostic launcher также поддерживает явный
+`--synthetic-inputs`: launcher-owned 320×240 diagnostic config/calibrations
+создаются в памяти и не требуют локальных files. Этот режим запрещён для любых
+mixed/real endpoint selections; normal launcher и mixed/real diagnostics
+по-прежнему используют file-backed typed inputs.
+
+Оба launcher создают per-session file log под `logs/`: normal — INFO, diagnostic
+— DEBUG. Manifest/environment/preflight и копии effective inputs относятся к
+следующему offline-diagnostics checkpoint, а не к `ApplicationRuntime`.
 `SoftwareSmokeRuntime` также делегирует общую worker/Mediator/lifecycle wiring
 `ApplicationRuntime`, но сохраняет ownership своих `InMemoryFrameSource` и
 synthetic producers.

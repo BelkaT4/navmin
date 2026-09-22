@@ -214,6 +214,37 @@ def _wait_until(predicate, *, timeout: float = 2.0) -> None:
     raise AssertionError("condition did not become true")
 
 
+def test_production_runtime_initializes_gstreamer_before_starting_workers(
+    monkeypatch,
+) -> None:
+    runtime = build_application_runtime(
+        config=_config(),
+        overview_calibration=_overview_calibration(),
+        stereo_calibration=_stereo_calibration(),
+    )
+    events: list[str] = []
+
+    monkeypatch.setattr(
+        "navmin.application.initialize_gstreamer_runtime",
+        lambda: events.append("gstreamer"),
+    )
+    monkeypatch.setattr(runtime.turret_worker, "start", lambda: events.append("turret"))
+    monkeypatch.setattr(
+        runtime.overview_worker,
+        "start",
+        lambda: events.append("overview"),
+    )
+    monkeypatch.setattr(
+        runtime.stereo_left_worker,
+        "start",
+        lambda: events.append("stereo_left"),
+    )
+
+    runtime.start()
+
+    assert events == ["gstreamer", "turret", "overview", "stereo_left"]
+
+
 def test_default_construction_uses_only_production_transport_boundaries() -> None:
     factories = ApplicationFactories()
     runtime = build_application_runtime(

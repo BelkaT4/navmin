@@ -21,6 +21,9 @@ RTP_JPEG_CAPS = (
     "application/x-rtp,media=video,encoding-name=JPEG,payload=26,clock-rate=90000"
 )
 
+_GSTREAMER_RUNTIME_LOCK = Lock()
+_GSTREAMER_MODULES: list[tuple[object, object]] = []
+
 
 class CameraSourceError(RuntimeError):
     """Base error for the production decoded-frame source."""
@@ -32,6 +35,37 @@ class UnsupportedCameraTransportError(CameraSourceError):
 
 class GStreamerUnavailableError(CameraSourceError):
     """PyGObject/GStreamer runtime is unavailable or incomplete."""
+
+
+def _import_gstreamer_modules() -> tuple[object, object]:
+    try:
+        import gi
+
+        gi.require_version("Gst", "1.0")
+        gi.require_version("GstApp", "1.0")
+        from gi.repository import GLib, Gst, GstApp
+
+        Gst.init(None)
+        _ = GstApp.AppSink
+    except (AttributeError, ImportError, ValueError) as exc:
+        raise GStreamerUnavailableError(
+            "PyGObject with Gst 1.0 and GstApp 1.0 is required"
+        ) from exc
+    return GLib, Gst
+
+
+def _load_gstreamer_modules() -> tuple[object, object]:
+    with _GSTREAMER_RUNTIME_LOCK:
+        if _GSTREAMER_MODULES:
+            return _GSTREAMER_MODULES[0]
+        modules = _import_gstreamer_modules()
+        _GSTREAMER_MODULES.append(modules)
+        return modules
+
+
+def initialize_gstreamer_runtime() -> None:
+    """Initialize PyGObject/GStreamer once before camera worker threads start."""
+    _load_gstreamer_modules()
 
 
 class _SourceBackend(Protocol):
@@ -198,18 +232,7 @@ class _PyGObjectGstBackend:
         on_frame: Callable[[np.ndarray], None],
         on_failure: Callable[[BaseException], None],
     ) -> None:
-        try:
-            import gi
-
-            gi.require_version("Gst", "1.0")
-            gi.require_version("GstApp", "1.0")
-            from gi.repository import GLib, Gst
-        except (ImportError, ValueError) as exc:
-            raise GStreamerUnavailableError(
-                "PyGObject with Gst 1.0 and GstApp 1.0 is required"
-            ) from exc
-
-        Gst.init(None)
+        GLib, Gst = _load_gstreamer_modules()
         self._GLib = GLib
         self._Gst = Gst
         self._on_frame = on_frame
@@ -321,4 +344,5 @@ __all__ = [
     "GStreamerUnavailableError",
     "UnsupportedCameraTransportError",
     "build_rtp_jpeg_pipeline_description",
+    "initialize_gstreamer_runtime",
 ]

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import time
-from threading import Event
+from threading import Event, Thread
 
 import numpy as np
 import pytest
@@ -9,11 +9,13 @@ import pytest
 from navmin.calibration import OverviewCalibration
 from navmin.config.models import CameraConfig
 from navmin.contracts import CameraRole, CameraState
+from navmin.vision import gstreamer_source
 from navmin.vision.camera_worker import CameraWorker, build_camera_worker
 from navmin.vision.gstreamer_source import (
     GStreamerRtpJpegSource,
     UnsupportedCameraTransportError,
     build_rtp_jpeg_pipeline_description,
+    initialize_gstreamer_runtime,
 )
 from navmin.vision.pipeline import (
     InMemoryFrameSource,
@@ -82,6 +84,30 @@ class _BackendFactory:
         self.description = description
         self.backend = _FakeBackend(on_frame, on_failure)
         return self.backend
+
+
+def test_gstreamer_runtime_initialization_is_serialized_and_cached(monkeypatch) -> None:
+    calls: list[int] = []
+
+    def fake_import() -> tuple[object, object]:
+        calls.append(1)
+        time.sleep(0.02)
+        return object(), object()
+
+    monkeypatch.setattr(gstreamer_source, "_GSTREAMER_MODULES", [])
+    monkeypatch.setattr(gstreamer_source, "_import_gstreamer_modules", fake_import)
+
+    threads = [
+        Thread(target=initialize_gstreamer_runtime),
+        Thread(target=initialize_gstreamer_runtime),
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=1.0)
+
+    assert all(not thread.is_alive() for thread in threads)
+    assert len(calls) == 1
 
 
 def test_rtp_jpeg_pipeline_uses_camera_config_and_low_latency_appsink() -> None:

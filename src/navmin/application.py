@@ -22,7 +22,10 @@ from navmin.core import Mediator
 from navmin.turret.worker import TransportFactory, TurretWorker
 from navmin.ui.bridge import CameraUiBinding
 from navmin.vision.camera_worker import CameraWorker, SourceFactory, build_camera_worker
-from navmin.vision.gstreamer_source import GStreamerRtpJpegSource
+from navmin.vision.gstreamer_source import (
+    GStreamerRtpJpegSource,
+    initialize_gstreamer_runtime,
+)
 from navmin.vision.pipeline import overview_corrector, stereo_left_corrector
 
 LOGGER = logging.getLogger(__name__)
@@ -137,6 +140,8 @@ class ApplicationRuntime:
         self._start_attempted = True
 
         try:
+            if self._uses_production_gstreamer():
+                initialize_gstreamer_runtime()
             self.turret_worker.start()
             self._active_components.add(_TURRET_COMPONENT)
             self.overview_worker.start()
@@ -265,6 +270,12 @@ class ApplicationRuntime:
             else:
                 self._active_components.remove(component)
         return tuple(failures)
+
+    def _uses_production_gstreamer(self) -> bool:
+        return any(
+            isinstance(worker.source, GStreamerRtpJpegSource)
+            for worker in (self.overview_worker, self.stereo_left_worker)
+        )
 
     @staticmethod
     def _binding(worker: CameraWorker) -> CameraUiBinding:

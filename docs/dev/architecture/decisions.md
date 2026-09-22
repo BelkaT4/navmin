@@ -646,6 +646,11 @@ shared runtime при READY/ON выполняет safety boundary `STOP_MOTION �
 делегирует ей эту общую wiring/lifecycle ответственность и владеет только
 synthetic external producers/sources.
 
+Production GStreamer/PyGObject runtime инициализируется один раз до старта camera
+worker threads и дополнительно защищён process-local lock/cache в receiver backend.
+Это исключает concurrent first-import race между Overview и Stereo Left, не создавая
+отдельный camera backend.
+
 Normal launcher предназначен только для реального железа:
 
 ```text
@@ -670,7 +675,7 @@ session artifacts не принадлежат `ApplicationRuntime` и управ
 
 `InMemoryFrameSource` и `FakeTransport/FakeStm32Endpoint` остаются deterministic automated-test boundaries и не становятся пользовательскими diagnostic runtime modes. Localhost RTP/JPEG нужен именно для проверки production GStreamer receiver без Raspberry Pi, а Linux PTY — для проверки production `SerialTransport`/pyserial byte path без физического controller.
 
-Backend selection должен быть явным и воспроизводимым; primary interface — command-line arguments. Runtime не угадывает автоматически, какой fake/real backend использовать. Выбранные backends записываются в session diagnostics.
+Backend selection должен быть явным и воспроизводимым; primary interface — command-line arguments. Runtime не угадывает автоматически, какой fake/real backend использовать. Выбранные backends записываются в session diagnostics. Для полностью software-only сочетания `localhost + localhost + pty` launcher может дополнительно получить явный `--synthetic-inputs`: тогда только launcher создаёт встроенные typed 320×240 diagnostic config/calibrations в памяти. Это не fallback по отсутствию файлов и не меняет normal startup rule: mixed/real diagnostics и normal launcher остаются file-backed, а `--synthetic-inputs` с любым real endpoint отклоняется.
 
 Normal launcher всегда сохраняет per-session INFO log. Diagnostic launcher добавляет подробный DEBUG log и offline-support artifacts: manifest/environment/preflight results и effective config/calibration inputs. Точная session-directory/retention policy остаётся implementation detail до integration checkpoint.
 
