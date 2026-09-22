@@ -13,6 +13,10 @@ from typing import IO, Any, Self
 
 from navmin.calibration import OverviewCalibration, StereoCalibration
 from navmin.config.models import CameraConfig
+from navmin.vision.gstreamer_source import (
+    GStreamerUnavailableError,
+    initialize_gstreamer_runtime,
+)
 
 GST_RECEIVER_ELEMENTS = (
     "udpsrc",
@@ -23,6 +27,7 @@ GST_RECEIVER_ELEMENTS = (
 )
 GST_SENDER_ELEMENTS = (
     "videotestsrc",
+    "videoconvert",
     "jpegenc",
     "jpegparse",
     "rtpjpegpay",
@@ -142,50 +147,20 @@ class PreflightResult:
 
 def _check_python_gstreamer() -> str | None:
     try:
-        import gi
-
-        gi.require_version("Gst", "1.0")
-        gi.require_version("GstApp", "1.0")
-        from gi.repository import Gst, GstApp
-
-        Gst.init(None)
-        _ = GstApp.AppSink
-    except (ImportError, ValueError) as exc:
+        initialize_gstreamer_runtime()
+    except GStreamerUnavailableError as exc:
         return f"{type(exc).__name__}: {exc}"
     return None
 
 
-def check_gstreamer_runtime(
+def _check_gstreamer_elements(
+    elements: tuple[str, ...],
     *,
-    which: Callable[[str], str | None] = shutil.which,
-    runner: Callable[..., Any] = subprocess.run,
-    python_binding_check: Callable[[], str | None] = _check_python_gstreamer,
-) -> PreflightResult:
-    """Check executables, Python bindings, and every required Gst element."""
+    inspect: str | None,
+    runner: Callable[..., Any],
+) -> list[PreflightCheck]:
     checks: list[PreflightCheck] = []
-    executable_paths: dict[str, str | None] = {}
-    for executable in ("gst-launch-1.0", "gst-inspect-1.0"):
-        path = which(executable)
-        executable_paths[executable] = path
-        checks.append(
-            PreflightCheck(
-                name=executable,
-                ok=path is not None,
-                detail=path or "not found in PATH",
-            )
-        )
-
-    binding_error = python_binding_check()
-    checks.append(
-        PreflightCheck(
-            name="Python gi / Gst 1.0 / GstApp 1.0",
-            ok=binding_error is None,
-            detail="available" if binding_error is None else binding_error,
-        )
-    )
-
-    inspect = executable_paths["gst-inspect-1.0"]
-    for element in (*GST_RECEIVER_ELEMENTS, *GST_SENDER_ELEMENTS):
+    for element in elements:
         if inspect is None:
             checks.append(
                 PreflightCheck(
@@ -224,6 +199,73 @@ def check_gstreamer_runtime(
                 detail=detail,
             )
         )
+    return checks
+
+
+def check_gstreamer_sender_runtime(
+    *,
+    which: Callable[[str], str | None] = shutil.which,
+    runner: Callable[..., Any] = subprocess.run,
+) -> PreflightResult:
+    """Check only diagnostics sender executables/elements, not receiver bindings."""
+    checks: list[PreflightCheck] = []
+    executable_paths: dict[str, str | None] = {}
+    for executable in ("gst-launch-1.0", "gst-inspect-1.0"):
+        path = which(executable)
+        executable_paths[executable] = path
+        checks.append(
+            PreflightCheck(
+                name=executable,
+                ok=path is not None,
+                detail=path or "not found in PATH",
+            )
+        )
+    checks.extend(
+        _check_gstreamer_elements(
+            GST_SENDER_ELEMENTS,
+            inspect=executable_paths["gst-inspect-1.0"],
+            runner=runner,
+        )
+    )
+    return PreflightResult(tuple(checks))
+
+
+def check_gstreamer_runtime(
+    *,
+    which: Callable[[str], str | None] = shutil.which,
+    runner: Callable[..., Any] = subprocess.run,
+    python_binding_check: Callable[[], str | None] = _check_python_gstreamer,
+) -> PreflightResult:
+    """Check executables, Python bindings, and every required Gst element."""
+    checks: list[PreflightCheck] = []
+    executable_paths: dict[str, str | None] = {}
+    for executable in ("gst-launch-1.0", "gst-inspect-1.0"):
+        path = which(executable)
+        executable_paths[executable] = path
+        checks.append(
+            PreflightCheck(
+                name=executable,
+                ok=path is not None,
+                detail=path or "not found in PATH",
+            )
+        )
+
+    binding_error = python_binding_check()
+    checks.append(
+        PreflightCheck(
+            name="Python gi / Gst 1.0 / GstApp 1.0",
+            ok=binding_error is None,
+            detail="available" if binding_error is None else binding_error,
+        )
+    )
+
+    checks.extend(
+        _check_gstreamer_elements(
+            (*GST_RECEIVER_ELEMENTS, *GST_SENDER_ELEMENTS),
+            inspect=executable_paths["gst-inspect-1.0"],
+            runner=runner,
+        )
+    )
     return PreflightResult(tuple(checks))
 
 
@@ -428,6 +470,7 @@ __all__ = [
     "SenderProcessError",
     "build_sender_command",
     "check_gstreamer_runtime",
+    "check_gstreamer_sender_runtime",
     "diagnostic_camera_config",
     "diagnostic_overview_calibration",
     "diagnostic_stereo_calibration",

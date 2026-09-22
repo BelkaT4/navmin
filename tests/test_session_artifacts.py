@@ -15,6 +15,11 @@ from navmin.logging_setup import (
     SESSION_LOG_MAX_BYTES,
     session_file_logging,
 )
+from navmin.preflight import (
+    PreflightStatus,
+    StartupPreflightCheck,
+    StartupPreflightReport,
+)
 from navmin.session_artifacts import (
     SessionArtifacts,
     SessionStatus,
@@ -225,3 +230,55 @@ def test_file_backed_source_hashes_match_real_files(tmp_path) -> None:
         assert sources[key]["source"] == "file"
         assert sources[key]["path"] == str(path)
         assert sources[key]["sha256"] == hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def test_preflight_report_is_written_atomically_and_failure_status_is_supported(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    artifacts = _artifacts(tmp_path)
+    report = StartupPreflightReport(
+        (
+            StartupPreflightCheck(
+                "serial-device",
+                PreflightStatus.FAIL,
+                "/dev/ttyUSB0 does not exist",
+            ),
+        )
+    )
+    calls: list[tuple[Path, Path]] = []
+    real_replace = os.replace
+
+    def recording_replace(source, destination) -> None:
+        calls.append((Path(source), Path(destination)))
+        real_replace(source, destination)
+
+    monkeypatch.setattr(session_artifacts_module.os, "replace", recording_replace)
+    artifacts.write_preflight(report)
+    artifacts.finalize(status=SessionStatus.PREFLIGHT_FAILED, exit_code=2)
+
+    preflight = _read_json(artifacts.preflight_path)
+    assert preflight == {
+        "schema_version": 1,
+        "overall_status": "fail",
+        "checks": [
+            {
+                "name": "serial-device",
+                "status": "fail",
+                "detail": "/dev/ttyUSB0 does not exist",
+            }
+        ],
+    }
+    manifest = _read_json(artifacts.manifest_path)
+    assert manifest["status"] == "preflight-failed"
+    assert manifest["exit_code"] == 2
+    preflight_replaces = [
+        (source, destination)
+        for source, destination in calls
+        if destination == artifacts.preflight_path
+    ]
+    assert len(preflight_replaces) == 1
+    source, destination = preflight_replaces[0]
+    assert source.parent == artifacts.session_dir
+    assert destination == artifacts.preflight_path
+    assert not source.exists()

@@ -687,7 +687,23 @@ metadata и optional local Git commit/branch/dirty evidence; environment dump,
 credentials и filesystem inventory не собираются. Normal file log остаётся INFO,
 diagnostic — DEBUG; каждый log file ограничен 10 MiB и пятью backups. Старые
 session directories launcher автоматически не удаляет: cross-session retention
-manual. Backend-aware preflight остаётся следующим отдельным checkpoint.
+manual.
+
+До запуска runtime оба launcher выполняют typed backend-aware static preflight и
+атомарно сохраняют `preflight.json`. Production receiver capability проверяется
+через тот же process-local GStreamer initialization boundary, который использует
+`ApplicationRuntime`; real-camera profile не зависит от localhost sender tools.
+Localhost profile дополнительно требует `gst-launch-1.0`, `gst-inspect-1.0` и
+`GST_SENDER_ELEMENTS`. Real Turret проверяет pyserial и filesystem accessibility
+configured serial path без открытия устройства; PTY profile проверяет Linux/
+`os.openpty`/pyserial и игнорирует physical serial path. Planned camera UDP listen
+endpoints должны быть bindable и не совпадать друг с другом.
+
+Mandatory preflight `FAIL` запрещает создание external diagnostic endpoints и shared
+runtime; `WARN` разрешает startup. `--preflight-only` использует ту же boundary, но
+не создаёт `QApplication`, workers, localhost sender или PTY emulator. Static
+preflight сознательно не заменяет hardware smoke: он не ждёт camera packets, не
+проверяет Raspberry Pi reachability и не открывает STM32 protocol.
 
 ESP32-C3 HIL не является prerequisite первых реальных hardware tests. Если после hardware day понадобится отдельный physical serial/fault-injection stand, он может быть реализован как optional post-hardware tool без изменения application composition.
 
@@ -709,6 +725,8 @@ Localhost RTP и PTY закрывают два крупных PC-side риска
 - **Использовать InMemory synthetic как пользовательский diagnostic camera mode.** Отклонено: для diagnostic launcher полезнее localhost RTP/JPEG, который дополнительно проверяет production GStreamer boundary; InMemory остаётся test harness.
 - **Автоматически выбирать fake/real backend по доступности devices/ports.** Отклонено как неоднозначное и потенциально опасное поведение.
 - **Писать файлы логов только в diagnostic mode.** Отклонено: сбой обычного hardware запуска тоже должен оставлять session evidence.
+- **Делать static preflight внутри `ApplicationRuntime`.** Отклонено: capability checking зависит от launcher-selected external backend и должно завершиться до создания endpoints/workers/UI.
+- **Открывать real serial device или ждать RTP frames в static preflight.** Отклонено: это уже runtime/hardware smoke и может иметь side effects (включая DTR/RTS/reset).
 - **Сделать ESP32-C3 обязательным HIL gate до STM32.** Отклонено ради экономии времени; PTY закрывает PC-side serial semantics, а необходимость отдельного physical emulator оценивается после реальных tests.
 
 ---

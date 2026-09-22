@@ -44,6 +44,11 @@ from navmin.launcher import (
     run_loaded_application,
     session_file_logging,
 )
+from navmin.preflight import (
+    StartupBackendSelection,
+    format_preflight_summary,
+    run_startup_preflight,
+)
 from navmin.session_artifacts import (
     SessionArtifacts,
     SessionStatus,
@@ -267,6 +272,19 @@ def _replace_camera_endpoint(config: AppConfig, *, camera_name: str) -> AppConfi
     return replace(config, vision=replace(config.vision, cameras=updated_cameras))
 
 
+def _planned_preflight_inputs(
+    selection: DiagnosticSelection,
+    inputs: LoadedApplicationInputs,
+) -> LoadedApplicationInputs:
+    """Apply only pure endpoint overrides needed to preflight the planned profile."""
+    config = replace(inputs.config, turret=replace(inputs.config.turret, emulate_stm32=False))
+    if selection.overview is CameraEndpoint.LOCALHOST:
+        config = _replace_camera_endpoint(config, camera_name="overview")
+    if selection.stereo_left is CameraEndpoint.LOCALHOST:
+        config = _replace_camera_endpoint(config, camera_name="stereo_left")
+    return replace(inputs, config=config)
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="run_diagnostic_app.py",
@@ -291,6 +309,11 @@ def _parser() -> argparse.ArgumentParser:
         type=Path,
         default=Path("logs"),
         help="Parent directory for per-session NavMin artifact directories.",
+    )
+    parser.add_argument(
+        "--preflight-only",
+        action="store_true",
+        help="Run static startup preflight, write session evidence, and exit.",
     )
     parser.add_argument(
         "--synthetic-inputs",
@@ -388,6 +411,40 @@ def main(argv: Sequence[str] | None = None) -> int:
                 failure=exc,
             )
             return 2
+
+        try:
+            planned_inputs = _planned_preflight_inputs(selection, inputs)
+            report = run_startup_preflight(
+                planned_inputs,
+                selection=StartupBackendSelection(
+                    overview=selection.overview.value,
+                    stereo_left=selection.stereo_left.value,
+                    turret=selection.turret.value,
+                ),
+                session_dir=artifacts.session_dir,
+            )
+            artifacts.write_preflight(report)
+        except Exception as exc:
+            LOGGER.exception("NavMin diagnostic preflight implementation failed")
+            artifacts.finalize(
+                status=SessionStatus.RUNTIME_FAILED,
+                exit_code=2,
+                failure=exc,
+            )
+            return 2
+
+        summary = format_preflight_summary(report)
+        print(summary)
+        LOGGER.info("%s", summary.replace("\n", " | "))
+        if not report.ok:
+            artifacts.finalize(
+                status=SessionStatus.PREFLIGHT_FAILED,
+                exit_code=2,
+            )
+            return 2
+        if args.preflight_only:
+            artifacts.finalize(status=SessionStatus.COMPLETED, exit_code=0)
+            return 0
 
         endpoints: DiagnosticEndpoints | None = None
         primary_failure: BaseException | None = None

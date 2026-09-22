@@ -68,6 +68,15 @@ def initialize_gstreamer_runtime() -> None:
     _load_gstreamer_modules()
 
 
+def find_missing_gstreamer_elements(element_names: tuple[str, ...]) -> tuple[str, ...]:
+    """Return missing Gst element factories using the shared initialized runtime."""
+    _glib, gst = _load_gstreamer_modules()
+    element_factory = gst.ElementFactory
+    return tuple(
+        name for name in element_names if element_factory.find(name) is None
+    )
+
+
 class _SourceBackend(Protocol):
     def start(self) -> None: ...
 
@@ -344,5 +353,6 @@ __all__ = [
     "GStreamerUnavailableError",
     "UnsupportedCameraTransportError",
     "build_rtp_jpeg_pipeline_description",
+    "find_missing_gstreamer_elements",
     "initialize_gstreamer_runtime",
 ]

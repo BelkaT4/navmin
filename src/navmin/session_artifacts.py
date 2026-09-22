@@ -12,7 +12,10 @@ from dataclasses import asdict, dataclass
 from datetime import UTC, datetime, timedelta
 from enum import Enum, StrEnum
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from navmin.preflight import StartupPreflightReport
 
 from navmin.calibration import OverviewCalibration, StereoCalibration
 from navmin.config import AppConfig, config_to_mapping
@@ -29,6 +32,7 @@ class SessionStatus(StrEnum):
     CLEANUP_FAILED = "cleanup-failed"
     COMPLETED = "completed"
     INTERRUPTED = "interrupted"
+    PREFLIGHT_FAILED = "preflight-failed"
 
 
 @dataclass(frozen=True)
@@ -47,6 +51,7 @@ class SessionArtifacts:
     runtime_log_path: Path
     manifest_path: Path
     inputs_dir: Path
+    preflight_path: Path
     _manifest: dict[str, Any]
 
     @classmethod
@@ -74,6 +79,7 @@ class SessionArtifacts:
         inputs_dir.mkdir()
         runtime_log_path = session_dir / "runtime.log"
         manifest_path = session_dir / "manifest.json"
+        preflight_path = session_dir / "preflight.json"
 
         manifest: dict[str, Any] = {
             "schema_version": _MANIFEST_SCHEMA_VERSION,
@@ -106,6 +112,7 @@ class SessionArtifacts:
             runtime_log_path=runtime_log_path,
             manifest_path=manifest_path,
             inputs_dir=inputs_dir,
+            preflight_path=preflight_path,
             _manifest=manifest,
         )
         artifacts.write_manifest()
@@ -113,6 +120,10 @@ class SessionArtifacts:
 
     def write_manifest(self) -> None:
         _atomic_write_json(self.manifest_path, self._manifest)
+
+    def write_preflight(self, report: StartupPreflightReport) -> None:
+        """Persist one typed startup preflight report atomically."""
+        _atomic_write_json(self.preflight_path, report.to_mapping())
 
     def write_effective_inputs(
         self,

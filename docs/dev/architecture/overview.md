@@ -342,13 +342,19 @@ mixed/real endpoint selections; normal launcher и mixed/real diagnostics
 
 Оба launcher создают отдельный UTC-timestamped session directory под `logs/`
 (или под parent directory из `--log-dir`) до загрузки config/calibration. Session
-owner остаётся launcher-side и хранит bounded rotating `runtime.log`, `manifest.json`
-и `inputs/` с effective config/calibration и provenance/hash evidence. Normal file
+owner остаётся launcher-side и хранит bounded rotating `runtime.log`, `manifest.json`,
+`preflight.json` и `inputs/` с effective config/calibration и provenance/hash evidence. Normal file
 log имеет INFO level, diagnostic — DEBUG; console logging сохраняется. Один runtime
 log ограничен 10 MiB с пятью backup files, а старые session directories автоматически
 не удаляются: cross-session retention остаётся ручной ответственностью оператора.
-Preflight остаётся отдельным следующим checkpoint и не принадлежит
-`ApplicationRuntime`.
+Backend-aware static preflight также остаётся launcher-side и не принадлежит
+`ApplicationRuntime`. После typed input loading normal launcher проверяет real
+receiver + real serial prerequisites; diagnostic launcher проверяет именно выбранные
+`real|localhost` camera и `real|pty` Turret backends до запуска внешних endpoints.
+`FAIL` записывает `preflight.json`, завершает manifest как `preflight-failed` и не
+создаёт `ApplicationRuntime`, `QApplication`, camera/turret workers, localhost sender
+или PTY service. `WARN` startup не блокирует. `--preflight-only` выполняет ту же
+static boundary и завершает session без runtime-specific effective PTY path.
 `SoftwareSmokeRuntime` также делегирует общую worker/Mediator/lifecycle wiring
 `ApplicationRuntime`, но сохраняет ownership своих `InMemoryFrameSource` и
 synthetic producers.

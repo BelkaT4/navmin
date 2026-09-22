@@ -32,7 +32,9 @@ python -m navmin \
 ```
 
 Normal launcher не делает fallback на software STM32. Если в config установлен
-`turret.emulate-stm32=true`, запуск завершается с явной ошибкой.
+`turret.emulate-stm32=true`, запуск завершается с явной ошибкой. До создания
+`ApplicationRuntime` launcher выполняет backend-aware static preflight. Mandatory
+`FAIL` завершает запуск с code `2` до UI/workers; `WARN` запуск не блокирует.
 
 ## Diagnostic launcher
 
@@ -73,7 +75,9 @@ python tools/run_diagnostic_app.py \
 `localhost` запускает внешний synthetic RTP/JPEG sender, но receiver приложения
 остаётся production `GStreamerRtpJpegSource`. `pty` запускает внешний software
 STM32 endpoint через Linux PTY, но приложение продолжает использовать production
-`SerialTransport`/pyserial.
+`SerialTransport`/pyserial. Diagnostic preflight выполняется до запуска localhost
+sender и PTY service, поэтому failed preflight не оставляет внешние diagnostic
+endpoints.
 
 Оба режима создают отдельный session directory в `logs/` (или в parent directory,
 заданном через `--log-dir`):
@@ -83,6 +87,7 @@ logs/
 └── navmin-<mode>-YYYYMMDD-HHMMSS-ffffff/
     ├── runtime.log
     ├── manifest.json
+    ├── preflight.json
     └── inputs/
         ├── effective-config.json
         ├── overview-calibration.json
@@ -98,5 +103,23 @@ rotates при 10 MiB и хранит до пяти backup files; старые s
 операционные параметры, поэтому session directory не следует считать автоматически
 безопасным для публичной публикации.
 
-Backend-aware preflight и offline hardware runbook добавляются следующими отдельными
-checkpoint.
+Для проверки окружения без запуска UI/workers/endpoints оба launcher поддерживают:
+
+```bash
+python -m navmin --preflight-only
+
+python tools/run_diagnostic_app.py \
+  --overview localhost \
+  --stereo-left localhost \
+  --turret pty \
+  --synthetic-inputs \
+  --preflight-only
+```
+
+`--preflight-only` всё равно создаёт session directory, `runtime.log`,
+`manifest.json` и `preflight.json`. `PASS`/`WARN` возвращают `0`; `FAIL` возвращает
+`2` и manifest status `preflight-failed`. Static preflight проверяет только
+prerequisites выбранных backends: он не ждёт RTP packets, не ping'ует Raspberry Pi,
+не открывает real serial device и не делает STM32 protocol probe.
+
+Offline hardware runbook остаётся следующим отдельным checkpoint.

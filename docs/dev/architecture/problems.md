@@ -111,9 +111,13 @@ Turret-specific policy закрыта: в v1 остаётся обычный Pyt
 Logging остаётся diagnostics output, а typed runtime state по-прежнему не заменяется
 парсингом логов.
 
+Backend-aware startup preflight, `preflight.json`, `preflight-failed` и
+`--preflight-only` закрыты launcher-side: mandatory FAIL происходит до external
+endpoints/workers/UI, а static checks выбираются по real/localhost и real/PTY
+backend.
+
 Остаются следующие integration details:
 
-- backend-aware preflight и `preflight.json`;
 - offline export/runbook workflow поверх уже существующего session directory;
 - production level/config source beyond fixed normal-vs-diagnostic baseline;
 - как UI показывает последние важные ошибки без превращения logging в machine-readable state.

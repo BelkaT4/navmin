@@ -43,11 +43,29 @@ from navmin.launcher import (
     session_file_logging,
     validate_normal_hardware_config,
 )
+from navmin.preflight import (
+    PreflightStatus,
+    StartupPreflightCheck,
+    StartupPreflightReport,
+)
 
 WIDTH = 64
 HEIGHT = 48
 K = ((50.0, 0.0, 31.5), (0.0, 50.0, 23.5), (0.0, 0.0, 1.0))
 IDENTITY = ((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0))
+
+
+def _preflight_report(status: PreflightStatus = PreflightStatus.PASS) -> StartupPreflightReport:
+    return StartupPreflightReport(
+        (StartupPreflightCheck("test preflight", status, "deterministic test result"),)
+    )
+
+
+@pytest.fixture(autouse=True)
+def _deterministic_launcher_preflight(monkeypatch) -> None:
+    check = lambda *args, **kwargs: _preflight_report()
+    monkeypatch.setattr("navmin.__main__.run_startup_preflight", check)
+    monkeypatch.setattr("navmin.diagnostic_launcher.run_startup_preflight", check)
 
 
 def _camera(port: int) -> CameraConfig:
@@ -475,6 +493,7 @@ def test_normal_missing_config_keeps_input_failure_session_evidence(
     assert manifest["status"] == "input-failed"
     assert manifest["exit_code"] == 2
     assert not (session / "inputs" / "effective-config.json").exists()
+    assert not (session / "preflight.json").exists()
 
 
 def test_normal_runtime_failure_and_clean_run_finalize_manifest(
@@ -574,3 +593,332 @@ def test_diagnostic_cleanup_failure_preserves_primary_runtime_failure(
     assert manifest["status"] == "cleanup-failed"
     assert manifest["failure_message"] == "runtime-boom"
     assert manifest["cleanup_failure_message"] == "cleanup-boom"
+
+
+def test_normal_preflight_only_pass_skips_runtime_and_keeps_evidence(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    config_path, overview_path, stereo_path = _write_source_placeholders(tmp_path)
+    monkeypatch.setattr("navmin.__main__.load_application_inputs", lambda _paths: _inputs())
+    monkeypatch.setattr(
+        "navmin.__main__.run_loaded_application",
+        lambda _inputs: pytest.fail("runtime must not start in --preflight-only"),
+    )
+
+    log_dir = tmp_path / "logs"
+    assert normal_main(
+        [
+            "--config",
+            str(config_path),
+            "--overview-calibration",
+            str(overview_path),
+            "--stereo-calibration",
+            str(stereo_path),
+            "--preflight-only",
+            "--log-dir",
+            str(log_dir),
+        ]
+    ) == 0
+
+    session = _single_session(log_dir)
+    manifest = json.loads((session / "manifest.json").read_text(encoding="utf-8"))
+    preflight = json.loads((session / "preflight.json").read_text(encoding="utf-8"))
+    assert manifest["status"] == "completed"
+    assert manifest["exit_code"] == 0
+    assert preflight["overall_status"] == "pass"
+    assert (session / "runtime.log").is_file()
+    assert not (session / "inputs" / "effective-config.json").exists()
+
+
+def test_diagnostic_preflight_only_uses_planned_localhost_endpoints_without_starting(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    captured: list[LoadedApplicationInputs] = []
+
+    def preflight(inputs, **kwargs):
+        del kwargs
+        captured.append(inputs)
+        return _preflight_report()
+
+    class MustNotConstructEndpoints:
+        def __init__(self, **kwargs) -> None:
+            raise AssertionError(kwargs)
+
+    monkeypatch.setattr("navmin.diagnostic_launcher.run_startup_preflight", preflight)
+    monkeypatch.setattr(
+        "navmin.diagnostic_launcher.DiagnosticEndpoints",
+        MustNotConstructEndpoints,
+    )
+    monkeypatch.setattr(
+        "navmin.diagnostic_launcher.run_loaded_application",
+        lambda _inputs: pytest.fail("runtime must not start in --preflight-only"),
+    )
+
+    log_dir = tmp_path / "logs"
+    assert diagnostic_main(
+        [
+            "--overview",
+            "localhost",
+            "--stereo-left",
+            "localhost",
+            "--turret",
+            "pty",
+            "--synthetic-inputs",
+            "--preflight-only",
+            "--log-dir",
+            str(log_dir),
+        ]
+    ) == 0
+
+    assert len(captured) == 1
+    planned = captured[0]
+    assert planned.config.vision.cameras.overview.address == "127.0.0.1"
+    assert planned.config.vision.cameras.stereo_left.address == "127.0.0.1"
+    assert planned.config.turret.serial.port == "diagnostic-pty"
+
+    session = _single_session(log_dir)
+    manifest = json.loads((session / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["status"] == "completed"
+    assert (session / "preflight.json").is_file()
+    assert not (session / "inputs" / "effective-config.json").exists()
+
+
+@pytest.mark.parametrize("diagnostic", [False, True])
+def test_preflight_failure_blocks_endpoints_runtime_and_records_status(
+    monkeypatch,
+    tmp_path,
+    diagnostic,
+) -> None:
+    failed = _preflight_report(PreflightStatus.FAIL)
+    if diagnostic:
+        monkeypatch.setattr(
+            "navmin.diagnostic_launcher.run_startup_preflight",
+            lambda *args, **kwargs: failed,
+        )
+
+        class MustNotConstructEndpoints:
+            def __init__(self, **kwargs) -> None:
+                raise AssertionError(kwargs)
+
+        monkeypatch.setattr(
+            "navmin.diagnostic_launcher.DiagnosticEndpoints",
+            MustNotConstructEndpoints,
+        )
+        monkeypatch.setattr(
+            "navmin.diagnostic_launcher.run_loaded_application",
+            lambda _inputs: pytest.fail("runtime must not start after preflight FAIL"),
+        )
+        log_dir = tmp_path / "diagnostic-logs"
+        exit_code = diagnostic_main(
+            [
+                "--overview",
+                "localhost",
+                "--stereo-left",
+                "localhost",
+                "--turret",
+                "pty",
+                "--synthetic-inputs",
+                "--log-dir",
+                str(log_dir),
+            ]
+        )
+    else:
+        config_path, overview_path, stereo_path = _write_source_placeholders(tmp_path)
+        monkeypatch.setattr(
+            "navmin.__main__.load_application_inputs",
+            lambda _paths: _inputs(),
+        )
+        monkeypatch.setattr(
+            "navmin.__main__.run_startup_preflight",
+            lambda *args, **kwargs: failed,
+        )
+        monkeypatch.setattr(
+            "navmin.__main__.run_loaded_application",
+            lambda _inputs: pytest.fail("runtime must not start after preflight FAIL"),
+        )
+        log_dir = tmp_path / "normal-logs"
+        exit_code = normal_main(
+            [
+                "--config",
+                str(config_path),
+                "--overview-calibration",
+                str(overview_path),
+                "--stereo-calibration",
+                str(stereo_path),
+                "--log-dir",
+                str(log_dir),
+            ]
+        )
+
+    assert exit_code == 2
+    session = _single_session(log_dir)
+    manifest = json.loads((session / "manifest.json").read_text(encoding="utf-8"))
+    preflight = json.loads((session / "preflight.json").read_text(encoding="utf-8"))
+    assert manifest["status"] == "preflight-failed"
+    assert manifest["exit_code"] == 2
+    assert preflight["overall_status"] == "fail"
+    assert (session / "runtime.log").is_file()
+    assert not (session / "inputs" / "effective-config.json").exists()
+
+
+def test_diagnostic_full_launch_orders_preflight_before_endpoints_and_runtime(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    events: list[str] = []
+
+    def preflight(inputs, **kwargs):
+        del inputs, kwargs
+        events.append("preflight")
+        return _preflight_report()
+
+    class FakeEndpoints:
+        def __init__(self, *, selection, inputs) -> None:
+            del selection
+            self.inputs = inputs
+            events.append("construct-endpoints")
+
+        def start(self):
+            events.append("start-endpoints")
+            return self.inputs
+
+        def stop(self) -> None:
+            events.append("stop-endpoints")
+
+    def run(_inputs) -> int:
+        events.append("runtime")
+        return 0
+
+    monkeypatch.setattr("navmin.diagnostic_launcher.run_startup_preflight", preflight)
+    monkeypatch.setattr("navmin.diagnostic_launcher.DiagnosticEndpoints", FakeEndpoints)
+    monkeypatch.setattr("navmin.diagnostic_launcher.run_loaded_application", run)
+
+    assert diagnostic_main(
+        [
+            "--overview",
+            "localhost",
+            "--stereo-left",
+            "localhost",
+            "--turret",
+            "pty",
+            "--synthetic-inputs",
+            "--log-dir",
+            str(tmp_path / "logs"),
+        ]
+    ) == 0
+
+    assert events == [
+        "preflight",
+        "construct-endpoints",
+        "start-endpoints",
+        "runtime",
+        "stop-endpoints",
+    ]
+
+
+def test_normal_full_launch_orders_preflight_before_runtime(monkeypatch, tmp_path) -> None:
+    config_path, overview_path, stereo_path = _write_source_placeholders(tmp_path)
+    events: list[str] = []
+    monkeypatch.setattr("navmin.__main__.load_application_inputs", lambda _paths: _inputs())
+
+    def preflight(inputs, **kwargs):
+        del inputs, kwargs
+        events.append("preflight")
+        return _preflight_report()
+
+    def run(_inputs) -> int:
+        events.append("runtime")
+        return 0
+
+    monkeypatch.setattr("navmin.__main__.run_startup_preflight", preflight)
+    monkeypatch.setattr("navmin.__main__.run_loaded_application", run)
+
+    assert normal_main(
+        [
+            "--config",
+            str(config_path),
+            "--overview-calibration",
+            str(overview_path),
+            "--stereo-calibration",
+            str(stereo_path),
+            "--log-dir",
+            str(tmp_path / "logs"),
+        ]
+    ) == 0
+    assert events == ["preflight", "runtime"]
+
+
+def test_preflight_only_warn_is_success(monkeypatch, tmp_path) -> None:
+    config_path, overview_path, stereo_path = _write_source_placeholders(tmp_path)
+    monkeypatch.setattr("navmin.__main__.load_application_inputs", lambda _paths: _inputs())
+    monkeypatch.setattr(
+        "navmin.__main__.run_startup_preflight",
+        lambda *args, **kwargs: _preflight_report(PreflightStatus.WARN),
+    )
+    monkeypatch.setattr(
+        "navmin.__main__.run_loaded_application",
+        lambda _inputs: pytest.fail("runtime must not start in --preflight-only"),
+    )
+
+    log_dir = tmp_path / "logs"
+    assert normal_main(
+        [
+            "--config",
+            str(config_path),
+            "--overview-calibration",
+            str(overview_path),
+            "--stereo-calibration",
+            str(stereo_path),
+            "--preflight-only",
+            "--log-dir",
+            str(log_dir),
+        ]
+    ) == 0
+    preflight = json.loads(
+        (_single_session(log_dir) / "preflight.json").read_text(encoding="utf-8")
+    )
+    assert preflight["overall_status"] == "warn"
+
+
+def test_unexpected_preflight_exception_is_runtime_failure_before_runtime(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    config_path, overview_path, stereo_path = _write_source_placeholders(tmp_path)
+    monkeypatch.setattr("navmin.__main__.load_application_inputs", lambda _paths: _inputs())
+
+    def explode(*args, **kwargs):
+        del args, kwargs
+        raise KeyError("preflight-bug")
+
+    monkeypatch.setattr("navmin.__main__.run_startup_preflight", explode)
+    monkeypatch.setattr(
+        "navmin.__main__.run_loaded_application",
+        lambda _inputs: pytest.fail("runtime must not start after preflight exception"),
+    )
+
+    log_dir = tmp_path / "logs"
+    assert normal_main(
+        [
+            "--config",
+            str(config_path),
+            "--overview-calibration",
+            str(overview_path),
+            "--stereo-calibration",
+            str(stereo_path),
+            "--log-dir",
+            str(log_dir),
+        ]
+    ) == 2
+
+    session = _single_session(log_dir)
+    manifest = json.loads((session / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["status"] == "runtime-failed"
+    assert manifest["failure_type"] == "KeyError"
+    assert "preflight-bug" in manifest["failure_message"]
+    assert not (session / "preflight.json").exists()
+    runtime_log = (session / "runtime.log").read_text(encoding="utf-8")
+    assert "Traceback (most recent call last)" in runtime_log
+    assert "preflight-bug" in runtime_log

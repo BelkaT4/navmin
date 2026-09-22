@@ -13,6 +13,7 @@ from navmin.diagnostics.localhost_rtp import (
     SenderProcessError,
     build_sender_command,
     check_gstreamer_runtime,
+    check_gstreamer_sender_runtime,
     diagnostic_camera_config,
     diagnostic_overview_calibration,
     diagnostic_stereo_calibration,
@@ -232,3 +233,22 @@ def test_diagnostic_calibrations_and_camera_config_match_synthetic_size() -> Non
     assert config.rtp_enabled
     assert config.buffer_size == 1
     assert not config.processing_enabled
+
+
+def test_sender_only_preflight_does_not_inspect_receiver_elements() -> None:
+    inspected: list[str] = []
+
+    def runner(command, **kwargs):
+        del kwargs
+        inspected.append(command[1])
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    result = check_gstreamer_sender_runtime(
+        which=lambda executable: f"/usr/bin/{executable}",
+        runner=runner,
+    )
+
+    assert result.ok
+    assert inspected == list(GST_SENDER_ELEMENTS)
+    receiver_only = set(GST_RECEIVER_ELEMENTS) - set(GST_SENDER_ELEMENTS)
+    assert not receiver_only.intersection(inspected)

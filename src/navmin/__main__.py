@@ -14,6 +14,11 @@ from navmin.launcher import (
     session_file_logging,
     validate_normal_hardware_config,
 )
+from navmin.preflight import (
+    StartupBackendSelection,
+    format_preflight_summary,
+    run_startup_preflight,
+)
 from navmin.session_artifacts import (
     SessionArtifacts,
     SessionStatus,
@@ -40,6 +45,11 @@ def _parser() -> argparse.ArgumentParser:
         "--stereo-calibration",
         type=Path,
         default=Path("calibration/stereo.json"),
+    )
+    parser.add_argument(
+        "--preflight-only",
+        action="store_true",
+        help="Run static startup preflight, write session evidence, and exit.",
     )
     parser.add_argument(
         "--log-dir",
@@ -92,6 +102,39 @@ def main(argv: Sequence[str] | None = None) -> int:
                 failure=exc,
             )
             return _FAILURE_EXIT_CODE
+
+        try:
+            report = run_startup_preflight(
+                inputs,
+                selection=StartupBackendSelection(
+                    overview="real",
+                    stereo_left="real",
+                    turret="real",
+                ),
+                session_dir=artifacts.session_dir,
+            )
+            artifacts.write_preflight(report)
+        except Exception as exc:
+            LOGGER.exception("NavMin preflight implementation failed")
+            artifacts.finalize(
+                status=SessionStatus.RUNTIME_FAILED,
+                exit_code=_FAILURE_EXIT_CODE,
+                failure=exc,
+            )
+            return _FAILURE_EXIT_CODE
+
+        summary = format_preflight_summary(report)
+        print(summary)
+        LOGGER.info("%s", summary.replace("\n", " | "))
+        if not report.ok:
+            artifacts.finalize(
+                status=SessionStatus.PREFLIGHT_FAILED,
+                exit_code=_FAILURE_EXIT_CODE,
+            )
+            return _FAILURE_EXIT_CODE
+        if args.preflight_only:
+            artifacts.finalize(status=SessionStatus.COMPLETED, exit_code=0)
+            return 0
 
         try:
             artifacts.write_effective_inputs(

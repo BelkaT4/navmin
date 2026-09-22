@@ -15,6 +15,7 @@ from navmin.vision.gstreamer_source import (
     GStreamerRtpJpegSource,
     UnsupportedCameraTransportError,
     build_rtp_jpeg_pipeline_description,
+    find_missing_gstreamer_elements,
     initialize_gstreamer_runtime,
 )
 from navmin.vision.pipeline import (
@@ -109,6 +110,25 @@ def test_gstreamer_runtime_initialization_is_serialized_and_cached(monkeypatch) 
     assert all(not thread.is_alive() for thread in threads)
     assert len(calls) == 1
 
+
+
+
+def test_gstreamer_element_probe_reuses_cached_runtime(monkeypatch) -> None:
+    calls: list[str] = []
+
+    class ElementFactory:
+        @staticmethod
+        def find(name):
+            calls.append(name)
+            return None if name == "jpegdec" else object()
+
+    fake_gst = type("FakeGst", (), {"ElementFactory": ElementFactory})
+    monkeypatch.setattr(gstreamer_source, "_GSTREAMER_MODULES", [(object(), fake_gst)])
+
+    assert find_missing_gstreamer_elements(("udpsrc", "jpegdec", "appsink")) == (
+        "jpegdec",
+    )
+    assert calls == ["udpsrc", "jpegdec", "appsink"]
 
 def test_rtp_jpeg_pipeline_uses_camera_config_and_low_latency_appsink() -> None:
     description = build_rtp_jpeg_pipeline_description(
