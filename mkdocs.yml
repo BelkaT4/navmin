@@ -43,6 +43,7 @@ nav:
   - Для пользователей:
     - Обзор: user/index.md
     - Быстрый старт: user/quick-start.md
+    - Offline Hardware Runbook: user/offline-hardware-runbook.md
     - Дополнительные функции: user/features.md
     - Калибровка: user/calibration.md
     - Устранение неисправностей: user/troubleshooting.md

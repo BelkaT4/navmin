@@ -1,14 +1,17 @@
 # NavMin
 
-Система автоматического обнаружения и наведения для борьбы с БПЛА
+NavMin — система BelkaT4 для приёма видеопотоков, Vision/Aiming и управления турелью через STM32.
 
 ## Как просматривать
 
-- `mkdocs serve` - Запустить сервер с автообновлением в реальном времени
-- `mkdocs build` - Собрать сайт с документацией (файл /site/index.html)
+- `mkdocs serve` — запустить локальный сервер документации с автообновлением;
+- `mkdocs build` — собрать статический сайт в `site/`.
 
 ## Быстрые ссылки
-- [Разработчикам: как начать работать над проектом](./dev/getting-started.md)
-- [Общая архитектура](./dev/architecture/overview.md)
-- [Руководство пользователя](./user/index.md)
 
+- [Быстрый старт](./user/quick-start.md)
+- [Руководство пользователя](./user/index.md)
+- [Offline Hardware Runbook](./user/offline-hardware-runbook.md)
+- [Разработчикам: как начать работу над проектом](./dev/getting-started.md)
+- [Общая архитектура](./dev/architecture/overview.md)
+- [Master implementation plan](./dev/implementation-plan.md)

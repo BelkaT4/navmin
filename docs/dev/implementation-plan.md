@@ -170,16 +170,18 @@ normal launcher + diagnostic launcher                     accepted
 offline session artifacts + bounded logging               accepted
 backend-aware preflight + --preflight-only                accepted
 offline hardware runbook + targeted docs sync             accepted
+VIRTUAL diagnostic scene + latency observability          accepted
+offline rehearsal без доступа к интернету                 accepted
 ```
 
-Следующий immutable порядок:
+Текущий checkpoint и следующий immutable порядок:
 
 ```text
-offline rehearsal без доступа к интернету
-→ fixes if required
-→ documentation cleanup + root README sync
+documentation cleanup + root README sync
 → merge feat/first-implementation into main
 → full validation on main
+→ GLOBAL PRE-HARDWARE INTEGRATION AUDIT (read-only)
+→ fixes only if audit finds blockers
 → annotated pre-hardware stable tag
 → selected external-development checkpoints (VT11 / STM32), но без STM32 implementation,
   которое требует ещё не измеренных hardware facts
@@ -188,10 +190,12 @@ offline rehearsal без доступа к интернету
      H1 identify / measure / very-low-energy boundary
      → actual hardware facts
      → STM32-V1/V2 implementation if required
-     → regression/rehearsal
+     → regression/rehearsal / targeted audit if changed
      → H2 safety-boundary validation
      → cameras-only smoke
-     → combined RELATIVE / TRACKING / failure checks
+     → controlled REAL RELATIVE
+     → TRACKING
+     → selected failure checks
 ```
 
 Два внешних READ-ONLY аудита уже завершены, но их implementation намеренно не
@@ -875,8 +879,10 @@ Future latest-live-frame mode (#22) остаётся deferred. Gesture/overlay/S
 Некоторые software-only prerequisites этого этапа уже выполнены заранее и не
 меняют формальный статус полного Stage 8: shared composition, normal/diagnostic
 launchers, localhost RTP/JPEG, PTY production-transport check, session artifacts,
-bounded logging, backend-aware static preflight и operator-facing offline hardware
-runbook. Следующий operational checkpoint — offline rehearsal без доступа к интернету.
+bounded logging, backend-aware static preflight, operator-facing offline hardware
+runbook и VIRTUAL latency observability. Offline rehearsal без доступа к интернету
+принята; текущий project checkpoint — documentation cleanup + root README sync перед
+merge в `main` и последующим global pre-hardware integration audit.
 
 ### Timing and tuning
 
