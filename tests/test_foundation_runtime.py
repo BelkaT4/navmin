@@ -76,9 +76,9 @@ def test_logging_bootstrap_is_idempotent_for_navmin_logger_tree() -> None:
         app_logger.propagate = old_propagate
 
 
-def test_package_module_executes_without_ui_or_hardware(tmp_path) -> None:
+def test_package_module_help_executes_without_ui_or_hardware(tmp_path) -> None:
     completed = subprocess.run(
-        [sys.executable, "-m", "navmin"],
+        [sys.executable, "-m", "navmin", "--help"],
         cwd=tmp_path,
         check=False,
         capture_output=True,
@@ -87,5 +87,5 @@ def test_package_module_executes_without_ui_or_hardware(tmp_path) -> None:
     )
 
     assert completed.returncode == 0
-    assert completed.stdout == ""
+    assert "real RTP cameras" in completed.stdout
     assert completed.stderr == ""
