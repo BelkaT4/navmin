@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
+from datetime import datetime
 from time import monotonic_ns
 
 from PyQt6.QtCore import QEvent, Qt
@@ -74,6 +75,8 @@ class MainWindow(QMainWindow):
         turret_states: LatestValue[TurretState],
         camera_stale_timeout_ms: int,
         clock_ns: Callable[[], int] = monotonic_ns,
+        wall_clock: Callable[[], datetime] = datetime.now,
+        show_diagnostic_clock: bool = False,
         frame_preparer: Callable[[VisionResult], PreparedVisionFrame] = prepare_vision_frame,
         start_timer: bool = True,
         start_fullscreen: bool = True,
@@ -86,6 +89,8 @@ class MainWindow(QMainWindow):
         self._mediator = mediator
         self._camera_bindings = dict(camera_bindings)
         self._clock_ns = clock_ns
+        self._wall_clock = wall_clock
+        self._show_diagnostic_clock = show_diagnostic_clock
         self._frame_preparer = frame_preparer
         self._prepared_frames: dict[CameraRole, PreparedVisionFrame] = {}
         self._camera_statuses: dict[CameraRole, CameraStatus] = {}
@@ -117,6 +122,10 @@ class MainWindow(QMainWindow):
         self.connection_label = QLabel()
         self.connection_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.connection_label.setFixedSize(170, 40)
+        self.now_label = QLabel()
+        self.now_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.now_label.setFixedSize(175, 40)
+        self.now_label.setVisible(show_diagnostic_clock)
         self.emergency_button = QPushButton("EMERGENCY")
         self.emergency_button.setFixedSize(190, 48)
         self.emergency_button.setStyleSheet(
@@ -133,6 +142,7 @@ class MainWindow(QMainWindow):
         bar_layout.addWidget(self.mode_button)
         bar_layout.addWidget(self.motor_button)
         bar_layout.addWidget(self.connection_label)
+        bar_layout.addWidget(self.now_label)
         bar_layout.addStretch(1)
         bar_layout.addWidget(self.emergency_button)
 
@@ -165,6 +175,7 @@ class MainWindow(QMainWindow):
         )
         self._refresh_turret_controls()
         self._refresh_view_roles()
+        self.refresh_presentation()
         if start_timer:
             self.state_pump.start()
         if start_fullscreen:
@@ -240,6 +251,10 @@ class MainWindow(QMainWindow):
         now_ns = self._clock_ns()
         self.main_view.refresh_freshness(now_ns)
         self.preview_view.refresh_freshness(now_ns)
+        if self._show_diagnostic_clock:
+            now = self._wall_clock()
+            milliseconds = now.microsecond // 1000
+            self.now_label.setText(f"NOW {now:%H:%M:%S}.{milliseconds:03d}")
 
     def _camera_session_accepted(self, session: CameraSessionStarted) -> None:
         self._prepared_frames.pop(session.camera, None)

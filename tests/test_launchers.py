@@ -227,6 +227,7 @@ def test_run_loaded_application_uses_shared_runtime_ui_surface_and_shutdown() ->
         assert kwargs["camera_bindings"] is ui_dependencies.camera_bindings
         assert kwargs["turret_states"] is ui_dependencies.turret_states
         assert kwargs["camera_stale_timeout_ms"] == 321
+        assert kwargs["show_diagnostic_clock"] is False
         assert kwargs["argv"] == ("--qt-test",)
         return 7
 
@@ -294,6 +295,7 @@ def test_diagnostic_selection_overrides_only_requested_external_endpoints(monkey
         assert sender_configs[0].port == 8888
         assert sender_configs[0].width == WIDTH
         assert sender_configs[0].height == HEIGHT
+        assert sender_configs[0].camera is CameraRole.OVERVIEW
         assert pty_events == ["start"]
     finally:
         endpoints.stop()
@@ -370,7 +372,8 @@ def test_diagnostic_synthetic_inputs_run_without_config_files(
         def stop(self) -> None:
             return None
 
-    def fake_run(inputs) -> int:
+    def fake_run(inputs, *, show_diagnostic_clock: bool) -> int:
+        assert show_diagnostic_clock
         captured_inputs.append(inputs)
         return 0
 
@@ -568,7 +571,8 @@ def test_diagnostic_cleanup_failure_preserves_primary_runtime_failure(
 
     monkeypatch.setattr("navmin.diagnostic_launcher.DiagnosticEndpoints", FakeEndpoints)
 
-    def fail_runtime(_inputs) -> int:
+    def fail_runtime(_inputs, *, show_diagnostic_clock: bool) -> int:
+        assert show_diagnostic_clock
         raise RuntimeError("runtime-boom")
 
     monkeypatch.setattr("navmin.diagnostic_launcher.run_loaded_application", fail_runtime)
@@ -787,7 +791,8 @@ def test_diagnostic_full_launch_orders_preflight_before_endpoints_and_runtime(
         def stop(self) -> None:
             events.append("stop-endpoints")
 
-    def run(_inputs) -> int:
+    def run(_inputs, *, show_diagnostic_clock: bool) -> int:
+        assert show_diagnostic_clock
         events.append("runtime")
         return 0
 

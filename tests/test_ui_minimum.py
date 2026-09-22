@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+from datetime import UTC, datetime
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -51,6 +52,14 @@ class _Clock:
 
     def __call__(self) -> int:
         return self.now_ns
+
+
+class _WallClock:
+    def __init__(self, value: datetime) -> None:
+        self.value = value
+
+    def __call__(self) -> datetime:
+        return self.value
 
 
 class _CameraModel:
@@ -209,6 +218,8 @@ def _window(
     mode: TurretControlMode = TurretControlMode.RELATIVE,
     motor: MotorState = MotorState.ON,
     clock: _Clock | None = None,
+    wall_clock: _WallClock | None = None,
+    show_diagnostic_clock: bool = False,
     frame_preparer=prepare_vision_frame,
     camera_stale_timeout_ms: int = 500,
 ) -> tuple[
@@ -227,6 +238,9 @@ def _window(
         turret_states=turret_states,
         camera_stale_timeout_ms=camera_stale_timeout_ms,
         clock_ns=clock or _Clock(),
+        wall_clock=wall_clock
+        or _WallClock(datetime(2026, 9, 22, 12, 0, 0, tzinfo=UTC)),
+        show_diagnostic_clock=show_diagnostic_clock,
         frame_preparer=frame_preparer,
         start_timer=False,
         start_fullscreen=False,
@@ -392,6 +406,7 @@ def test_operational_bar_is_compact_and_emergency_remains_largest(
         window.mode_button,
         window.motor_button,
         window.connection_label,
+        window.now_label,
     )
     assert all(control.height() <= 42 for control in ordinary_controls)
     assert window.emergency_button.height() > max(
@@ -401,6 +416,41 @@ def test_operational_bar_is_compact_and_emergency_remains_largest(
         control.width() for control in ordinary_controls
     )
     window.close()
+
+
+def test_now_clock_is_diagnostic_only_and_updates_in_operational_bar(
+    qt_application: QApplication,
+) -> None:
+    normal, *_normal_dependencies = _window(qt_application)
+    assert normal.now_label.isHidden()
+    normal.close()
+
+    wall_clock = _WallClock(
+        datetime(2026, 9, 22, 14, 58, 21, 515_000, tzinfo=UTC)
+    )
+    diagnostic, *_diagnostic_dependencies = _window(
+        qt_application,
+        wall_clock=wall_clock,
+        show_diagnostic_clock=True,
+    )
+    assert diagnostic.now_label.isVisible()
+    assert diagnostic.now_label.text() == "NOW 14:58:21.515"
+    assert diagnostic.now_label.parent() is diagnostic.operational_bar
+    assert diagnostic.emergency_button.isVisible()
+
+    wall_clock.value = datetime(
+        2026,
+        9,
+        22,
+        14,
+        58,
+        22,
+        7_000,
+        tzinfo=UTC,
+    )
+    diagnostic.refresh_presentation()
+    assert diagnostic.now_label.text() == "NOW 14:58:22.007"
+    diagnostic.close()
 
 
 def test_mode_motor_connection_and_emergency_use_authoritative_state(

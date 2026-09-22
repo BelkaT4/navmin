@@ -6,7 +6,7 @@ import argparse
 import socket
 import sys
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from itertools import pairwise
 from queue import Empty
 from time import monotonic, monotonic_ns, sleep
@@ -230,7 +230,7 @@ def _worker_for(camera: CameraRole, port: int) -> CameraWorker:
     )
     return build_camera_worker(
         camera=camera,
-        config=diagnostic_camera_config(port),
+        config=replace(diagnostic_camera_config(port), processing_enabled=True),
         corrector=corrector,
         idle_wait_s=0.005,
     )
@@ -273,6 +273,48 @@ def _wait_for_worker_progress(
     )
 
 
+def _wait_for_stable_moving_track(
+    worker: CameraWorker,
+) -> tuple[int, tuple[float, float], tuple[float, float]]:
+    deadline = monotonic() + _WAIT_TIMEOUT_SECONDS
+    last_revision = 0
+    observations: list[tuple[int, int, tuple[float, float]]] = []
+    while monotonic() < deadline:
+        _status_or_failure(worker)
+        snapshot = worker.pipeline.latest_result.snapshot()
+        if snapshot.revision <= last_revision or snapshot.value is None:
+            sleep(0.01)
+            continue
+        last_revision = snapshot.revision
+        tracked = snapshot.value.tracked_objects
+        if len(tracked) != 1:
+            sleep(0.01)
+            continue
+        item = tracked[0]
+        center = (
+            item.bbox.x + item.bbox.width / 2.0,
+            item.bbox.y + item.bbox.height / 2.0,
+        )
+        if observations and item.track_id != observations[-1][0]:
+            observations.clear()
+        observations.append((item.track_id, item.age_frames, center))
+        if len(observations) >= 4:
+            recent = observations[-4:]
+            if (
+                len({entry[0] for entry in recent}) == 1
+                and all(
+                    current[1] > previous[1]
+                    for previous, current in pairwise(recent)
+                )
+                and recent[0][2] != recent[-1][2]
+            ):
+                return recent[-1][0], recent[0][2], recent[-1][2]
+        sleep(0.01)
+    raise DiagnosticFailure(
+        f"{worker.pipeline.camera.value} did not produce one stable moving Legacy14 track"
+    )
+
+
 def _assert_result_contract(worker: CameraWorker, *, port: int) -> tuple[int, int]:
     pipeline = worker.pipeline
     result = pipeline.latest_result.get()
@@ -312,6 +354,7 @@ def _gate_c(port: int, resources: _ResourceTracker) -> GateOutcome:
         session = worker.pipeline.session_barriers.receive(timeout=1.0)
         sender.start()
         _wait_for_worker_progress(worker)
+        track_id, first_center, last_center = _wait_for_stable_moving_track(worker)
         frame_id, receive_timestamp_ns = _assert_result_contract(worker, port=port)
         if session.generation != 1 or session.camera is not CameraRole.OVERVIEW:
             raise DiagnosticFailure("CameraSessionStarted does not match worker session")
@@ -324,6 +367,10 @@ def _gate_c(port: int, resources: _ResourceTracker) -> GateOutcome:
                 f"latest frame_id: {frame_id}",
                 f"last_receive_timestamp_ns: {receive_timestamp_ns}",
                 "working frame: 320x240, uint8, read-only, capture_id=None",
+                (
+                    f"Legacy14 track_id={track_id} moved "
+                    f"{first_center} -> {last_center}"
+                ),
             ),
         )
     finally:
@@ -383,8 +430,15 @@ def _gate_d_and_e(
     stereo = _worker_for(CameraRole.STEREO_LEFT, stereo_left_port)
     resources.remember_worker(overview)
     resources.remember_worker(stereo)
-    overview_sender = resources.new_sender(RtpJpegSenderConfig(port=overview_port))
-    stereo_sender = resources.new_sender(RtpJpegSenderConfig(port=stereo_left_port))
+    overview_sender = resources.new_sender(
+        RtpJpegSenderConfig(port=overview_port, camera=CameraRole.OVERVIEW)
+    )
+    stereo_sender = resources.new_sender(
+        RtpJpegSenderConfig(
+            port=stereo_left_port,
+            camera=CameraRole.STEREO_LEFT,
+        )
+    )
     resumed_sender: LocalhostRtpJpegSender | None = None
     try:
         overview.start()
@@ -400,6 +454,8 @@ def _gate_d_and_e(
         stereo_sender.start()
         _wait_for_worker_progress(overview)
         _wait_for_worker_progress(stereo)
+        overview_track = _wait_for_stable_moving_track(overview)
+        stereo_track = _wait_for_stable_moving_track(stereo)
         overview_frame_id, overview_timestamp = _assert_result_contract(
             overview, port=overview_port
         )
@@ -442,6 +498,10 @@ def _gate_d_and_e(
                 _format_camera_observation(overview_observation),
                 _format_camera_observation(stereo_observation),
                 "both streams ONLINE, generation=1, independent ports and roles",
+                (
+                    "Legacy14 stable moving tracks: "
+                    f"overview={overview_track[0]}, stereo-left={stereo_track[0]}"
+                ),
             ),
         )
 

@@ -20,6 +20,7 @@ def run_ui(
     camera_bindings: Mapping[CameraRole, CameraUiBinding],
     turret_states: LatestValue[TurretState],
     camera_stale_timeout_ms: int,
+    show_diagnostic_clock: bool = False,
     argv: Sequence[str] = (),
 ) -> int:
     """Run only the Qt UI; application composition owns all workers."""
@@ -31,6 +32,7 @@ def run_ui(
         camera_bindings=camera_bindings,
         turret_states=turret_states,
         camera_stale_timeout_ms=camera_stale_timeout_ms,
+        show_diagnostic_clock=show_diagnostic_clock,
     )
     window.showFullScreen()
     return application.exec()

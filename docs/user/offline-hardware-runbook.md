@@ -182,6 +182,17 @@ python tools/run_diagnostic_app.py \
 production `GStreamerRtpJpegSource`, а PTY Turret — через production
 `SerialTransport`/pyserial.
 
+При visual smoke обе synthetic camera показывают `SOURCE HH:MM:SS.mmm` и
+`FRAME n`, а нижняя operational bar — `NOW HH:MM:SS.mmm`:
+
+- сравнить `SOURCE` и `NOW` как приблизительный текущий visual lag;
+- подтвердить, что `FRAME` постоянно увеличивается;
+- в течение короткого наблюдения убедиться, что gap `SOURCE` → `NOW` визуально
+  не растёт и bbox движущейся цели продолжает обновляться.
+
+Это localhost-only проверка в clock domain одного PC, а не измерение latency
+реальных Raspberry Pi cameras.
+
 ### 4.2 STM32
 
 Boundary:
@@ -784,8 +795,9 @@ python tools/run_localhost_rtp_diagnostic.py \
   --stereo-left-port 8889
 ```
 
-Он проверяет localhost RTP/JPEG через production camera receiver path. Это не real
-camera acceptance.
+Он проверяет detector-friendly localhost scene через production RTP/JPEG camera
+receiver path, включая стабильный движущийся Legacy14 track на обеих cameras.
+Это не real camera acceptance и не real-camera latency measurement.
 
 ### PTY STM32 through production SerialTransport
 

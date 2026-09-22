@@ -62,6 +62,7 @@ def run_loaded_application(
     inputs: LoadedApplicationInputs,
     *,
     qt_argv: Sequence[str] = (),
+    show_diagnostic_clock: bool = False,
     runtime_builder: RuntimeBuilder | None = None,
     ui_runner: UiRunner | None = None,
 ) -> int:
@@ -88,6 +89,7 @@ def run_loaded_application(
             camera_bindings=ui.camera_bindings,
             turret_states=ui.turret_states,
             camera_stale_timeout_ms=ui.camera_stale_timeout_ms,
+            show_diagnostic_clock=show_diagnostic_clock,
             argv=qt_argv,
         )
     finally:

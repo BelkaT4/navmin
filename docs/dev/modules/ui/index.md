@@ -87,6 +87,12 @@ Baseline object overlay минимален: bbox всех текущих `Tracke
 
 Основное окно стартует fullscreen. `F11` неограниченно переключает fullscreen/windowed state. Main video занимает основную область, preview находится в её правом нижнем углу, а компактная нижняя operational bar остаётся отдельной постоянной полосой.
 
+Diagnostic launcher при наличии localhost camera явно включает в operational bar
+`NOW HH:MM:SS.mmm`; normal production launcher этот debug clock не показывает.
+Clock не заменяет mode/motor/connection controls, а Emergency остаётся самым
+крупным и постоянно доступным элементом bar. В VIRTUAL это локальный companion
+для sender-side `SOURCE` pixels, не real-camera latency telemetry.
+
 `Esc` открывает или скрывает единственный `Operator Window`; fullscreen state при этом не меняется. Это отдельное modeless movable tool-window, принадлежащее `MainWindow`: оно остаётся поверх основного окна NavMin, но не использует global always-on-top и уходит назад вместе с приложением при переключении на другое приложение. Закрытие крестиком скрывает только Operator Window и не останавливает main window или workers.
 
 Operator Window показывает только уже существующее runtime state:

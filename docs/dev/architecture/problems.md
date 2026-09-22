@@ -195,6 +195,14 @@ Aim point уже per-camera. После prototype проверить, доста
 
 Software soak уже получил bounded observability для command/transport histories, reconnect count, thread count, RSS и cycle timing. Targeted memory diagnosis на synthetic `InMemoryFrameSource + FakeTransport` path не нашёл unbounded Python-level retention: nominal, generation-restart, reconnect и stale/resume runs показали ранний RSS allocation step с последующим plateau, а Legacy14/OpenCV microbench подтвердил bounded native allocator/cache behaviour. Это не закрывает profiling на production RTP/SerialTransport и real hardware.
 
+Для localhost/VIRTUAL добавлена только визуальная наблюдаемость camera latency:
+sender наносит `SOURCE HH:MM:SS.mmm` и `FRAME n` до JPEG/RTP/UDP, а diagnostic
+UI показывает `NOW HH:MM:SS.mmm` в том же clock domain одного PC. Это позволяет
+заметить frozen frame и визуально проверить, что gap не растёт, но не является
+калиброванным benchmark. Real Raspberry Pi camera end-to-end latency остаётся
+открытой: отдельные clocks, их synchronization, network path и sender scheduling
+этим механизмом не измеряются.
+
 Минимальные candidates для следующих transport/hardware checkpoints:
 
 - camera FPS;

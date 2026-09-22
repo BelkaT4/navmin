@@ -104,10 +104,10 @@ class DiagnosticEndpoints:
                 overview = self._base_inputs.overview_calibration
                 camera = config.vision.cameras.overview
                 self._start_sender(
+                    camera_role=CameraRole.OVERVIEW,
                     port=camera.port,
                     width=overview.image_width,
                     height=overview.image_height,
-                    pattern="ball",
                 )
                 config = _replace_camera_endpoint(
                     config,
@@ -118,10 +118,10 @@ class DiagnosticEndpoints:
                 stereo = self._base_inputs.stereo_calibration
                 camera = config.vision.cameras.stereo_left
                 self._start_sender(
+                    camera_role=CameraRole.STEREO_LEFT,
                     port=camera.port,
                     width=stereo.image_width,
                     height=stereo.image_height,
-                    pattern="smpte",
                 )
                 config = _replace_camera_endpoint(
                     config,
@@ -169,17 +169,17 @@ class DiagnosticEndpoints:
     def _start_sender(
         self,
         *,
+        camera_role: CameraRole,
         port: int,
         width: int,
         height: int,
-        pattern: str,
     ) -> None:
         sender = LocalhostRtpJpegSender(
             RtpJpegSenderConfig(
                 port=port,
                 width=width,
                 height=height,
-                pattern=pattern,
+                camera=camera_role,
             )
         )
         sender.start()
@@ -460,7 +460,13 @@ def main(argv: Sequence[str] | None = None) -> int:
                 stereo_calibration=effective_inputs.stereo_calibration,
                 source_paths=source_paths,
             )
-            exit_code = run_loaded_application(effective_inputs)
+            exit_code = run_loaded_application(
+                effective_inputs,
+                show_diagnostic_clock=(
+                    CameraEndpoint.LOCALHOST
+                    in (selection.overview, selection.stereo_left)
+                ),
+            )
             if exit_code == 0:
                 status = SessionStatus.COMPLETED
             else:

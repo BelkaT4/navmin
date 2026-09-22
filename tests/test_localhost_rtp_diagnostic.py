@@ -1,16 +1,22 @@
 from __future__ import annotations
 
 import subprocess
+from datetime import UTC, datetime
+from itertools import pairwise
 from types import SimpleNamespace
 
+import cv2
+import numpy as np
 import pytest
 
+from navmin.contracts import CameraRole, FramePacket
 from navmin.diagnostics.localhost_rtp import (
     GST_RECEIVER_ELEMENTS,
     GST_SENDER_ELEMENTS,
     LocalhostRtpJpegSender,
     RtpJpegSenderConfig,
     SenderProcessError,
+    SyntheticDiagnosticFrameGenerator,
     build_sender_command,
     check_gstreamer_runtime,
     check_gstreamer_sender_runtime,
@@ -18,6 +24,8 @@ from navmin.diagnostics.localhost_rtp import (
     diagnostic_overview_calibration,
     diagnostic_stereo_calibration,
 )
+from navmin.vision.pipeline import overview_corrector, stereo_left_corrector
+from navmin.vision.processors.legacy_14.processor import Legacy14VisionProcessor
 
 
 @pytest.mark.parametrize(
@@ -29,7 +37,7 @@ from navmin.diagnostics.localhost_rtp import (
         ({"port": 9999, "height": -1}, "height"),
         ({"port": 9999, "fps": 0}, "fps"),
         ({"port": 9999, "host": "0.0.0.0"}, "127.0.0.1"),
-        ({"port": 9999, "pattern": "moving ball"}, "pattern"),
+        ({"port": 9999, "camera": CameraRole.STEREO_RIGHT}, "camera"),
     ],
 )
 def test_sender_config_rejects_invalid_transport_values(kwargs, message) -> None:
@@ -46,17 +54,15 @@ def test_sender_command_is_shell_free_rtp_jpeg_pipeline() -> None:
     assert command == (
         "/usr/bin/gst-launch-1.0",
         "-q",
-        "videotestsrc",
-        "is-live=true",
-        "pattern=ball",
+        "fdsrc",
+        "fd=0",
+        "do-timestamp=true",
         "!",
-        "videoconvert",
-        "!",
-        "video/x-raw,format=I420,width=320,height=240,framerate=20/1",
-        "!",
-        "jpegenc",
+        "image/jpeg,framerate=20/1",
         "!",
         "jpegparse",
+        "!",
+        "image/jpeg,width=320,height=240,framerate=20/1",
         "!",
         "rtpjpegpay",
         "pt=26",
@@ -69,6 +75,21 @@ def test_sender_command_is_shell_free_rtp_jpeg_pipeline() -> None:
     )
 
 
+def test_sender_command_declares_jpeg_caps_before_parser() -> None:
+    command = build_sender_command(RtpJpegSenderConfig(port=18_888, fps=17))
+
+    fdsrc_index = command.index("fdsrc")
+    assert command[fdsrc_index : fdsrc_index + 7] == (
+        "fdsrc",
+        "fd=0",
+        "do-timestamp=true",
+        "!",
+        "image/jpeg,framerate=17/1",
+        "!",
+        "jpegparse",
+    )
+
+
 def test_preflight_checks_executables_bindings_and_each_required_element() -> None:
     inspected: list[str] = []
 
@@ -76,9 +97,9 @@ def test_preflight_checks_executables_bindings_and_each_required_element() -> No
         del kwargs
         inspected.append(command[1])
         return SimpleNamespace(
-            returncode=1 if command[1] == "jpegenc" else 0,
+            returncode=1 if command[1] == "jpegparse" else 0,
             stdout="",
-            stderr="missing jpegenc",
+            stderr="missing jpegparse",
         )
 
     result = check_gstreamer_runtime(
@@ -90,9 +111,9 @@ def test_preflight_checks_executables_bindings_and_each_required_element() -> No
     assert not result.ok
     assert inspected == [*GST_RECEIVER_ELEMENTS, *GST_SENDER_ELEMENTS]
     assert [failure.name for failure in result.failures] == [
-        "GStreamer element jpegenc"
+        "GStreamer element jpegparse"
     ]
-    assert result.failures[0].detail == "missing jpegenc"
+    assert result.failures[0].detail == "missing jpegparse"
 
 
 def test_preflight_reports_missing_runtime_without_running_gst_inspect() -> None:
@@ -118,6 +139,7 @@ def test_preflight_reports_missing_runtime_without_running_gst_inspect() -> None
 class _FakeProcess:
     def __init__(self, *, initial_returncode: int | None = None) -> None:
         self._returncode = initial_returncode
+        self.stdin = _FakeStdin()
         self.terminate_calls = 0
         self.kill_calls = 0
         self.wait_calls: list[float] = []
@@ -139,6 +161,26 @@ class _FakeProcess:
             raise subprocess.TimeoutExpired("gst-launch-1.0", timeout)
         self._returncode = 0 if self._returncode is None else self._returncode
         return self._returncode
+
+
+class _FakeStdin:
+    def __init__(self) -> None:
+        self.closed = False
+        self.bytes_written = 0
+
+    def write(self, data) -> int:
+        if self.closed:
+            raise ValueError("closed")
+        size = len(data)
+        self.bytes_written += size
+        return size
+
+    def flush(self) -> None:
+        if self.closed:
+            raise ValueError("closed")
+
+    def close(self) -> None:
+        self.closed = True
 
 
 class _ProcessFactory:
@@ -168,8 +210,9 @@ def test_sender_process_lifecycle_terminates_bounded_without_shell() -> None:
     assert factory.command == list(sender.command)
     assert factory.kwargs is not None
     assert "shell" not in factory.kwargs
-    assert factory.kwargs["stdin"] is subprocess.DEVNULL
+    assert factory.kwargs["stdin"] == subprocess.PIPE
     assert factory.kwargs["stdout"] is subprocess.DEVNULL
+    assert factory.kwargs["text"] is False
 
     sender.stop()
 
@@ -177,6 +220,7 @@ def test_sender_process_lifecycle_terminates_bounded_without_shell() -> None:
     assert process.terminate_calls == 1
     assert process.kill_calls == 0
     assert process.wait_calls == [0.25]
+    assert process.stdin.closed
 
 
 def test_sender_process_kills_only_after_bounded_terminate_timeout() -> None:
@@ -226,13 +270,89 @@ def test_diagnostic_calibrations_and_camera_config_match_synthetic_size() -> Non
 
     assert (overview.image_width, overview.image_height) == (320, 240)
     assert overview.D == (0.0, 0.0, 0.0, 0.0)
+    assert overview.K[0][0] == overview.K[1][1] == 1000.0
     assert (stereo.image_width, stereo.image_height) == (320, 240)
     assert stereo.D_left == stereo.D_right == (0.0, 0.0, 0.0, 0.0, 0.0)
+    assert stereo.K_left[0][0] == stereo.K_left[1][1] == 250.0
     assert config.address == "127.0.0.1"
     assert config.port == 18_889
     assert config.rtp_enabled
     assert config.buffer_size == 1
     assert not config.processing_enabled
+
+
+def test_synthetic_scene_renders_target_source_time_and_advancing_frame_counter() -> None:
+    fixed = datetime(2026, 9, 22, 14, 58, 21, 372_000, tzinfo=UTC)
+    generator = SyntheticDiagnosticFrameGenerator(
+        camera=CameraRole.OVERVIEW,
+        width=320,
+        height=240,
+        wall_clock=lambda: fixed,
+    )
+
+    first = generator.next_frame()
+    second = generator.next_frame()
+
+    assert first.shape == (240, 320, 3)
+    assert first.dtype == np.uint8
+    assert generator.frames_generated == 2
+    assert tuple(first[82, 190]) == (245, 245, 245)
+    assert tuple(second[82, 192]) == (245, 245, 245)
+    assert np.max(first[204:, :]) >= 240
+    assert not np.array_equal(first[204:, :], second[204:, :])
+
+
+def test_detector_friendly_scene_survives_jpeg_and_keeps_stable_track() -> None:
+    fixed = datetime(2026, 9, 22, 14, 58, 21, 372_000, tzinfo=UTC)
+    cases = (
+        (
+            CameraRole.OVERVIEW,
+            overview_corrector(diagnostic_overview_calibration()),
+        ),
+        (
+            CameraRole.STEREO_LEFT,
+            stereo_left_corrector(diagnostic_stereo_calibration()),
+        ),
+    )
+
+    for camera, corrector in cases:
+        generator = SyntheticDiagnosticFrameGenerator(
+            camera=camera,
+            width=320,
+            height=240,
+            wall_clock=lambda: fixed,
+        )
+        processor = Legacy14VisionProcessor()
+        tracked_by_frame = []
+        for frame_id in range(120):
+            encoded, jpeg = cv2.imencode(
+                ".jpg",
+                generator.next_frame(),
+                (cv2.IMWRITE_JPEG_QUALITY, 85),
+            )
+            assert encoded
+            decoded = cv2.imdecode(jpeg, cv2.IMREAD_COLOR)
+            result = processor.process(
+                FramePacket(
+                    camera=camera,
+                    generation=1,
+                    frame_id=frame_id,
+                    capture_id=None,
+                    receive_timestamp_ns=frame_id * 50_000_000,
+                    image=corrector.correct(decoded),
+                )
+            )
+            tracked_by_frame.append(result.tracked_objects)
+
+        settled = tracked_by_frame[20:]
+        assert all(len(tracked) == 1 for tracked in settled)
+        assert len({tracked[0].track_id for tracked in settled}) == 1
+        stable = [tracked[0] for tracked in settled[:20]]
+        assert all(
+            current.age_frames > previous.age_frames
+            for previous, current in pairwise(stable)
+        )
+        assert stable[0].bbox != stable[-1].bbox
 
 
 def test_sender_only_preflight_does_not_inspect_receiver_elements() -> None:

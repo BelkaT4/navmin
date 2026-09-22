@@ -56,16 +56,23 @@ Appsink callback выполняется GStreamer streaming thread; process-glob
 GStreamer senders для Overview и Stereo Left:
 
 ```text
-videotestsrc is-live=true
-→ raw video caps 320x240 @ 20 FPS
-→ videoconvert
-→ jpegenc
+Python/OpenCV detector-friendly scene 320x240 @ 20 FPS
+→ SOURCE HH:MM:SS.mmm + FRAME n rendered into source pixels
+→ OpenCV JPEG encode
+→ GStreamer fdsrc → jpegparse
 → rtpjpegpay payload=26
 → udpsink 127.0.0.1:8888/8889
 → существующий production GStreamerRtpJpegSource
 → CameraWorker
 → VisionPipeline
 ```
+
+Overview и Stereo Left используют различимые спокойные backgrounds и один
+high-contrast target с принятой synthetic geometry: radius 6 px при 320×240 и
+ping-pong motion 2 px/source frame. Diagnostic text находится у нижней границы,
+а target остаётся detector-friendly после JPEG и соответствующей synthetic
+correction. Timestamp и frame counter формируются sender-side до JPEG/RTP/UDP;
+они не добавляют fields в `FramePacket` или `VisionResult`.
 
 Sender ownership и preflight реализованы в `navmin.diagnostics.localhost_rtp`,
 чтобы будущий diagnostic launcher мог переиспользовать boundary без импорта из
@@ -76,7 +83,8 @@ stereo calibration.
 
 Diagnostic runner проверяет оба startup ordering, одновременный progress двух
 потоков, silence/resume одного UDP sender на том же работающем receiver,
-отклонение wrong-resolution кадра без raw fallback и bounded cleanup. Он не
+отклонение wrong-resolution кадра без raw fallback, stable moving Legacy14 track
+для обеих camera roles и bounded cleanup. Он не
 является общей application composition, не запускает UI/Turret и не заменяет
 быстрые `InMemoryFrameSource` tests. Silence/resume сохраняет текущую generation,
 но не закрывает production camera reconnect/backoff: source recreation, hard
