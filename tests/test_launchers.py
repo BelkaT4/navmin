@@ -3,13 +3,20 @@ from __future__ import annotations
 import json
 import logging
 from dataclasses import replace
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
 from navmin.__main__ import main as normal_main
-from navmin.calibration import OverviewCalibration, StereoCalibration
+from navmin.calibration import (
+    OverviewCalibration,
+    StereoCalibration,
+    load_overview_calibration,
+    load_stereo_calibration,
+)
+from navmin.config import load_config, save_config
 from navmin.config.models import (
     AimingConfig,
     AimPointConfig,
@@ -37,7 +44,10 @@ from navmin.diagnostic_launcher import (
     TurretEndpoint,
 )
 from navmin.diagnostic_launcher import main as diagnostic_main
+from navmin.input_recovery import InputRecoveryError, recover_default_inputs
 from navmin.launcher import (
+    ApplicationInputError,
+    LauncherPaths,
     LoadedApplicationInputs,
     run_loaded_application,
     session_file_logging,
@@ -53,6 +63,8 @@ WIDTH = 64
 HEIGHT = 48
 K = ((50.0, 0.0, 31.5), (0.0, 50.0, 23.5), (0.0, 0.0, 1.0))
 IDENTITY = ((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0))
+TEST_LOCAL_TZ = timezone(timedelta(hours=7))
+RECOVERY_TEST_NOW = datetime(2026, 9, 23, 10, 15, 30, tzinfo=TEST_LOCAL_TZ)
 
 
 def _preflight_report(status: PreflightStatus = PreflightStatus.PASS) -> StartupPreflightReport:
@@ -66,6 +78,7 @@ def _deterministic_launcher_preflight(monkeypatch) -> None:
     check = lambda *args, **kwargs: _preflight_report()
     monkeypatch.setattr("navmin.__main__.run_startup_preflight", check)
     monkeypatch.setattr("navmin.diagnostic_launcher.run_startup_preflight", check)
+    monkeypatch.setattr("navmin.__main__._prompt_input_recovery", lambda _error: False)
 
 
 def _camera(port: int) -> CameraConfig:
@@ -465,6 +478,241 @@ def _write_source_placeholders(tmp_path: Path) -> tuple[Path, Path, Path]:
     overview_path.write_text("{}", encoding="utf-8")
     stereo_path.write_text("{}", encoding="utf-8")
     return config_path, overview_path, stereo_path
+
+
+def _recovery_paths(tmp_path: Path) -> LauncherPaths:
+    return LauncherPaths(
+        config=tmp_path / "config.json",
+        overview_calibration=tmp_path / "calibration" / "overview.json",
+        stereo_calibration=tmp_path / "calibration" / "stereo.json",
+        log_dir=tmp_path / "logs",
+    )
+
+
+def test_load_application_inputs_identifies_exact_failing_file(tmp_path) -> None:
+    paths = _recovery_paths(tmp_path)
+    paths.overview_calibration.parent.mkdir(parents=True)
+    save_config(paths.config, _config())
+    paths.overview_calibration.write_text("{broken", encoding="utf-8")
+
+    from navmin.launcher import load_application_inputs
+
+    with pytest.raises(ApplicationInputError) as exc_info:
+        load_application_inputs(paths)
+
+    assert exc_info.value.label == "overview calibration"
+    assert exc_info.value.path == paths.overview_calibration
+    assert str(paths.overview_calibration) in str(exc_info.value)
+    assert "malformed JSON" in str(exc_info.value)
+
+
+def test_input_recovery_creates_valid_safe_defaults_without_existing_files(
+    tmp_path,
+) -> None:
+    paths = _recovery_paths(tmp_path)
+    result = recover_default_inputs(paths, now=RECOVERY_TEST_NOW)
+
+    assert result.timestamp == "20260923-101530"
+    assert result.backups == ()
+    assert result.restored_paths == (
+        paths.config,
+        paths.overview_calibration,
+        paths.stereo_calibration,
+    )
+
+    config = load_config(paths.config)
+    overview = load_overview_calibration(paths.overview_calibration)
+    stereo = load_stereo_calibration(paths.stereo_calibration)
+    assert config.turret.serial.port == "/dev/navmin-configure-serial-port"
+    assert config.turret.controller.pid_kp_x == 0.0
+    assert config.turret.controller.pid_kp_y == 0.0
+    assert config.turret.axes.x.max_relative_move_deg == 1.0
+    assert config.turret.axes.y.max_relative_move_deg == 1.0
+    assert overview.image_width == 320
+    assert overview.image_height == 240
+    assert stereo.image_width == 320
+    assert stereo.image_height == 240
+    assert stereo.T == (0.0, 0.0, 0.0)
+
+
+def test_input_recovery_uses_common_local_timestamp_and_collision_suffix(
+    tmp_path,
+) -> None:
+    paths = _recovery_paths(tmp_path)
+    paths.overview_calibration.parent.mkdir(parents=True)
+    originals = {
+        paths.config: b"broken-config",
+        paths.overview_calibration: b"broken-overview",
+        paths.stereo_calibration: b"broken-stereo",
+    }
+    for path, content in originals.items():
+        path.write_bytes(content)
+
+    existing_backup = tmp_path / "config.json-20260923-101530.bak"
+    existing_backup.write_bytes(b"older-backup")
+
+    result = recover_default_inputs(paths, now=RECOVERY_TEST_NOW)
+
+    assert result.timestamp == "20260923-101530-01"
+    assert existing_backup.read_bytes() == b"older-backup"
+    assert {backup.name for _, backup in result.backups} == {
+        "config.json-20260923-101530-01.bak",
+        "overview.json-20260923-101530-01.bak",
+        "stereo.json-20260923-101530-01.bak",
+    }
+    for source, backup in result.backups:
+        assert backup.read_bytes() == originals[source]
+
+
+def test_input_recovery_backup_failure_keeps_original_set_untouched(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    paths = _recovery_paths(tmp_path)
+    paths.overview_calibration.parent.mkdir(parents=True)
+    originals = {
+        paths.config: b"config-original",
+        paths.overview_calibration: b"overview-original",
+        paths.stereo_calibration: b"stereo-original",
+    }
+    for path, content in originals.items():
+        path.write_bytes(content)
+
+    from navmin import input_recovery
+
+    real_backup = input_recovery._create_backup
+    calls = 0
+
+    def fail_second_backup(source: Path, destination: Path) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise InputRecoveryError("backup-failed")
+        real_backup(source, destination)
+
+    monkeypatch.setattr(input_recovery, "_create_backup", fail_second_backup)
+
+    with pytest.raises(InputRecoveryError, match="backup-failed"):
+        recover_default_inputs(paths, now=RECOVERY_TEST_NOW)
+
+    for path, content in originals.items():
+        assert path.read_bytes() == content
+    assert not list(tmp_path.rglob("*.bak"))
+    assert not list(tmp_path.rglob("*.recovery-*.tmp"))
+
+
+def test_input_recovery_install_failure_rolls_back_original_set(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    paths = _recovery_paths(tmp_path)
+    paths.overview_calibration.parent.mkdir(parents=True)
+    originals = {
+        paths.config: b"config-original",
+        paths.overview_calibration: b"overview-original",
+        paths.stereo_calibration: b"stereo-original",
+    }
+    for path, content in originals.items():
+        path.write_bytes(content)
+
+    from navmin import input_recovery
+
+    real_replace = input_recovery.os.replace
+
+    def fail_overview_install(source, destination) -> None:
+        source_path = Path(source)
+        destination_path = Path(destination)
+        if (
+            destination_path == paths.overview_calibration
+            and ".recovery-" in source_path.name
+        ):
+            raise OSError("install-failed")
+        real_replace(source, destination)
+
+    monkeypatch.setattr(input_recovery.os, "replace", fail_overview_install)
+
+    with pytest.raises(InputRecoveryError, match="install-failed"):
+        recover_default_inputs(paths, now=RECOVERY_TEST_NOW)
+
+    for path, content in originals.items():
+        assert path.read_bytes() == content
+    assert not list(tmp_path.rglob("*.bak"))
+    assert not list(tmp_path.rglob("*.recovery-*.tmp"))
+    assert not list(tmp_path.rglob("*.rollback.tmp"))
+
+
+def test_normal_input_failure_can_restore_defaults_but_never_continues_startup(
+    monkeypatch,
+    tmp_path,
+    capsys,
+) -> None:
+    paths = _recovery_paths(tmp_path)
+    shown_results = []
+    monkeypatch.setattr("navmin.__main__._prompt_input_recovery", lambda _error: True)
+    monkeypatch.setattr(
+        "navmin.__main__._show_input_recovery_result", shown_results.append
+    )
+    monkeypatch.setattr(
+        "navmin.__main__.run_startup_preflight",
+        lambda *args, **kwargs: pytest.fail("preflight must wait for a new launch"),
+    )
+    monkeypatch.setattr(
+        "navmin.__main__.run_loaded_application",
+        lambda _inputs: pytest.fail("runtime must wait for a new launch"),
+    )
+
+    exit_code = normal_main(
+        [
+            "--config",
+            str(paths.config),
+            "--overview-calibration",
+            str(paths.overview_calibration),
+            "--stereo-calibration",
+            str(paths.stereo_calibration),
+            "--log-dir",
+            str(paths.log_dir),
+        ]
+    )
+
+    assert exit_code == 2
+    assert len(shown_results) == 1
+    assert paths.config.is_file()
+    assert paths.overview_calibration.is_file()
+    assert paths.stereo_calibration.is_file()
+    assert "INPUT ERROR: config" in capsys.readouterr().err
+    manifest = json.loads(
+        (_single_session(paths.log_dir) / "manifest.json").read_text(encoding="utf-8")
+    )
+    assert manifest["status"] == "input-failed"
+
+
+def test_normal_preflight_only_input_failure_never_opens_recovery_dialog(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    paths = _recovery_paths(tmp_path)
+    monkeypatch.setattr(
+        "navmin.__main__._prompt_input_recovery",
+        lambda _error: pytest.fail("--preflight-only must remain headless"),
+    )
+
+    assert normal_main(
+        [
+            "--config",
+            str(paths.config),
+            "--overview-calibration",
+            str(paths.overview_calibration),
+            "--stereo-calibration",
+            str(paths.stereo_calibration),
+            "--preflight-only",
+            "--log-dir",
+            str(paths.log_dir),
+        ]
+    ) == 2
+
+    assert not paths.config.exists()
+    assert not paths.overview_calibration.exists()
+    assert not paths.stereo_calibration.exists()
 
 
 def test_normal_missing_config_keeps_input_failure_session_evidence(

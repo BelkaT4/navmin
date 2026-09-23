@@ -19,3 +19,8 @@ site/
 logs/
 
 *.zip
+# Local operator inputs and their recovery backups are site-specific.
+/config*.json
+/config*.json-*.bak
+/calibration/*.json
+/calibration/*.json-*.bak

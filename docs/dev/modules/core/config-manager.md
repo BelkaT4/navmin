@@ -17,12 +17,14 @@ Config Manager:
 
 Startup/persistence policy v1 строгая:
 
-- отсутствующий `config.json` — startup/config error, файл не создаётся автоматически;
+- отсутствующий `config.json` — startup/config error; strict loader сам файл не создаёт;
 - malformed JSON, missing/invalid `schema-version`, unknown field, missing required field, invalid type/range/non-finite value — validation error;
 - `schema-version != 1` — unsupported schema error без automatic migration;
 - только явно документированные optional fields получают in-memory defaults;
 - invalid runtime update не заменяет последний валидный snapshot и не публикуется частично;
 - загрузка/validation сама по себе не переписывает пользовательский файл.
+
+`config.json` и calibration — локальные site-specific inputs и не входят в repository baseline. Явный startup recovery принадлежит launcher/UI boundary, а не Config Manager: после input error оператор может закрыть программу или восстановить весь local input set из safe defaults с timestamped backups. Даже после успешного recovery текущий normal startup не продолжается. `--preflight-only` и diagnostic/headless paths остаются неинтерактивными.
 
 Полный required/optional contract и value constraints находятся в [Конфигурации системы](../../architecture/configuration.md).
 

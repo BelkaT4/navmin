@@ -326,6 +326,8 @@ Normal и diagnostic launchers передают сюда effective typed inputs 
 `turret.emulate-stm32=true`, чтобы normal запуск не мог молча перейти на
 `FakeTransport`.
 
+Эти file-backed inputs являются локальными site-specific файлами и не входят в repository baseline. Strict loaders не создают и не чинят их автоматически. Если обычный GUI startup получает missing/invalid input, launcher до preflight/workers может предложить оператору закрыть программу либо выполнить явный recovery: timestamped backup всего существующего input set → safe non-hardware-ready defaults → завершение текущего startup для ручной проверки параметров. `--preflight-only` и diagnostic/headless paths такого диалога не открывают.
+
 Diagnostic entrypoint — `python tools/run_diagnostic_app.py`. Он требует явного
 выбора `--overview real|localhost`, `--stereo-left real|localhost` и
 `--turret real|pty`. Localhost RTP senders и PTY STM32 emulator остаются внешними

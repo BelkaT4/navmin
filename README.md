@@ -19,6 +19,8 @@ python -m navmin
 
 `--preflight-only` проверяет статические prerequisites выбранных real backends и создаёт session evidence, но не запускает workers/UI и не выполняет hardware protocol probe.
 
+`config.json` и `calibration/*.json` являются локальными site-specific inputs и не входят в repository baseline. Обычный GUI startup при missing/invalid input может по явному выбору оператора сохранить существующие файлы в timestamped `.bak`, создать safe recovery defaults и завершиться для ручной проверки параметров перед повторным запуском.
+
 ## Полностью виртуальный diagnostic
 
 Для software-only проверки production transport boundaries без камер и STM32:

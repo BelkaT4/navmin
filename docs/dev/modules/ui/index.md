@@ -21,6 +21,8 @@ UI:
 
 UI не выполняет VisionProcessor, calibration math, Aiming, PID или UART.
 
+Отдельный startup input-recovery dialog находится в `navmin.input_recovery_dialog`, но не является частью `MainWindow`/operational UI. Его вызывает только normal launcher **до** preflight/workers после strict input error. Он показывает точную причину и предлагает закрыть программу либо явно восстановить local config/calibration set; после recovery текущий startup завершается. `--preflight-only` и diagnostic/headless paths этот dialog не используют.
+
 ## `main_camera` и preview
 
 Одна из двух камер является main:

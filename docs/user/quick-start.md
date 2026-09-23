@@ -36,6 +36,31 @@ Normal launcher не делает fallback на software STM32. Если в conf
 `ApplicationRuntime` launcher выполняет backend-aware static preflight. Mandatory
 `FAIL` завершает запуск с code `2` до UI/workers; `WARN` запуск не блокирует.
 
+### Локальные настройки и восстановление
+
+`config.json`, `calibration/overview.json` и `calibration/stereo.json` — локальные файлы конкретной установки; они не должны коммититься и не входят в project snapshot.
+
+Если при обычном `python -m navmin` один из этих файлов отсутствует или не проходит strict validation, до запуска workers показывается точная причина и предлагается:
+
+```text
+Закрыть программу
+Восстановить настройки по умолчанию
+```
+
+При восстановлении существующие файлы сначала сохраняются с timestamp **местного системного времени**, например:
+
+```text
+config.json-20260923-101530.bak
+overview.json-20260923-101530.bak
+stereo.json-20260923-101530.bak
+```
+
+При коллизии используется общий suffix `-01`, `-02`, ...; backup никогда не перезаписывается. Если backup хотя бы одного существующего файла не удалось создать, восстановление не заменяет исходный набор.
+
+Созданные defaults — только безопасная точка восстановления: serial path специально требует ручной настройки, PID = 0, motion limits низкие, calibration нейтральная 320×240. После восстановления NavMin **не продолжает запуск**. Проверьте serial port, steps/rev, направления/limits и реальные calibration files, затем запустите программу снова.
+
+`--preflight-only` и diagnostic launcher диалог восстановления не показывают: они печатают точную input error и завершаются.
+
 ## Diagnostic launcher
 
 Diagnostic launcher использует тот же `ApplicationRuntime`, но позволяет явно

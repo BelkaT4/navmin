@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import sys
 from collections.abc import Sequence
 from dataclasses import dataclass, replace
 from enum import Enum
@@ -405,6 +406,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
         except (OSError, ValueError) as exc:
             LOGGER.exception("NavMin diagnostic input loading failed")
+            print(f"INPUT ERROR: {exc}", file=sys.stderr)
             artifacts.finalize(
                 status=SessionStatus.INPUT_FAILED,
                 exit_code=2,

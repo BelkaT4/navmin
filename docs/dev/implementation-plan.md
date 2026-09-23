@@ -319,7 +319,7 @@ Qt-specific notification bridge остаётся до UI-этапа.
 
 До начала реализации зафиксирована v1-policy:
 
-- полностью отсутствующий `config.json` — startup/config error; файл автоматически не создаётся;
+- полностью отсутствующий `config.json` — startup/config error; strict loader автоматически файл не создаёт, а normal GUI может только по явному выбору оператора выполнить backup + safe recovery и затем завершить текущий startup;
 - malformed/corrupted JSON — startup/config error; исходный файл не изменяется;
 - отсутствующий/неверного типа `schema-version` — invalid config;
 - `schema-version != 1` — unsupported schema error без автоматической migration;

@@ -216,6 +216,8 @@ calibration/overview.json
 calibration/stereo.json
 ```
 
+Это локальные site-specific inputs, они не входят в repository baseline. Если обычный GUI startup обнаруживает missing/invalid input, оператор может закрыть программу либо явно восстановить safe defaults; существующие файлы получают backup вида `<filename>-YYYYMMDD-HHMMSS[-NN].bak` по местному системному времени. Recovery не продолжает запуск автоматически и не заменяет on-site настройку serial/mechanics/calibration. Preflight/diagnostic paths остаются неинтерактивными.
+
 Preflight:
 
 ```bash

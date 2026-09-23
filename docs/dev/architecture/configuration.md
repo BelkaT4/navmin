@@ -26,9 +26,21 @@ write temporary file
 → atomic replace config.json
 ```
 
-Повреждённый существующий JSON не должен молча перезаписываться defaults: Config Manager сообщает startup/config error и сохраняет исходный файл для диагностики.
+Повреждённый существующий JSON не должен молча перезаписываться defaults: Config Manager сообщает startup/config error. Полностью отсутствующий `config.json` также является startup/config error; strict loader не создаёт файл автоматически и не запускает normal runtime на неявных defaults.
 
-Полностью отсутствующий `config.json` — startup/config error. Config Manager не создаёт файл автоматически и не запускает normal runtime на неявных defaults.
+`config.json` и `calibration/*.json` являются локальными operator/site-specific inputs и не входят в repository baseline. При обычном GUI-запуске launcher после ошибки загрузки показывает точную причину и предлагает только два действия: закрыть программу или **явно** восстановить полный local input set безопасными recovery defaults. `--preflight-only` и diagnostic/headless launchers остаются неинтерактивными: они печатают ошибку и завершаются.
+
+При подтверждённом recovery все существующие файлы набора сначала копируются в backup с единым timestamp локального системного времени:
+
+```text
+config.json-YYYYMMDD-HHMMSS.bak
+overview.json-YYYYMMDD-HHMMSS.bak
+stereo.json-YYYYMMDD-HHMMSS.bak
+```
+
+Если любое имя уже занято, для **всего recovery set** выбирается следующий общий suffix `-01`, `-02`, ... перед `.bak`; существующий backup никогда не перезаписывается. Если backup хотя бы одного существующего файла создать нельзя, исходный набор не заменяется. После успешного recovery normal startup намеренно завершается: оператор обязан проверить hardware-specific serial/mechanics/calibration values и запустить NavMin снова.
+
+Recovery defaults валидны по schema, но намеренно не являются hardware-ready: PID равен нулю, motion limits консервативны, serial path указывает на заведомо несуществующий placeholder, calibration нейтральная 320×240. Поэтому recovery — способ вернуть редактируемый валидный набор файлов, а не automatic hardware configuration.
 
 ### Строгая validation policy v1
 
@@ -74,7 +86,7 @@ calibration/
 
 Calibration содержит measured camera/stereo geometry и собственный `schema_version`. Для первой реализации `schema_version = 1`.
 
-Calibration files также валидируются строго: malformed JSON, неизвестное поле, неверный тип/shape, non-finite matrix value или несовпадение `image_width/image_height` с source resolution дают calibration error. Config Manager/Vision не исправляют и не перезаписывают calibration автоматически.
+Calibration files также валидируются строго: malformed JSON, неизвестное поле, неверный тип/shape, non-finite matrix value или несовпадение `image_width/image_height` с source resolution дают calibration error. Config Manager/Vision не исправляют и не перезаписывают calibration автоматически; только отдельный явно подтверждённый startup recovery может заменить local input set после создания backup.
 
 Отсутствующая/невалидная calibration не обязана останавливать всё приложение, но соответствующий camera pipeline не считается ready и не публикует raw frame как fallback.
 

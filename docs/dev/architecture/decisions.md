@@ -393,7 +393,9 @@ Stereo pairing — отдельная сложная задача синхрон
 
 ### Решение
 
-`config.json` обязателен для normal startup. Отсутствующий файл, malformed JSON, unknown fields, missing required fields, invalid values и unsupported `schema-version` дают явную config/startup error. Только заранее документированные optional fields получают in-memory defaults; loader не дописывает их в файл автоматически. Invalid runtime update не заменяет последний полностью валидный snapshot.
+`config.json` обязателен для normal startup. Отсутствующий файл, malformed JSON, unknown fields, missing required fields, invalid values и unsupported `schema-version` дают явную config/startup error. Только заранее документированные optional fields получают in-memory defaults; strict loader не дописывает и не чинит файл автоматически. Invalid runtime update не заменяет последний полностью валидный snapshot.
+
+После такой ошибки обычный GUI launcher может **отдельно и только по явному выбору оператора** выполнить recovery всего local input set (`config.json` + calibration): сначала timestamped backups по локальному системному времени, затем schema-valid safe defaults, после чего startup завершается и требует ручной проверки hardware-specific values перед новым запуском. Headless/preflight/diagnostic paths recovery-dialog не открывают. Это recovery workflow, а не fallback внутри parser/Config Manager.
 
 Schema v1 использует `schema-version = 1`; automatic migration не проектируется до появления реальной schema v2.
 
@@ -403,7 +405,7 @@ Schema v1 использует `schema-version = 1`; automatic migration не п
 
 ### Отвергнутые альтернативы
 
-- **Автоматически создавать полный default config при отсутствующем файле.** Отклонено: безопасные универсальные hardware defaults неизвестны, а примерные числа в документации не являются аппаратными пределами.
+- **Автоматически создавать полный default config и продолжать startup при отсутствующем файле.** Отклонено: безопасные универсальные hardware defaults неизвестны. Принятый recovery создаёт только явно запрошенный оператором non-hardware-ready набор и завершает текущий startup.
 - **Игнорировать unknown fields.** Отклонено: опечатка превращается в скрытый fallback/неприменённую настройку.
 - **Исправлять invalid values defaults и продолжать startup.** Отклонено: скрывает проблему и создаёт неочевидный effective config.
 - **Проектировать migration framework заранее.** Отклонено до появления второй реальной schema; требования migration пока неизвестны.
@@ -674,6 +676,8 @@ session artifacts не принадлежат `ApplicationRuntime` и управ
 внешней стороне shared composition.
 
 `InMemoryFrameSource` и `FakeTransport/FakeStm32Endpoint` остаются deterministic automated-test boundaries и не становятся пользовательскими diagnostic runtime modes. Localhost RTP/JPEG нужен именно для проверки production GStreamer receiver без Raspberry Pi, а Linux PTY — для проверки production `SerialTransport`/pyserial byte path без физического controller.
+
+Normal GUI launcher также владеет operator-approved recovery для локальных `config.json`/calibration inputs. Recovery выполняется только после явной input error и до preflight/runtime: strict loaders остаются strict, существующие файлы сначала получают timestamped backup, safe defaults не считаются hardware configuration, а текущий startup после восстановления завершается. Эта boundary не принадлежит `ApplicationRuntime`, Config Manager или diagnostic launcher.
 
 Backend selection должен быть явным и воспроизводимым; primary interface — command-line arguments. Runtime не угадывает автоматически, какой fake/real backend использовать. Выбранные backends записываются в session diagnostics. Для полностью software-only сочетания `localhost + localhost + pty` launcher может дополнительно получить явный `--synthetic-inputs`: тогда только launcher создаёт встроенные typed 320×240 diagnostic config/calibrations в памяти. Это не fallback по отсутствию файлов и не меняет normal startup rule: mixed/real diagnostics и normal launcher остаются file-backed, а `--synthetic-inputs` с любым real endpoint отклоняется.
 

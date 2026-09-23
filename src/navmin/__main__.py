@@ -4,9 +4,15 @@ from __future__ import annotations
 
 import argparse
 import logging
+import sys
 from collections.abc import Sequence
 from pathlib import Path
 
+from navmin.input_recovery import (
+    InputRecoveryError,
+    InputRecoveryResult,
+    recover_default_inputs,
+)
 from navmin.launcher import (
     LauncherPaths,
     load_application_inputs,
@@ -26,6 +32,26 @@ from navmin.session_artifacts import (
 )
 
 LOGGER = logging.getLogger(__name__)
+
+
+def _prompt_input_recovery(error_text: str) -> bool:
+    from navmin.input_recovery_dialog import prompt_input_recovery
+
+    return prompt_input_recovery(error_text)
+
+
+def _show_input_recovery_result(result: InputRecoveryResult) -> None:
+    from navmin.input_recovery_dialog import show_input_recovery_result
+
+    show_input_recovery_result(result)
+
+
+def _show_input_recovery_failure(message: str) -> None:
+    from navmin.input_recovery_dialog import show_input_recovery_failure
+
+    show_input_recovery_failure(message)
+
+
 _FAILURE_EXIT_CODE = 2
 _INTERRUPTED_EXIT_CODE = 130
 
@@ -93,9 +119,49 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         try:
             inputs = load_application_inputs(paths)
-            validate_normal_hardware_config(inputs.config)
         except (OSError, ValueError) as exc:
             LOGGER.exception("NavMin input loading failed")
+            print(f"INPUT ERROR: {exc}", file=sys.stderr)
+            should_recover = False
+            if not args.preflight_only:
+                try:
+                    should_recover = _prompt_input_recovery(str(exc))
+                except (ImportError, OSError, RuntimeError) as dialog_exc:
+                    LOGGER.exception("NavMin input recovery dialog unavailable")
+                    print(f"RECOVERY UI ERROR: {dialog_exc}", file=sys.stderr)
+            if should_recover:
+                try:
+                    result = recover_default_inputs(paths)
+                except InputRecoveryError as recovery_exc:
+                    LOGGER.exception("NavMin input recovery failed")
+                    print(f"RECOVERY ERROR: {recovery_exc}", file=sys.stderr)
+                    try:
+                        _show_input_recovery_failure(str(recovery_exc))
+                    except (ImportError, OSError, RuntimeError):
+                        LOGGER.exception("NavMin recovery failure dialog unavailable")
+                else:
+                    LOGGER.warning(
+                        "NavMin local inputs restored; normal startup intentionally "
+                        "stops until operator reviews hardware-specific values"
+                    )
+                    for source, backup in result.backups:
+                        LOGGER.warning("Input backup: %s -> %s", source, backup)
+                    try:
+                        _show_input_recovery_result(result)
+                    except (ImportError, OSError, RuntimeError):
+                        LOGGER.exception("NavMin recovery result dialog unavailable")
+            artifacts.finalize(
+                status=SessionStatus.INPUT_FAILED,
+                exit_code=_FAILURE_EXIT_CODE,
+                failure=exc,
+            )
+            return _FAILURE_EXIT_CODE
+
+        try:
+            validate_normal_hardware_config(inputs.config)
+        except ValueError as exc:
+            LOGGER.exception("NavMin normal hardware config rejected")
+            print(f"INPUT ERROR: {exc}", file=sys.stderr)
             artifacts.finalize(
                 status=SessionStatus.INPUT_FAILED,
                 exit_code=_FAILURE_EXIT_CODE,
