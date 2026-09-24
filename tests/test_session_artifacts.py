@@ -4,11 +4,17 @@ import hashlib
 import json
 import logging
 import os
+from dataclasses import replace
 from datetime import UTC, datetime
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 import navmin.session_artifacts as session_artifacts_module
+from navmin.config.models import (
+    RtspDecoderMode,
+    RtspProtocol,
+    RtspSourceConfig,
+)
 from navmin.diagnostic_launcher import _synthetic_diagnostic_inputs
 from navmin.logging_setup import (
     SESSION_LOG_BACKUP_COUNT,
@@ -179,6 +185,9 @@ def test_effective_synthetic_inputs_and_allowlisted_manifest_evidence(tmp_path) 
     )
 
     assert (artifacts.inputs_dir / "effective-config.json").is_file()
+    effective = _read_json(artifacts.inputs_dir / "effective-config.json")
+    assert effective["schema-version"] == 1
+    assert effective["vision"]["cameras"]["overview"]["source"]["type"] == "rtp-jpeg"
     assert (artifacts.inputs_dir / "overview-calibration.json").is_file()
     assert (artifacts.inputs_dir / "stereo-calibration.json").is_file()
     sources = _read_json(artifacts.inputs_dir / "source-hashes.json")
@@ -201,6 +210,43 @@ def test_effective_synthetic_inputs_and_allowlisted_manifest_evidence(tmp_path) 
     assert manifest["git_dirty"] is None
     forbidden = {"environment", "environ", "path", "home", "credentials"}
     assert forbidden.isdisjoint({key.lower() for key in manifest})
+
+
+def test_effective_inputs_persist_rtsp_source_schema(tmp_path) -> None:
+    artifacts = _artifacts(tmp_path)
+    inputs = _synthetic_diagnostic_inputs()
+    overview = replace(
+        inputs.config.vision.cameras.overview,
+        source=RtspSourceConfig(
+            uri="rtsp://camera.local:8554/stream",
+            protocol=RtspProtocol.TCP,
+            decoder_mode=RtspDecoderMode.SOFTWARE,
+            latency_ms=100,
+            drop_on_latency=True,
+            buffer_size=1,
+        ),
+    )
+    cameras = replace(inputs.config.vision.cameras, overview=overview)
+    config = replace(inputs.config, vision=replace(inputs.config.vision, cameras=cameras))
+
+    artifacts.write_effective_inputs(
+        config=config,
+        overview_calibration=inputs.overview_calibration,
+        stereo_calibration=inputs.stereo_calibration,
+        source_paths=None,
+    )
+
+    effective = _read_json(artifacts.inputs_dir / "effective-config.json")
+    source = effective["vision"]["cameras"]["overview"]["source"]
+    assert source == {
+        "type": "rtsp",
+        "uri": "rtsp://camera.local:8554/stream",
+        "protocol": "tcp",
+        "decoder-mode": "software",
+        "latency-ms": 100,
+        "drop-on-latency": True,
+        "buffer-size": 1,
+    }
 
 
 def test_file_backed_source_hashes_match_real_files(tmp_path) -> None:

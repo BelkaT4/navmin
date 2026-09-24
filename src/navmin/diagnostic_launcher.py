@@ -20,6 +20,7 @@ from navmin.config import (
     CamerasConfig,
     PidControllerConfig,
     ProcessingScope,
+    RtpJpegSourceConfig,
     SerialConfig,
     StereoDistanceConfig,
     Stm32Config,
@@ -103,30 +104,34 @@ class DiagnosticEndpoints:
         try:
             if self.selection.overview is CameraEndpoint.LOCALHOST:
                 overview = self._base_inputs.overview_calibration
-                camera = config.vision.cameras.overview
-                self._start_sender(
-                    camera_role=CameraRole.OVERVIEW,
-                    port=camera.port,
-                    width=overview.image_width,
-                    height=overview.image_height,
-                )
                 config = _replace_camera_endpoint(
                     config,
                     camera_name="overview",
+                    fallback_port=8888,
+                )
+                source = config.vision.cameras.overview.source
+                assert isinstance(source, RtpJpegSourceConfig)
+                self._start_sender(
+                    camera_role=CameraRole.OVERVIEW,
+                    port=source.port,
+                    width=overview.image_width,
+                    height=overview.image_height,
                 )
 
             if self.selection.stereo_left is CameraEndpoint.LOCALHOST:
                 stereo = self._base_inputs.stereo_calibration
-                camera = config.vision.cameras.stereo_left
-                self._start_sender(
-                    camera_role=CameraRole.STEREO_LEFT,
-                    port=camera.port,
-                    width=stereo.image_width,
-                    height=stereo.image_height,
-                )
                 config = _replace_camera_endpoint(
                     config,
                     camera_name="stereo_left",
+                    fallback_port=8889,
+                )
+                source = config.vision.cameras.stereo_left.source
+                assert isinstance(source, RtpJpegSourceConfig)
+                self._start_sender(
+                    camera_role=CameraRole.STEREO_LEFT,
+                    port=source.port,
+                    width=stereo.image_width,
+                    height=stereo.image_height,
                 )
 
             if self.selection.turret is TurretEndpoint.PTY:
@@ -265,10 +270,24 @@ def _synthetic_diagnostic_inputs() -> LoadedApplicationInputs:
     )
 
 
-def _replace_camera_endpoint(config: AppConfig, *, camera_name: str) -> AppConfig:
+def _replace_camera_endpoint(
+    config: AppConfig,
+    *,
+    camera_name: str,
+    fallback_port: int,
+) -> AppConfig:
     cameras = config.vision.cameras
     camera = getattr(cameras, camera_name)
-    local = replace(camera, address="127.0.0.1", rtp_enabled=True)
+    source = camera.source
+    port = source.port if isinstance(source, RtpJpegSourceConfig) else fallback_port
+    local = replace(
+        camera,
+        source=RtpJpegSourceConfig(
+            bind_address="127.0.0.1",
+            port=port,
+            buffer_size=source.buffer_size,
+        ),
+    )
     updated_cameras = replace(cameras, **{camera_name: local})
     return replace(config, vision=replace(config.vision, cameras=updated_cameras))
 
@@ -280,9 +299,13 @@ def _planned_preflight_inputs(
     """Apply only pure endpoint overrides needed to preflight the planned profile."""
     config = replace(inputs.config, turret=replace(inputs.config.turret, emulate_stm32=False))
     if selection.overview is CameraEndpoint.LOCALHOST:
-        config = _replace_camera_endpoint(config, camera_name="overview")
+        config = _replace_camera_endpoint(
+            config, camera_name="overview", fallback_port=8888
+        )
     if selection.stereo_left is CameraEndpoint.LOCALHOST:
-        config = _replace_camera_endpoint(config, camera_name="stereo_left")
+        config = _replace_camera_endpoint(
+            config, camera_name="stereo_left", fallback_port=8889
+        )
     return replace(inputs, config=config)
 
 

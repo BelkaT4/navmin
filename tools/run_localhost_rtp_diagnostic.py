@@ -154,7 +154,7 @@ def _run_single_transport_ordering(
     receiver_first: bool,
     resources: _ResourceTracker,
 ) -> tuple[int, int]:
-    source = GStreamerRtpJpegSource(diagnostic_camera_config(port))
+    source = GStreamerRtpJpegSource(diagnostic_camera_config(port).source)
     sender = resources.new_sender(RtpJpegSenderConfig(port=port))
     try:
         if receiver_first:

@@ -7,6 +7,7 @@ import math
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, NoReturn
+from urllib.parse import urlsplit
 
 from navmin.contracts import CameraRole, DistanceSource
 
@@ -21,6 +22,10 @@ from .models import (
     CamerasConfig,
     PidControllerConfig,
     ProcessingScope,
+    RtpJpegSourceConfig,
+    RtspDecoderMode,
+    RtspProtocol,
+    RtspSourceConfig,
     SerialConfig,
     StereoDistanceConfig,
     Stm32Config,
@@ -153,29 +158,90 @@ def _enum_string(value: Any, path: str, allowed: set[str]) -> str:
     return value
 
 
+def _parse_camera_source(value: Any, path: str) -> RtpJpegSourceConfig | RtspSourceConfig:
+    obj = _object(value, path)
+    if "type" not in obj:
+        _validation(f"{path}.type", "missing required field")
+    source_type = _enum_string(obj["type"], f"{path}.type", {"rtp-jpeg", "rtsp"})
+
+    if source_type == "rtp-jpeg":
+        obj = _fields(
+            obj,
+            path,
+            required={"type", "bind-address", "port", "buffer-size"},
+        )
+        port = _int(obj["port"], f"{path}.port", minimum=1)
+        if port > 65535:
+            _validation(f"{path}.port", "must be <= 65535")
+        return RtpJpegSourceConfig(
+            bind_address=_nonempty_string(
+                obj["bind-address"], f"{path}.bind-address"
+            ),
+            port=port,
+            buffer_size=_int(
+                obj["buffer-size"], f"{path}.buffer-size", minimum=1
+            ),
+        )
+
+    obj = _fields(
+        obj,
+        path,
+        required={
+            "type",
+            "uri",
+            "protocol",
+            "decoder-mode",
+            "latency-ms",
+            "drop-on-latency",
+            "buffer-size",
+        },
+    )
+    uri = _nonempty_string(obj["uri"], f"{path}.uri")
+    try:
+        parsed_uri = urlsplit(uri)
+        port = parsed_uri.port
+    except ValueError as exc:
+        _validation(f"{path}.uri", f"invalid RTSP URI: {exc}")
+    if parsed_uri.scheme.lower() != "rtsp" or parsed_uri.hostname is None:
+        _validation(f"{path}.uri", "expected rtsp://host[:port]/path URI")
+    if port is not None and not 1 <= port <= 65535:
+        _validation(f"{path}.uri", "RTSP URI port must be in range 1..65535")
+    protocol = _enum_string(
+        obj["protocol"],
+        f"{path}.protocol",
+        {item.value for item in RtspProtocol},
+    )
+    decoder_mode = _enum_string(
+        obj["decoder-mode"],
+        f"{path}.decoder-mode",
+        {item.value for item in RtspDecoderMode},
+    )
+    return RtspSourceConfig(
+        uri=uri,
+        protocol=RtspProtocol(protocol),
+        decoder_mode=RtspDecoderMode(decoder_mode),
+        latency_ms=_int(obj["latency-ms"], f"{path}.latency-ms", minimum=0),
+        drop_on_latency=_bool(
+            obj["drop-on-latency"], f"{path}.drop-on-latency"
+        ),
+        buffer_size=_int(obj["buffer-size"], f"{path}.buffer-size", minimum=1),
+    )
+
+
 def _parse_camera(value: Any, path: str) -> CameraConfig:
     obj = _fields(
         value,
         path,
         required={
             "enabled",
-            "address",
-            "port",
-            "rtp-enabled",
-            "buffer-size",
+            "source",
             "processing-enabled",
             "vision-processor-class",
         },
     )
-    port = _int(obj["port"], f"{path}.port", minimum=1)
-    if port > 65535:
-        _validation(f"{path}.port", "must be <= 65535")
     return CameraConfig(
         enabled=_bool(obj["enabled"], f"{path}.enabled"),
-        address=_nonempty_string(obj["address"], f"{path}.address"),
-        port=port,
-        rtp_enabled=_bool(obj["rtp-enabled"], f"{path}.rtp-enabled"),
-        buffer_size=_int(obj["buffer-size"], f"{path}.buffer-size", minimum=1),
+        source=_parse_camera_source(obj["source"], f"{path}.source"),
         processing_enabled=_bool(
             obj["processing-enabled"], f"{path}.processing-enabled"
         ),
@@ -547,13 +613,33 @@ def load_config(path: str | Path) -> AppConfig:
     return parse_config(data)
 
 
+def _camera_source_to_mapping(
+    source: RtpJpegSourceConfig | RtspSourceConfig,
+) -> dict[str, Any]:
+    if isinstance(source, RtpJpegSourceConfig):
+        return {
+            "type": "rtp-jpeg",
+            "bind-address": source.bind_address,
+            "port": source.port,
+            "buffer-size": source.buffer_size,
+        }
+    if isinstance(source, RtspSourceConfig):
+        return {
+            "type": "rtsp",
+            "uri": source.uri,
+            "protocol": source.protocol.value,
+            "decoder-mode": source.decoder_mode.value,
+            "latency-ms": source.latency_ms,
+            "drop-on-latency": source.drop_on_latency,
+            "buffer-size": source.buffer_size,
+        }
+    raise TypeError(f"unsupported camera source config: {type(source).__name__}")
+
+
 def _camera_to_mapping(config: CameraConfig) -> dict[str, Any]:
     return {
         "enabled": config.enabled,
-        "address": config.address,
-        "port": config.port,
-        "rtp-enabled": config.rtp_enabled,
-        "buffer-size": config.buffer_size,
+        "source": _camera_source_to_mapping(config.source),
         "processing-enabled": config.processing_enabled,
         "vision-processor-class": config.vision_processor_class,
     }

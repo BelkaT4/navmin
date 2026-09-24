@@ -28,6 +28,7 @@ from navmin.config.models import (
     CamerasConfig,
     PidControllerConfig,
     ProcessingScope,
+    RtpJpegSourceConfig,
     SerialConfig,
     StereoDistanceConfig,
     Stm32Config,
@@ -303,10 +304,11 @@ def _smoke_turret_config() -> TurretConfig:
 def _smoke_camera_config(port: int, *, processing_enabled: bool) -> CameraConfig:
     return CameraConfig(
         enabled=True,
-        address="127.0.0.1",
-        port=port,
-        rtp_enabled=True,
-        buffer_size=1,
+        source=RtpJpegSourceConfig(
+            bind_address="127.0.0.1",
+            port=port,
+            buffer_size=1,
+        ),
         processing_enabled=processing_enabled,
         vision_processor_class="Legacy14VisionProcessor",
     )

@@ -87,5 +87,5 @@ def test_package_module_help_executes_without_ui_or_hardware(tmp_path) -> None:
     )
 
     assert completed.returncode == 0
-    assert "real RTP cameras" in completed.stdout
+    assert "configured real camera sources" in completed.stdout
     assert completed.stderr == ""

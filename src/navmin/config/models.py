@@ -24,13 +24,39 @@ class ConfigApplyPolicy(Enum):
     APPLICATION_RESTART = "application-restart"
 
 
+class RtspProtocol(Enum):
+    TCP = "tcp"
+    UDP = "udp"
+
+
+class RtspDecoderMode(Enum):
+    SOFTWARE = "software"
+
+
+@dataclass(frozen=True)
+class RtpJpegSourceConfig:
+    bind_address: str
+    port: int
+    buffer_size: int
+
+
+@dataclass(frozen=True)
+class RtspSourceConfig:
+    uri: str
+    protocol: RtspProtocol
+    decoder_mode: RtspDecoderMode
+    latency_ms: int
+    drop_on_latency: bool
+    buffer_size: int
+
+
+type CameraSourceConfig = RtpJpegSourceConfig | RtspSourceConfig
+
+
 @dataclass(frozen=True)
 class CameraConfig:
     enabled: bool
-    address: str
-    port: int
-    rtp_enabled: bool
-    buffer_size: int
+    source: CameraSourceConfig
     processing_enabled: bool
     vision_processor_class: str
 
@@ -183,17 +209,12 @@ def config_apply_policy(path: str) -> ConfigApplyPolicy | None:
     if parts[:2] == ["turret", "stm32"] and len(parts) == 3:
         return ConfigApplyPolicy.DYNAMIC
 
-    if len(parts) == 4 and parts[:2] == ["vision", "cameras"]:
-        field = parts[3]
-        if field == "processing-enabled":
+    if len(parts) >= 4 and parts[:2] == ["vision", "cameras"]:
+        if parts[3] == "processing-enabled" and len(parts) == 4:
             return ConfigApplyPolicy.DYNAMIC
-        if field in {
-            "address",
-            "port",
-            "rtp-enabled",
-            "buffer-size",
-            "vision-processor-class",
-        }:
+        if parts[3] == "vision-processor-class" and len(parts) == 4:
+            return ConfigApplyPolicy.CAMERA_PIPELINE_RESTART
+        if parts[3] == "source" and len(parts) == 5:
             return ConfigApplyPolicy.CAMERA_PIPELINE_RESTART
 
     if path in {
@@ -260,10 +281,15 @@ __all__ = [
     "AxesConfig",
     "AxisMechanicsConfig",
     "CameraConfig",
+    "CameraSourceConfig",
     "CamerasConfig",
     "ConfigApplyPolicy",
     "PidControllerConfig",
     "ProcessingScope",
+    "RtpJpegSourceConfig",
+    "RtspDecoderMode",
+    "RtspProtocol",
+    "RtspSourceConfig",
     "SerialConfig",
     "StereoDistanceConfig",
     "Stm32Config",

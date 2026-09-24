@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from time import monotonic, sleep
 
 import pytest
@@ -21,6 +22,10 @@ from navmin.config.models import (
     CamerasConfig,
     PidControllerConfig,
     ProcessingScope,
+    RtpJpegSourceConfig,
+    RtspDecoderMode,
+    RtspProtocol,
+    RtspSourceConfig,
     SerialConfig,
     StereoDistanceConfig,
     Stm32Config,
@@ -38,7 +43,10 @@ from navmin.contracts import (
 from navmin.turret.protocol import CommandCode
 from navmin.turret.simulator import FakeStm32Endpoint, FakeTransport
 from navmin.turret.worker import TurretWorker
-from navmin.vision.gstreamer_source import GStreamerRtpJpegSource
+from navmin.vision.gstreamer_source import (
+    GStreamerRtpJpegSource,
+    GStreamerRtspSource,
+)
 from navmin.vision.pipeline import InMemoryFrameSource
 
 WIDTH = 32
@@ -54,10 +62,27 @@ IDENTITY_3X3 = (
 def _camera(port: int, *, enabled: bool = True) -> CameraConfig:
     return CameraConfig(
         enabled=enabled,
-        address="0.0.0.0",
-        port=port,
-        rtp_enabled=True,
-        buffer_size=1,
+        source=RtpJpegSourceConfig(
+            bind_address="0.0.0.0",
+            port=port,
+            buffer_size=1,
+        ),
+        processing_enabled=False,
+        vision_processor_class="Legacy14VisionProcessor",
+    )
+
+
+def _rtsp_camera(uri: str) -> CameraConfig:
+    return CameraConfig(
+        enabled=True,
+        source=RtspSourceConfig(
+            uri=uri,
+            protocol=RtspProtocol.TCP,
+            decoder_mode=RtspDecoderMode.SOFTWARE,
+            latency_ms=100,
+            drop_on_latency=True,
+            buffer_size=1,
+        ),
         processing_enabled=False,
         vision_processor_class="Legacy14VisionProcessor",
     )
@@ -262,6 +287,42 @@ def test_default_construction_uses_only_production_transport_boundaries() -> Non
     assert isinstance(runtime.turret_worker, TurretWorker)
     assert factories.turret_transport_factory is None
 
+
+
+def test_default_composition_supports_overview_rtsp_and_stereo_left_rtp() -> None:
+    base = _config()
+    cameras = replace(
+        base.vision.cameras,
+        overview=_rtsp_camera("rtsp://overview.local/stream"),
+    )
+    config = replace(base, vision=replace(base.vision, cameras=cameras))
+
+    runtime = build_application_runtime(
+        config=config,
+        overview_calibration=_overview_calibration(),
+        stereo_calibration=_stereo_calibration(),
+    )
+
+    assert isinstance(runtime.overview_worker.source, GStreamerRtspSource)
+    assert isinstance(runtime.stereo_left_worker.source, GStreamerRtpJpegSource)
+
+
+def test_default_composition_supports_overview_rtp_and_stereo_left_rtsp() -> None:
+    base = _config()
+    cameras = replace(
+        base.vision.cameras,
+        stereo_left=_rtsp_camera("rtsp://stereo-left.local/stream"),
+    )
+    config = replace(base, vision=replace(base.vision, cameras=cameras))
+
+    runtime = build_application_runtime(
+        config=config,
+        overview_calibration=_overview_calibration(),
+        stereo_calibration=_stereo_calibration(),
+    )
+
+    assert isinstance(runtime.overview_worker.source, GStreamerRtpJpegSource)
+    assert isinstance(runtime.stereo_left_worker.source, GStreamerRtspSource)
 
 def test_shared_runtime_starts_and_exposes_complete_ui_dependency_surface() -> None:
     runtime, sources, _endpoint = _injected_runtime()
