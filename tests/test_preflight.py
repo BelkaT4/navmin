@@ -20,6 +20,10 @@ from navmin.config.models import (
     CamerasConfig,
     PidControllerConfig,
     ProcessingScope,
+    RtpJpegSourceConfig,
+    RtspDecoderMode,
+    RtspProtocol,
+    RtspSourceConfig,
     SerialConfig,
     StereoDistanceConfig,
     Stm32Config,
@@ -48,10 +52,31 @@ IDENTITY = ((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0))
 def _camera(port: int, *, address: str = "127.0.0.1") -> CameraConfig:
     return CameraConfig(
         enabled=True,
-        address=address,
-        port=port,
-        rtp_enabled=True,
-        buffer_size=1,
+        source=RtpJpegSourceConfig(
+            bind_address=address,
+            port=port,
+            buffer_size=1,
+        ),
+        processing_enabled=False,
+        vision_processor_class="Legacy14VisionProcessor",
+    )
+
+
+def _rtsp_camera(
+    uri: str = "rtsp://camera.local/stream",
+    *,
+    protocol: RtspProtocol = RtspProtocol.TCP,
+) -> CameraConfig:
+    return CameraConfig(
+        enabled=True,
+        source=RtspSourceConfig(
+            uri=uri,
+            protocol=protocol,
+            decoder_mode=RtspDecoderMode.SOFTWARE,
+            latency_ms=100,
+            drop_on_latency=True,
+            buffer_size=1,
+        ),
         processing_enabled=False,
         vision_processor_class="Legacy14VisionProcessor",
     )
@@ -187,7 +212,7 @@ def _run(
     defaults = {
         "session_directory_check": lambda _path: None,
         "qt_check": lambda: None,
-        "receiver_check": lambda: None,
+        "receiver_check": lambda _elements: None,
         "sender_check": lambda: _sender_result(),
         "pyserial_check": lambda: None,
         "pty_check": lambda: PtyPreflightResult(True, True, True),
@@ -275,7 +300,7 @@ def test_localhost_camera_requires_receiver_and_sender_tools(tmp_path) -> None:
         tmp_path,
         _inputs(18_883, 18_884),
         StartupBackendSelection("localhost", "real", "pty"),
-        receiver_check=lambda: calls.append("receiver") or None,
+        receiver_check=lambda _elements: calls.append("receiver") or None,
         sender_check=lambda: calls.append("sender") or _sender_result(),
     )
 
@@ -440,7 +465,9 @@ def test_duplicate_camera_endpoint_fails_before_runtime(tmp_path) -> None:
     assert f"127.0.0.1:{port}" in failure.detail
 
 
-def test_rtp_disabled_is_preflight_failure(tmp_path) -> None:
+def test_mixed_rtsp_and_rtp_preflight_checks_only_relevant_dependencies(
+    tmp_path,
+) -> None:
     inputs = _inputs(18_892, 18_893)
     cameras = inputs.config.vision.cameras
     config = replace(
@@ -449,22 +476,39 @@ def test_rtp_disabled_is_preflight_failure(tmp_path) -> None:
             inputs.config.vision,
             cameras=replace(
                 cameras,
-                overview=replace(cameras.overview, rtp_enabled=False),
+                overview=_rtsp_camera(protocol=RtspProtocol.UDP),
             ),
         ),
     )
+    element_calls: list[tuple[str, ...]] = []
+    udp_calls: list[tuple[str, int]] = []
 
     report = _run(
         tmp_path,
         replace(inputs, config=config),
         StartupBackendSelection("real", "real", "pty"),
+        receiver_check=lambda elements: element_calls.append(elements) or None,
+        udp_check=lambda address, port: udp_calls.append((address, port)) or None,
     )
 
-    assert not report.ok
+    assert report.ok
+    assert len(element_calls) == 1
+    elements = element_calls[0]
+    assert {
+        "rtspsrc",
+        "rtph264depay",
+        "h264parse",
+        "avdec_h264",
+        "videoconvert",
+        "appsink",
+        "udpsrc",
+        "rtpjpegdepay",
+        "jpegdec",
+    }.issubset(elements)
+    assert udp_calls == [("127.0.0.1", 18_893)]
+    assert any(check.name == "Overview RTSP configuration" for check in report.checks)
     assert any(
-        check.name == "Overview RTP configuration"
-        and check.status is PreflightStatus.FAIL
-        for check in report.checks
+        check.name == "Stereo Left RTP/JPEG configuration" for check in report.checks
     )
 
 
@@ -483,8 +527,9 @@ def test_receiver_capability_probe_uses_production_initializer_and_factory_probe
         lambda elements: events.append(elements) or (),
     )
 
-    assert preflight_module._check_gstreamer_receiver() is None
-    assert events == ["initialize", preflight_module.GST_RECEIVER_ELEMENTS]
+    elements = ("rtspsrc", "rtph264depay", "avdec_h264")
+    assert preflight_module._check_gstreamer_receiver(elements) is None
+    assert events == ["initialize", elements]
 
 
 def test_serial_device_check_requires_exists_readable_and_writable(

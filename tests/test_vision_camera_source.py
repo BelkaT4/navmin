@@ -7,14 +7,22 @@ import numpy as np
 import pytest
 
 from navmin.calibration import OverviewCalibration
-from navmin.config.models import CameraConfig
+from navmin.config.models import (
+    CameraConfig,
+    RtpJpegSourceConfig,
+    RtspDecoderMode,
+    RtspProtocol,
+    RtspSourceConfig,
+)
 from navmin.contracts import CameraRole, CameraState
 from navmin.vision import gstreamer_source
+from navmin.vision.camera_source import create_camera_source
 from navmin.vision.camera_worker import CameraWorker, build_camera_worker
 from navmin.vision.gstreamer_source import (
     GStreamerRtpJpegSource,
-    UnsupportedCameraTransportError,
+    GStreamerRtspSource,
     build_rtp_jpeg_pipeline_description,
+    build_rtsp_pipeline_description,
     find_missing_gstreamer_elements,
     initialize_gstreamer_runtime,
 )
@@ -29,18 +37,48 @@ HEIGHT = 24
 K = ((20.0, 0.0, 15.0), (0.0, 20.0, 11.0), (0.0, 0.0, 1.0))
 
 
-def camera_config(**overrides) -> CameraConfig:
-    values = {
-        "enabled": True,
-        "address": "0.0.0.0",
-        "port": 8888,
-        "rtp_enabled": True,
-        "buffer_size": 1,
-        "processing_enabled": True,
-        "vision_processor_class": "Legacy14VisionProcessor",
-    }
-    values.update(overrides)
-    return CameraConfig(**values)
+def rtp_source_config(
+    *,
+    bind_address: str = "0.0.0.0",
+    port: int = 8888,
+    buffer_size: int = 1,
+) -> RtpJpegSourceConfig:
+    return RtpJpegSourceConfig(
+        bind_address=bind_address,
+        port=port,
+        buffer_size=buffer_size,
+    )
+
+
+def rtsp_source_config(
+    *,
+    protocol: RtspProtocol = RtspProtocol.TCP,
+    latency_ms: int = 100,
+    drop_on_latency: bool = True,
+    buffer_size: int = 1,
+) -> RtspSourceConfig:
+    return RtspSourceConfig(
+        uri="rtsp://camera.local:8554/stream",
+        protocol=protocol,
+        decoder_mode=RtspDecoderMode.SOFTWARE,
+        latency_ms=latency_ms,
+        drop_on_latency=drop_on_latency,
+        buffer_size=buffer_size,
+    )
+
+
+def camera_config(
+    *,
+    source: RtpJpegSourceConfig | RtspSourceConfig | None = None,
+    processing_enabled: bool = True,
+    vision_processor_class: str = "Legacy14VisionProcessor",
+) -> CameraConfig:
+    return CameraConfig(
+        enabled=True,
+        source=source or rtp_source_config(),
+        processing_enabled=processing_enabled,
+        vision_processor_class=vision_processor_class,
+    )
 
 
 def overview_calibration() -> OverviewCalibration:
@@ -130,9 +168,9 @@ def test_gstreamer_element_probe_reuses_cached_runtime(monkeypatch) -> None:
     )
     assert calls == ["udpsrc", "jpegdec", "appsink"]
 
-def test_rtp_jpeg_pipeline_uses_camera_config_and_low_latency_appsink() -> None:
+def test_rtp_jpeg_pipeline_uses_typed_source_config_and_low_latency_appsink() -> None:
     description = build_rtp_jpeg_pipeline_description(
-        camera_config(address="127.0.0.1", port=8889, buffer_size=1)
+        rtp_source_config(bind_address="127.0.0.1", port=8889, buffer_size=1)
     )
 
     assert 'udpsrc address="127.0.0.1" port=8889' in description
@@ -141,16 +179,41 @@ def test_rtp_jpeg_pipeline_uses_camera_config_and_low_latency_appsink() -> None:
     assert "appsink name=sink emit-signals=true max-buffers=1 drop=true sync=false" in description
 
 
-def test_non_rtp_camera_config_is_explicitly_unsupported() -> None:
-    with pytest.raises(UnsupportedCameraTransportError):
-        build_rtp_jpeg_pipeline_description(camera_config(rtp_enabled=False))
+@pytest.mark.parametrize(
+    ("protocol", "drop_on_latency", "expected_protocol", "expected_drop"),
+    [
+        (RtspProtocol.TCP, True, "protocols=tcp", "drop-on-latency=true"),
+        (RtspProtocol.UDP, False, "protocols=udp", "drop-on-latency=false"),
+    ],
+)
+def test_rtsp_pipeline_is_h264_software_low_latency(
+    protocol: RtspProtocol,
+    drop_on_latency: bool,
+    expected_protocol: str,
+    expected_drop: str,
+) -> None:
+    description = build_rtsp_pipeline_description(
+        rtsp_source_config(
+            protocol=protocol,
+            latency_ms=75,
+            drop_on_latency=drop_on_latency,
+        )
+    )
+
+    assert 'rtspsrc location="rtsp://camera.local:8554/stream"' in description
+    assert expected_protocol in description
+    assert "latency=75" in description
+    assert expected_drop in description
+    assert "! rtph264depay ! h264parse ! avdec_h264 ! videoconvert" in description
+    assert "video/x-raw,format=BGR" in description
+    assert "max-buffers=1 drop=true sync=false" in description
 
 
 def test_gstreamer_source_owns_frame_memory_and_replaces_latest_without_fifo() -> None:
     factory = _BackendFactory()
     timestamps = iter((101, 202, 303))
     source = GStreamerRtpJpegSource(
-        camera_config(),
+        rtp_source_config(),
         timestamp_clock_ns=lambda: next(timestamps),
         backend_factory=factory,
     )
@@ -176,9 +239,33 @@ def test_gstreamer_source_owns_frame_memory_and_replaces_latest_without_fifo() -
     assert factory.backend.stopped
 
 
+def test_rtsp_source_uses_same_decoded_frame_contract_and_cleanup() -> None:
+    factory = _BackendFactory()
+    source = GStreamerRtspSource(
+        rtsp_source_config(protocol=RtspProtocol.TCP),
+        timestamp_clock_ns=lambda: 404,
+        backend_factory=factory,
+    )
+
+    source.start()
+    assert factory.backend is not None
+    factory.backend.on_frame(frame(42))
+
+    decoded = source.read()
+    assert decoded is not None
+    assert decoded.image.dtype == np.uint8
+    assert decoded.image.shape == (HEIGHT, WIDTH, 3)
+    assert decoded.receive_timestamp_ns == 404
+    assert decoded.capture_id is None
+    assert source.read() is None
+
+    source.stop()
+    assert factory.backend.stopped
+
+
 def test_gstreamer_source_surfaces_backend_failure() -> None:
     factory = _BackendFactory()
-    source = GStreamerRtpJpegSource(camera_config(), backend_factory=factory)
+    source = GStreamerRtpJpegSource(rtp_source_config(), backend_factory=factory)
     source.start()
     assert factory.backend is not None
     error = RuntimeError("decoder failed")
@@ -197,10 +284,17 @@ def _wait_until(predicate, timeout: float = 2.0) -> None:
     raise AssertionError("condition did not become true")
 
 
+def test_source_factory_selects_transport_specific_implementation() -> None:
+    rtp = create_camera_source(camera_config(source=rtp_source_config()))
+    rtsp = create_camera_source(camera_config(source=rtsp_source_config()))
+
+    assert isinstance(rtp, GStreamerRtpJpegSource)
+    assert isinstance(rtsp, GStreamerRtspSource)
+
+
 def test_build_camera_worker_binds_existing_camera_config_without_parallel_schema() -> None:
     config = camera_config(
-        address="0.0.0.0",
-        port=8889,
+        source=rtp_source_config(bind_address="0.0.0.0", port=8889),
         processing_enabled=False,
         vision_processor_class="Legacy14VisionProcessor",
     )

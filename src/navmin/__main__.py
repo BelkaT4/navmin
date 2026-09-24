@@ -59,7 +59,7 @@ _INTERRUPTED_EXIT_CODE = 130
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="navmin",
-        description="Run NavMin against real RTP cameras and a real STM32 serial device.",
+        description="Run NavMin against configured real camera sources and a real STM32 serial device.",
     )
     parser.add_argument("--config", type=Path, default=Path("config.json"))
     parser.add_argument(
@@ -110,7 +110,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     with session_file_logging(artifacts.runtime_log_path, level=logging.INFO):
         LOGGER.info(
-            "Normal launcher selected real RTP cameras + real STM32; "
+            "Normal launcher selected configured real cameras + real STM32; "
             "config=%s overview_calibration=%s stereo_calibration=%s session=%s",
             paths.config,
             paths.overview_calibration,

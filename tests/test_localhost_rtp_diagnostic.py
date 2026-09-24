@@ -274,10 +274,9 @@ def test_diagnostic_calibrations_and_camera_config_match_synthetic_size() -> Non
     assert (stereo.image_width, stereo.image_height) == (320, 240)
     assert stereo.D_left == stereo.D_right == (0.0, 0.0, 0.0, 0.0, 0.0)
     assert stereo.K_left[0][0] == stereo.K_left[1][1] == 250.0
-    assert config.address == "127.0.0.1"
-    assert config.port == 18_889
-    assert config.rtp_enabled
-    assert config.buffer_size == 1
+    assert config.source.bind_address == "127.0.0.1"
+    assert config.source.port == 18_889
+    assert config.source.buffer_size == 1
     assert not config.processing_enabled
 
 

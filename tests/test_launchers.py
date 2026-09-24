@@ -28,6 +28,10 @@ from navmin.config.models import (
     CamerasConfig,
     PidControllerConfig,
     ProcessingScope,
+    RtpJpegSourceConfig,
+    RtspDecoderMode,
+    RtspProtocol,
+    RtspSourceConfig,
     SerialConfig,
     StereoDistanceConfig,
     Stm32Config,
@@ -42,6 +46,7 @@ from navmin.diagnostic_launcher import (
     DiagnosticEndpoints,
     DiagnosticSelection,
     TurretEndpoint,
+    _planned_preflight_inputs,
 )
 from navmin.diagnostic_launcher import main as diagnostic_main
 from navmin.input_recovery import InputRecoveryError, recover_default_inputs
@@ -84,10 +89,11 @@ def _deterministic_launcher_preflight(monkeypatch) -> None:
 def _camera(port: int) -> CameraConfig:
     return CameraConfig(
         enabled=True,
-        address="0.0.0.0",
-        port=port,
-        rtp_enabled=True,
-        buffer_size=1,
+        source=RtpJpegSourceConfig(
+            bind_address="0.0.0.0",
+            port=port,
+            buffer_size=1,
+        ),
         processing_enabled=False,
         vision_processor_class="Legacy14VisionProcessor",
     )
@@ -299,9 +305,9 @@ def test_diagnostic_selection_overrides_only_requested_external_endpoints(monkey
     )
     effective = endpoints.start()
     try:
-        assert effective.config.vision.cameras.overview.address == "127.0.0.1"
-        assert effective.config.vision.cameras.overview.port == 8888
-        assert effective.config.vision.cameras.stereo_left.address == "0.0.0.0"
+        assert effective.config.vision.cameras.overview.source.bind_address == "127.0.0.1"
+        assert effective.config.vision.cameras.overview.source.port == 8888
+        assert effective.config.vision.cameras.stereo_left.source.bind_address == "0.0.0.0"
         assert effective.config.turret.serial.port == "/tmp/navmin-test-pty/stm32"
         assert effective.config.turret.emulate_stm32 is False
         assert len(sender_configs) == 1
@@ -423,8 +429,8 @@ def test_diagnostic_synthetic_inputs_run_without_config_files(
     assert inputs.stereo_calibration.image_width == 320
     assert inputs.stereo_calibration.image_height == 240
     assert inputs.config.turret.emulate_stm32 is False
-    assert inputs.config.vision.cameras.overview.port == 8888
-    assert inputs.config.vision.cameras.stereo_left.port == 8889
+    assert inputs.config.vision.cameras.overview.source.port == 8888
+    assert inputs.config.vision.cameras.stereo_left.source.port == 8889
 
     session = _single_session(tmp_path / "logs")
     effective_config = json.loads(
@@ -524,6 +530,11 @@ def test_input_recovery_creates_valid_safe_defaults_without_existing_files(
     overview = load_overview_calibration(paths.overview_calibration)
     stereo = load_stereo_calibration(paths.stereo_calibration)
     assert config.turret.serial.port == "/dev/navmin-configure-serial-port"
+    assert isinstance(config.vision.cameras.overview.source, RtpJpegSourceConfig)
+    assert config.vision.cameras.overview.source.bind_address == "0.0.0.0"
+    assert config.vision.cameras.overview.source.port == 8888
+    assert isinstance(config.vision.cameras.stereo_left.source, RtpJpegSourceConfig)
+    assert config.vision.cameras.stereo_left.source.port == 8889
     assert config.turret.controller.pid_kp_x == 0.0
     assert config.turret.controller.pid_kp_y == 0.0
     assert config.turret.axes.x.max_relative_move_deg == 1.0
@@ -883,6 +894,38 @@ def test_normal_preflight_only_pass_skips_runtime_and_keeps_evidence(
     assert not (session / "inputs" / "effective-config.json").exists()
 
 
+def test_planned_localhost_backend_replaces_rtsp_source_with_rtp_jpeg() -> None:
+    inputs = _inputs()
+    overview = replace(
+        inputs.config.vision.cameras.overview,
+        source=RtspSourceConfig(
+            uri="rtsp://camera.local/stream",
+            protocol=RtspProtocol.TCP,
+            decoder_mode=RtspDecoderMode.SOFTWARE,
+            latency_ms=100,
+            drop_on_latency=True,
+            buffer_size=3,
+        ),
+    )
+    cameras = replace(inputs.config.vision.cameras, overview=overview)
+    config = replace(inputs.config, vision=replace(inputs.config.vision, cameras=cameras))
+
+    planned = _planned_preflight_inputs(
+        DiagnosticSelection(
+            overview=CameraEndpoint.LOCALHOST,
+            stereo_left=CameraEndpoint.REAL,
+            turret=TurretEndpoint.PTY,
+        ),
+        replace(inputs, config=config),
+    )
+
+    source = planned.config.vision.cameras.overview.source
+    assert isinstance(source, RtpJpegSourceConfig)
+    assert source.bind_address == "127.0.0.1"
+    assert source.port == 8888
+    assert source.buffer_size == 3
+
+
 def test_diagnostic_preflight_only_uses_planned_localhost_endpoints_without_starting(
     monkeypatch,
     tmp_path,
@@ -926,8 +969,8 @@ def test_diagnostic_preflight_only_uses_planned_localhost_endpoints_without_star
 
     assert len(captured) == 1
     planned = captured[0]
-    assert planned.config.vision.cameras.overview.address == "127.0.0.1"
-    assert planned.config.vision.cameras.stereo_left.address == "127.0.0.1"
+    assert planned.config.vision.cameras.overview.source.bind_address == "127.0.0.1"
+    assert planned.config.vision.cameras.stereo_left.source.bind_address == "127.0.0.1"
     assert planned.config.turret.serial.port == "diagnostic-pty"
 
     session = _single_session(log_dir)

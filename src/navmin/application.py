@@ -21,9 +21,11 @@ from navmin.contracts import (
 from navmin.core import Mediator
 from navmin.turret.worker import TransportFactory, TurretWorker
 from navmin.ui.bridge import CameraUiBinding
+from navmin.vision.camera_source import create_camera_source
 from navmin.vision.camera_worker import CameraWorker, SourceFactory, build_camera_worker
 from navmin.vision.gstreamer_source import (
     GStreamerRtpJpegSource,
+    GStreamerRtspSource,
     initialize_gstreamer_runtime,
 )
 from navmin.vision.pipeline import overview_corrector, stereo_left_corrector
@@ -41,8 +43,8 @@ _TURRET_SAFETY_COMPONENT = "Turret safety shutdown"
 class ApplicationFactories:
     """Narrow hardware-boundary seams; defaults retain production transports."""
 
-    overview_source_factory: SourceFactory = GStreamerRtpJpegSource
-    stereo_left_source_factory: SourceFactory = GStreamerRtpJpegSource
+    overview_source_factory: SourceFactory = create_camera_source
+    stereo_left_source_factory: SourceFactory = create_camera_source
     turret_transport_factory: TransportFactory | None = None
 
 
@@ -273,7 +275,7 @@ class ApplicationRuntime:
 
     def _uses_production_gstreamer(self) -> bool:
         return any(
-            isinstance(worker.source, GStreamerRtpJpegSource)
+            isinstance(worker.source, (GStreamerRtpJpegSource, GStreamerRtspSource))
             for worker in (self.overview_worker, self.stereo_left_worker)
         )
 

@@ -30,28 +30,34 @@ def _valid_config() -> dict:
             "cameras": {
                 "overview": {
                     "enabled": True,
-                    "address": "192.168.1.101",
-                    "port": 5001,
-                    "rtp-enabled": False,
-                    "buffer-size": 1,
+                    "source": {
+                        "type": "rtp-jpeg",
+                        "bind-address": "192.168.1.101",
+                        "port": 5001,
+                        "buffer-size": 1,
+                    },
                     "processing-enabled": True,
                     "vision-processor-class": "DefaultVisionProcessor",
                 },
                 "stereo-left": {
                     "enabled": True,
-                    "address": "192.168.1.102",
-                    "port": 5002,
-                    "rtp-enabled": False,
-                    "buffer-size": 1,
+                    "source": {
+                        "type": "rtp-jpeg",
+                        "bind-address": "192.168.1.102",
+                        "port": 5002,
+                        "buffer-size": 1,
+                    },
                     "processing-enabled": True,
                     "vision-processor-class": "DefaultVisionProcessor",
                 },
                 "stereo-right": {
                     "enabled": True,
-                    "address": "192.168.1.103",
-                    "port": 5003,
-                    "rtp-enabled": False,
-                    "buffer-size": 1,
+                    "source": {
+                        "type": "rtp-jpeg",
+                        "bind-address": "192.168.1.103",
+                        "port": 5003,
+                        "buffer-size": 1,
+                    },
                     "processing-enabled": False,
                     "vision-processor-class": "DefaultVisionProcessor",
                 },
@@ -138,6 +144,153 @@ def test_valid_schema_v1_builds_typed_immutable_snapshot() -> None:
 
     with pytest.raises(FrozenInstanceError):
         config.aiming.lead_time_ms = 10  # type: ignore[misc]
+
+
+
+def test_rtsp_camera_source_is_strict_typed_union() -> None:
+    data = _valid_config()
+    data["vision"]["cameras"]["overview"]["source"] = {
+        "type": "rtsp",
+        "uri": "rtsp://camera.local:8554/stream",
+        "protocol": "tcp",
+        "decoder-mode": "software",
+        "latency-ms": 100,
+        "drop-on-latency": True,
+        "buffer-size": 1,
+    }
+
+    config = parse_config(data)
+    source = config.vision.cameras.overview.source
+
+    assert source.uri == "rtsp://camera.local:8554/stream"
+    assert source.protocol.value == "tcp"
+    assert source.decoder_mode.value == "software"
+    assert source.latency_ms == 100
+    assert source.drop_on_latency is True
+
+
+@pytest.mark.parametrize("protocol", ["tcp", "udp"])
+def test_rtsp_protocol_tcp_and_udp_are_supported(protocol: str) -> None:
+    data = _valid_config()
+    data["vision"]["cameras"]["overview"]["source"] = {
+        "type": "rtsp",
+        "uri": "rtsp://camera.local/stream",
+        "protocol": protocol,
+        "decoder-mode": "software",
+        "latency-ms": 0,
+        "drop-on-latency": False,
+        "buffer-size": 2,
+    }
+
+    source = parse_config(data).vision.cameras.overview.source
+
+    assert source.protocol.value == protocol
+
+
+@pytest.mark.parametrize(
+    ("mutate", "expected_path"),
+    [
+        (
+            lambda d: d["vision"]["cameras"]["overview"]["source"].__setitem__(
+                "type", "gstreamer"
+            ),
+            "vision.cameras.overview.source.type",
+        ),
+        (
+            lambda d: d["vision"]["cameras"]["overview"]["source"].__setitem__(
+                "uri", "rtsp://not-valid-for-rtp"
+            ),
+            "vision.cameras.overview.source.uri",
+        ),
+    ],
+)
+def test_camera_source_invalid_type_or_mixed_fields_are_rejected(
+    mutate, expected_path
+) -> None:
+    data = _valid_config()
+    mutate(data)
+
+    with pytest.raises(ConfigValidationError) as exc_info:
+        parse_config(data)
+
+    assert exc_info.value.path == expected_path
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("decoder-mode", "hardware"),
+        ("protocol", "auto"),
+        ("codec", "h265"),
+    ],
+)
+def test_rtsp_unsupported_modes_and_codec_field_are_rejected(field, value) -> None:
+    data = _valid_config()
+    source = {
+        "type": "rtsp",
+        "uri": "rtsp://camera.local/stream",
+        "protocol": "tcp",
+        "decoder-mode": "software",
+        "latency-ms": 100,
+        "drop-on-latency": True,
+        "buffer-size": 1,
+    }
+    source[field] = value
+    data["vision"]["cameras"]["overview"]["source"] = source
+
+    with pytest.raises(ConfigValidationError):
+        parse_config(data)
+
+
+
+def test_legacy_flat_camera_schema_is_rejected_without_migration() -> None:
+    data = _valid_config()
+    data["vision"]["cameras"]["overview"] = {
+        "enabled": True,
+        "address": "0.0.0.0",
+        "port": 8888,
+        "rtp-enabled": True,
+        "buffer-size": 1,
+        "processing-enabled": True,
+        "vision-processor-class": "Legacy14VisionProcessor",
+    }
+
+    with pytest.raises(ConfigValidationError):
+        parse_config(data)
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "expected_path"),
+    [
+        ("uri", "http://camera.local/stream", "vision.cameras.overview.source.uri"),
+        ("latency-ms", -1, "vision.cameras.overview.source.latency-ms"),
+        (
+            "drop-on-latency",
+            1,
+            "vision.cameras.overview.source.drop-on-latency",
+        ),
+    ],
+)
+def test_rtsp_invalid_uri_latency_or_boolean_is_rejected(
+    field, value, expected_path
+) -> None:
+    data = _valid_config()
+    source = {
+        "type": "rtsp",
+        "uri": "rtsp://camera.local/stream",
+        "protocol": "tcp",
+        "decoder-mode": "software",
+        "latency-ms": 100,
+        "drop-on-latency": True,
+        "buffer-size": 1,
+    }
+    source[field] = value
+    data["vision"]["cameras"]["overview"]["source"] = source
+
+    with pytest.raises(ConfigValidationError) as exc_info:
+        parse_config(data)
+
+    assert exc_info.value.path == expected_path
 
 
 def test_missing_config_is_explicit_error(tmp_path) -> None:
@@ -248,8 +401,8 @@ def test_optional_aim_point_missing_and_null_both_mean_center() -> None:
     ("mutate", "expected_path"),
     [
         (
-            lambda d: d["vision"]["cameras"]["overview"].__setitem__("port", True),
-            "vision.cameras.overview.port",
+            lambda d: d["vision"]["cameras"]["overview"]["source"].__setitem__("port", True),
+            "vision.cameras.overview.source.port",
         ),
         (
             lambda d: d["turret"]["controller"].__setitem__("pid-kp-x", True),
@@ -293,8 +446,8 @@ def test_non_finite_numbers_are_rejected_with_field_path(invalid) -> None:
             "vision.processing-scope",
         ),
         (
-            lambda d: d["vision"]["cameras"]["overview"].__setitem__("port", 0),
-            "vision.cameras.overview.port",
+            lambda d: d["vision"]["cameras"]["overview"]["source"].__setitem__("port", 0),
+            "vision.cameras.overview.source.port",
         ),
         (
             lambda d: d["turret"]["serial"].__setitem__("baudrate", 230400),
@@ -396,6 +549,28 @@ def test_atomic_save_round_trips_in_temp_directory(tmp_path) -> None:
     assert not list(tmp_path.glob(".config.json.*.tmp"))
 
 
+def test_rtsp_config_round_trip_preserves_source_specific_fields(tmp_path) -> None:
+    path = tmp_path / "config.json"
+    data = _valid_config()
+    data["vision"]["cameras"]["overview"]["source"] = {
+        "type": "rtsp",
+        "uri": "rtsp://camera.local:8554/stream",
+        "protocol": "udp",
+        "decoder-mode": "software",
+        "latency-ms": 75,
+        "drop-on-latency": False,
+        "buffer-size": 2,
+    }
+    config = parse_config(data)
+
+    save_config(path, config)
+
+    saved = json.loads(path.read_text(encoding="utf-8"))
+    assert saved["schema-version"] == 1
+    assert saved["vision"]["cameras"]["overview"]["source"] == data["vision"]["cameras"]["overview"]["source"]
+    assert load_config(path) == config
+
+
 def test_loading_valid_config_does_not_rewrite_optional_fields(tmp_path) -> None:
     path = tmp_path / "config.json"
     data = _valid_config()
@@ -437,6 +612,14 @@ def test_change_metadata_reports_only_fixed_architecture_classification() -> Non
     )
     assert (
         config_apply_policy("vision.cameras.overview.vision-processor-class")
+        is ConfigApplyPolicy.CAMERA_PIPELINE_RESTART
+    )
+    assert (
+        config_apply_policy("vision.cameras.overview.source.type")
+        is ConfigApplyPolicy.CAMERA_PIPELINE_RESTART
+    )
+    assert (
+        config_apply_policy("vision.cameras.overview.source.port")
         is ConfigApplyPolicy.CAMERA_PIPELINE_RESTART
     )
     assert (

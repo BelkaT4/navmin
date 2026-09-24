@@ -34,9 +34,11 @@ class InputRecoveryResult:
 def _default_config_mapping() -> dict[str, Any]:
     camera_common = {
         "enabled": True,
-        "address": "0.0.0.0",
-        "rtp-enabled": True,
-        "buffer-size": 1,
+        "source": {
+            "type": "rtp-jpeg",
+            "bind-address": "0.0.0.0",
+            "buffer-size": 1,
+        },
         "processing-enabled": True,
         "vision-processor-class": "Legacy14VisionProcessor",
     }
@@ -45,13 +47,19 @@ def _default_config_mapping() -> dict[str, Any]:
         "vision": {
             "processing-scope": "main-and-preview",
             "cameras": {
-                "overview": {**camera_common, "port": 8888},
-                "stereo-left": {**camera_common, "port": 8889},
+                "overview": {
+                    **camera_common,
+                    "source": {**camera_common["source"], "port": 8888},
+                },
+                "stereo-left": {
+                    **camera_common,
+                    "source": {**camera_common["source"], "port": 8889},
+                },
                 "stereo-right": {
                     **camera_common,
                     "enabled": False,
                     "processing-enabled": False,
-                    "port": 8890,
+                    "source": {**camera_common["source"], "port": 8890},
                 },
             },
             "distance": {

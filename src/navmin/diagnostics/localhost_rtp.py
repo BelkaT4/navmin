@@ -17,7 +17,7 @@ import cv2
 import numpy as np
 
 from navmin.calibration import OverviewCalibration, StereoCalibration
-from navmin.config.models import CameraConfig
+from navmin.config.models import CameraConfig, RtpJpegSourceConfig
 from navmin.contracts import CameraRole
 from navmin.vision.gstreamer_source import (
     GStreamerUnavailableError,
@@ -608,10 +608,11 @@ def diagnostic_camera_config(port: int) -> CameraConfig:
     RtpJpegSenderConfig(port=port)
     return CameraConfig(
         enabled=True,
-        address="127.0.0.1",
-        port=port,
-        rtp_enabled=True,
-        buffer_size=1,
+        source=RtpJpegSourceConfig(
+            bind_address="127.0.0.1",
+            port=port,
+            buffer_size=1,
+        ),
         processing_enabled=False,
         vision_processor_class="Legacy14VisionProcessor",
     )

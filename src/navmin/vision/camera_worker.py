@@ -13,7 +13,8 @@ from navmin.config.models import CameraConfig
 from navmin.contracts import CameraModel, CameraRole, CameraState
 from navmin.lifecycle import StopToken
 
-from .gstreamer_source import CameraSourceError, GStreamerRtpJpegSource
+from .camera_source import create_camera_source
+from .gstreamer_source import CameraSourceError
 from .pipeline import DecodedFrameSource, VisionPipeline, VisionPipelineError
 from .processor import create_vision_processor
 
@@ -112,10 +113,10 @@ def build_camera_worker(
     camera: CameraRole,
     config: CameraConfig,
     corrector: _FrameCorrector,
-    source_factory: SourceFactory = GStreamerRtpJpegSource,
+    source_factory: SourceFactory = create_camera_source,
     idle_wait_s: float = 0.01,
 ) -> CameraWorker:
-    """Bind the existing CameraConfig to the production source/pipeline path."""
+    """Bind typed camera config to one decoded source and VisionPipeline."""
     source = source_factory(config)
     pipeline = VisionPipeline(
         camera=camera,

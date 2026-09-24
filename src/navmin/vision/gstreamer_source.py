@@ -1,4 +1,4 @@
-"""Low-latency RTP/JPEG-over-UDP decoded-frame source for Vision."""
+"""Low-latency GStreamer decoded-frame sources for Vision."""
 
 from __future__ import annotations
 
@@ -11,7 +11,12 @@ from typing import Protocol
 import numpy as np
 
 from navmin.concurrency import LatestValue
-from navmin.config.models import CameraConfig
+from navmin.config.models import (
+    RtpJpegSourceConfig,
+    RtspDecoderMode,
+    RtspProtocol,
+    RtspSourceConfig,
+)
 
 from .pipeline import DecodedFrame
 
@@ -19,6 +24,21 @@ LOGGER = logging.getLogger(__name__)
 
 RTP_JPEG_CAPS = (
     "application/x-rtp,media=video,encoding-name=JPEG,payload=26,clock-rate=90000"
+)
+RTP_JPEG_GSTREAMER_ELEMENTS = (
+    "udpsrc",
+    "rtpjpegdepay",
+    "jpegdec",
+    "videoconvert",
+    "appsink",
+)
+RTSP_H264_GSTREAMER_ELEMENTS = (
+    "rtspsrc",
+    "rtph264depay",
+    "h264parse",
+    "avdec_h264",
+    "videoconvert",
+    "appsink",
 )
 
 _GSTREAMER_RUNTIME_LOCK = Lock()
@@ -95,36 +115,64 @@ def _gst_quote(value: str) -> str:
     return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
 
 
-def build_rtp_jpeg_pipeline_description(config: CameraConfig) -> str:
-    """Build the v1 receiver pipeline from the existing CameraConfig."""
-    if not config.rtp_enabled:
-        raise UnsupportedCameraTransportError(
-            "CameraConfig.rtp_enabled must be true for the RTP/JPEG source"
-        )
+def _appsink_description(buffer_size: int) -> str:
     return (
-        f"udpsrc address={_gst_quote(config.address)} port={config.port} "
+        "appsink name=sink emit-signals=true "
+        f"max-buffers={buffer_size} drop=true sync=false"
+    )
+
+
+def build_rtp_jpeg_pipeline_description(config: RtpJpegSourceConfig) -> str:
+    """Build the production RTP/JPEG receiver pipeline."""
+    return (
+        f"udpsrc address={_gst_quote(config.bind_address)} port={config.port} "
         f"caps={_gst_quote(RTP_JPEG_CAPS)} "
         "! rtpjpegdepay "
         "! jpegdec "
         "! videoconvert "
         "! video/x-raw,format=BGR "
-        "! appsink name=sink emit-signals=true "
-        f"max-buffers={config.buffer_size} drop=true sync=false"
+        f"! {_appsink_description(config.buffer_size)}"
     )
 
 
-class GStreamerRtpJpegSource:
-    """Own one Gst pipeline and expose only the freshest decoded BGR frame."""
+def build_rtsp_pipeline_description(config: RtspSourceConfig) -> str:
+    """Build the H.264 RTSP receiver pipeline for the supported v1 modes."""
+    if config.decoder_mode is not RtspDecoderMode.SOFTWARE:
+        raise UnsupportedCameraTransportError(
+            f"unsupported RTSP decoder mode: {config.decoder_mode!r}"
+        )
+    if config.protocol not in (RtspProtocol.TCP, RtspProtocol.UDP):
+        raise UnsupportedCameraTransportError(
+            f"unsupported RTSP protocol: {config.protocol!r}"
+        )
+    drop_on_latency = "true" if config.drop_on_latency else "false"
+    return (
+        f"rtspsrc location={_gst_quote(config.uri)} "
+        f"protocols={config.protocol.value} "
+        f"latency={config.latency_ms} "
+        f"drop-on-latency={drop_on_latency} "
+        "! rtph264depay "
+        "! h264parse "
+        "! avdec_h264 "
+        "! videoconvert "
+        "! video/x-raw,format=BGR "
+        f"! {_appsink_description(config.buffer_size)}"
+    )
+
+
+class _GStreamerDecodedFrameSource:
+    """Shared Gst/appsink lifecycle for transport-specific decoded sources."""
 
     def __init__(
         self,
-        config: CameraConfig,
+        pipeline_description: str,
         *,
+        source_description: str,
         timestamp_clock_ns: Callable[[], int] = monotonic_ns,
         backend_factory: BackendFactory | None = None,
     ) -> None:
-        self._config = config
-        self.pipeline_description = build_rtp_jpeg_pipeline_description(config)
+        self.pipeline_description = pipeline_description
+        self._source_description = source_description
         self._timestamp_clock_ns = timestamp_clock_ns
         self._backend_factory = backend_factory or _default_backend_factory
         self._latest: LatestValue[DecodedFrame] = LatestValue()
@@ -168,11 +216,7 @@ class GStreamerRtpJpegSource:
             raise
         with self._state_lock:
             self._started = True
-        LOGGER.info(
-            "GStreamer camera source started bind=%s port=%d",
-            self._config.address,
-            self._config.port,
-        )
+        LOGGER.info("GStreamer camera source started %s", self._source_description)
 
     def stop(self) -> None:
         with self._state_lock:
@@ -183,11 +227,7 @@ class GStreamerRtpJpegSource:
         if backend is not None:
             backend.stop()
         if was_started:
-            LOGGER.info(
-                "GStreamer camera source stopped bind=%s port=%d",
-                self._config.address,
-                self._config.port,
-            )
+            LOGGER.info("GStreamer camera source stopped %s", self._source_description)
 
     def read(self) -> DecodedFrame | None:
         self._poll_backend_failure()
@@ -204,7 +244,8 @@ class GStreamerRtpJpegSource:
         if frame.dtype != np.uint8 or frame.ndim != 3 or frame.shape[2] != 3:
             self._record_failure(
                 CameraSourceError(
-                    f"decoded frame must be BGR uint8 HxWx3, got {frame.dtype} {frame.shape!r}"
+                    "decoded frame must be BGR uint8 HxWx3, "
+                    f"got {frame.dtype} {frame.shape!r}"
                 )
             )
             return
@@ -230,6 +271,45 @@ class GStreamerRtpJpegSource:
         error = backend.poll_failure()
         if error is not None:
             self._record_failure(error)
+
+
+class GStreamerRtpJpegSource(_GStreamerDecodedFrameSource):
+    """RTP/JPEG-over-UDP source exposing only the freshest decoded BGR frame."""
+
+    def __init__(
+        self,
+        config: RtpJpegSourceConfig,
+        *,
+        timestamp_clock_ns: Callable[[], int] = monotonic_ns,
+        backend_factory: BackendFactory | None = None,
+    ) -> None:
+        super().__init__(
+            build_rtp_jpeg_pipeline_description(config),
+            source_description=f"bind={config.bind_address} port={config.port}",
+            timestamp_clock_ns=timestamp_clock_ns,
+            backend_factory=backend_factory,
+        )
+
+
+class GStreamerRtspSource(_GStreamerDecodedFrameSource):
+    """H.264 RTSP source exposing only the freshest decoded BGR frame."""
+
+    def __init__(
+        self,
+        config: RtspSourceConfig,
+        *,
+        timestamp_clock_ns: Callable[[], int] = monotonic_ns,
+        backend_factory: BackendFactory | None = None,
+    ) -> None:
+        super().__init__(
+            build_rtsp_pipeline_description(config),
+            source_description=(
+                f"uri={config.uri} protocol={config.protocol.value} "
+                f"latency_ms={config.latency_ms}"
+            ),
+            timestamp_clock_ns=timestamp_clock_ns,
+            backend_factory=backend_factory,
+        )
 
 
 class _PyGObjectGstBackend:
@@ -348,11 +428,15 @@ def _default_backend_factory(
 
 __all__ = [
     "RTP_JPEG_CAPS",
+    "RTP_JPEG_GSTREAMER_ELEMENTS",
+    "RTSP_H264_GSTREAMER_ELEMENTS",
     "CameraSourceError",
     "GStreamerRtpJpegSource",
+    "GStreamerRtspSource",
     "GStreamerUnavailableError",
     "UnsupportedCameraTransportError",
     "build_rtp_jpeg_pipeline_description",
+    "build_rtsp_pipeline_description",
     "find_missing_gstreamer_elements",
     "initialize_gstreamer_runtime",
 ]

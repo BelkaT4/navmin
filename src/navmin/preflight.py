@@ -10,15 +10,23 @@ from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
+from navmin.config.models import (
+    RtpJpegSourceConfig,
+    RtspDecoderMode,
+    RtspProtocol,
+    RtspSourceConfig,
+)
 from navmin.diagnostics.localhost_rtp import (
-    GST_RECEIVER_ELEMENTS,
     PreflightResult,
     check_gstreamer_sender_runtime,
 )
 from navmin.diagnostics.pty_stm32 import PtyPreflightResult, check_pty_preflight
 from navmin.launcher import LoadedApplicationInputs
 from navmin.vision.gstreamer_source import (
+    RTP_JPEG_GSTREAMER_ELEMENTS,
+    RTSP_H264_GSTREAMER_ELEMENTS,
     GStreamerUnavailableError,
     find_missing_gstreamer_elements,
     initialize_gstreamer_runtime,
@@ -90,6 +98,7 @@ class StartupBackendSelection:
 
 
 StringCheck = Callable[[], str | None]
+ReceiverCheck = Callable[[tuple[str, ...]], str | None]
 UdpCheck = Callable[[str, int], str | None]
 SerialPathCheck = Callable[[str], str | None]
 PtyCheck = Callable[[], PtyPreflightResult]
@@ -103,7 +112,7 @@ def run_startup_preflight(
     session_dir: Path,
     session_directory_check: Callable[[Path], str | None] | None = None,
     qt_check: StringCheck | None = None,
-    receiver_check: StringCheck | None = None,
+    receiver_check: ReceiverCheck | None = None,
     sender_check: SenderCheck | None = None,
     pyserial_check: StringCheck | None = None,
     pty_check: PtyCheck | None = None,
@@ -123,7 +132,6 @@ def run_startup_preflight(
     checks: list[StartupPreflightCheck] = []
     checks.append(_result_check("Session directory", session_directory_check(session_dir)))
     checks.append(_result_check("PyQt6 QtWidgets", qt_check()))
-    checks.append(_result_check("GStreamer receiver", receiver_check()))
 
     camera_specs = (
         (
@@ -143,6 +151,7 @@ def run_startup_preflight(
     )
 
     endpoints: list[tuple[str, str, int]] = []
+    receiver_elements: list[str] = []
     localhost_selected = False
     real_camera_selected = False
     for label, backend, camera, width, height in camera_specs:
@@ -155,23 +164,64 @@ def run_startup_preflight(
                 detail=f"typed calibration loaded ({width}x{height})",
             )
         )
-        if camera.rtp_enabled:
+
+        source = camera.source
+        if isinstance(source, RtpJpegSourceConfig):
+            receiver_elements.extend(RTP_JPEG_GSTREAMER_ELEMENTS)
+            source_error = _rtp_jpeg_config_error(source)
             checks.append(
-                StartupPreflightCheck(
-                    name=f"{label} RTP configuration",
-                    status=PreflightStatus.PASS,
-                    detail="RTP/JPEG receiver enabled",
+                _result_check(
+                    f"{label} RTP/JPEG configuration",
+                    source_error,
+                    success_detail=(
+                        f"bind={source.bind_address}:{source.port}; "
+                        f"buffer-size={source.buffer_size}"
+                    ),
                 )
             )
+            endpoints.append((label, source.bind_address, source.port))
+        elif isinstance(source, RtspSourceConfig):
+            receiver_elements.extend(RTSP_H264_GSTREAMER_ELEMENTS)
+            source_error = _rtsp_config_error(source)
+            checks.append(
+                _result_check(
+                    f"{label} RTSP configuration",
+                    source_error,
+                    success_detail=(
+                        f"uri={source.uri}; H.264 {source.protocol.value}; "
+                        f"decoder={source.decoder_mode.value}; "
+                        f"latency={source.latency_ms} ms; "
+                        f"drop-on-latency={source.drop_on_latency}"
+                    ),
+                )
+            )
+            if backend == "localhost":
+                checks.append(
+                    StartupPreflightCheck(
+                        name=f"{label} localhost transport",
+                        status=PreflightStatus.FAIL,
+                        detail="localhost diagnostic sender requires rtp-jpeg",
+                    )
+                )
         else:
             checks.append(
                 StartupPreflightCheck(
-                    name=f"{label} RTP configuration",
+                    name=f"{label} camera source",
                     status=PreflightStatus.FAIL,
-                    detail="configured rtp-enabled=false",
+                    detail=f"unsupported source config: {type(source).__name__}",
                 )
             )
-        endpoints.append((label, camera.address, camera.port))
+
+    unique_receiver_elements = tuple(dict.fromkeys(receiver_elements))
+    checks.append(
+        _result_check(
+            "GStreamer receiver",
+            receiver_check(unique_receiver_elements),
+            success_detail=(
+                "required elements available: " + ", ".join(unique_receiver_elements)
+            ),
+        )
+    )
 
     duplicate_detail = _duplicate_endpoint_detail(endpoints)
     if duplicate_detail is not None:
@@ -220,7 +270,10 @@ def run_startup_preflight(
             StartupPreflightCheck(
                 name="Real camera reachability",
                 status=PreflightStatus.WARN,
-                detail="static preflight does not wait for RTP packets or camera ONLINE",
+                detail=(
+                    "static preflight does not probe RTP packets, RTSP endpoints, "
+                    "or camera ONLINE"
+                ),
             )
         )
 
@@ -285,6 +338,39 @@ def _result_check(
     )
 
 
+
+def _rtp_jpeg_config_error(source: RtpJpegSourceConfig) -> str | None:
+    if not source.bind_address:
+        return "bind-address must be non-empty"
+    if type(source.port) is not int or not 1 <= source.port <= 65_535:
+        return "port must be an integer in range 1..65535"
+    if type(source.buffer_size) is not int or source.buffer_size < 1:
+        return "buffer-size must be an integer >= 1"
+    return None
+
+
+def _rtsp_config_error(source: RtspSourceConfig) -> str | None:
+    try:
+        parsed = urlsplit(source.uri)
+        port = parsed.port
+    except (TypeError, ValueError) as exc:
+        return f"invalid RTSP URI: {exc}"
+    if parsed.scheme.lower() != "rtsp" or parsed.hostname is None:
+        return "URI must use rtsp:// and include a host"
+    if port is not None and not 1 <= port <= 65_535:
+        return "RTSP URI port must be in range 1..65535"
+    if source.protocol not in (RtspProtocol.TCP, RtspProtocol.UDP):
+        return "protocol must be tcp or udp"
+    if source.decoder_mode is not RtspDecoderMode.SOFTWARE:
+        return "decoder-mode must be software"
+    if type(source.latency_ms) is not int or source.latency_ms < 0:
+        return "latency-ms must be an integer >= 0"
+    if type(source.drop_on_latency) is not bool:
+        return "drop-on-latency must be boolean"
+    if type(source.buffer_size) is not int or source.buffer_size < 1:
+        return "buffer-size must be an integer >= 1"
+    return None
+
 def _check_session_directory(path: Path) -> str | None:
     directory = Path(path)
     if not directory.is_dir():
@@ -320,10 +406,10 @@ def _check_pyqt6() -> str | None:
     return None
 
 
-def _check_gstreamer_receiver() -> str | None:
+def _check_gstreamer_receiver(element_names: tuple[str, ...]) -> str | None:
     try:
         initialize_gstreamer_runtime()
-        missing = find_missing_gstreamer_elements(GST_RECEIVER_ELEMENTS)
+        missing = find_missing_gstreamer_elements(element_names)
     except GStreamerUnavailableError as exc:
         return str(exc)
     if missing:
