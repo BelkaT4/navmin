@@ -31,10 +31,10 @@ stereo-right
 
 ```text
 Overview:
-RTP/JPEG UDP → GStreamer decode → fisheye undistort → FramePacket → VisionProcessor → VisionResult
+RTP/JPEG UDP или H.264 RTSP → GStreamer decode → fisheye undistort → FramePacket → VisionProcessor → VisionResult
 
 Stereo Left / Right:
-RTP/JPEG UDP → GStreamer decode → rectify → FramePacket → VisionProcessor → VisionResult
+RTP/JPEG UDP или H.264 RTSP → GStreamer decode → rectify → FramePacket → VisionProcessor → VisionResult
 ```
 
 `FramePacket.image` — working frame. Raw image наружу как обычный `FramePacket` не публикуется.
@@ -50,6 +50,10 @@ CameraSessionStarted(camera, generation, camera_model)
 В main thread общий `CameraSessionGate` атомарно принимает `generation + CameraModel`. Core и UI отбрасывают данные generation, которая не принята gate. Никакой consumer не должен принять `VisionResult generation=N` раньше session event `generation=N`.
 
 `VisionProcessor` — заменяемый компонент и обязан выдавать `TrackedObject` со стабильными ID внутри одной generation.
+
+Для H.264 RTSP `CameraWorker` автоматически восстанавливает transport после `ERROR`, `EOS` или ошибки открытия. Во время восстановления публикуется `CameraState.RECONNECTING`; применяется прерываемый backoff `0.25 → 0.5 → 1.0 → 2.0 → 2.0 ... s`. Неудачная попытка подключения не создаёт новую generation. После успешного запуска новой RTSP session тот же `VisionPipeline` выполняет `start()`, увеличивает generation ровно один раз, сбрасывает `VisionProcessor`, инвалидирует старый latest result и публикует новый `CameraSessionStarted` до данных новой generation. Поздние callbacks старой GStreamer session игнорируются source-local session token.
+
+Кратковременное отсутствие кадров само по себе reconnect не запускает: freshness/stale остаётся отдельной consumer-side семантикой. RTP/JPEG receiver также сохраняет прежнее поведение при паузе sender: pipeline не пересоздаётся и generation не меняется.
 
 Подробно: [Vision](../modules/vision/index.md).
 
@@ -308,10 +312,11 @@ TurretWorker ───────────┘
 ```
 
 Оба camera worker создаются существующим `build_camera_worker(...)` с реальными
-corrector из переданных calibration. Production defaults используют
-`GStreamerRtpJpegSource`, а Turret создаётся через существующий
+corrector из переданных calibration. Production source выбирается типизированным
+`CameraConfig.source`: `GStreamerRtpJpegSource` для `rtp-jpeg` или
+`GStreamerRtspSource` для `rtsp`. Turret создаётся через существующий
 `TurretWorker(config.turret)` и его production transport policy. Узкие factories
-для двух camera sources и physical Turret transport существуют только как
+для camera sources и physical Turret transport существуют только как
 explicit dependency-injection seams; silent fallback на InMemory/Fake отсутствует.
 
 Runtime сразу предоставляет полную UI dependency surface: один `Mediator`,
@@ -322,7 +327,7 @@ normal UI/application flow не входит.
 Normal и diagnostic launchers передают сюда effective typed inputs и вызывают
 одну и ту же composition. Normal entrypoint — `python -m navmin` (или root
 `main.py`): он принимает пути к `config.json`, `calibration/overview.json` и
-`calibration/stereo.json`, использует только production RTP receivers и запрещает
+`calibration/stereo.json`, использует production camera sources из config (`rtp-jpeg | rtsp`) и запрещает
 `turret.emulate-stm32=true`, чтобы normal запуск не мог молча перейти на
 `FakeTransport`.
 
@@ -332,7 +337,7 @@ Diagnostic entrypoint — `python tools/run_diagnostic_app.py`. Он требу�
 выбора `--overview real|localhost`, `--stereo-left real|localhost` и
 `--turret real|pty`. Localhost RTP senders и PTY STM32 emulator остаются внешними
 diagnostic endpoints и не принадлежат `ApplicationRuntime`; внутренними
-production boundaries остаются `GStreamerRtpJpegSource` и `SerialTransport`.
+production camera boundary остаётся `DecodedFrameSource` с transport-specific `GStreamerRtpJpegSource` или `GStreamerRtspSource`, а Turret boundary — `SerialTransport`.
 Localhost sender использует resolution загруженной calibration соответствующей
 camera role, а PTY selection формирует effective Turret config со stable PTY path
 и `emulate-stm32=false`. Для полностью software-only сочетания

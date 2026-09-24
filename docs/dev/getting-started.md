@@ -131,17 +131,22 @@ sudo apt install \
   gstreamer1.0-tools \
   gstreamer1.0-plugins-base \
   gstreamer1.0-plugins-good \
+  gstreamer1.0-plugins-bad \
+  gstreamer1.0-libav \
   gir1.2-gstreamer-1.0 \
   gir1.2-gst-plugins-base-1.0
 ```
 
-`plugins-bad` текущему pipeline не требуется. Проверка нужных элементов:
+`plugins-bad` нужен для `h264parse`, а `gstreamer1.0-libav` — для программного `avdec_h264` в RTSP/H.264 path. Проверка production camera elements:
 
 ```bash
-gst-inspect-1.0 udpsrc rtpjpegdepay jpegdec videoconvert appsink
+gst-inspect-1.0 \
+  udpsrc rtpjpegdepay jpegdec \
+  rtspsrc rtph264depay h264parse avdec_h264 \
+  videoconvert appsink
 ```
 
-Production receiver v1 слушает RTP/JPEG over UDP. Рекомендуемые значения config: local bind `0.0.0.0`, Overview port `8888`, Stereo Left `8889`, Stereo Right `8890`, `rtp-enabled=true`, `buffer-size=1`. Raspberry Pi source IP настраивается sender-side и не является `CameraConfig.address` PC receiver.
+Production camera source выбирается через `vision.cameras.<camera>.source.type = rtp-jpeg | rtsp`. Для RTP/JPEG обычный local bind — `0.0.0.0`, принятые порты Overview/Stereo Left/Stereo Right — `8888/8889/8890`, `buffer-size=1`. Для RTSP endpoint задаётся в `source.uri`; первая реализация поддерживает H.264, `protocol = tcp | udp` и `decoder-mode = software`.
 
 # Offline rehearsal и hardware day
 

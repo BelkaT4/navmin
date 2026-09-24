@@ -170,6 +170,9 @@ class DecodedFrame:
 class DecodedFrameSource(Protocol):
     """Owner-local source boundary feeding raw decoded BGR frames."""
 
+    @property
+    def supports_reconnect(self) -> bool: ...
+
     def start(self) -> None: ...
 
     def stop(self) -> None: ...
@@ -187,6 +190,10 @@ class InMemoryFrameSource:
         self._latest: LatestValue[DecodedFrame] = LatestValue()
         self._last_read_revision = 0
         self._timestamp_clock_ns = timestamp_clock_ns
+
+    @property
+    def supports_reconnect(self) -> bool:
+        return False
 
     def start(self) -> None:
         return None
@@ -316,6 +323,31 @@ class VisionPipeline:
                 )
             )
         LOGGER.info("Vision pipeline stopped camera=%s generation=%s", self.camera.value, generation)
+
+    def report_source_reconnecting(self, error: BaseException) -> None:
+        """Publish recoverable source loss without terminating the camera worker."""
+        with self._state_lock:
+            generation = self._generation if self._generation > 0 else None
+            current = self.status.get()
+            last_receive_timestamp_ns = (
+                current.last_receive_timestamp_ns if current is not None else None
+            )
+            self.status.publish(
+                CameraStatus(
+                    camera=self.camera,
+                    state=CameraState.RECONNECTING,
+                    generation=generation,
+                    last_receive_timestamp_ns=last_receive_timestamp_ns,
+                    error_code=type(error).__name__,
+                    message=str(error),
+                )
+            )
+        LOGGER.warning(
+            "Vision source reconnecting camera=%s generation=%s: %s",
+            self.camera.value,
+            generation,
+            error,
+        )
 
     def report_source_failure(self, error: BaseException) -> None:
         with self._state_lock:

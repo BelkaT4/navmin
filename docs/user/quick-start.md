@@ -10,7 +10,7 @@ calibration/overview.json
 calibration/stereo.json
 ```
 
-и запускает только production RTP cameras + production serial path к STM32:
+и запускает рабочие источники камер из `config.json` (`rtp-jpeg` или `rtsp`) и рабочее последовательное соединение со STM32:
 
 ```bash
 python -m navmin
@@ -97,8 +97,7 @@ python tools/run_diagnostic_app.py \
   --turret pty
 ```
 
-`localhost` запускает внешний synthetic RTP/JPEG sender, но receiver приложения
-остаётся production `GStreamerRtpJpegSource`. `pty` запускает внешний software
+`localhost` запускает внешний синтетический RTP/JPEG sender и поэтому требует для соответствующей камеры `source.type = rtp-jpeg`; приёмник приложения остаётся `GStreamerRtpJpegSource`. При `real` источник берётся из конфигурации и может быть `rtp-jpeg` или `rtsp`. `pty` запускает внешний программный
 STM32 endpoint через Linux PTY, но приложение продолжает использовать production
 `SerialTransport`/pyserial. Diagnostic preflight выполняется до запуска localhost
 sender и PTY service, поэтому failed preflight не оставляет внешние diagnostic
@@ -144,7 +143,41 @@ python tools/run_diagnostic_app.py \
 `--preflight-only` всё равно создаёт session directory, `runtime.log`,
 `manifest.json` и `preflight.json`. `PASS`/`WARN` возвращают `0`; `FAIL` возвращает
 `2` и manifest status `preflight-failed`. Static preflight проверяет только
-prerequisites выбранных backends: он не ждёт RTP packets, не ping'ует Raspberry Pi,
-не открывает real serial device и не делает STM32 protocol probe.
+необходимые условия выбранных backends: он не ждёт RTP-пакеты, не подключается к RTSP-источнику, не проверяет состояние камеры `ONLINE`, не открывает реальное последовательное устройство и не выполняет проверочный запрос к протоколу STM32.
+
+
+## H.264 RTSP
+
+Для RTSP-камеры в `config.json` используется вложенный `source`, например:
+
+```json
+{
+  "enabled": true,
+  "source": {
+    "type": "rtsp",
+    "uri": "rtsp://camera.local/stream",
+    "protocol": "tcp",
+    "decoder-mode": "software",
+    "latency-ms": 100,
+    "drop-on-latency": true,
+    "buffer-size": 1
+  },
+  "processing-enabled": true,
+  "vision-processor-class": "Legacy14VisionProcessor"
+}
+```
+
+При ошибке транспорта `ERROR`, событии `EOS` или неудачном открытии RTSP NavMin автоматически переходит в `RECONNECTING` и повторяет подключение с задержками `0.25 → 0.5 → 1 → 2 → 2 ... s` до восстановления или штатного завершения приложения. Успешное восстановление создаёт новое поколение камеры (`generation`); неудачные попытки `generation` не меняют. Обычное устаревание кадра (stale) без ошибки транспорта само по себе переподключение не запускает.
+
+`--preflight-only` проверяет конфигурацию и наличие нужных компонентов GStreamer, но не подключается к RTSP-камере. Для ограниченной проверки доступного H.264 RTSP-источника используется:
+
+```bash
+python tools/run_rtsp_camera_diagnostic.py \
+  --uri 'rtsp://HOST/stream' \
+  --protocol tcp \
+  --duration-seconds 10
+```
+
+Это средство диагностики проверяет рабочий `GStreamerRtspSource` и получение декодированных BGR-кадров, но не доказывает длительную стабильность или надёжность переподключения конкретной камеры.
 
 Для автономной репетиции, четырёх рекомендуемых operator profiles и controlled hardware-day gates см. [Offline Hardware Runbook](./offline-hardware-runbook.md).

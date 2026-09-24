@@ -512,6 +512,39 @@ def test_mixed_rtsp_and_rtp_preflight_checks_only_relevant_dependencies(
     )
 
 
+def test_rtsp_preflight_detail_redacts_uri_credentials_and_query(tmp_path) -> None:
+    inputs = _inputs(18_894, 18_895)
+    cameras = inputs.config.vision.cameras
+    config = replace(
+        inputs.config,
+        vision=replace(
+            inputs.config.vision,
+            cameras=replace(
+                cameras,
+                overview=_rtsp_camera(
+                    uri="rtsp://operator:secret@camera.local:8554/stream?token=hidden"
+                ),
+            ),
+        ),
+    )
+
+    report = _run(
+        tmp_path,
+        replace(inputs, config=config),
+        StartupBackendSelection("real", "real", "pty"),
+    )
+
+    check = next(
+        item for item in report.checks if item.name == "Overview RTSP configuration"
+    )
+    assert check.status is PreflightStatus.PASS
+    assert "rtsp://camera.local:8554/stream" in check.detail
+    assert "operator" not in check.detail
+    assert "secret" not in check.detail
+    assert "token" not in check.detail
+    assert "hidden" not in check.detail
+
+
 def test_receiver_capability_probe_uses_production_initializer_and_factory_probe(
     monkeypatch,
 ) -> None:
