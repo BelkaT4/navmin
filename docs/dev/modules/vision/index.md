@@ -32,23 +32,65 @@ Stereo Right worker
 
 В current accepted minimum отдельного постоянного production `Camera Registry` нет. Каждый `VisionPipeline` является фактическим owner своей generation в пределах lifetime экземпляра и предоставляет собственные `session_barriers`, `latest_result` и `status`. E2E-1 использует эти pipeline-owned boundaries напрямую.
 
-Единственный `CameraSessionGate` находится в main thread и принадлежит `Mediator`; второго generation gate/counter нет. Ownership при будущем camera reconnect или replacement экземпляра pipeline остаётся открытой частью полного reconnect work: monotonic generation semantics должны сохраниться, а единственный production owner будет выбран до/в E2E-4. См. [открытый вопрос о camera reconnect](../../architecture/problems.md#8-camera-reconnect-transitions-backoff).
+Единственный `CameraSessionGate` находится в main thread и принадлежит `Mediator`; второго generation gate/counter нет. `VisionPipeline` остаётся единственным владельцем monotonic generation в пределах lifetime camera worker. RTSP reconnect переиспользует тот же pipeline: неудачные попытки подключения generation не меняют, а успешно запущенная новая RTSP session вызывает ровно один новый `VisionPipeline.start()`.
 
 ### Production camera transport v1
 
-Текущий production source — `GStreamerRtpJpegSource`: RTP/JPEG (MJPEG) over UDP → `rtpjpegdepay` → `jpegdec` → `videoconvert` → BGR `appsink`. Source владеет Gst pipeline, получает фактические width/height из sample caps и копирует Gst buffer в независимый NumPy frame до `unmap()`.
-
-Low-latency boundary:
+Production composition выбирает source по типизированному `CameraConfig.source`:
 
 ```text
-appsink emit-signals=true max-buffers=<CameraConfig.buffer-size> drop=true sync=false
+source.type = rtp-jpeg → GStreamerRtpJpegSource
+source.type = rtsp     → GStreamerRtspSource
 ```
 
-Для prototype `buffer-size = 1`; source и `VisionPipeline` оба latest-only и не образуют processing FIFO. `receive_timestamp_ns` ставится monotonic clock в момент application-side получения decoded frame. Текущий RTP transport не несёт согласованный cross-camera `capture_id`, поэтому Overview/Stereo Left/Stereo Right source публикуют `capture_id = None` до отдельного stereo-pairing решения.
+Оба source реализуют один `DecodedFrameSource` contract и публикуют только decoded BGR `uint8 HxWx3`. Geometric correction остаётся единственной responsibility `VisionPipeline`.
 
-`CameraConfig.address` — local bind address PC receiver, `port` — local listen UDP port, `rtp-enabled=true` обязателен. Рабочая mapping: Overview `8888`, Stereo Left `8889`, Stereo Right `8890`.
+RTP/JPEG path:
 
-Appsink callback выполняется GStreamer streaming thread; process-global `GLib.MainLoop` для source не требуется. Один application `CameraWorker` на camera соединяет source с существующим `VisionPipeline.submit_decoded_frame() → process_latest()`, использует cooperative stop и bounded join. Reconnect/backoff policy в этом checkpoint не вводится.
+```text
+udpsrc → rtpjpegdepay → jpegdec → videoconvert → BGR appsink
+```
+
+RTSP v1 path:
+
+```text
+rtspsrc → rtph264depay → h264parse → avdec_h264 → videoconvert → BGR appsink
+```
+
+RTSP v1 поддерживает H.264, `protocol = tcp | udp` и только `decoder-mode = software`. Для обоих transport `appsink` сохраняет bounded/latest-only semantics:
+
+```text
+emit-signals=true max-buffers=<source.buffer-size> drop=true sync=false
+```
+
+Для prototype `buffer-size = 1`; source и `VisionPipeline` не образуют processing FIFO. `receive_timestamp_ns` ставится monotonic clock в момент application-side получения decoded frame. Текущие transport не формируют согласованный cross-camera `capture_id`, поэтому source публикует `capture_id = None` до отдельного stereo-pairing решения.
+
+RTP/JPEG config использует `source.bind-address`, `source.port` и `source.buffer-size`. Принятая port mapping: Overview `8888`, Stereo Left `8889`, Stereo Right `8890`. `bind-address` относится к локальному PC receiver; IP Raspberry Pi/source sender задаётся на стороне sender.
+
+RTSP config использует `source.uri`, `source.protocol`, `source.decoder-mode`, `source.latency-ms`, `source.drop-on-latency` и `source.buffer-size`. Endpoint целиком задаётся URI; RTP/JPEG bind address/port к RTSP branch не относятся.
+
+Appsink callback выполняется GStreamer streaming thread; process-global `GLib.MainLoop` не требуется. Один application `CameraWorker` на camera соединяет source с существующим `VisionPipeline.submit_decoded_frame() → process_latest()`, использует cooperative stop и bounded join.
+
+#### RTSP automatic reconnect
+
+Только RTSP source объявляет поддержку automatic reconnect. При `GStreamer ERROR`, `EOS` или ошибке открытия `CameraWorker`:
+
+```text
+RECONNECTING
+→ cleanup текущего source backend
+→ interruptible backoff 0.25 → 0.5 → 1.0 → 2.0 → 2.0 ... s
+→ новая попытка start
+```
+
+Попытки продолжаются до успешного запуска или shutdown. Лимита количества попыток нет. Backoff сбрасывается к `0.25 s` после первого принятого кадра восстановленной session.
+
+Неудачная попытка не создаёт фиктивную generation. После успешного запуска новой RTSP session тот же `VisionPipeline` вызывает `start()`: generation увеличивается ровно один раз, состояние processor сбрасывается, previous latest result инвалидируется и публикуется новый `CameraSessionStarted`. Во время backoff UI может продолжать показывать последний кадр старой generation вместе со статусом `RECONNECTING`; после успешного start generation barrier очищает старый displayed result по существующему consumer contract.
+
+`GStreamerRtspSource` использует owner-local session token для callbacks конкретного backend. После cleanup callback старой Gst pipeline не может опубликовать frame или failure в новую session. Перед каждым start source также фиксирует current latest revision, поэтому кадр предыдущей session не читается как первый кадр новой.
+
+Кратковременная stale-ситуация сама по себе reconnect не запускает. Для RTP/JPEG sender silence/resume остаётся прежним: receiver продолжает жить, generation не меняется. Hard failure non-reconnecting source остаётся terminal `ERROR`.
+
+Shutdown имеет приоритет над recovery: stop token прерывает backoff, а successful source start не публикует новую `CameraSessionStarted`, если stop уже был запрошен.
 
 ### Localhost RTP/JPEG diagnostic boundary
 
@@ -62,7 +104,7 @@ Python/OpenCV detector-friendly scene 320x240 @ 20 FPS
 → GStreamer fdsrc → jpegparse
 → rtpjpegpay payload=26
 → udpsink 127.0.0.1:8888/8889
-→ существующий production GStreamerRtpJpegSource
+→ production GStreamerRtpJpegSource
 → CameraWorker
 → VisionPipeline
 ```
@@ -77,7 +119,7 @@ correction. Timestamp и frame counter формируются sender-side до J
 Sender ownership и preflight реализованы в `navmin.diagnostics.localhost_rtp`,
 чтобы будущий diagnostic launcher мог переиспользовать boundary без импорта из
 `tools/`. Это не второй receiver и не альтернативный camera source: UDP/RTP/JPEG
-всегда принимает существующий production `GStreamerRtpJpegSource`, а correction
+всегда принимает production `GStreamerRtpJpegSource`, а correction
 выполняется существующим `VisionPipeline` через tool-local exact-size fisheye и
 stereo calibration.
 
@@ -86,9 +128,7 @@ Diagnostic runner проверяет оба startup ordering, одновреме
 отклонение wrong-resolution кадра без raw fallback, stable moving Legacy14 track
 для обеих camera roles и bounded cleanup. Он не
 является общей application composition, не запускает UI/Turret и не заменяет
-быстрые `InMemoryFrameSource` tests. Silence/resume сохраняет текущую generation,
-но не закрывает production camera reconnect/backoff: source recreation, hard
-GStreamer ERROR/EOS recovery и ownership новой generation остаются вопросом #8.
+быстрые `InMemoryFrameSource` tests. Silence/resume сохраняет текущую generation и отдельно проверяет UDP freshness semantics. RTSP hard `ERROR`/`EOS` recovery покрывается automatic reconnect в `CameraWorker` и не меняет этот localhost RTP/JPEG diagnostic.
 
 Ручной transport check запускается одной командой из project root:
 
@@ -102,7 +142,7 @@ python tools/run_localhost_rtp_diagnostic.py --duration-seconds 30
 
 ```text
 Overview:
-RTP/JPEG over UDP
+RTP/JPEG over UDP или H.264 RTSP
 → GStreamer decode to raw BGR
 → OpenCV fisheye undistort
 → FramePacket
@@ -110,7 +150,7 @@ RTP/JPEG over UDP
 → VisionResult
 
 Stereo Left / Right:
-RTP/JPEG over UDP
+RTP/JPEG over UDP или H.264 RTSP
 → GStreamer decode to raw BGR
 → pinhole/stereo rectify
 → FramePacket
@@ -206,7 +246,7 @@ CameraSessionStarted generation=N
 
 Generation защищает от запоздалых результатов старого worker и от повторного использования `track_id` после restart.
 
-`VisionPipeline.start()` инвалидирует предыдущий latest result и сбрасывает processor state до публикации barrier. Полный reconnect/replacement lifecycle, включая сохранение monotonic generation при замене экземпляра pipeline, остаётся частью открытого reconnect work.
+`VisionPipeline.start()` инвалидирует предыдущий latest result и сбрасывает processor state до публикации barrier. RTSP reconnect сохраняет monotonic sequence за счёт переиспользования того же pipeline instance; worker не создаёт отдельный generation counter или `Camera Registry`.
 
 ## `CameraSessionGate`
 
@@ -451,7 +491,7 @@ Vision публикует latest-only `CameraStatus` per camera с `camera`, `st
 
 Freshness не является отдельным state. UI вычисляет prototype presentation stale по `CameraStatus.last_receive_timestamp_ns` и authoritative `vision.camera-stale-timeout-ms`; это не меняет camera lifecycle state.
 
-Конкретная reconnect/backoff policy остаётся открытым вопросом реализации.
+Для RTSP recoverable failure `CameraWorker` публикует `RECONNECTING` и сохраняет последнее `last_receive_timestamp_ns`; успешная новая session проходит через `STARTING` и становится `ONLINE` после первого принятого frame. Неудачные reconnect attempts не создают новую generation. RTP/JPEG sender silence не меняет lifecycle state автоматически и определяется consumer как stale по timestamp.
 
 ## Запись видео
 
@@ -480,7 +520,6 @@ Diagnostics/errors идут в logging, runtime state — через typed contr
 
 - механизм `capture_id` и stereo resync;
 - owner staleness `DistanceResult`;
-- camera reconnect/backoff;
 - адаптация нагрузки после profiling.
 
 Полный список: [Открытые вопросы](../../architecture/problems.md).

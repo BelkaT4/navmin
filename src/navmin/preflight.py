@@ -30,6 +30,7 @@ from navmin.vision.gstreamer_source import (
     GStreamerUnavailableError,
     find_missing_gstreamer_elements,
     initialize_gstreamer_runtime,
+    rtsp_uri_for_diagnostics,
 )
 
 _PREFLIGHT_SCHEMA_VERSION = 1
@@ -188,7 +189,8 @@ def run_startup_preflight(
                     f"{label} RTSP configuration",
                     source_error,
                     success_detail=(
-                        f"uri={source.uri}; H.264 {source.protocol.value}; "
+                        f"uri={rtsp_uri_for_diagnostics(source.uri)}; "
+                        f"H.264 {source.protocol.value}; "
                         f"decoder={source.decoder_mode.value}; "
                         f"latency={source.latency_ms} ms; "
                         f"drop-on-latency={source.drop_on_latency}"

@@ -133,6 +133,19 @@ class CameraStatus:
 
 `CameraStatus` — latest-only per camera. `generation` относится к текущей/последней известной session, если она существует.
 
+Для recoverable RTSP transport действуют переходы:
+
+```text
+нет успешной session + start failure → RECONNECTING, generation=None
+ONLINE + transport ERROR/EOS        → RECONNECTING, generation=N
+failed reconnect attempt            → RECONNECTING, generation=N
+successful source start             → STARTING, generation=N+1
+первый принятый frame               → ONLINE, generation=N+1
+shutdown                             → STOPPED
+```
+
+Неудачная попытка RTSP подключения не создаёт новую generation. Новый `CameraSessionStarted` публикуется только после успешного запуска новой source session. `ERROR` остаётся terminal/non-recoverable состоянием, когда worker не может корректно продолжать recovery, например при ошибке обязательного cleanup или pipeline processing. RTP/JPEG sender silence не является transition в `RECONNECTING`: freshness определяется отдельно.
+
 `STALE` не является отдельным взаимоисключающим `CameraState`. Свежесть вычисляется consumer по `last_receive_timestamp_ns`:
 
 ```text

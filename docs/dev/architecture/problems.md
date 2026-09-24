@@ -55,31 +55,6 @@ Generation уже не позволяет смешивать разные camera
 
 STM32 max speed / acceleration / velocity watchdog уже применяются dynamic полным атомарным `SET_CONFIG` snapshot. Axis mechanics (`invert`, steps/rev, microstep, `max-relative-move-deg`) — restart-only и safe-point semantics для них не нужна.
 
-### 8. Camera reconnect transitions / backoff
-
-Enum уже определён:
-
-```text
-STARTING
-ONLINE
-RECONNECTING
-ERROR
-STOPPED
-```
-
-Freshness вычисляется отдельно по timestamp.
-
-Остаётся определить:
-
-- точные state transitions;
-- reconnect/backoff;
-- критерий устойчивого ERROR;
-- restart/reset `VisionProcessor`;
-- единственный production owner monotonic generation при reconnect или replacement экземпляра pipeline; current prototype владеет generation внутри существующего `VisionPipeline`, без отдельного `Camera Registry` или второго counter;
-- reconnect history/logging.
-
-При каждом новом pipeline start создаётся новая `generation`; replacement не должен сбрасывать или дублировать monotonic sequence соответствующей camera role.
-
 ### 11. Частичные отказы
 
 Нужно определить доступность функций/UI в сценариях:

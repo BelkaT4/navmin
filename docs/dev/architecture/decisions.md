@@ -590,23 +590,23 @@ Baseline overlay показывает bbox и selection highlight без пос�
 - **Постоянные diagnostic labels возле каждого bbox.** Отклонены ради читаемого основного изображения; расширенная диагностика может включаться отдельно.
 - **Stereo Right как обычная main/preview camera.** Отклонено: её роль остаётся diagnostic/stereo и не должна менять обычный two-camera interaction contract.
 
-## 29. Camera transport v1 — RTP/JPEG через GStreamer; Overview correction — OpenCV fisheye без silent scaling
+## 29. Camera transport v1 — типизированные RTP/JPEG и RTSP sources через GStreamer; Overview correction — OpenCV fisheye без silent scaling
 
 ### Решение
 
-Production camera source v1 использует фактически подтверждённый sender/receiver path RTP/JPEG over UDP. PC receiver декодирует через GStreamer в raw BGR и хранит только freshest frame; geometric correction остаётся единственной responsibility `VisionPipeline`. `appsink` работает bounded/latest-oriented (`drop=true`, `sync=false`, prototype `max-buffers=1`).
+Production camera transport выбирается типизированным `CameraConfig.source`. Поддерживаются `rtp-jpeg` через `GStreamerRtpJpegSource` и H.264 `rtsp` через `GStreamerRtspSource`; оба декодируют через GStreamer в raw BGR и отдают единый `DecodedFrameSource` contract. RTSP v1 поддерживает `tcp | udp` и только программное декодирование через `avdec_h264`. Geometric correction остаётся единственной responsibility `VisionPipeline`. `appsink` для обоих transport работает bounded/latest-oriented (`drop=true`, `sync=false`, prototype `max-buffers=1`).
 
 Overview calibration schema v1 трактуется как OpenCV fisheye: `D` содержит ровно четыре коэффициента, maps строятся через `cv2.fisheye.initUndistortRectifyMap`, а исправленная geometry использует `new_camera_matrix`. Source size обязан точно совпадать с calibration size; автоматическое scaling `K/new_camera_matrix` не выполняется.
 
 ### Почему
 
-Этот RTP/JPEG sender/receiver path уже реально работает на camera setup и GStreamer appsink даёт прямой low-latency latest-frame boundary без отдельной display loop architecture. Fisheye API обязателен, потому что фактическая Overview calibration была получена через OpenCV fisheye model; обычный pinhole `initUndistortRectifyMap` описывает другую camera model. Exact-size validation сохраняет явную геометрическую ошибку вместо скрытого изменения calibration.
+RTP/JPEG sender/receiver path реально проверен на camera setup, а общий GStreamer appsink даёт прямой low-latency latest-frame boundary без отдельной display loop architecture. RTSP добавлен как transport-specific source перед тем же decoded-frame boundary и поэтому не меняет calibration/Vision/Core/UI contracts. Fisheye API обязателен, потому что фактическая Overview calibration была получена через OpenCV fisheye model; обычный pinhole `initUndistortRectifyMap` описывает другую camera model. Exact-size validation сохраняет явную геометрическую ошибку вместо скрытого изменения calibration. Реальный H.264 RTSP smoke остаётся отдельным endpoint-dependent gate и не подменяется software tests.
 
 ### Отвергнутые альтернативы
 
 - **Выполнять fisheye correction внутри camera source.** Отклонено: это дублировало бы correction path и смешало transport с geometry.
 - **Автоматически масштабировать `K`/`new_camera_matrix` под любой decoded size.** Отклонено: silent scaling скрывает geometry mismatch; NavMin требует exact calibration resolution.
-- **Использовать Raspberry Pi IP как `CameraConfig.address` receiver-side correlation.** Отклонено: UDP sender уже направляет stream на PC; receiver bind address и local listen port являются достаточной source boundary.
+- **Использовать Raspberry Pi IP как `source.bind-address` receiver-side correlation для RTP/JPEG.** Отклонено: UDP sender уже направляет stream на PC; локальные bind address и listen port являются достаточной receiver boundary. Для RTSP удалённый endpoint задаётся в `source.uri`.
 - **Копировать process-global `GLib.MainLoop` из reference viewer.** Отклонено: appsink callback и polling bus достаточны owner-local source и не создают новый application-global manager.
 
 ---
@@ -656,7 +656,7 @@ worker threads и дополнительно защищён process-local lock/c
 Normal launcher предназначен только для реального железа:
 
 ```text
-real RTP cameras
+real cameras через configured `rtp-jpeg | rtsp` source
 +
 production SerialTransport → real STM32
 ```
@@ -665,9 +665,7 @@ production SerialTransport → real STM32
 
 Diagnostic launcher запускает то же приложение, но разрешает явно выбирать
 внешние endpoints. Для каждой camera role он выбирает real Raspberry Pi RTP
-sender или localhost RTP/JPEG sender и передаёт соответствующую effective
-listen-конфигурацию; receiver внутри composition в обоих случаях остаётся
-`GStreamerRtpJpegSource`. Для controller он выбирает реальный serial device или
+source из file-backed config или localhost RTP/JPEG sender. Для backend `real` production source выбирается из `CameraConfig.source` (`rtp-jpeg | rtsp`); для `localhost` launcher требует `rtp-jpeg` и подменяет только локальный RTP/JPEG endpoint. Для controller он выбирает реальный serial device или
 stable PTY path; physical transport внутри composition в обоих случаях остаётся
 production `SerialTransport`.
 
@@ -844,6 +842,39 @@ Exact migration на external protocol 4.0 остаётся отдельным a
 - **Заменить NavMin firmware целиком Stage8.2 `main.c`.** Отклонено: теряются принятые transaction/recovery/Emergency semantics.
 - **Перенести exact protocol 4.0 как текущий NavMin protocol.** Отклонено: wire/command collisions требуют breaking PC+MCU migration без доказанной необходимости.
 - **Принять 20 000 STEP/rev или 5000 STEP/s как готовую настройку.** Отклонено до hardware measurements.
+
+---
+
+
+## 34. RTSP transport восстанавливается в `CameraWorker`, а generation остаётся собственностью существующего `VisionPipeline`
+
+### Решение
+
+H.264 RTSP source объявляет recoverable transport capability. `CameraWorker` при `GStreamer ERROR`, `EOS` или ошибке открытия не завершает camera pipeline, а переводит `CameraStatus` в `RECONNECTING`, очищает текущий source backend и выполняет повторные попытки с interruptible backoff:
+
+```text
+0.25 → 0.5 → 1.0 → 2.0 → 2.0 ... s
+```
+
+Количество попыток не ограничивается; shutdown прерывает ожидание. Кратковременная stale-ситуация без transport failure сама по себе reconnect не запускает. RTP/JPEG automatic reconnect не добавляется: UDP sender silence/resume продолжает использовать уже работающий receiver и не меняет generation.
+
+Generation не получает второго owner. При неудачных RTSP попытках она не меняется. Только после успешного `source.start()` тот же `VisionPipeline` выполняет `start()`, увеличивает generation ровно один раз, сбрасывает `VisionProcessor`, инвалидирует предыдущий latest result и публикует новый `CameraSessionStarted`.
+
+`GStreamerRtspSource` связывает callbacks с owner-local session token. Callback старого backend после cleanup не может опубликовать frame или failure в новую session. Перед новым start предыдущая latest revision также считается уже прочитанной, поэтому кадр старой session не может стать первым кадром новой generation.
+
+### Почему
+
+Reconnect относится к lifecycle camera transport и должен работать без перезапуска приложения, но downstream contracts уже имеют достаточную session boundary — `VisionPipeline.start()` + `CameraSessionStarted`. Переиспользование существующего pipeline сохраняет monotonic generation без отдельного `Camera Registry` или второго counter. Отдельный source-local token закрывает race поздних GStreamer callbacks на физической boundary.
+
+Backoff совпадает с уже принятым для Turret recovery по форме и остаётся коротким/ограниченным сверху. Он сбрасывается после реально принятого кадра новой session, а не только после успешного вызова `start()`, чтобы быстро падающая RTSP session не создавала tight retry loop.
+
+### Отвергнутые альтернативы
+
+- **Создать отдельный global Camera Registry/generation manager только ради reconnect.** Отклонено: существующий `VisionPipeline` уже является единственным owner generation, а worker может переиспользовать его между RTSP sessions.
+- **Увеличивать generation на каждой неудачной попытке.** Отклонено: это создаёт фиктивные sessions без работающего source.
+- **Считать любой stale timeout причиной reconnect.** Отклонено: freshness и transport state — разные сигналы; реальный timeout можно добавить позже по hardware evidence.
+- **Ограничить reconnect конечным числом попыток.** Отклонено: временный network/camera outage не должен требовать restart NavMin.
+- **Автоматически переключать `tcp ↔ udp`.** Отклонено: configured transport сохраняется при recovery, скрытый fallback затрудняет диагностику.
 
 ---
 

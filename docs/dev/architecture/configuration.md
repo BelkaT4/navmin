@@ -149,8 +149,8 @@ aiming.aim-points.stereo-left.y-px
 
 ### Общие ограничения значений
 
-- `address`, serial `port` path и `vision-processor-class` — непустые строки;
-- UDP/TCP camera `port` — integer `1..65535`;
+- camera `source.bind-address`, RTSP `source.uri`, serial `port` path и `vision-processor-class` — непустые строки;
+- RTP/JPEG camera `source.port` и RTSP URI port, если указан, — integer `1..65535`;
 - buffer sizes — integer `>= 1`;
 - timeout/delay fields — integer `> 0`, кроме `lead-time-ms >= 0` и `max-retries >= 0`;
 - `manual-distance-m` — finite number `> 0`;
@@ -179,25 +179,43 @@ stereo-right
 
 ```text
 enabled: bool
-address: str
-port: int
-rtp-enabled: bool
-buffer-size: int
+source: rtp-jpeg | rtsp
 processing-enabled: bool          # per-camera master switch
 vision-processor-class: str
 ```
 
-Для production camera source v1 эти существующие поля имеют следующую operational semantics:
+`source` — типизированная ветвь транспорта. Для RTP/JPEG:
 
-- `address` — local bind/listen address PC receiver для `udpsrc`; portable default для обычного listen — `0.0.0.0`; это не Raspberry Pi source IP;
-- `port` — local UDP listen port на PC; role→port не hardcode'ится production source;
-- `rtp-enabled = true` обязателен для текущего RTP/JPEG source; non-RTP transport этим source не реализуется;
-- `buffer-size` — bounded `appsink max-buffers`; для low-latency prototype используется `1`; `drop=true` и `sync=false` не допускают накопления FIFO старых кадров;
-- `processing-enabled` и `vision-processor-class` сохраняют существующую processing semantics.
+```text
+source.type: rtp-jpeg
+source.bind-address: str
+source.port: int
+source.buffer-size: int
+```
 
-Фактически подтверждённая v1 deployment mapping: Overview `8888`, Stereo Left `8889`, Stereo Right `8890`. Raspberry Pi IP относится к sender-side/service configuration и не используется PC receiver для correlation.
+- `bind-address` — локальный адрес PC receiver для `udpsrc`; обычный portable listen — `0.0.0.0`; это не IP Raspberry Pi/source sender;
+- `port` — локальный UDP listen port на PC; соответствие роли камеры и порта не зашито в production source;
+- `buffer-size` — `appsink max-buffers`; для low-latency prototype используется `1`; `drop=true` и `sync=false` не допускают накопления очереди старых кадров.
 
-`processing-enabled = false` полностью запрещает VisionProcessor для этой камеры, но pipeline продолжает публиковать corrected working frame через `VisionResult` с пустым `tracked_objects`.
+Для RTSP/H.264:
+
+```text
+source.type: rtsp
+source.uri: str                    # rtsp://host[:port]/path
+source.protocol: tcp | udp
+source.decoder-mode: software
+source.latency-ms: int >= 0
+source.drop-on-latency: bool
+source.buffer-size: int >= 1
+```
+
+Первая RTSP-реализация поддерживает только H.264 и программное декодирование через GStreamer `avdec_h264`. `protocol` задаёт транспорт RTSP и не меняется автоматически при восстановлении соединения. `buffer-size`, `drop=true` и `sync=false` сохраняют bounded/latest-only поведение `appsink`.
+
+`source.uri` может содержать локальные credentials. Обычные lifecycle/preflight diagnostic строки скрывают URI userinfo и query, однако session artifact `inputs/effective-config.json` сохраняет фактический effective config и поэтому не считается безопасным для публичной публикации без проверки.
+
+`processing-enabled` и `vision-processor-class` не зависят от выбранного транспорта. `processing-enabled = false` полностью запрещает `VisionProcessor` для этой камеры, но pipeline продолжает публиковать corrected working frame через `VisionResult` с пустым `tracked_objects`.
+
+Для принятого RTP/JPEG развёртывания используются Overview `8888`, Stereo Left `8889`, Stereo Right `8890`. При `source.type = rtsp` endpoint задаётся целиком в `source.uri`; локальный UDP bind address и RTP/JPEG port к этой ветви не относятся.
 
 ### Processing scope main / preview
 
@@ -221,6 +239,22 @@ AND
 `Stereo Right` не подчиняется main/preview selection и используется по diagnostic/stereo policy.
 
 В v1 processor-specific tuning не входит в `config.json`: detector/tracker constants принадлежат реализации выбранного `VisionProcessor`, не persistятся Config Manager и не показываются UI. Публичным config contract остаётся выбор `vision-processor-class`. Если позднее конкретный processor parameter потребуется менять per-camera/runtime, он добавляется в schema только вместе с явной validation/apply policy.
+
+Пример camera source для H.264 RTSP:
+
+```json
+"source": {
+  "type": "rtsp",
+  "uri": "rtsp://camera.local/stream",
+  "protocol": "tcp",
+  "decoder-mode": "software",
+  "latency-ms": 100,
+  "drop-on-latency": true,
+  "buffer-size": 1
+}
+```
+
+Static preflight проверяет схему и наличие нужных GStreamer elements, но не подключается к RTSP endpoint и не доказывает его доступность.
 
 ### Distance
 
@@ -249,7 +283,9 @@ vision.simulation-mode
 
 Camera connection state и freshness разделены. Stale вычисляется consumer по `last_receive_timestamp_ns`.
 
-Конкретная reconnect/backoff policy остаётся открытой.
+Для `source.type = rtsp` transport `ERROR`/`EOS` и ошибка открытия запускают автоматическое восстановление без перезапуска приложения. Во время попыток состояние камеры — `RECONNECTING`; backoff: `0.25 → 0.5 → 1.0 → 2.0 → 2.0 ... s`, ожидание прерывается shutdown. Неудачные попытки не меняют `generation`; успешный запуск новой RTSP session вызывает новый `VisionPipeline.start()` и увеличивает `generation` ровно один раз. Кратковременная stale-ситуация сама по себе reconnect не запускает.
+
+RTP/JPEG поверх UDP сохраняет прежнюю семантику: отсутствие пакетов отражается через freshness/stale, а sender может продолжить на том же receiver без новой generation.
 
 ## Aiming
 
@@ -440,7 +476,7 @@ UI overlays не являются частью recorded working frame.
 | `processing-scope` | dynamic |
 | `processing-enabled` | dynamic |
 | `vision-processor-class` | camera pipeline restart / new generation |
-| camera source/address/port/GStreamer settings | camera pipeline restart / new generation |
+| camera `source` / transport / GStreamer settings | camera pipeline restart / new generation; RTSP transport loss также создаёт новую generation после успешного automatic reconnect |
 | calibration file/content | camera pipeline restart / new generation |
 | serial port | Turret reconnect |
 | `response-timeout-ms`, `max-retries`, `inter-request-delay-ms` | Turret reconnect; новая session использует freshest accepted values, active in-flight transaction не перенастраивается |
@@ -464,28 +500,34 @@ Processor-specific tuning в v1 не является частью config schema
     "cameras": {
       "overview": {
         "enabled": true,
-        "address": "0.0.0.0",
-        "port": 8888,
-        "rtp-enabled": true,
-        "buffer-size": 1,
+        "source": {
+          "type": "rtp-jpeg",
+          "bind-address": "0.0.0.0",
+          "port": 8888,
+          "buffer-size": 1
+        },
         "processing-enabled": true,
         "vision-processor-class": "Legacy14VisionProcessor"
       },
       "stereo-left": {
         "enabled": true,
-        "address": "0.0.0.0",
-        "port": 8889,
-        "rtp-enabled": true,
-        "buffer-size": 1,
+        "source": {
+          "type": "rtp-jpeg",
+          "bind-address": "0.0.0.0",
+          "port": 8889,
+          "buffer-size": 1
+        },
         "processing-enabled": true,
         "vision-processor-class": "Legacy14VisionProcessor"
       },
       "stereo-right": {
-        "enabled": true,
-        "address": "0.0.0.0",
-        "port": 8890,
-        "rtp-enabled": true,
-        "buffer-size": 1,
+        "enabled": false,
+        "source": {
+          "type": "rtp-jpeg",
+          "bind-address": "0.0.0.0",
+          "port": 8890,
+          "buffer-size": 1
+        },
         "processing-enabled": false,
         "vision-processor-class": "Legacy14VisionProcessor"
       }

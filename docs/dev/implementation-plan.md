@@ -164,6 +164,8 @@ Software-only transport/application preparation уже последовател�
 
 ```text
 localhost RTP/JPEG diagnostic camera backend              accepted
+typed production camera source: RTP/JPEG | H.264 RTSP     implemented software-side
+automatic RTSP reconnect/recovery                          implemented software-side
 production SerialTransport через Linux PTY                accepted
 shared application composition                            accepted
 normal launcher + diagnostic launcher                     accepted
@@ -572,13 +574,14 @@ Host-side protocol tests из этапа 3 не дублировать в firmwa
 - `docs/dev/architecture/decisions.md`
 - `docs/dev/modules/vision/index.md`
 - `docs/dev/diagrams/vision-diagram.mmd`
-- `problems.md` #8, Vision часть #10/#13
+- `problems.md`, Vision часть #10/#13
 
 ### Реализовать
 
 - camera pipelines по `CameraRole` без отдельного production `Camera Registry`;
 - по одному pipeline worker на роль;
-- в current accepted minimum каждый `VisionPipeline` владеет своей monotonic generation в пределах lifetime экземпляра, а `VisionPipeline.start()` публикует `CameraSessionStarted` до данных новой generation;
+- типизированный `CameraConfig.source`: production `rtp-jpeg` или H.264 `rtsp`, оба через единый `DecodedFrameSource` contract;
+- каждый `VisionPipeline` владеет своей monotonic generation в пределах lifetime экземпляра, а `VisionPipeline.start()` публикует `CameraSessionStarted` до данных новой generation;
 - E2E-1 использует напрямую pipeline-owned `VisionPipeline.session_barriers`, `VisionPipeline.latest_result` и `VisionPipeline.status`;
 - `FramePacket` stamping;
 - receive timestamp/freshness;
@@ -592,14 +595,14 @@ Host-side protocol tests из этапа 3 не дублировать в firmwa
 - processor/tracker internal tuning через owner-local `settings.py` module constants, без processor-specific fields в `config.json`/UI v1;
 - per-camera processing config + processing scope;
 - `VisionResult` latest-only per camera;
-- camera reconnect/state transitions/backoff;
+- RTSP automatic reconnect/state transitions/backoff: `RECONNECTING`, interruptible `0.25 → 0.5 → 1 → 2 → 2 ... s`, без finite attempt limit; successful source restart → ровно одна новая generation;
 - published `FramePacket.image` остаётся clean corrected working frame без overlays и пригоден для последующего UI-side recording;
 - manual `DistanceResult` source как полноценный v1 path;
 - camera/pipeline simulation suitable for tests and UI development.
 
 Для первого runnable vertical slice достаточно сначала реализовать `Legacy14VisionProcessor` (default) + общий `SimpleTracker` и working-frame path Overview/Stereo Left. `Legacy11VisionProcessor` остаётся обязательным для полного завершения Stage 5, но не блокирует первый end-to-end smoke.
 
-Этот current minimum не принимает окончательного решения об ownership при будущем camera reconnect или replacement экземпляра pipeline. До/в E2E-4 и полном Stage 5 reconnect work нужно сохранить monotonic generation semantics и выбрать одного production owner; отдельный registry или второй generation counter не являются требованием E2E-1.
+RTSP reconnect не вводит отдельный generation owner: `CameraWorker` переиспользует существующий `VisionPipeline`. Неудачные попытки source start generation не меняют; successful restart вызывает ровно один `VisionPipeline.start()`. Source-local session token блокирует поздние callbacks старой GStreamer session.
 
 ### Отложить
 
@@ -625,7 +628,6 @@ Stereo Right pipeline должен существовать настолько, 
 
 ### Открытые вопросы, которые должен закрыть этап
 
-- #8 camera reconnect transitions/backoff;
 - Vision часть #10 worker lifecycle;
 - Vision часть #13 logging.
 
@@ -847,8 +849,8 @@ Future latest-live-frame mode (#22) остаётся deferred. Gesture/overlay/S
 ### Реализовать/проверить
 
 - один shared application composition root для normal и diagnostic launchers;
-- normal launcher использует только real RTP cameras + real STM32 через production `SerialTransport` и не имеет silent fake fallback;
-- diagnostic launcher запускает то же приложение, но явно выбирает внешние backends: независимо для камер (`localhost RTP/JPEG` или real RTP) и для controller (`Linux PTY STM32 emulator` или real STM32); `InMemoryFrameSource`/`FakeTransport` остаются test-harness boundaries;
+- normal launcher использует real cameras через configured production source (`rtp-jpeg | rtsp`) + real STM32 через production `SerialTransport` и не имеет silent fake fallback;
+- diagnostic launcher запускает то же приложение, но явно выбирает внешние backends: независимо для камер (`localhost RTP/JPEG` или real source из config) и для controller (`Linux PTY STM32 emulator` или real STM32); `InMemoryFrameSource`/`FakeTransport` остаются test-harness boundaries;
 - backend selection явный и воспроизводимый (primary interface — command-line arguments), без auto-detection, способного незаметно подменить real hardware;
 - startup order;
 - shutdown order;
@@ -881,8 +883,7 @@ Future latest-live-frame mode (#22) остаётся deferred. Gesture/overlay/S
 launchers, localhost RTP/JPEG, PTY production-transport check, session artifacts,
 bounded logging, backend-aware static preflight, operator-facing offline hardware
 runbook и VIRTUAL latency observability. Offline rehearsal без доступа к интернету
-принята; текущий project checkpoint — documentation cleanup + root README sync перед
-merge в `main` и последующим global pre-hardware integration audit.
+принята. Production RTSP transport и automatic reconnect реализованы software-side; реальный H.264 RTSP smoke остаётся endpoint-dependent hardware gate. Следующая pre-hardware задача — UI aim-point/reticle observability и затем актуальный hardware-readiness audit.
 
 ### Timing and tuning
 
@@ -950,7 +951,6 @@ Hardware tests остаются отдельным suite.
 | #2 capture_id / stereo pairing | deferred |
 | #3 DistanceResult stereo lifecycle | deferred / 5 только manual path |
 | #7 runtime config edge cases | 2 config infrastructure; processor-specific Vision part closed before 5; 6 target-loss-timeout checkpoint |
-| #8 camera reconnect | 5 |
 | #10 worker lifecycle | 1 foundation + Vision/integration stages + 8 final; Turret part closed before 3 |
 | #11 partial failures | 7 + 8 |
 | #13 logging | 1 foundation + UI/integration + 8 final; Turret part closed before 3 |

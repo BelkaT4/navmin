@@ -71,7 +71,7 @@ REHEARSAL FAIL
 
 Preflight **не доказывает**, что:
 
-- real cameras уже передают RTP;
+- реальные камеры уже передают RTP/JPEG или отвечают по RTSP;
 - STM32 отвечает по NavMin protocol;
 - motors/mechanics безопасны;
 - camera image quality или latency приемлемы;
@@ -82,8 +82,7 @@ Preflight **не доказывает**, что:
 но не открывает real serial port, не переключает DTR/RTS, не отправляет STM32 `PING`
 и не двигает motors.
 
-Для real cameras preflight проверяет static receiver readiness, config/calibration и
-UDP endpoint availability, но не ждёт RTP traffic, не ping'ует Raspberry Pi, не
+Для реальных камер preflight проверяет статическую готовность приёмника, конфигурацию/калибровку и условия, необходимые выбранному транспорту. Для RTP/JPEG он также проверяет локальную UDP-точку приёма; для RTSP — URI, конфигурацию и нужные компоненты GStreamer. Preflight не ждёт RTP-трафик, не подключается к RTSP-источнику, не проверяет состояние камеры `ONLINE` и не
 подключается по SSH и не оценивает изображение.
 
 Technical exit semantics:
@@ -135,7 +134,7 @@ Diagnostic launcher технически поддерживает восемь �
 | --- | --- | --- | --- | --- | --- | --- |
 | **VIRTUAL** | localhost | localhost | pty | synthetic | none | Offline rehearsal и software-only readiness |
 | **STM32** | localhost | localhost | real | files | STM32/turret only | Controlled physical STM32 preparation |
-| **CAMERAS** | real | real | pty | files | cameras only | Real RTP camera bring-up без real Turret |
+| **CAMERAS** | real | real | pty | files | cameras only | Проверка реальных камер без реальной Turret; источник каждой камеры берётся из конфигурации (`rtp-jpeg | rtsp`) |
 | **REAL** | real | real | real | files | cameras + STM32/turret | Eventual combined hardware run |
 
 `--synthetic-inputs` используется только в **VIRTUAL**. Current launcher запрещает
@@ -279,7 +278,7 @@ python tools/run_diagnostic_app.py \
   --turret pty
 ```
 
-Это проверяет physical cameras, production RTP receiver, real Vision/UI/Core и PTY
+Это проверяет физические камеры, настроенные рабочие источники камер, реальные Vision/UI/Core и PTY
 Turret boundary без физической турели.
 
 ### 4.4 REAL
@@ -395,8 +394,8 @@ cp calibration/stereo.json calibration/stereo-hardware-day.json
 9. Hardware-critical изменения дополнительно перенести в [hardware measurement
    worksheet](#7-hardware-measurement-worksheet).
 
-`PASS` здесь означает только static readiness выбранных inputs/backends. Для real
-camera preflight не видит фактические RTP pixels, а для real Turret не открывает
+`PASS` здесь означает только статическую готовность выбранных inputs/backends. Для реальной
+камеры preflight не видит фактические декодированные пиксели и не устанавливает RTSP-сессию, а для реальной Turret не открывает
 serial port и не проверяет protocol response.
 
 #### Что именно менять в `config.json`
@@ -405,10 +404,14 @@ serial port и не проверяет protocol response.
 
 | Задача | Current field | Operational meaning |
 | --- | --- | --- |
-| Overview UDP port | `vision.cameras.overview.port` | local UDP listen port на PC; для localhost diagnostics тот же port используется diagnostic sender/receiver pair |
-| Stereo Left UDP port | `vision.cameras.stereo-left.port` | local UDP listen port на PC; для localhost diagnostics тот же port используется diagnostic sender/receiver pair |
-| Overview local bind address | `vision.cameras.overview.address` | local PC address для production receiver при backend `real` |
-| Stereo Left local bind address | `vision.cameras.stereo-left.address` | local PC address для production receiver при backend `real` |
+| Тип источника Overview | `vision.cameras.overview.source.type` | `rtp-jpeg` или `rtsp` |
+| Тип источника Stereo Left | `vision.cameras.stereo-left.source.type` | `rtp-jpeg` или `rtsp` |
+| UDP-порт Overview RTP/JPEG | `vision.cameras.overview.source.port` | только для `type=rtp-jpeg`; локальный UDP-порт приёма на PC; в localhost-диагностике тот же порт использует пара sender/receiver |
+| UDP-порт Stereo Left RTP/JPEG | `vision.cameras.stereo-left.source.port` | только для `type=rtp-jpeg`; локальный UDP-порт приёма на PC |
+| Адрес привязки Overview RTP/JPEG | `vision.cameras.overview.source.bind-address` | только для `type=rtp-jpeg`; локальный адрес PC для рабочего приёмника |
+| Адрес привязки Stereo Left RTP/JPEG | `vision.cameras.stereo-left.source.bind-address` | только для `type=rtp-jpeg`; локальный адрес PC для рабочего приёмника |
+| RTSP-источник | `vision.cameras.<camera>.source.uri` | только для `type=rtsp`; полный URI `rtsp://host[:port]/path` |
+| RTSP-протокол | `vision.cameras.<camera>.source.protocol` | `tcp` или `udp`; переподключение не меняет его автоматически |
 | Real serial device | `turret.serial.port` | например фактически обнаруженный `/dev/ttyUSB0` или `/dev/ttyACM0` |
 | Desired Turret baudrate | `turret.serial.baudrate` | желаемая рабочая скорость serial link |
 
@@ -416,17 +419,11 @@ serial port и не проверяет protocol response.
 [Configuration](../dev/architecture/configuration.md). Не добавлять неизвестные
 JSON keys: parser schema-v1 строгий.
 
-**Camera `address` не является IP Raspberry Pi.** Это адрес, на котором PC receiver
-делает local UDP bind/listen. Обычный portable listen может использовать
-`0.0.0.0`; конкретный address, если выбран, должен принадлежать PC. IP назначения,
-куда Raspberry Pi/source sender отправляет RTP, задаётся **на стороне sender** и
-должен указывать на подходящий адрес PC. В current NavMin config отдельного поля
-`Raspberry Pi source IP` нет.
+Для `source.type = rtp-jpeg` поле `bind-address` **не является IP Raspberry Pi**. Это адрес, на котором приёмник PC выполняет локальную UDP-привязку. Обычное прослушивание всех интерфейсов может использовать `0.0.0.0`; конкретный адрес должен принадлежать PC. IP назначения, куда Raspberry Pi/source sender отправляет RTP, задаётся на стороне sender и должен указывать на подходящий адрес PC.
 
-Для diagnostic backend `localhost` launcher намеренно заменяет camera `address` на
-`127.0.0.1` и включает RTP receiver. Поэтому изменение
-`vision.cameras.<camera>.address` не меняет localhost diagnostic bind address;
-`port` при этом остаётся взят из выбранного config file.
+Для `source.type = rtsp` адрес удалённой камеры/сервера, наоборот, задаётся непосредственно в `source.uri`. В этой ветви нет `bind-address`/`port` RTP-приёмника. Первая реализация поддерживает H.264, `protocol = tcp | udp`, `decoder-mode = software`.
+
+Для диагностического backend `localhost` launcher намеренно использует `127.0.0.1` и RTP/JPEG. Поэтому выбранная камера должна иметь `source.type = rtp-jpeg`; localhost-диагностика не подменяет RTSP-источник тестовым RTSP-сервером. `source.port` при этом берётся из выбранного файла конфигурации.
 
 #### Изменение real stream resolution
 
@@ -447,8 +444,7 @@ new sender resolution
 → launch
 ```
 
-NavMin не масштабирует calibration автоматически. Для real RTP preflight может
-подтвердить, что typed calibration загружена, но не получает реальные кадры и
+NavMin не масштабирует калибровку автоматически. Для реальной камеры preflight может подтвердить, что типизированная калибровка загружена, но не получает реальные кадры и
 поэтому не может заранее проверить фактический stream resolution. Если decoded
 frame имеет другой размер, production correction path выдаёт hard
 `WorkingFrameError` вида `source resolution ... does not match calibration ...`;
@@ -801,6 +797,23 @@ python tools/run_localhost_rtp_diagnostic.py \
 receiver path, включая стабильный движущийся Legacy14 track на обеих cameras.
 Это не real camera acceptance и не real-camera latency measurement.
 
+### Доступный H.264 RTSP-источник
+
+Когда доступен реальный или лабораторный H.264 RTSP-источник, рабочий source можно проверить изолированно:
+
+```bash
+cd ~/NAV\ MIN
+
+python tools/run_rtsp_camera_diagnostic.py \
+  --uri 'rtsp://HOST/stream' \
+  --protocol tcp \
+  --duration-seconds 10
+```
+
+Этот инструмент проверяет `GStreamerRtspSource`, получение BGR-кадров и ограниченное по времени завершение. Он не создаёт RTSP-сервер и не доказывает автоматическое переподключение конкретной физической камеры. Проверку отключения/повторного подключения выполнять только в заранее контролируемом сценарии, где безопасно перезапустить или временно отключить именно камеру или сетевой источник.
+
+При обычной работе приложения ошибка транспорта `ERROR`/`EOS` переводит камеру в `RECONNECTING`; попытки продолжаются с увеличивающейся задержкой `0.25 → 0.5 → 1 → 2 → 2 ... s` до восстановления или завершения приложения. Успешное восстановление создаёт новое поколение камеры (`generation`). Устаревание кадра (stale) без ошибки транспорта само по себе переподключение не запускает.
+
 ### PTY STM32 through production SerialTransport
 
 Current CLI:
@@ -1062,8 +1075,8 @@ clean shutdown
 CAMERAS-only smoke не закрывает:
 
 ```text
-camera reconnect #8
-automatic production reconnect/backoff
+реальное отключение/восстановление RTSP на конкретном источнике
+длительная стабильность/задержка RTSP
 Stereo Right production path
 production stereo distance
 full Stage 5
@@ -1319,7 +1332,7 @@ related session directory:       UNKNOWN
 
 ```text
 offline rehearsal itself
-camera reconnect/backoff #8
+реальное отключение/восстановление/стабильность RTSP на конкретном источнике
 UI error surfacing
 production stereo distance
 physical limit enforcement

@@ -7,6 +7,7 @@ from collections.abc import Callable
 from threading import Lock
 from time import monotonic_ns
 from typing import Protocol
+from urllib.parse import urlsplit
 
 import numpy as np
 
@@ -115,6 +116,39 @@ def _gst_quote(value: str) -> str:
     return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
 
 
+def rtsp_uri_for_diagnostics(uri: str) -> str:
+    """Return an RTSP endpoint description without userinfo/query credentials."""
+    parsed = urlsplit(uri)
+    host = parsed.hostname or "<invalid-host>"
+    if ":" in host and not host.startswith("["):
+        host = f"[{host}]"
+    try:
+        port = f":{parsed.port}" if parsed.port is not None else ""
+    except ValueError:
+        port = ":<invalid-port>"
+    path = parsed.path or ""
+    return f"{parsed.scheme or 'rtsp'}://{host}{port}{path}"
+
+
+def _rtsp_error_for_diagnostics(error: BaseException, uri: str) -> BaseException:
+    """Remove configured RTSP credentials/query data from surfaced error text."""
+    text = str(error)
+    parsed = urlsplit(uri)
+    safe_uri = rtsp_uri_for_diagnostics(uri)
+    sanitized = text.replace(uri, safe_uri)
+    if parsed.netloc:
+        sanitized = sanitized.replace(parsed.netloc, urlsplit(safe_uri).netloc)
+    if parsed.query:
+        sanitized = sanitized.replace(parsed.query, "<redacted-query>")
+    if parsed.password:
+        sanitized = sanitized.replace(parsed.password, "<redacted>")
+    if parsed.username:
+        sanitized = sanitized.replace(parsed.username, "<redacted>")
+    if sanitized == text:
+        return error
+    return CameraSourceError(sanitized)
+
+
 def _appsink_description(buffer_size: int) -> str:
     return (
         "appsink name=sink emit-signals=true "
@@ -168,6 +202,8 @@ class _GStreamerDecodedFrameSource:
         pipeline_description: str,
         *,
         source_description: str,
+        supports_reconnect: bool,
+        error_sanitizer: Callable[[BaseException], BaseException] | None = None,
         timestamp_clock_ns: Callable[[], int] = monotonic_ns,
         backend_factory: BackendFactory | None = None,
     ) -> None:
@@ -175,12 +211,20 @@ class _GStreamerDecodedFrameSource:
         self._source_description = source_description
         self._timestamp_clock_ns = timestamp_clock_ns
         self._backend_factory = backend_factory or _default_backend_factory
+        self._supports_reconnect = supports_reconnect
+        self._error_sanitizer = error_sanitizer or (lambda error: error)
         self._latest: LatestValue[DecodedFrame] = LatestValue()
         self._last_read_revision = 0
         self._backend: _SourceBackend | None = None
+        self._active_session_id: int | None = None
+        self._next_session_id = 1
         self._failure: BaseException | None = None
         self._started = False
         self._state_lock = Lock()
+
+    @property
+    def supports_reconnect(self) -> bool:
+        return self._supports_reconnect
 
     @property
     def failure(self) -> BaseException | None:
@@ -197,25 +241,37 @@ class _GStreamerDecodedFrameSource:
         with self._state_lock:
             if self._started:
                 return
+            session_id = self._next_session_id
+            self._next_session_id += 1
             self._failure = None
-            backend = self._backend_factory(
-                self.pipeline_description,
-                self._publish_frame,
-                self._record_failure,
-            )
+            self._last_read_revision = self._latest.snapshot().revision
+            try:
+                backend = self._backend_factory(
+                    self.pipeline_description,
+                    lambda frame: self._publish_frame(session_id, frame),
+                    lambda error: self._record_failure(session_id, error),
+                )
+            except CameraSourceError as exc:
+                safe_error = self._sanitize_error(exc)
+                raise safe_error from None
             self._backend = backend
+            self._active_session_id = session_id
         try:
             backend.start()
         except CameraSourceError as exc:
-            self._record_failure(exc)
+            safe_error = self._sanitize_error(exc)
+            self._record_failure(session_id, safe_error)
             try:
                 backend.stop()
             finally:
                 with self._state_lock:
-                    self._backend = None
-            raise
+                    if self._active_session_id == session_id:
+                        self._backend = None
+                        self._active_session_id = None
+            raise safe_error from None
         with self._state_lock:
-            self._started = True
+            if self._active_session_id == session_id:
+                self._started = True
         LOGGER.info("GStreamer camera source started %s", self._source_description)
 
     def stop(self) -> None:
@@ -224,6 +280,7 @@ class _GStreamerDecodedFrameSource:
             was_started = self._started
             self._started = False
             self._backend = None
+            self._active_session_id = None
         if backend is not None:
             backend.stop()
         if was_started:
@@ -237,40 +294,51 @@ class _GStreamerDecodedFrameSource:
         self._last_read_revision = snapshot.revision
         return snapshot.value
 
-    def _publish_frame(self, frame: np.ndarray) -> None:
+    def _publish_frame(self, session_id: int, frame: np.ndarray) -> None:
         if not isinstance(frame, np.ndarray):
-            self._record_failure(CameraSourceError("decoded frame must be numpy.ndarray"))
+            self._record_failure(
+                session_id, CameraSourceError("decoded frame must be numpy.ndarray")
+            )
             return
         if frame.dtype != np.uint8 or frame.ndim != 3 or frame.shape[2] != 3:
             self._record_failure(
+                session_id,
                 CameraSourceError(
                     "decoded frame must be BGR uint8 HxWx3, "
                     f"got {frame.dtype} {frame.shape!r}"
-                )
+                ),
             )
             return
         owned = np.array(frame, copy=True, order="C")
-        self._latest.publish(
-            DecodedFrame(
-                image=owned,
-                capture_id=None,
-                receive_timestamp_ns=self._timestamp_clock_ns(),
-            )
-        )
-
-    def _record_failure(self, error: BaseException) -> None:
         with self._state_lock:
-            if self._failure is None:
-                self._failure = error
+            if session_id != self._active_session_id:
+                return
+            self._latest.publish(
+                DecodedFrame(
+                    image=owned,
+                    capture_id=None,
+                    receive_timestamp_ns=self._timestamp_clock_ns(),
+                )
+            )
+
+    def _record_failure(self, session_id: int, error: BaseException) -> None:
+        safe_error = self._sanitize_error(error)
+        with self._state_lock:
+            if session_id == self._active_session_id and self._failure is None:
+                self._failure = safe_error
+
+    def _sanitize_error(self, error: BaseException) -> BaseException:
+        return self._error_sanitizer(error)
 
     def _poll_backend_failure(self) -> None:
         with self._state_lock:
             backend = self._backend
-        if backend is None:
+            session_id = self._active_session_id
+        if backend is None or session_id is None:
             return
         error = backend.poll_failure()
         if error is not None:
-            self._record_failure(error)
+            self._record_failure(session_id, error)
 
 
 class GStreamerRtpJpegSource(_GStreamerDecodedFrameSource):
@@ -286,6 +354,7 @@ class GStreamerRtpJpegSource(_GStreamerDecodedFrameSource):
         super().__init__(
             build_rtp_jpeg_pipeline_description(config),
             source_description=f"bind={config.bind_address} port={config.port}",
+            supports_reconnect=False,
             timestamp_clock_ns=timestamp_clock_ns,
             backend_factory=backend_factory,
         )
@@ -304,9 +373,12 @@ class GStreamerRtspSource(_GStreamerDecodedFrameSource):
         super().__init__(
             build_rtsp_pipeline_description(config),
             source_description=(
-                f"uri={config.uri} protocol={config.protocol.value} "
+                f"uri={rtsp_uri_for_diagnostics(config.uri)} "
+                f"protocol={config.protocol.value} "
                 f"latency_ms={config.latency_ms}"
             ),
+            supports_reconnect=True,
+            error_sanitizer=lambda error: _rtsp_error_for_diagnostics(error, config.uri),
             timestamp_clock_ns=timestamp_clock_ns,
             backend_factory=backend_factory,
         )
@@ -439,4 +511,5 @@ __all__ = [
     "build_rtsp_pipeline_description",
     "find_missing_gstreamer_elements",
     "initialize_gstreamer_runtime",
+    "rtsp_uri_for_diagnostics",
 ]
