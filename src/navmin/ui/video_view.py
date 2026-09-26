@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass
 
-from PyQt6.QtCore import QEvent, QPointF, QRectF, QSize, Qt
+from PyQt6.QtCore import QEvent, QLineF, QPointF, QRectF, QSize, Qt
 from PyQt6.QtGui import (
     QColor,
     QEnterEvent,
@@ -30,6 +30,10 @@ from navmin.contracts import (
 from navmin.core import CameraSessionGate
 
 STALE_MESSAGE = "НЕТ НОВЫХ КАДРОВ"
+
+_RETICLE_GAP_PX = 4.0
+_RETICLE_LENGTH_PX = 10.0
+_RETICLE_PEN_WIDTH_PX = 3
 
 _CAMERA_NAMES = {
     CameraRole.OVERVIEW: "Overview",
@@ -102,6 +106,39 @@ def map_widget_to_source(
     )
 
 
+def map_source_to_widget(
+    point: tuple[float, float],
+    display_rect: QRectF,
+    source_size: QSize,
+) -> QPointF | None:
+    """Map working-frame pixel coordinates into the rendered image rectangle."""
+    if display_rect.isEmpty() or source_size.isEmpty():
+        return None
+    x_px, y_px = point
+    if not (0.0 <= x_px < source_size.width() and 0.0 <= y_px < source_size.height()):
+        return None
+    return QPointF(
+        display_rect.left()
+        + (x_px + 0.5) * display_rect.width() / source_size.width(),
+        display_rect.top()
+        + (y_px + 0.5) * display_rect.height() / source_size.height(),
+    )
+
+
+def reticle_segments(center: QPointF) -> tuple[QLineF, QLineF, QLineF, QLineF]:
+    """Return the four fixed-size reticle segments around a clear center."""
+    x = center.x()
+    y = center.y()
+    gap = _RETICLE_GAP_PX
+    length = _RETICLE_LENGTH_PX
+    return (
+        QLineF(x - gap - length, y, x - gap, y),
+        QLineF(x + gap, y, x + gap + length, y),
+        QLineF(x, y - gap - length, x, y - gap),
+        QLineF(x, y + gap, x, y + gap + length),
+    )
+
+
 def is_camera_stale(
     status: CameraStatus | None,
     now_ns: int,
@@ -135,6 +172,7 @@ class VideoView(QWidget):
         self._prepared: PreparedVisionFrame | None = None
         self._status: CameraStatus | None = None
         self._selected_target: TargetRef | None = None
+        self._aim_point: tuple[float, float] | None = None
         self._stale = False
         self.setMinimumSize(1, 1)
         self.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent)
@@ -167,6 +205,10 @@ class VideoView(QWidget):
         return self._stale
 
     @property
+    def aim_point(self) -> tuple[float, float] | None:
+        return self._aim_point
+
+    @property
     def stale_overlay_text(self) -> str | None:
         return STALE_MESSAGE if self._prepared is not None and self._stale else None
 
@@ -174,12 +216,15 @@ class VideoView(QWidget):
         if camera is self._camera:
             return
         self._camera = camera
+        self._aim_point = None
         self.update()
 
     def set_prepared_frame(self, prepared: PreparedVisionFrame | None) -> None:
         if prepared is self._prepared:
             return
         self._prepared = prepared
+        if prepared is None:
+            self._aim_point = None
         self.update()
 
     def set_camera_status(self, status: CameraStatus | None) -> None:
@@ -192,6 +237,12 @@ class VideoView(QWidget):
         if target == self._selected_target:
             return
         self._selected_target = target
+        self.update()
+
+    def set_aim_point(self, point: tuple[float, float] | None) -> None:
+        if point == self._aim_point:
+            return
+        self._aim_point = point
         self.update()
 
     def refresh_freshness(self, now_ns: int) -> None:
@@ -301,6 +352,7 @@ class VideoView(QWidget):
             display_rect = self.rendered_rect()
             painter.drawPixmap(display_rect, prepared.pixmap, QRectF(prepared.pixmap.rect()))
             self._draw_objects(painter, display_rect, prepared.result)
+            self._draw_reticle(painter, display_rect, prepared.result)
             if self._stale:
                 painter.fillRect(display_rect, QColor(0, 0, 0, 110))
                 self._draw_center_message(painter, display_rect, STALE_MESSAGE)
@@ -338,6 +390,28 @@ class VideoView(QWidget):
                 )
             )
 
+    def _draw_reticle(
+        self,
+        painter: QPainter,
+        display_rect: QRectF,
+        result: VisionResult,
+    ) -> None:
+        if self._preview or self._aim_point is None:
+            return
+        height, width = result.frame.image.shape[:2]
+        center = map_source_to_widget(
+            self._aim_point,
+            display_rect,
+            QSize(width, height),
+        )
+        if center is None:
+            return
+        pen = QPen(QColor(255, 0, 0), _RETICLE_PEN_WIDTH_PX)
+        pen.setCapStyle(Qt.PenCapStyle.FlatCap)
+        painter.setPen(pen)
+        for segment in reticle_segments(center):
+            painter.drawLine(segment)
+
     def _draw_camera_and_status(self, painter: QPainter) -> None:
         name = _CAMERA_NAMES[self._camera]
         status = self._status
@@ -371,7 +445,9 @@ __all__ = [
     "PreparedVisionFrame",
     "VideoView",
     "is_camera_stale",
+    "map_source_to_widget",
     "map_widget_to_source",
     "prepare_vision_frame",
     "rendered_image_rect",
+    "reticle_segments",
 ]

@@ -248,6 +248,7 @@ class MainWindow(QMainWindow):
             self._shown_selection = self._mediator.selected_target
             self.main_view.set_selected_target(self._shown_selection)
             self.preview_view.set_selected_target(self._shown_selection)
+        self._refresh_aim_point()
         now_ns = self._clock_ns()
         self.main_view.refresh_freshness(now_ns)
         self.preview_view.refresh_freshness(now_ns)
@@ -255,6 +256,16 @@ class MainWindow(QMainWindow):
             now = self._wall_clock()
             milliseconds = now.microsecond // 1000
             self.now_label.setText(f"NOW {now:%H:%M:%S}.{milliseconds:03d}")
+
+    def _refresh_aim_point(self) -> None:
+        result = self.main_view.displayed_result
+        point = (
+            None
+            if result is None
+            else self._mediator.aiming.aim_point(result.frame.camera, result.frame)
+        )
+        self.main_view.set_aim_point(point)
+        self.preview_view.set_aim_point(None)
 
     def _camera_session_accepted(self, session: CameraSessionStarted) -> None:
         self._prepared_frames.pop(session.camera, None)
