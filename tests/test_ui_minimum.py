@@ -44,6 +44,7 @@ from navmin.ui import (
     prepare_vision_frame,
     rendered_image_rect,
 )
+from navmin.ui.video_view import map_source_to_widget, reticle_segments
 
 
 class _Clock:
@@ -147,6 +148,7 @@ def _mediator(
     mode: TurretControlMode = TurretControlMode.RELATIVE,
     motor: MotorState = MotorState.ON,
     counting: bool = False,
+    aim_points: AimPointsConfig | None = None,
 ) -> tuple[Mediator, _FakeTurret]:
     turret = _FakeTurret(_turret_state(mode=mode, motor=motor))
     mediator_type = _CountingMediator if counting else Mediator
@@ -154,7 +156,8 @@ def _mediator(
         aiming_config=AimingConfig(
             lead_time_ms=100,
             target_lost_timeout_ms=500,
-            aim_points=AimPointsConfig(
+            aim_points=aim_points
+            or AimPointsConfig(
                 overview=AimPointConfig(50, 25),
                 stereo_left=AimPointConfig(50, 25),
             ),
@@ -222,6 +225,7 @@ def _window(
     show_diagnostic_clock: bool = False,
     frame_preparer=prepare_vision_frame,
     camera_stale_timeout_ms: int = 500,
+    aim_points: AimPointsConfig | None = None,
 ) -> tuple[
     MainWindow,
     Mediator,
@@ -229,7 +233,9 @@ def _window(
     dict[CameraRole, CameraUiBinding],
     LatestValue[TurretState],
 ]:
-    mediator, turret = _mediator(mode=mode, motor=motor)
+    mediator, turret = _mediator(
+        mode=mode, motor=motor, aim_points=aim_points
+    )
     bindings = _bindings()
     turret_states: LatestValue[TurretState] = LatestValue()
     window = MainWindow(
@@ -280,6 +286,130 @@ def test_rendered_rect_and_widget_mapping_cover_letterbox_boundaries() -> None:
     assert bottom_right == pytest.approx((99.0, 49.0))
     assert map_widget_to_source(QPointF(100, 49), rect, QSize(100, 50)) is None
     assert map_widget_to_source(QPointF(200, 100), rect, QSize(100, 50)) is None
+
+
+def test_source_to_widget_and_reticle_geometry_keep_center_clear() -> None:
+    display_rect = rendered_image_rect(QSize(200, 200), QSize(100, 50))
+    center = map_source_to_widget((49.5, 24.5), display_rect, QSize(100, 50))
+    assert center == QPointF(100.0, 100.0)
+
+    segments = reticle_segments(center)
+    assert len(segments) == 4
+    assert [(line.x1(), line.y1(), line.x2(), line.y2()) for line in segments] == [
+        (86.0, 100.0, 96.0, 100.0),
+        (104.0, 100.0, 114.0, 100.0),
+        (100.0, 86.0, 100.0, 96.0),
+        (100.0, 104.0, 100.0, 114.0),
+    ]
+
+
+def test_main_reticle_draw_uses_red_three_pixel_pen_and_preview_draws_none(
+    qt_application: QApplication,
+) -> None:
+    class _PainterSpy:
+        def __init__(self) -> None:
+            self.pen = None
+            self.lines = []
+
+        def setPen(self, pen) -> None:
+            self.pen = pen
+
+        def drawLine(self, line) -> None:
+            self.lines.append(line)
+
+    result = _result(CameraRole.OVERVIEW, 1)
+    prepared = prepare_vision_frame(result)
+    main = VideoView(
+        camera=CameraRole.OVERVIEW,
+        preview=False,
+        stale_timeout_ns=500_000_000,
+    )
+    main.resize(200, 200)
+    main.set_prepared_frame(prepared)
+    main.set_aim_point((49.5, 24.5))
+    painter = _PainterSpy()
+    main._draw_reticle(painter, main.rendered_rect(), result)
+
+    assert painter.pen is not None
+    assert painter.pen.color().getRgb()[:3] == (255, 0, 0)
+    assert painter.pen.widthF() == 3.0
+    assert painter.pen.capStyle() == Qt.PenCapStyle.FlatCap
+    assert len(painter.lines) == 4
+
+    preview = VideoView(
+        camera=CameraRole.OVERVIEW,
+        preview=True,
+        stale_timeout_ns=500_000_000,
+    )
+    preview.resize(200, 200)
+    preview.set_prepared_frame(prepared)
+    preview.set_aim_point((49.5, 24.5))
+    preview_painter = _PainterSpy()
+    preview._draw_reticle(preview_painter, preview.rendered_rect(), result)
+    assert preview_painter.pen is None
+    assert preview_painter.lines == []
+    main.close()
+    preview.close()
+
+
+def test_main_reticle_uses_aiming_fallback_and_clears_on_generation_boundary(
+    qt_application: QApplication,
+) -> None:
+    fallback = AimPointsConfig(
+        overview=AimPointConfig(None, None),
+        stereo_left=AimPointConfig(None, None),
+    )
+    window, _mediator_value, _turret, bindings, _states = _window(
+        qt_application, aim_points=fallback
+    )
+    _publish_camera(window, bindings, _result(CameraRole.OVERVIEW, 1))
+
+    assert window.main_view.aim_point == (49.5, 24.5)
+    assert window.preview_view.aim_point is None
+
+    bindings[CameraRole.OVERVIEW].session_barriers.publish(
+        _session(CameraRole.OVERVIEW, 2)
+    )
+    window.state_pump.pump_once()
+    assert window.main_view.displayed_result is None
+    assert window.main_view.aim_point is None
+    window.close()
+
+
+def test_main_reticle_follows_camera_swap_and_dynamic_aiming_config(
+    qt_application: QApplication,
+) -> None:
+    initial = AimPointsConfig(
+        overview=AimPointConfig(20, 10),
+        stereo_left=AimPointConfig(80, 40),
+    )
+    window, mediator, _turret, bindings, _states = _window(
+        qt_application, aim_points=initial
+    )
+    _publish_camera(window, bindings, _result(CameraRole.OVERVIEW, 1))
+    _publish_camera(window, bindings, _result(CameraRole.STEREO_LEFT, 1))
+    assert window.main_view.camera is CameraRole.OVERVIEW
+    assert window.main_view.aim_point == (20.0, 10.0)
+    assert window.preview_view.aim_point is None
+
+    window.swap_main_preview()
+    assert window.main_view.camera is CameraRole.STEREO_LEFT
+    assert window.main_view.aim_point == (80.0, 40.0)
+    assert window.preview_view.aim_point is None
+
+    mediator.aiming.replace_config(
+        AimingConfig(
+            lead_time_ms=100,
+            target_lost_timeout_ms=500,
+            aim_points=AimPointsConfig(
+                overview=AimPointConfig(25, 15),
+                stereo_left=AimPointConfig(70, 30),
+            ),
+        )
+    )
+    window.refresh_presentation()
+    assert window.main_view.aim_point == (70.0, 30.0)
+    window.close()
 
 
 def test_freshness_boundary_is_deterministic() -> None:
@@ -767,6 +897,7 @@ def test_no_frame_uses_placeholder_state(qt_application: QApplication) -> None:
     view.show()
     qt_application.processEvents()
     assert view.displayed_result is None
+    assert view.aim_point is None
     assert view.rendered_rect().isEmpty()
     status = _status(CameraRole.OVERVIEW, 1, state=CameraState.STARTING)
     view.set_camera_status(status)

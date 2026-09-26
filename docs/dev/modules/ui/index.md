@@ -85,6 +85,10 @@ Overlays не изменяют сам `FramePacket.image`.
 
 Baseline object overlay минимален: bbox всех текущих `TrackedObject` и явное выделение selected target. Постоянные `track_id`, distance, velocity и `age_frames` рядом с каждым bbox не показываются; расширенный diagnostic overlay может быть добавлен отдельно без изменения общего `TrackedObject` contract.
 
+На основном видео UI также показывает прицельную метку фактической `aim point`, которую использует Aiming для этой камеры. UI не хранит отдельную точку наведения. Если `aiming.aim-points.<camera>.x-px` / `y-px` не заданы, Aiming использует центр working frame, и метка отображается в этом же центре. После swap метка соответствует новой main camera; на preview она не рисуется. При новом `CameraSessionStarted` метка исчезает вместе со старым displayed result и появляется только после принятия кадра новой generation.
+
+Прицельная метка состоит из четырёх тонких красных отрезков вокруг свободного центра: толщина линии `3 px`, зазор от центра `4 px`, длина каждого отрезка `10 px`. Размеры относятся к экранному отображению и не масштабируются вместе с working frame. Центральная область остаётся свободной, чтобы метка не закрывала небольшую цель. Координаты `aim point` переводятся через тот же rendered image rect с учётом aspect ratio и letterbox.
+
 ## Основной layout и menu bar
 
 Основное окно стартует fullscreen. `F11` неограниченно переключает fullscreen/windowed state. Main video занимает основную область, preview находится в её правом нижнем углу, а компактная нижняя operational bar остаётся отдельной постоянной полосой.
