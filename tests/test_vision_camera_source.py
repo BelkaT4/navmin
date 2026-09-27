@@ -236,14 +236,159 @@ def test_rtsp_pipeline_is_h264_software_low_latency(
         )
     )
 
-    assert 'rtspsrc location="rtsp://camera.local:8554/stream"' in description
+    assert 'rtspsrc name=rtsp_source location="rtsp://camera.local:8554/stream"' in description
     assert expected_protocol in description
     assert "latency=75" in description
     assert expected_drop in description
-    assert "! rtph264depay ! h264parse ! avdec_h264 ! videoconvert" in description
+    assert (
+        "! rtph264depay "
+        "! video/x-h264,stream-format=byte-stream,alignment=au "
+        "! h264parse config-interval=-1 "
+        "! avdec_h264 ! videoconvert"
+    ) in description
     assert "video/x-raw,format=BGR" in description
     assert "max-buffers=1 drop=true sync=false" in description
 
+
+class _FakeCapsStructure:
+    def __init__(self, name: str, **fields: str) -> None:
+        self._name = name
+        self._fields = fields
+
+    def get_name(self) -> str:
+        return self._name
+
+    def get_string(self, key: str) -> str | None:
+        return self._fields.get(key)
+
+
+class _FakeCaps:
+    def __init__(self, *structures: _FakeCapsStructure) -> None:
+        self._structures = structures
+
+    def get_size(self) -> int:
+        return len(self._structures)
+
+    def get_structure(self, index: int) -> _FakeCapsStructure:
+        return self._structures[index]
+
+
+def _rtp_caps(media: str, encoding_name: str) -> _FakeCaps:
+    return _FakeCaps(
+        _FakeCapsStructure(
+            "application/x-rtp",
+            media=media,
+            **{"encoding-name": encoding_name},
+        )
+    )
+
+
+def _pretransport_rtsp_caps(media: str, encoding_name: str) -> _FakeCaps:
+    # rtspsrc builds SDP-derived caps as application/x-unknown before SETUP.
+    # It changes the structure name to the negotiated RTP media type later.
+    return _FakeCaps(
+        _FakeCapsStructure(
+            "application/x-unknown",
+            media=media,
+            **{"encoding-name": encoding_name},
+        )
+    )
+
+
+def test_rtsp_backend_selects_first_h264_video_and_ignores_aac(monkeypatch) -> None:
+    class FakeSink:
+        def connect(self, signal_name: str, callback) -> int:
+            assert signal_name == "new-sample"
+            self.callback = callback
+            return 1
+
+    class FakeRtspSource:
+        def __init__(self) -> None:
+            self.callbacks = {}
+            self.disconnected: list[int] = []
+
+        def connect(self, signal_name: str, callback) -> int:
+            assert signal_name == "select-stream"
+            self.callbacks[signal_name] = callback
+            return 17
+
+        def disconnect(self, handler_id: int) -> None:
+            self.disconnected.append(handler_id)
+
+    class FakePipeline:
+        def __init__(self) -> None:
+            self.sink = FakeSink()
+            self.rtsp_source = FakeRtspSource()
+
+        def get_by_name(self, name: str):
+            return {"sink": self.sink, "rtsp_source": self.rtsp_source}.get(name)
+
+        def get_bus(self):
+            return object()
+
+        def set_state(self, _state):
+            return "success"
+
+    pipeline = FakePipeline()
+
+    class FakeGst:
+        class State:
+            NULL = "null"
+
+        class StateChangeReturn:
+            FAILURE = "failure"
+
+        @staticmethod
+        def parse_launch(_description: str):
+            return pipeline
+
+    class FakeGLib:
+        Error = RuntimeError
+
+    monkeypatch.setattr(
+        gstreamer_source,
+        "_load_gstreamer_modules",
+        lambda: (FakeGLib, FakeGst),
+    )
+
+    backend = gstreamer_source._PyGObjectGstBackend(
+        "ignored", lambda _frame: None, lambda _error: None
+    )
+    select_stream = pipeline.rtsp_source.callbacks["select-stream"]
+
+    # Match the real thermal camera: H.264 video plus AAC audio.  The caps name
+    # deliberately reflects the actual pre-transport rtspsrc state rather than
+    # the later application/x-rtp pad caps.
+    assert not select_stream(
+        pipeline.rtsp_source,
+        0,
+        _pretransport_rtsp_caps("audio", "MPEG4-GENERIC"),
+    )
+    assert select_stream(
+        pipeline.rtsp_source,
+        1,
+        _pretransport_rtsp_caps("video", "H264"),
+    )
+    assert not select_stream(
+        pipeline.rtsp_source,
+        2,
+        _pretransport_rtsp_caps("video", "H264"),
+    )
+
+    backend.stop()
+    assert pipeline.rtsp_source.disconnected == [17]
+
+
+def test_rtsp_stream_classifier_does_not_require_application_x_rtp_name() -> None:
+    assert gstreamer_source._is_h264_video_stream_caps(
+        _pretransport_rtsp_caps("video", "H264")
+    )
+    assert not gstreamer_source._is_h264_video_stream_caps(
+        _pretransport_rtsp_caps("audio", "MPEG4-GENERIC")
+    )
+    assert not gstreamer_source._is_h264_video_stream_caps(
+        _pretransport_rtsp_caps("video", "H265")
+    )
 
 def test_gstreamer_source_owns_frame_memory_and_replaces_latest_without_fifo() -> None:
     factory = _BackendFactory()

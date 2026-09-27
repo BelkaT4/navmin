@@ -54,10 +54,15 @@ udpsrc → rtpjpegdepay → jpegdec → videoconvert → BGR appsink
 RTSP v1 path:
 
 ```text
-rtspsrc → rtph264depay → h264parse → avdec_h264 → videoconvert → BGR appsink
+rtspsrc
+→ через `select-stream` выбрать первый stream с `media=video` и `encoding-name=H264`
+→ rtph264depay
+→ video/x-h264, stream-format=byte-stream, alignment=au
+→ h264parse config-interval=-1
+→ avdec_h264 → videoconvert → BGR appsink
 ```
 
-RTSP v1 поддерживает H.264, `protocol = tcp | udp` и только `decoder-mode = software`. Для обоих transport `appsink` сохраняет bounded/latest-only semantics:
+RTSP source использует `rtspsrc::select-stream` и разрешает только первый поток, чьи SDP-derived caps содержат `media=video` и `encoding-name=H264`. Во время `select-stream` имя структуры caps ещё может быть `application/x-unknown`; `rtspsrc` меняет его на согласованный RTP media type позже при настройке transport, поэтому выбор не зависит от временного имени caps. Дополнительные аудиопотоки и потоки метаданных endpoint не настраиваются. Например, AAC рядом с H.264 video отклоняется до настройки этого потока. В H.264 branch попадает только выбранный видеопоток. После `rtph264depay` поток принудительно переводится в `byte-stream` (Annex B) перед `h264parse`. Это не даёт `rtph264depay` согласовать AVC-формат с `codec_data`: на некоторых RTSP-источниках такой `codec_data` формируется несовместимо с `h264parse`, хотя сам H.264 RTP корректно принимается. `h264parse config-interval=-1` повторяет SPS/PPS с IDR-кадрами для устойчивого декодирования после старта и потерь RTP. RTSP v1 поддерживает H.264, `protocol = tcp | udp` и только `decoder-mode = software`. Для обоих transport `appsink` сохраняет bounded/latest-only semantics:
 
 ```text
 emit-signals=true max-buffers=<source.buffer-size> drop=true sync=false
