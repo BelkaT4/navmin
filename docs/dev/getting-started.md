@@ -111,7 +111,71 @@ uv pip install -e .[dev,docs]
 ```
 Откройте новый терминал в IDE. Если окружение не активируеся автоматически, проверьте, есть ли в проекте диреткория `.vscode/`, в ней настройки для автоматического запуска окружения. Без нее вы сможете активировать окружение только вручную.
 
-## 4. Camera runtime: GStreamer
+## 4. Git hooks проекта
+
+В репозитории есть локальные Git hooks, которые автоматически запускают обязательные проверки перед `commit` и `push`. Файлы hooks хранятся в `.githooks/`, но Git не включает их автоматически после `clone` или `pull`. Для каждой новой рабочей копии один раз включите их:
+
+```bash
+git config core.hooksPath .githooks
+```
+
+Проверить текущую настройку:
+
+```bash
+git config --get core.hooksPath
+```
+
+Ожидаемый вывод:
+
+```text
+.githooks
+```
+
+`pre-commit` выполняет быстрые проверки:
+
+```text
+git diff --cached --check
+Ruff
+compileall
+```
+
+`pre-push` запускает полный Python test suite:
+
+```text
+pytest
+```
+
+Если проверка завершается ошибкой, `commit` или `push` блокируется. Сначала исправьте причину ошибки и повторите команду Git. Hooks не изменяют код автоматически и не выполняют `ruff --fix`. Проверки запускаются через `uv --offline`: они не скачивают зависимости во время `commit` или `push`, поэтому dev-окружение должно быть подготовлено заранее по инструкции выше.
+
+Чтобы отключить проектные hooks в текущей рабочей копии:
+
+```bash
+git config --unset core.hooksPath
+```
+
+Эта команда только отключает использование `.githooks/` для текущей рабочей копии; файлы hooks из репозитория не удаляются.
+
+Ручные эквиваленты проверок:
+
+```bash
+git --no-pager diff --cached --check
+
+uv run --offline --extra dev ruff check \
+  src \
+  tests \
+  main.py \
+  tools/run_software_smoke.py \
+  tools/run_software_soak.py \
+  tools/run_localhost_rtp_diagnostic.py \
+  tools/run_pty_stm32_diagnostic.py \
+  tools/run_diagnostic_app.py \
+  tools/run_rtsp_camera_diagnostic.py
+
+uv run --offline --extra dev python -m compileall -q src main.py tests tools
+uv run --offline --extra dev pytest
+```
+
+## 5. Camera runtime: GStreamer
 
 `PyGObject` является Python dependency проекта и устанавливается через `uv`. Сам GStreamer и typelibs/plugins являются **system runtime dependencies Debian**, а не Python packages.
 
