@@ -143,6 +143,42 @@ PNG/SVG диаграммы — только экспорт.
 
 Если manager-controlled prompt явно оставляет Ruff для user-side validation, рабочий чат Ruff не запускает и пишет в handoff точно: `Ruff: NOT RUN — user-side validation required.` Не добивайся зелёного lint через новые `noqa`, `ignore`, `per-file-ignore`, сокращение lint selection, Ruff preview или изменение formatter/lint policy без отдельного осознанного решения. `--unsafe-fixes` без явного разрешения не использовать. Это не глобальный запрет Ruff: в других задачах запускай его, когда этого требует task/tooling.
 
+### Обязательные локальные проверки и Git hooks
+
+В репозитории используются версионируемые hooks из `.githooks/`. Для каждой новой рабочей копии их нужно один раз включить:
+
+```bash
+git config core.hooksPath .githooks
+```
+
+Проверить активную настройку можно так:
+
+```bash
+git config --get core.hooksPath
+```
+
+Ожидаемое значение: `.githooks`.
+
+По умолчанию hooks выполняют следующие обязательные проверки:
+
+```text
+pre-commit
+→ git --no-pager diff --cached --check
+→ Ruff по принятому набору путей проекта
+→ python -m compileall -q src main.py tests tools
+
+pre-push
+→ полный pytest
+```
+
+Hooks запускают Python-проверки через `uv run --offline`, поэтому не должны скачивать зависимости во время `commit` или `push`. Окружение разработки должно быть подготовлено заранее. Ошибка hook блокирует соответствующую Git-операцию; сначала исправь причину, затем повтори `commit` или `push`.
+
+Hooks — страховка от пропущенных базовых проверок, но не замена task-specific validation. Если задача требует дополнительных проверок — например MkDocs, отдельного diagnostic tool, hardware smoke, STM32 tests или user-side validation — выполни их отдельно. Не объявляй checkpoint полностью зелёным только потому, что `pre-commit` или `pre-push` прошёл.
+
+Не используй `--no-verify` как штатный способ работы и не предлагай его для экономии времени. Обход hook допустим только как отдельное осознанное диагностическое действие с явной причиной. Если обязательная проверка была пропущена через `--no-verify`, до handoff/PR её нужно выполнить вручную и явно зафиксировать результат; иначе она считается `NOT RUN`.
+
+Не предполагай, что hooks активированы только потому, что `.githooks/` присутствует в working tree: `clone` и `pull` не устанавливают `core.hooksPath` автоматически. Практические команды включения, проверки и отключения hooks описаны в `docs/dev/getting-started.md`.
+
 ## 6. Когда менять документацию
 
 Архитектурные документы обычно **не меняются** при изменении private helper, внутреннем rename, оптимизации или refactor без изменения responsibility/API/behavior.
@@ -357,12 +393,29 @@ Amend последнего локального commit допустим для �
 
 Перед delivery проверяй фактический diff и не включай unrelated files.
 
+### Вывод Git-команд для агента
+
+Если вывод Git-команды предназначен для чтения, копирования в чат или анализа агентом, отключай pager явно через глобальную опцию `--no-pager`. Не полагайся на интерактивный pager: он может обрезать, скрыть или неудобно представить вывод в handoff/evidence.
+
+Используй, например:
+
+```bash
+git --no-pager status --short
+git --no-pager diff
+git --no-pager diff --check
+git --no-pager diff --cached
+git --no-pager show --stat
+git --no-pager log -n 10 --oneline
+```
+
+Для Git-команд, которые не выдают pageable output (`git add`, `git commit`, `git push`, `git switch`, `git pull`), `--no-pager` не требуется.
+
 После install/test/build/docs/package/codegen или другой команды, способной создать файлы, проверь working tree. Для user-side проверки по умолчанию достаточно:
 
 ```bash
-git status --short
-git status --short --ignored
-git diff --check
+git --no-pager status --short
+git --no-pager status --short --ignored
+git --no-pager diff --check
 ```
 
 Каждый новый артефакт классифицируй:
