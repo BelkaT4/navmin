@@ -1,0 +1,25 @@
+#!/bin/sh
+set -eu
+
+repo_root=$(git rev-parse --show-toplevel)
+cd "$repo_root"
+
+echo "[pre-commit] staged diff check"
+git --no-pager diff --cached --check
+
+echo "[pre-commit] ruff"
+uv run --offline --extra dev ruff check \
+  src \
+  tests \
+  main.py \
+  tools/run_software_smoke.py \
+  tools/run_software_soak.py \
+  tools/run_localhost_rtp_diagnostic.py \
+  tools/run_pty_stm32_diagnostic.py \
+  tools/run_diagnostic_app.py \
+  tools/run_rtsp_camera_diagnostic.py
+
+echo "[pre-commit] compileall"
+uv run --offline --extra dev python -m compileall -q src main.py tests tools
+
+echo "[pre-commit] PASS"

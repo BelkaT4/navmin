@@ -156,6 +156,34 @@ def _appsink_description(buffer_size: int) -> str:
     )
 
 
+def _is_h264_video_stream_caps(caps: object) -> bool:
+    """Return whether pre-transport rtspsrc caps identify H.264 video.
+
+    During ``rtspsrc::select-stream`` the caps are derived from SDP but their
+    structure name can still be ``application/x-unknown``.  ``rtspsrc`` changes
+    that name to the negotiated RTP media type later, while configuring the
+    transport.  The stable fields available at selection time are ``media`` and
+    ``encoding-name``.
+    """
+    try:
+        size = int(caps.get_size())
+    except (AttributeError, TypeError, ValueError):
+        return False
+    for index in range(size):
+        try:
+            structure = caps.get_structure(index)
+            media = structure.get_string("media")
+            encoding_name = structure.get_string("encoding-name")
+        except (AttributeError, TypeError, ValueError):
+            continue
+        if (
+            str(media or "").lower() == "video"
+            and str(encoding_name or "").upper() == "H264"
+        ):
+            return True
+    return False
+
+
 def build_rtp_jpeg_pipeline_description(config: RtpJpegSourceConfig) -> str:
     """Build the production RTP/JPEG receiver pipeline."""
     return (
@@ -181,12 +209,13 @@ def build_rtsp_pipeline_description(config: RtspSourceConfig) -> str:
         )
     drop_on_latency = "true" if config.drop_on_latency else "false"
     return (
-        f"rtspsrc location={_gst_quote(config.uri)} "
+        f"rtspsrc name=rtsp_source location={_gst_quote(config.uri)} "
         f"protocols={config.protocol.value} "
         f"latency={config.latency_ms} "
         f"drop-on-latency={drop_on_latency} "
         "! rtph264depay "
-        "! h264parse "
+        "! video/x-h264,stream-format=byte-stream,alignment=au "
+        "! h264parse config-interval=-1 "
         "! avdec_h264 "
         "! videoconvert "
         "! video/x-raw,format=BGR "
@@ -406,6 +435,13 @@ class _PyGObjectGstBackend:
         if self._sink is None:
             raise CameraSourceError("GStreamer pipeline does not expose appsink 'sink'")
         self._sink.connect("new-sample", self._on_new_sample)
+        self._selected_rtsp_stream_num: int | None = None
+        self._rtsp_source = self._pipeline.get_by_name("rtsp_source")
+        self._rtsp_select_stream_handler_id: int | None = None
+        if self._rtsp_source is not None:
+            self._rtsp_select_stream_handler_id = self._rtsp_source.connect(
+                "select-stream", self._on_select_rtsp_stream
+            )
         self._bus = self._pipeline.get_bus()
 
     def start(self) -> None:
@@ -418,6 +454,13 @@ class _PyGObjectGstBackend:
             result = self._pipeline.set_state(self._Gst.State.NULL)
         except self._GLib.Error as exc:
             raise CameraSourceError(f"cannot stop GStreamer pipeline: {exc}") from exc
+        finally:
+            if (
+                self._rtsp_source is not None
+                and self._rtsp_select_stream_handler_id is not None
+            ):
+                self._rtsp_source.disconnect(self._rtsp_select_stream_handler_id)
+                self._rtsp_select_stream_handler_id = None
         if result == self._Gst.StateChangeReturn.FAILURE:
             raise CameraSourceError("GStreamer pipeline failed to enter NULL")
 
@@ -433,6 +476,14 @@ class _PyGObjectGstBackend:
             detail = f": {debug}" if debug else ""
             return CameraSourceError(f"GStreamer error: {error}{detail}")
         return CameraSourceError("GStreamer stream reached EOS")
+
+    def _on_select_rtsp_stream(self, _source, stream_num: int, caps) -> bool:
+        if self._selected_rtsp_stream_num is not None:
+            return stream_num == self._selected_rtsp_stream_num
+        if not _is_h264_video_stream_caps(caps):
+            return False
+        self._selected_rtsp_stream_num = stream_num
+        return True
 
     def _on_new_sample(self, sink):
         Gst = self._Gst
