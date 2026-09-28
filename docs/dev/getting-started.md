@@ -212,6 +212,128 @@ gst-inspect-1.0 \
 
 Production camera source выбирается через `vision.cameras.<camera>.source.type = rtp-jpeg | rtsp`. Для RTP/JPEG обычный local bind — `0.0.0.0`, принятые порты Overview/Stereo Left/Stereo Right — `8888/8889/8890`, `buffer-size=1`. Для RTSP endpoint задаётся в `source.uri`; первая реализация поддерживает H.264, `protocol = tcp | udp` и `decoder-mode = software`.
 
+## 6. Подготовка Linux-хоста для реального оборудования
+
+Системные настройки последовательного порта и сети вынесены из Python-кода NavMin в отдельные Linux-скрипты. Параметры конкретного компьютера хранятся в локальном файле `config/host.local.env`: он не коммитится и служит единым источником настроек для setup/runtime-скриптов.
+
+Сначала один раз создайте локальный файл из шаблона:
+
+```bash
+cp config/host.example.env config/host.local.env
+```
+
+Откройте `config/host.local.env` и задайте значения для текущего ПК:
+
+```text
+SERIAL_SETUP_DEVICE=/dev/ttyUSB0
+SERIAL_ALIAS=navmin-turret
+CAMERA_INTERFACE=enp3s0
+CAMERA_HOST_ADDRESS=192.168.42.2/24
+CAMERA_PROFILE_NAME=NavMin Cameras
+```
+
+`/dev/ttyUSB0`, `enp3s0` и `192.168.42.2/24` здесь только примеры. Значения с пробелами поддерживаются без shell-кавычек. Если файл отсутствует или обязательное поле задано дважды, setup/runtime-скрипты завершаются ошибкой вместо применения догадок.
+
+### Serial-адаптер
+
+Ручной `chmod 666/777 /dev/ttyUSB*` использовать не нужно: такой режим сбрасывается при каждом переподключении устройства и даёт избыточные права.
+
+`SERIAL_SETUP_DEVICE` — это только текущий путь USB-UART во время одноразовой настройки. На одном ПК это может быть `/dev/ttyUSB0`, на другом — `/dev/ttyUSB1` или `/dev/ttyACM0`. После настройки runtime использует стабильное имя из `SERIAL_ALIAS`.
+
+При подключённом адаптере один раз выполните:
+
+```bash
+sudo tools/platform/linux/setup_serial_access.sh
+```
+
+Скрипт:
+
+- читает `SERIAL_SETUP_DEVICE` и `SERIAL_ALIAS` из `config/host.local.env`;
+- определяет USB VID/PID и, если доступен, серийный номер адаптера;
+- создаёт `/etc/udev/rules.d/99-navmin-turret.rules`;
+- задаёт `GROUP="dialout"` и `MODE="0660"`;
+- создаёт стабильное имя `/dev/<SERIAL_ALIAS>`;
+- при необходимости добавляет пользователя, запустившего `sudo`, в группу `dialout`.
+
+Если пользователь был добавлен в `dialout`, выйдите из пользовательской сессии и войдите снова. При значении `SERIAL_ALIAS=navmin-turret` в локальном `config.json` рекомендуется использовать:
+
+```text
+turret.serial.port = /dev/navmin-turret
+```
+
+Если на другом ПК адаптер получил другое временное имя, достаточно изменить `SERIAL_SETUP_DEVICE` в `host.local.env` и повторить setup. Повторный запуск безопасен: совпадающее правило не создаётся заново.
+
+### Сетевой профиль камер
+
+NavMin не хранит Wi-Fi пароль и не создаёт сетевое подключение с нуля. Сначала обычными средствами NetworkManager подключите нужный интерфейс к сети камеры: выберите Wi-Fi камеры или подключите нужный Ethernet-интерфейс. Затем узнайте имя интерфейса:
+
+```bash
+nmcli device status
+```
+
+Запишите его в `CAMERA_INTERFACE`. В `CAMERA_HOST_ADDRESS` укажите **адрес ПК, на который настроены отправители видеопотока**, включая CIDR-префикс. Этот адрес не должен совпадать с IP самой камеры. Имя создаваемого профиля задаётся в `CAMERA_PROFILE_NAME`.
+
+После редактирования `host.local.env` один раз выполните:
+
+```bash
+sudo tools/platform/linux/setup_camera_network.sh
+```
+
+Если профиль из `CAMERA_PROFILE_NAME` ещё не существует, скрипт клонирует текущее активное подключение выбранного интерфейса. Поэтому для Wi-Fi сохраняются SSID и параметры безопасности уже созданного подключения NetworkManager, а секреты не попадают в репозиторий. Затем профиль получает параметры из локального setup-файла:
+
+```text
+CAMERA_INTERFACE       → connection.interface-name
+CAMERA_HOST_ADDRESS    → статический IPv4
+connection.autoconnect = no
+ipv4.never-default     = yes
+IPv6                   = disabled
+```
+
+`config/host.local.env` является источником параметров хоста, а NetworkManager-профиль — применённым системным состоянием. Если позже изменить интерфейс, адрес или имя профиля в setup-файле, повторно запустите `setup_camera_network.sh`. Runtime-проверка не позволит молча использовать профиль, который больше не соответствует `host.local.env`.
+
+### Ручное включение и восстановление сети
+
+Для диагностики профиль можно включить вручную:
+
+```bash
+tools/platform/linux/camera_network_up.sh
+```
+
+Скрипт читает `host.local.env`, проверяет соответствие подготовленного NetworkManager-профиля, запоминает UUID подключения, которое было активно на том же интерфейсе, активирует профиль камер и проверяет ожидаемый статический IPv4.
+
+Вернуть прежнее состояние:
+
+```bash
+tools/platform/linux/camera_network_down.sh
+```
+
+`camera_network_down.sh` восстанавливает состояние из runtime state-файла и намеренно не зависит от наличия `host.local.env`: cleanup должен оставаться возможным даже если локальный setup-файл был удалён или изменён во время сессии.
+
+Если до запуска профиль NavMin уже был активен, `down` оставит его активным. Если до запуска на интерфейсе не было подключения, `down` просто отключит профиль камер.
+
+### Рекомендуемый запуск NavMin на Linux
+
+Обычный запуск с реальным оборудованием выполняйте из корня репозитория:
+
+```bash
+./run_navmin.sh --preflight-only
+./run_navmin.sh
+```
+
+`run_navmin.sh` выполняет последовательность:
+
+```text
+camera_network_up.sh
+→ uv run --offline python -m navmin ...
+→ camera_network_down.sh
+```
+
+Аргументы после `run_navmin.sh` передаются обычному `python -m navmin`. Сам launcher не содержит IP, имя интерфейса или профиль: их читает `camera_network_up.sh` из локального setup-файла.
+
+Восстановление сети выполняется при обычном завершении, ошибке приложения и штатно обрабатываемом завершении процесса, включая обычный `Ctrl+C`. Если процесс был принудительно завершён через `SIGKILL` или компьютер потерял питание, выполнить восстановление невозможно. В пределах той же пользовательской сессии оставшийся файл состояния будет обнаружен следующим `camera_network_up.sh`, и новый запуск будет остановлен до явного восстановления через `camera_network_down.sh`.
+
+`run_navmin.sh` не нужно запускать через `sudo`. Повышенные права нужны только для одноразовых `setup_serial_access.sh` и `setup_camera_network.sh`.
+
 # Offline rehearsal и hardware day
 
 Этот документ описывает первоначальную установку окружения и поэтому содержит online setup steps. Для автономной проверки уже подготовленной машины network не должен требоваться. Operator procedure, четыре рекомендуемых profiles, preflight gates и hardware measurement boundaries описаны в [Offline Hardware Runbook](../user/offline-hardware-runbook.md).

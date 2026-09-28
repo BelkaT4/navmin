@@ -412,12 +412,14 @@ serial port и не проверяет protocol response.
 | Адрес привязки Stereo Left RTP/JPEG | `vision.cameras.stereo-left.source.bind-address` | только для `type=rtp-jpeg`; локальный адрес PC для рабочего приёмника |
 | RTSP-источник | `vision.cameras.<camera>.source.uri` | только для `type=rtsp`; полный URI `rtsp://host[:port]/path` |
 | RTSP-протокол | `vision.cameras.<camera>.source.protocol` | `tcp` или `udp`; переподключение не меняет его автоматически |
-| Real serial device | `turret.serial.port` | например фактически обнаруженный `/dev/ttyUSB0` или `/dev/ttyACM0` |
+| Real serial device | `turret.serial.port` | на подготовленном Linux-хосте рекомендуется стабильный `/dev/navmin-turret`; прямые `/dev/ttyUSB*`/`ttyACM*` остаются только временным вариантом для диагностики |
 | Desired Turret baudrate | `turret.serial.baudrate` | желаемая рабочая скорость serial link |
 
 Полная current schema и apply policy описаны в
 [Configuration](../dev/architecture/configuration.md). Не добавлять неизвестные
 JSON keys: parser schema-v1 строгий.
+
+Linux-настройки самого ПК не добавляются в `config.json`. Для подготовленного хоста они задаются в локальном `config/host.local.env`, созданном из `config/host.example.env`: временный путь USB-UART для setup, стабильный serial alias, интерфейс камеры, статический IPv4 ПК и имя NetworkManager-профиля. Файл `host.local.env` не коммитится. После его изменения соответствующий одноразовый `setup_*` скрипт нужно выполнить повторно.
 
 Для `source.type = rtp-jpeg` поле `bind-address` **не является IP Raspberry Pi**. Это адрес, на котором приёмник PC выполняет локальную UDP-привязку. Обычное прослушивание всех интерфейсов может использовать `0.0.0.0`; конкретный адрес должен принадлежать PC. IP назначения, куда Raspberry Pi/source sender отправляет RTP, задаётся на стороне sender и должен указывать на подходящий адрес PC.
 
@@ -522,26 +524,28 @@ python tools/run_diagnostic_app.py \
 
 После `PASS` повторить ту же команду без `--preflight-only`.
 
-**REAL — production entrypoint:**
+**REAL — production entrypoint на подготовленном Linux-хосте:**
 
 ```bash
 cd ~/NAV\ MIN
 
-python -m navmin \
+./run_navmin.sh \
   --config config-hardware-day.json \
   --overview-calibration calibration/overview-hardware-day.json \
   --stereo-calibration calibration/stereo-hardware-day.json \
   --preflight-only
 ```
 
-После `PASS`:
+`run_navmin.sh` перед запуском активирует подготовленный профиль NetworkManager для камер, а после завершения восстанавливает прежнее сетевое подключение. После `PASS`:
 
 ```bash
-python -m navmin \
+./run_navmin.sh \
   --config config-hardware-day.json \
   --overview-calibration calibration/overview-hardware-day.json \
   --stereo-calibration calibration/stereo-hardware-day.json
 ```
+
+Прямой запуск `python -m navmin` остаётся допустимым, если сеть уже подготовлена вручную или используется другая платформа.
 
 Те же three file options поддерживаются explicit diagnostic REAL command и
 advanced mixed combinations. Новый `--profile` flag для этого не нужен.
@@ -554,8 +558,7 @@ advanced mixed combinations. Новый `--profile` flag для этого не 
 turret.serial.port
 ```
 
-на фактический device path, например `/dev/ttyUSB0` или `/dev/ttyACM0`. Real-Turret
-preflight проверит наличие path и read/write access, но **не** откроет serial port,
+На Linux-хосте временный путь адаптера задаётся в `SERIAL_SETUP_DEVICE` локального `config/host.local.env` и используется только одноразовым `tools/platform/linux/setup_serial_access.sh`. После setup рекомендуется использовать стабильный `/dev/navmin-turret` (или `/dev/<SERIAL_ALIAS>` при другом alias). Ручной `chmod 666/777` для `/dev/ttyUSB*` не является постоянной настройкой и не должен использоваться как штатное решение. Прямые `/dev/ttyUSB0` или `/dev/ttyACM0` допустимы только для setup/временной диагностики. Real-Turret preflight проверит наличие пути и права чтения/записи, но **не** откроет serial port,
 не переключит DTR/RTS и не докажет, что STM32 отвечает.
 
 Желаемая рабочая скорость задаётся:
@@ -1031,9 +1034,16 @@ RTP receiver; `FakeTransport` не заменяет camera acceptance.
 
 ## C2. Preflight
 
+На подготовленном Linux-хосте `config/host.local.env` должен содержать фактические `CAMERA_INTERFACE`, `CAMERA_HOST_ADDRESS` и `CAMERA_PROFILE_NAME`, а одноразовый `setup_camera_network.sh` должен быть уже выполнен. Затем активировать профиль камер:
+
 ```bash
 cd ~/NAV\ MIN
+tools/platform/linux/camera_network_up.sh
+```
 
+Затем:
+
+```bash
 python tools/run_diagnostic_app.py \
   --overview real \
   --stereo-left real \
@@ -1042,17 +1052,31 @@ python tools/run_diagnostic_app.py \
 ```
 
 `PREFLIGHT PASS` подтверждает static receiver/config/calibration/UDP readiness, но
-не означает, что реальные RTP packets уже приходят.
+не означает, что реальные RTP packets уже приходят. После отдельного preflight-only
+запуска можно вернуть прежнюю сеть командой `tools/platform/linux/camera_network_down.sh`
+или оставить профиль активным для немедленного Cameras-only run.
 
 ## C3. Launch
 
-```bash
-cd ~/NAV\ MIN
+Если после preflight сеть была восстановлена, снова выполнить:
 
+```bash
+tools/platform/linux/camera_network_up.sh
+```
+
+Затем:
+
+```bash
 python tools/run_diagnostic_app.py \
   --overview real \
   --stereo-left real \
   --turret pty
+```
+
+После завершения диагностики обязательно восстановить прежнее сетевое состояние:
+
+```bash
+tools/platform/linux/camera_network_down.sh
 ```
 
 После launch проверить:

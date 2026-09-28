@@ -24,3 +24,6 @@ logs/
 /config*.json-*.bak
 /calibration/*.json
 /calibration/*.json-*.bak
+
+# Machine-specific NavMin host provisioning settings.
+/config/host.local.env
