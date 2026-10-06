@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from typing import Protocol
 
@@ -13,6 +14,8 @@ from navmin.contracts import (
 )
 
 DEFAULT_VISION_PROCESSOR_CLASS = "Legacy14VisionProcessor"
+
+LOGGER = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -54,7 +57,22 @@ def create_vision_processor(
     if class_name == DEFAULT_VISION_PROCESSOR_CLASS:
         from .processors import Legacy14VisionProcessor
 
-        return Legacy14VisionProcessor()
+        processor = Legacy14VisionProcessor()
+        LOGGER.info("Vision processor: %s", DEFAULT_VISION_PROCESSOR_CLASS)
+        return processor
+    if class_name == "Vt11VisionProcessor":
+        from .processors.vt11 import Vt11VisionProcessor
+        from .processors.vt11.settings import VT11_PROFILE
+
+        profile = VT11_PROFILE
+        if profile not in {"day", "thermal"}:
+            raise ValueError("VT11_PROFILE must be 'day' or 'thermal'")
+        processor = Vt11VisionProcessor(profile_name=profile)
+        LOGGER.info(
+            "Vision processor: Vt11VisionProcessor profile=%s",
+            processor.settings_snapshot.profile,
+        )
+        return processor
     raise ValueError(f"unsupported VisionProcessor class in this checkpoint: {class_name}")
 
 

@@ -34,6 +34,8 @@ from navmin.vision.pipeline import (
     VisionPipeline,
     overview_corrector,
 )
+from navmin.vision.processors.vt11 import Vt11VisionProcessor
+from navmin.vision.processors.vt11 import settings as vt11_settings
 
 WIDTH = 32
 HEIGHT = 24
@@ -488,6 +490,27 @@ def test_build_camera_worker_binds_existing_camera_config_without_parallel_schem
     assert isinstance(worker.source, GStreamerRtpJpegSource)
     assert 'port=8889' in worker.source.pipeline_description
     assert worker.pipeline.camera is CameraRole.STEREO_LEFT
+
+
+def test_build_camera_worker_routes_configured_vt11_through_production_factory(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(vt11_settings, "VT11_PROFILE", "thermal")
+    config = camera_config(
+        source=rtp_source_config(bind_address="0.0.0.0", port=8889),
+        processing_enabled=False,
+        vision_processor_class="Vt11VisionProcessor",
+    )
+
+    worker = build_camera_worker(
+        camera=CameraRole.STEREO_LEFT,
+        config=config,
+        corrector=overview_corrector(overview_calibration()),
+    )
+
+    processor = worker.pipeline._processor
+    assert isinstance(processor, Vt11VisionProcessor)
+    assert processor.settings_snapshot.profile == "thermal"
 
 
 def test_camera_worker_uses_existing_source_to_pipeline_path_and_stops_bounded() -> None:

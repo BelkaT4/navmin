@@ -24,6 +24,8 @@ from navmin.contracts import (
 from navmin.vision import VisionProcessorOutput, create_vision_processor
 from navmin.vision.processors.legacy_14.detector import Legacy14Detector
 from navmin.vision.processors.legacy_14.processor import Legacy14VisionProcessor
+from navmin.vision.processors.vt11 import Vt11VisionProcessor
+from navmin.vision.processors.vt11 import settings as vt11_settings
 from navmin.vision.tracking import PublicTrackIdAllocator, SimpleTracker
 
 
@@ -70,6 +72,35 @@ def packet(
 
 def test_default_processor_is_legacy14() -> None:
     assert isinstance(create_vision_processor(), Legacy14VisionProcessor)
+
+
+@pytest.mark.parametrize("profile", ["day", "thermal"])
+def test_factory_creates_vt11_with_internal_profile(
+    monkeypatch: pytest.MonkeyPatch,
+    profile: str,
+) -> None:
+    monkeypatch.setattr(vt11_settings, "VT11_PROFILE", profile)
+
+    processor = create_vision_processor("Vt11VisionProcessor")
+
+    assert isinstance(processor, Vt11VisionProcessor)
+    assert processor.settings_snapshot.profile == profile
+
+
+@pytest.mark.parametrize("profile", ["invalid", "DAY"])
+def test_factory_rejects_invalid_vt11_internal_profile(
+    monkeypatch: pytest.MonkeyPatch,
+    profile: str,
+) -> None:
+    monkeypatch.setattr(vt11_settings, "VT11_PROFILE", profile)
+
+    with pytest.raises(ValueError, match="VT11_PROFILE must be 'day' or 'thermal'"):
+        create_vision_processor("Vt11VisionProcessor")
+
+
+def test_factory_rejects_unknown_processor_class() -> None:
+    with pytest.raises(ValueError, match="unsupported VisionProcessor class"):
+        create_vision_processor("UnknownVisionProcessor")
 
 
 def test_target_control_and_lifecycle_contracts_are_immutable_unions() -> None:
