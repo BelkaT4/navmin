@@ -12,7 +12,12 @@ from PyQt6.QtGui import QPixmap
 from PyQt6.QtTest import QTest
 from PyQt6.QtWidgets import QApplication, QMessageBox
 
-from navmin.concurrency import CameraSessionBarrierChannel, LatestValue
+from navmin.concurrency import (
+    CameraSessionBarrierChannel,
+    LatestValue,
+    TargetControlChannel,
+    TargetLifecycleEventChannel,
+)
 from navmin.config.models import AimingConfig, AimPointConfig, AimPointsConfig, UiConfig
 from navmin.contracts import (
     BBox,
@@ -24,6 +29,7 @@ from navmin.contracts import (
     FramePacket,
     MotorState,
     MoveRelativeCommand,
+    TargetAcquired,
     TargetRef,
     TrackedObject,
     TrackingError,
@@ -118,8 +124,18 @@ class _CountingMediator(Mediator):
         super().__init__(*args, **kwargs)
         self.vision_accept_calls = 0
         self.turret_accept_calls = 0
+        self.accept_order: list[str] = []
+
+    def accept_camera_session(self, session: CameraSessionStarted) -> bool:
+        self.accept_order.append("session")
+        return super().accept_camera_session(session)
+
+    def accept_target_lifecycle_event(self, event) -> bool:
+        self.accept_order.append("target_event")
+        return super().accept_target_lifecycle_event(event)
 
     def accept_vision_result(self, result: VisionResult) -> bool:
+        self.accept_order.append("vision_result")
         self.vision_accept_calls += 1
         return super().accept_vision_result(result)
 
@@ -164,6 +180,10 @@ def _mediator(
         ),
         ui_config=UiConfig(CameraRole.OVERVIEW, False, False),
         turret=turret,
+        target_controls={
+            camera: TargetControlChannel(camera)
+            for camera in (CameraRole.OVERVIEW, CameraRole.STEREO_LEFT)
+        },
     )
     return mediator, turret
 
@@ -208,6 +228,7 @@ def _bindings() -> dict[CameraRole, CameraUiBinding]:
         camera: CameraUiBinding(
             camera,
             CameraSessionBarrierChannel(),
+            TargetLifecycleEventChannel(),
             LatestValue(),
             LatestValue(),
         )
@@ -269,6 +290,29 @@ def _publish_camera(
     binding.latest_result.publish(result)
     binding.status.publish(status or _status(result.frame.camera, result.frame.generation))
     window.state_pump.pump_once()
+
+
+def _publish_acquired(
+    window: MainWindow,
+    mediator: Mediator,
+    bindings: dict[CameraRole, CameraUiBinding],
+    *,
+    track_id: int = 7,
+) -> TargetRef:
+    request = mediator.pending_selection
+    assert request is not None
+    target = TargetRef(request.camera, request.generation, track_id)
+    bindings[request.camera].target_events.publish(
+        TargetAcquired(
+            selection_id=request.selection_id,
+            target=target,
+            request_frame_id=request.frame_id,
+            decision_frame_id=request.frame_id,
+            decision_frame_timestamp_ns=1_000_000_000,
+        )
+    )
+    window.state_pump.pump_once()
+    return target
 
 
 def test_rendered_rect_and_widget_mapping_cover_letterbox_boundaries() -> None:
@@ -443,7 +487,7 @@ def test_relative_click_uses_displayed_result_not_newer_unpumped_latest(
     window.close()
 
 
-def test_tracking_hit_test_uses_displayed_bbox_and_deterministic_tie(
+def test_tracking_click_sends_exact_displayed_frame_to_mediator(
     qt_application: QApplication,
 ) -> None:
     window, mediator, _turret, bindings, _states = _window(
@@ -460,21 +504,35 @@ def test_tracking_hit_test_uses_displayed_bbox_and_deterministic_tie(
     )
 
     window._handle_main_click(displayed, 50.0, 25.0)
-    assert mediator.selected_target == TargetRef(CameraRole.OVERVIEW, 1, 3)
-
-    window._handle_main_click(displayed, 5.0, 5.0)
+    request = mediator.pending_selection
+    assert request is not None
+    assert request.camera is CameraRole.OVERVIEW
+    assert request.generation == 1
+    assert request.frame_id == displayed.frame.frame_id
+    assert (request.x_px, request.y_px) == (50.0, 25.0)
     assert mediator.selected_target is None
+
+    selected = _publish_acquired(window, mediator, bindings, track_id=3)
+    assert mediator.selected_target == selected
     window.close()
 
 
-def test_tracking_overlap_chooses_closest_center() -> None:
-    objects = (
-        TrackedObject(8, BBox(10, 10, 40, 30), 0.0, 0.0, 1),
-        TrackedObject(4, BBox(25, 10, 40, 30), 0.0, 0.0, 1),
+def test_tracking_empty_point_is_forwarded_without_ui_hit_test(
+    qt_application: QApplication,
+) -> None:
+    window, mediator, _turret, bindings, _states = _window(
+        qt_application, mode=TurretControlMode.TRACKING
     )
-    result = _result(CameraRole.OVERVIEW, 1, objects=objects)
-    assert MainWindow._hit_test(result, 45.0, 25.0) == 4
-    assert MainWindow._hit_test(result, 90.0, 25.0) is None
+    displayed = _result(CameraRole.OVERVIEW, 1, objects=())
+    _publish_camera(window, bindings, displayed)
+
+    window._handle_main_click(displayed, 5.0, 5.0)
+
+    request = mediator.pending_selection
+    assert request is not None
+    assert request.frame_id == displayed.frame.frame_id
+    assert (request.x_px, request.y_px) == (5.0, 5.0)
+    window.close()
 
 
 def test_right_click_and_letterbox_do_nothing(qt_application: QApplication) -> None:
@@ -675,6 +733,54 @@ def test_pump_drains_all_barriers_before_freshest_payloads_and_coalesces() -> No
     assert mediator.vision_accept_calls == 2
 
 
+def test_pump_orders_generation_barrier_then_lifecycle_then_latest_result() -> None:
+    mediator, _turret = _mediator(
+        mode=TurretControlMode.TRACKING,
+        counting=True,
+    )
+    assert isinstance(mediator, _CountingMediator)
+    bindings = _bindings()
+    first = _result(CameraRole.OVERVIEW, 1)
+    assert mediator.accept_camera_session(_session(CameraRole.OVERVIEW, 1))
+    assert mediator.accept_vision_result(first)
+    assert mediator.request_target_selection(first, 50.0, 25.0)
+    pending = mediator.pending_selection
+    assert pending is not None
+    mediator.accept_order.clear()
+
+    overview = bindings[CameraRole.OVERVIEW]
+    overview.session_barriers.publish(_session(CameraRole.OVERVIEW, 2))
+    overview.target_events.publish(
+        TargetAcquired(
+            selection_id=pending.selection_id,
+            target=TargetRef(CameraRole.OVERVIEW, 1, 7),
+            request_frame_id=pending.frame_id,
+            decision_frame_id=pending.frame_id,
+            decision_frame_timestamp_ns=1_000_000_000,
+        )
+    )
+    overview.latest_result.publish(
+        _result(CameraRole.OVERVIEW, 2, frame_id=1)
+    )
+    pump = UiStatePump(
+        mediator=mediator,
+        camera_bindings=bindings,
+        turret_states=LatestValue(),
+        on_camera_session=lambda _item: None,
+        on_vision_result=lambda _item: None,
+        on_camera_status=lambda _item: None,
+        on_turret_state=lambda _item: None,
+        on_presentation_tick=lambda: None,
+    )
+
+    pump.pump_once()
+
+    assert mediator.accept_order == ["session", "target_event", "vision_result"]
+    assert mediator.pending_selection is None
+    assert mediator.selected_target is None
+    assert mediator.latest_vision_result(CameraRole.OVERVIEW).frame.generation == 2
+
+
 def test_rejected_new_generation_revision_is_retried_after_barrier() -> None:
     mediator, _turret = _mediator(counting=True)
     assert isinstance(mediator, _CountingMediator)
@@ -751,8 +857,7 @@ def test_temporary_target_miss_keeps_authoritative_selection_without_old_bbox(
     initial = _result(CameraRole.OVERVIEW, 1)
     _publish_camera(window, bindings, initial)
     window._handle_main_click(initial, 50.0, 25.0)
-    selected = mediator.selected_target
-    assert selected is not None
+    selected = _publish_acquired(window, mediator, bindings)
 
     missing = _result(CameraRole.OVERVIEW, 1, frame_id=2, objects=())
     bindings[CameraRole.OVERVIEW].latest_result.publish(missing)
@@ -836,8 +941,7 @@ def test_stale_tracking_does_not_select_or_deselect(qt_application: QApplication
         status=_status(CameraRole.OVERVIEW, 1, timestamp_ns=1_000_000_000),
     )
     window._handle_main_click(result, 50.0, 25.0)
-    selected = mediator.selected_target
-    assert selected is not None
+    selected = _publish_acquired(window, mediator, bindings)
     clock.now_ns = 1_500_000_000
     window.refresh_presentation()
     window._handle_main_click(result, 5.0, 5.0)

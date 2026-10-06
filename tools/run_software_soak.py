@@ -553,9 +553,11 @@ class SoftwareSoak:
         )
         baseline = self._command_count(CommandCode.SET_VELOCITY)
         QTest.mouseClick(self.window.main_view, Qt.MouseButton.LeftButton, pos=click)
-        self.application.processEvents()
-        if self.runtime.mediator.selected_target is None:
-            raise SoakFailure("TRACKING selection was not established")
+        self._wait_until(
+            lambda: self.runtime.mediator.selected_target is not None,
+            2.0,
+            "TRACKING selection was not acquired",
+        )
         self._wait_until(lambda: self._has_nonzero_velocity_since(baseline), 2.0, "nonzero SET_VELOCITY did not reach endpoint")
 
     def _deselect_tracking(self) -> None:

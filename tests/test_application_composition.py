@@ -350,6 +350,10 @@ def test_shared_runtime_starts_and_exposes_complete_ui_dependency_surface() -> N
             bindings[CameraRole.STEREO_LEFT].session_barriers
             is runtime.stereo_left_worker.pipeline.session_barriers
         )
+        assert (
+            bindings[CameraRole.OVERVIEW].target_events
+            is runtime.overview_worker.pipeline.target_events
+        )
 
         for binding in bindings.values():
             session = binding.session_barriers.receive(timeout=0.5)

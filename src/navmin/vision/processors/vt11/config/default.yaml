@@ -1,0 +1,816 @@
+project:
+  name: Adaptive Target Tracking Research Stand
+  checkpoint: VT-11-HOTFIX-4-REV5-REACQ-CONTINUITY-FIX
+  config_version: 31
+video:
+  start_paused: true
+  loop: false
+  supported_extensions:
+  - .mp4
+  - .avi
+  - .mov
+  - .mkv
+  - .m4v
+acquire:
+  roi_radius_px: 70
+  initial_frames: 7
+  top_k_candidates: 5
+  click_error_test_px:
+  - 0
+  - 10
+  - 20
+  - 30
+  - 40
+  - 50
+  candidate_detector:
+    method: local_contrast_components
+    blur_sigma_px: 3.0
+    threshold_sigma: 2.5
+    min_response: 5.0
+    min_area_px: 2
+    max_area_px: 2500
+    morph_close_px: 3
+    spatial_sigma_px: 35.0
+    spatial_weight: 0.8
+    detector_weight: 0.2
+    adaptive_area_enabled: true
+    adaptive_min_area_ratio: 0.15
+    adaptive_max_area_ratio: 4.0
+    expected_area_sigma_log: 0.8
+    expected_area_weight: 0.5
+    adaptive_hard_max_area_px: 50000
+    thermal_polarity: bright
+    thermal_top_hat_kernel_px: 21
+    thermal_top_hat_scale: 2.2
+    thermal_top_hat_max_px: 81
+    acquire_multiscale_enabled: false
+    acquire_large_scale_sigma_px: 22.0
+    acquire_large_target_trigger_area_px: 2500.0
+    acquire_max_area_fraction_roi: 0.70
+    acquire_expand_roi_radius_px: 140
+    acquire_border_margin_px: 5
+    acquire_click_seed_enabled: false
+    acquire_click_seed_roi_radius_px: 180
+    acquire_click_seed_close_px: 11
+    acquire_click_seed_max_support_distance_px: 42.0
+    micro_enabled: true
+    micro_min_area_px: 3
+    micro_max_area_px: 80
+    micro_response_multiplier: 1.2
+    micro_top_k: 4
+  scoring:
+    mode: combined
+    combined_spatial_weight: 0.45
+    confidence_gap_low: 0.05
+    confidence_gap_high: 0.12
+    custom_weights:
+      spatial: 0.45
+      appearance: 0.3
+      edge: 0.12
+      projection: 0.06
+      contrast: 0.05
+      geometry: 0.02
+  initial_train:
+    reference_bank_size: 5
+    identity_weight: 0.6
+    motion_weight: 0.3
+    size_weight: 0.1
+    motion_sigma_px: 28.0
+    bank_update_min_score: 0.62
+    confirm_min_valid_fraction: 0.7
+    confirm_min_median_score: 0.62
+    confirm_min_median_gap: 0.06
+    observe_min_valid_fraction: 0.5
+    observe_min_median_score: 0.48
+identity:
+  preset: M2
+  weights:
+    appearance: 0.603654
+    projection: 0.108268
+    edge: 0.288078
+    photocenter: 0.0
+    color: 0.0
+    contrast: 0.0
+    geometry: 0.0
+    peak_prominence: 0.0
+    hot_core_compactness: 0.0
+    radial_hotspot_profile: 0.0
+    energy_concentration: 0.0
+    thermal_2d_ratio: 0.0
+  thermal_weights:
+    appearance: 0.10941503
+    projection: 0.09329633
+    edge: 0.08464987
+    thermal_contrast: 0.25757899
+    hot_area: 0.45505978
+thermal:
+  video_mode: auto
+  hud_suppression_enabled: false
+  reticle_mode: auto
+  auto_channel_corr_min: 0.997
+  auto_channel_spread_p90_max: 35.0
+  auto_reticle_search_fraction: 0.34
+  static_contrast_min: 6.0
+  static_contrast_percentile: 98.5
+  static_std_max: 3.0
+  static_dilate_px: 3
+  static_max_component_area_px: 1200
+  manual_center_x: -1.0
+  manual_center_y: -1.0
+  manual_search_radius_px: 110
+  inpaint_radius_px: 3
+  thermal_top_hat_kernel_px: 21
+  thermal_top_hat_scale: 2.2
+  thermal_top_hat_max_px: 81
+  static_overlay_penalty_weight: 0.25
+  hud_negative_enabled: true
+  hud_soft_dilate_px: 15
+  hud_negative_penalty_weight: 0.42
+  hud_hard_overlap_ratio: 0.08
+  hud_soft_overlap_ratio: 0.10
+tracking:
+  velocity_window_frames: 5
+  enable_motion_prediction: true
+  search_radius_px: 90
+  top_k_candidates: 5
+  identity_weight: 0.6
+  motion_weight: 0.3
+  size_weight: 0.1
+  motion_sigma_px: 30.0
+  min_track_score: 0.48
+  min_identity_similarity: 0.42
+  min_confidence_gap: 0.02
+  lost_after_misses: 3
+  dynamic_search_enabled: true
+  min_search_radius_px: 50
+  max_search_radius_px: 180
+  speed_radius_gain: 0.5
+  uncertainty_radius_gain: 2.0
+  miss_radius_growth_px: 25.0
+  confidence_gap_reference: 0.12
+  prediction_error_warn_px: 35.0
+  expected_area_update_alpha: 0.15
+  track_warmup_frames: 6
+  warmup_search_radius_px: 150
+  warmup_motion_weight: 0.08
+  warmup_identity_weight: 0.82
+  warmup_size_weight: 0.1
+  warmup_motion_sigma_px: 90.0
+  warmup_min_track_score: 0.38
+  warmup_min_identity_similarity: 0.32
+  warmup_min_confidence_gap: 0.01
+  identity_first_safe_warmup_enabled: true
+  warmup_max_unexplained_jump_px: 70.0
+  size_update_min_identity: 0.55
+  size_update_min_gap: 0.04
+  size_update_max_step_ratio: 1.25
+  size_update_max_prediction_error_px: 1000000000.0
+  thermal_jump_quarantine_enabled: false
+  jump_quarantine_distance_px: 60.0
+  jump_extreme_distance_px: 85.0
+  jump_confirm_hits: 2
+  jump_extreme_confirm_hits: 3
+  jump_single_candidate_extra_hits: 1
+  jump_link_distance_px: 35.0
+  jump_min_identity: 0.62
+  jump_confirm_min_identity: 0.7
+  jump_min_gap: 0.04
+  jump_min_size_score: 0.03
+  jump_max_static_overlay_penalty: 0.4
+  jump_clutter_penalty_weight: 0.14
+  jump_anchor_norm_threshold: 3.0
+  jump_anchor_sigma_floor_px: 18.0
+  jump_local_preference_max_identity_deficit: 0.25
+  jump_global_motion_veto_response_min: 0.25
+  jump_global_motion_veto_residual_px: 60.0
+  reliable_anchor_update_max_prediction_error_px: 35.0
+  anchor_time_normalization_enabled: false
+  anchor_time_speed_multiplier: 1.5
+  anchor_time_min_speed_px_per_frame: 3.0
+  anchor_time_max_speed_px_per_frame: 22.0
+  anchor_time_max_growth_px: 360.0
+  thermal_frame_reliability_enabled: false
+  frame_reliability_max_dimension_px: 128
+  frame_reliability_residual_scale: 0.75
+  frame_reliability_phase_response_floor: 0.02
+  frame_reliability_phase_response_good: 0.50
+  frame_reliability_phase_weight: 0.15
+  frame_reliability_enter_threshold: 0.55
+  frame_reliability_exit_threshold: 0.72
+  frame_reliability_max_hold_frames: 5
+  thermal_hud_negative_enabled: false
+  hud_hard_probability_threshold: 0.90
+  hud_soft_probability_threshold: 0.45
+  hud_occlusion_max_frames: 18
+  hud_occlusion_prediction_tolerance_px: 48.0
+  hud_exit_confirm_hits: 2
+  hud_exit_link_distance_px: 42.0
+  hud_exit_min_identity: 0.52
+  hud_exit_max_probability: 0.30
+  drift_rescue_enabled: true
+  drift_rescue_min_motion_score: 0.92
+  drift_rescue_min_identity_similarity: 0.3
+  drift_rescue_min_confidence_gap: 0.08
+  drift_rescue_min_size_score: 0.04
+  drift_rescue_max_prediction_error_px: 18.0
+  drift_rescue_max_consecutive: 8
+  motion_break_enabled: true
+  motion_break_error_px: 80.0
+  motion_break_window_frames: 3
+  motion_break_hits_required: 2
+  motion_break_visual_identity_min: 0.72
+  motion_break_visual_gap_min: 0.06
+  motion_break_visual_size_min: 0.03
+  motion_relock_frames: 3
+  global_shift_enabled: true
+  global_shift_trigger_error_px: 45.0
+  global_shift_downscale: 0.5
+  global_shift_max_dimension_px: 320
+  global_shift_phase_min_response: 0.08
+  global_shift_phase_direct_max_fraction: 0.3
+  global_shift_phase_max_change_from_previous_px: 90.0
+  global_shift_feature_fallback: true
+  performance_target_fps: 25.0
+  thermal_scale_stability_enabled: false
+  thermal_scale_parameter_distance_enabled: false
+  scale_anchor_base_allowed_log_distance: 0.85
+  scale_anchor_growth_per_frame: 0.045
+  scale_anchor_max_allowed_log_distance: 1.60
+  scale_nonlinear_gate_strength: 1.50
+  scale_quarantine_confirm_hits: 3
+  scale_quarantine_extreme_confirm_hits: 5
+  scale_quarantine_extreme_log_distance: 2.30
+  scale_quarantine_max_confirm_excess_log: 1.10
+  scale_quarantine_link_log_span: 0.45
+  scale_reliable_update_alpha: 0.20
+  scale_confirm_frames: 4
+  scale_consistency_log_span: 0.35
+  scale_max_log_change_per_frame: 0.025
+  scale_large_change_ratio: 1.8
+  scale_large_change_confirm_frames: 6
+  scale_micro_max_area_px: 80.0
+  scale_micro_confirm_frames: 3
+  scale_micro_exit_confirm_frames: 4
+  scale_micro_consistency_log_span: 0.55
+  scale_micro_max_log_change_per_frame: 0.12
+  scale_robust_history_frames: 12
+reacquisition:
+  top_k_candidates: 8
+  initial_radius_px: 140
+  max_radius_px: 360
+  radius_growth_px_per_frame: 18.0
+  uncertainty_radius_gain: 2.0
+  speed_radius_gain: 0.75
+  max_frames: 90
+  confirm_frames: 3
+  max_confirmation_error_px: 65.0
+  identity_weight: 0.7
+  motion_weight: 0.2
+  size_weight: 0.1
+  motion_sigma_px: 70.0
+  velocity_window_frames: 5
+  min_score: 0.5
+  min_identity_similarity: 0.46
+  min_confidence_gap: 0.025
+  confidence_gap_reference: 0.12
+  max_reacq_cycles: 5
+  confirm_window_frames: 5
+  expected_area_update_alpha: 0.15
+  robust_motion_break_enabled: true
+  broken_identity_weight: 0.85
+  broken_motion_weight: 0.05
+  broken_size_weight: 0.1
+  broken_motion_sigma_px: 180.0
+  broken_min_score: 0.48
+  broken_min_identity_similarity: 0.46
+  broken_min_confidence_gap: 0.02
+  tracklets_enabled: true
+  tracklet_top_k: 3
+  tracklet_window_frames: 5
+  tracklet_confirm_hits: 3
+  tracklet_max_link_distance_px: 110.0
+  full_frame_after_frames: 15
+  full_frame_thermal_only: true
+  auto_promote_enabled: true
+  auto_promote_window_frames: 3
+  auto_promote_hits_required: 2
+  auto_promote_min_identity: 0.7
+  auto_promote_min_gap: 0.06
+  auto_promote_min_size_score: 0.04
+  auto_promote_max_motion_score: 0.35
+  auto_promote_max_static_overlay_penalty: 0.45
+  identity_first_enabled: true
+  micro_detector_enabled: true
+  micro_min_thermal_contrast: 0.5
+  micro_min_hot_area: 0.4
+  far_jump_distance_px: 100.0
+  anchor_time_normalization_enabled: false
+  anchor_time_speed_multiplier: 1.5
+  anchor_time_min_speed_px_per_frame: 3.0
+  anchor_time_max_speed_px_per_frame: 22.0
+  anchor_time_max_growth_px: 360.0
+  anchor_time_uncertainty_gain: 1.0
+  thermal_frame_reliability_enabled: false
+  frame_reliability_max_dimension_px: 128
+  frame_reliability_residual_scale: 0.75
+  frame_reliability_phase_response_floor: 0.02
+  frame_reliability_phase_response_good: 0.50
+  frame_reliability_phase_weight: 0.15
+  frame_reliability_enter_threshold: 0.55
+  frame_reliability_exit_threshold: 0.72
+  frame_reliability_max_hold_frames: 5
+  far_jump_min_identity: 0.88
+  far_jump_min_gap: 0.1
+  far_jump_confirm_hits: 5
+  far_jump_max_static_overlay_penalty: 0.35
+  size_update_min_identity: 0.6
+  size_update_min_gap: 0.06
+  size_update_max_step_ratio: 1.25
+  global_emergency_after_frames: 15
+  global_shift_enabled: true
+  global_shift_downscale: 0.5
+  global_shift_max_dimension_px: 320
+  global_shift_phase_min_response: 0.08
+  global_shift_phase_direct_max_fraction: 0.3
+  global_shift_phase_max_change_from_previous_px: 90.0
+  global_shift_feature_fallback: true
+  performance_target_fps: 25.0
+  global_search_interval_frames: 3
+  global_diversity_min_distance_px: 80.0
+  tracklet_admission_min_identity: 0.55
+  tracklet_admission_min_score: 0.44
+  far_jump_admission_min_identity: 0.6
+  far_jump_admission_min_gap: 0.0
+  far_jump_admission_max_static_overlay_penalty: 0.45
+  far_jump_min_thermal_profile: 0.68
+  tracklet_max_scale_log_span: 0.65
+  thermal_scale_stability_enabled: false
+  thermal_scale_parameter_distance_enabled: false
+  scale_anchor_base_allowed_log_distance: 0.85
+  scale_anchor_growth_per_frame: 0.045
+  scale_anchor_max_allowed_log_distance: 1.60
+  scale_nonlinear_gate_strength: 1.50
+  scale_quarantine_confirm_hits: 3
+  scale_quarantine_extreme_confirm_hits: 5
+  scale_quarantine_extreme_log_distance: 2.30
+  scale_quarantine_max_confirm_excess_log: 1.10
+  scale_quarantine_link_log_span: 0.45
+  scale_reliable_update_alpha: 0.20
+  scale_confirm_frames: 4
+  scale_consistency_log_span: 0.35
+  scale_max_log_change_per_frame: 0.025
+  scale_large_change_ratio: 1.8
+  scale_large_change_confirm_frames: 6
+  scale_micro_max_area_px: 80.0
+  scale_micro_confirm_frames: 3
+  scale_micro_exit_confirm_frames: 4
+  scale_micro_consistency_log_span: 0.55
+  scale_micro_max_log_change_per_frame: 0.12
+adaptation:
+  mode: adaptive_memory
+  ema:
+    alpha: 0.05
+    min_confidence: 0.68
+    min_identity_similarity: 0.48
+    min_confidence_gap: 0.1
+    max_prediction_error_px: 12.0
+    warmup_accepted_frames: 1
+    update_interval_frames: 2
+    max_updates: 10000
+    fast_alpha: 0.25
+    recent_bank_size: 5
+    recent_update_interval_frames: 1
+    fast_min_confidence: 0.52
+    fast_min_identity_similarity: 0.3
+    fast_min_confidence_gap: 0.08
+    fast_min_motion_score: 0.88
+    fast_max_prediction_error_px: 18.0
+    fast_min_size_score: 0.04
+    fast_burst_frames: 6
+    drift_score_trigger: 0.34
+    drift_similarity_trigger: 0.58
+    drift_size_ratio_trigger: 1.35
+ui:
+  show_debug_overlay: true
+  target_marker: green_center_cross
+  selection_marker: amber_cross
+  selection_roi: amber_dashed
+  candidate_overlay: cyan_numbered_boxes
+  best_candidate_overlay: green_box_cross
+evaluation:
+  ground_truth_tolerance_px: 20.0
+  acquisition_tolerance_px: 20.0
+  annotated_video_codec: mp4v
+  output_fps_mode: source
+  experiment_click_directions: 8
+  include_reacq_tentative_as_prediction: false
+hotfix1:
+  run_mode: live
+  pace_to_source_fps: true
+  show_search_roi: true
+  diagnostic_history_rows: 30
+hotfix2:
+  diagnostics_enabled: true
+  output_root: logs/live_diagnostics
+  save_incident_frames: true
+  pre_lost_frames: 8
+  post_lost_frames: 12
+  flush_every_frame: true
+  make_zip_bundle: true
+hotfix3:
+  adaptive_area_enabled: true
+  reacq_confirmation_rule: 3_of_5
+  tracking_lost_hysteresis_frames: 3
+  ema_default_enabled: true
+  source_diagnostic_bundle: user diagnostic_bundle.zip analyzed 2026-09-07
+hotfix4:
+  modes:
+  - auto
+  - visible
+  - thermal
+  thermal_detector: white_top_hat_hot_blob
+  reticle_suppression: static_mask_inpaint
+  static_candidate_penalty: reticle_overlap_x_motion_mismatch
+  source_diagnostic_bundle: thermal diagnostic_bundle.zip analyzed 2026-09-07
+hotfix5:
+  adaptive_memory_enabled: true
+  track_warmup_enabled: true
+  memory_layers:
+  - BaseBank
+  - SlowEMA
+  - FastEMA
+  - RecentBank
+  drift_rescue_enabled: true
+hotfix6:
+  motion_break: event_driven
+  global_motion_primary: phase_correlation_low_resolution
+  global_motion_fallback: sparse_lk_affine_ransac
+  robust_reacq: visual_tracklets
+  full_frame_fallback_after_frames: 8
+  target_performance_fps: 25.0
+  source_diagnostics: six HOTFIX-5 diagnostic bundles analyzed 2026-09-08
+hotfix6_rev1:
+  auto_promote_reacq: strong_visual_bad_motion_2_of_3
+  auto_promote_identity_min: 0.7
+  auto_promote_gap_min: 0.06
+  auto_promote_size_min: 0.04
+  global_shift_plausibility: phase_requires_feature_confirmation_if_large_or_discontinuous
+  phase_direct_max_fraction: 0.3
+  phase_max_change_from_previous_px: 90.0
+  source_diagnostics: three HOTFIX-6 diagnostic bundles analyzed 2026-09-08
+hotfix6_rev2:
+  priority: identity_first
+  principle: prefer_true_target_over_fast_global_reaction
+  micro_detector: shared_pass_thermal_micro_channel
+  micro_area_px:
+  - 3
+  - 80
+  safe_reacq: local_conservative_then_global_emergency
+  global_emergency_after_frames: 15
+  far_jump_identity_min: 0.88
+  far_jump_confirm_hits: 5
+  tentative_updates_reliable_anchor: false
+  tentative_updates_expected_area: false
+  warmup_large_jump_guard_px: 70.0
+  source_diagnostics: three REV1 bundles analyzed 2026-09-08
+observation:
+  profile: auto
+  auto_mapping:
+    visible: day
+    thermal: thermal
+  principle: shared_tracking_core_with_domain_specific_profiles
+profiles:
+  day:
+    label: DAY — дневное / видимый диапазон
+    video_mode: visible
+    summary: appearance + edge + projection + geometry + HSV color; conservative motion aid
+    overrides:
+      thermal:
+        video_mode: visible
+        reticle_mode: 'off'
+      identity:
+        weights:
+          appearance: 0.5
+          edge: 0.24
+          projection: 0.09
+          geometry: 0.07
+          color: 0.1
+          thermal_contrast: 0.0
+          hot_area: 0.0
+      acquire:
+        candidate_detector:
+          method: local_contrast_components
+          micro_enabled: false
+          adaptive_min_area_ratio: 0.12
+          adaptive_max_area_ratio: 4.5
+        initial_train:
+          identity_weight: 0.6
+          motion_weight: 0.3
+          size_weight: 0.1
+          motion_sigma_px: 28.0
+          bank_update_min_score: 0.62
+      tracking:
+        identity_weight: 0.6
+        motion_weight: 0.3
+        size_weight: 0.1
+        min_track_score: 0.48
+        min_identity_similarity: 0.42
+        motion_sigma_px: 30.0
+        prediction_error_warn_px: 35.0
+        drift_rescue_min_motion_score: 0.92
+        motion_break_error_px: 105.0
+        global_shift_trigger_error_px: 70.0
+        warmup_max_unexplained_jump_px: 75.0
+      reacquisition:
+        identity_weight: 0.74
+        motion_weight: 0.16
+        size_weight: 0.1
+        min_score: 0.5
+        min_identity_similarity: 0.46
+        broken_identity_weight: 0.9
+        broken_motion_weight: 0.03
+        broken_size_weight: 0.07
+        auto_promote_hits_required: 3
+        auto_promote_window_frames: 4
+        far_jump_distance_px: 115.0
+        far_jump_min_identity: 0.92
+        far_jump_min_gap: 0.12
+        far_jump_confirm_hits: 6
+        micro_detector_enabled: false
+        global_emergency_after_frames: 20
+        full_frame_after_frames: 20
+      adaptation:
+        ema:
+          alpha: 0.05
+          fast_alpha: 0.22
+          shape_alpha_multiplier: 1.0
+          thermal_alpha_multiplier: 1.0
+          color_alpha_multiplier: 1.0
+          drift_similarity_trigger: 0.56
+          drift_size_ratio_trigger: 1.4
+  thermal:
+    label: THERMAL — ночное / тепловизионное
+    video_mode: thermal
+    summary: conservative thermal identity + robust scale + MICRO + temporal anchor + multiscale initial ACQUIRE
+    overrides:
+      thermal:
+        video_mode: thermal
+        hud_suppression_enabled: false
+        reticle_mode: auto
+      identity:
+        weights:
+          appearance: 0.04
+          edge: 0.015
+          projection: 0.07
+          geometry: 0.015
+          color: 0.0
+          thermal_contrast: 0.16
+          hot_area: 0.2
+          peak_prominence: 0.18
+          hot_core_compactness: 0.14
+          radial_hotspot_profile: 0.14
+          energy_concentration: 0.04
+          thermal_2d_ratio: 0.0
+          _thermal_scale_adaptive: 1.0
+          _micro_area_threshold_px: 80.0
+          _small_area_threshold_px: 240.0
+          _micro_shape_factor: 0.2
+          _small_shape_factor: 0.55
+          _micro_thermal_boost: 1.38
+          _small_thermal_boost: 1.18
+      acquire:
+        candidate_detector:
+          method: thermal_hot_blob
+          acquire_multiscale_enabled: true
+          acquire_large_scale_sigma_px: 22.0
+          acquire_large_target_trigger_area_px: 2500.0
+          acquire_max_area_fraction_roi: 0.70
+          acquire_expand_roi_radius_px: 140
+          acquire_border_margin_px: 5
+          acquire_click_seed_enabled: true
+          acquire_click_seed_roi_radius_px: 180
+          acquire_click_seed_close_px: 11
+          acquire_click_seed_max_support_distance_px: 42.0
+          micro_enabled: true
+          micro_min_area_px: 3
+          micro_max_area_px: 80
+          adaptive_min_area_ratio: 0.1
+          adaptive_max_area_ratio: 5.0
+        initial_train:
+          identity_weight: 0.64
+          motion_weight: 0.23
+          size_weight: 0.13
+          motion_sigma_px: 34.0
+          bank_update_min_score: 0.58
+          temporal_click_acquire_enabled: true
+          temporal_click_bootstrap_frames: 5
+          temporal_click_min_stable_hits: 3
+          temporal_click_max_log_area_deviation: 0.35
+      tracking:
+        identity_weight: 0.7
+        motion_weight: 0.18
+        size_weight: 0.12
+        min_track_score: 0.44
+        min_identity_similarity: 0.36
+        motion_sigma_px: 36.0
+        prediction_error_warn_px: 42.0
+        size_update_min_identity: 0.62
+        size_update_min_gap: 0.06
+        size_update_max_prediction_error_px: 30.0
+        thermal_jump_quarantine_enabled: true
+        jump_quarantine_distance_px: 55.0
+        jump_extreme_distance_px: 80.0
+        jump_confirm_hits: 2
+        jump_extreme_confirm_hits: 3
+        jump_single_candidate_extra_hits: 1
+        jump_link_distance_px: 38.0
+        jump_min_identity: 0.60
+        jump_confirm_min_identity: 0.70
+        jump_min_gap: 0.04
+        jump_min_size_score: 0.025
+        jump_max_static_overlay_penalty: 0.40
+        jump_clutter_penalty_weight: 0.14
+        jump_anchor_norm_threshold: 3.0
+        jump_anchor_sigma_floor_px: 18.0
+        jump_local_preference_max_identity_deficit: 0.35
+        jump_global_motion_veto_response_min: 0.25
+        jump_global_motion_veto_residual_px: 55.0
+        reliable_anchor_update_max_prediction_error_px: 30.0
+        anchor_time_normalization_enabled: true
+        anchor_time_speed_multiplier: 1.5
+        anchor_time_min_speed_px_per_frame: 3.0
+        anchor_time_max_speed_px_per_frame: 22.0
+        anchor_time_max_growth_px: 360.0
+        thermal_frame_reliability_enabled: false
+        frame_reliability_max_dimension_px: 128
+        frame_reliability_residual_scale: 0.75
+        frame_reliability_phase_response_floor: 0.02
+        frame_reliability_phase_response_good: 0.50
+        frame_reliability_phase_weight: 0.15
+        frame_reliability_enter_threshold: 0.55
+        frame_reliability_exit_threshold: 0.72
+        frame_reliability_max_hold_frames: 5
+        thermal_hud_negative_enabled: true
+        hud_hard_probability_threshold: 0.90
+        hud_soft_probability_threshold: 0.45
+        hud_occlusion_max_frames: 18
+        hud_occlusion_prediction_tolerance_px: 48.0
+        hud_exit_confirm_hits: 2
+        hud_exit_link_distance_px: 42.0
+        hud_exit_min_identity: 0.52
+        hud_exit_max_probability: 0.30
+        drift_rescue_min_motion_score: 0.86
+        motion_break_error_px: 120.0
+        global_shift_trigger_error_px: 75.0
+        warmup_max_unexplained_jump_px: 65.0
+        scale_expansion_uncertainty_enabled: true
+        scale_expansion_uncertainty_min_identity: 0.70
+        scale_expansion_uncertainty_min_motion_score: 0.55
+        scale_expansion_uncertainty_min_gap: 0.02
+        scale_expansion_uncertainty_max_prediction_error_px: 45.0
+        scale_expansion_uncertainty_max_log_distance: 1.85
+        scale_expansion_uncertainty_min_raw_score: 0.44
+        thermal_scale_stability_enabled: true
+        thermal_scale_parameter_distance_enabled: true
+        scale_anchor_base_allowed_log_distance: 0.85
+        scale_anchor_growth_per_frame: 0.045
+        scale_anchor_max_allowed_log_distance: 1.60
+        scale_nonlinear_gate_strength: 1.50
+        scale_quarantine_confirm_hits: 3
+        scale_quarantine_extreme_confirm_hits: 5
+        scale_quarantine_extreme_log_distance: 2.30
+        scale_quarantine_max_confirm_excess_log: 1.10
+        scale_quarantine_link_log_span: 0.45
+        scale_reliable_update_alpha: 0.20
+        scale_confirm_frames: 4
+        scale_consistency_log_span: 0.35
+        scale_max_log_change_per_frame: 0.025
+        scale_large_change_ratio: 1.8
+        scale_large_change_confirm_frames: 6
+        scale_micro_max_area_px: 80.0
+        scale_micro_confirm_frames: 3
+        scale_micro_exit_confirm_frames: 4
+        scale_micro_consistency_log_span: 0.55
+        scale_micro_max_log_change_per_frame: 0.12
+        scale_robust_history_frames: 12
+      reacquisition:
+        identity_weight: 0.85
+        motion_weight: 0.05
+        size_weight: 0.1
+        min_score: 0.47
+        min_identity_similarity: 0.4
+        broken_identity_weight: 0.92
+        broken_motion_weight: 0.01
+        broken_size_weight: 0.07
+        broken_min_identity_similarity: 0.4
+        tracklet_top_k: 5
+        tracklet_window_frames: 7
+        tracklet_confirm_hits: 4
+        tracklet_max_link_distance_px: 110.0
+        auto_promote_window_frames: 4
+        auto_promote_hits_required: 3
+        micro_detector_enabled: true
+        micro_min_thermal_contrast: 0.45
+        micro_min_hot_area: 0.35
+        far_jump_distance_px: 90.0
+        anchor_time_normalization_enabled: true
+        anchor_time_speed_multiplier: 1.5
+        anchor_time_min_speed_px_per_frame: 3.0
+        anchor_time_max_speed_px_per_frame: 22.0
+        anchor_time_max_growth_px: 360.0
+        anchor_time_uncertainty_gain: 1.0
+        thermal_frame_reliability_enabled: false
+        frame_reliability_max_dimension_px: 128
+        frame_reliability_residual_scale: 0.75
+        frame_reliability_phase_response_floor: 0.02
+        frame_reliability_phase_response_good: 0.50
+        frame_reliability_phase_weight: 0.15
+        frame_reliability_enter_threshold: 0.55
+        frame_reliability_exit_threshold: 0.72
+        frame_reliability_max_hold_frames: 5
+        far_jump_min_identity: 0.78
+        far_jump_min_gap: 0.06
+        far_jump_confirm_hits: 6
+        global_emergency_after_frames: 15
+        full_frame_after_frames: 15
+        global_search_interval_frames: 3
+        global_diversity_min_distance_px: 80.0
+        tracklet_admission_min_identity: 0.55
+        tracklet_admission_min_score: 0.44
+        far_jump_admission_min_identity: 0.6
+        far_jump_admission_min_gap: 0.0
+        far_jump_admission_max_static_overlay_penalty: 0.45
+        far_jump_min_thermal_profile: 0.68
+        tracklet_max_scale_log_span: 0.65
+        size_update_min_identity: 0.62
+        size_update_min_gap: 0.06
+        thermal_scale_stability_enabled: true
+        thermal_scale_parameter_distance_enabled: true
+        scale_anchor_base_allowed_log_distance: 0.85
+        scale_anchor_growth_per_frame: 0.045
+        scale_anchor_max_allowed_log_distance: 1.60
+        scale_nonlinear_gate_strength: 1.50
+        scale_quarantine_confirm_hits: 3
+        scale_quarantine_extreme_confirm_hits: 5
+        scale_quarantine_extreme_log_distance: 2.30
+        scale_quarantine_max_confirm_excess_log: 1.10
+        scale_quarantine_link_log_span: 0.45
+        scale_reliable_update_alpha: 0.20
+        scale_confirm_frames: 4
+        scale_consistency_log_span: 0.35
+        scale_max_log_change_per_frame: 0.025
+        scale_large_change_ratio: 1.8
+        scale_large_change_confirm_frames: 6
+        scale_micro_max_area_px: 80.0
+        scale_micro_confirm_frames: 3
+        scale_micro_exit_confirm_frames: 4
+        scale_micro_consistency_log_span: 0.55
+        scale_micro_max_log_change_per_frame: 0.12
+      adaptation:
+        ema:
+          alpha: 0.045
+          fast_alpha: 0.24
+          shape_alpha_multiplier: 0.65
+          thermal_alpha_multiplier: 1.4
+          color_alpha_multiplier: 1.0
+          fast_min_identity_similarity: 0.26
+          drift_similarity_trigger: 0.58
+          drift_size_ratio_trigger: 1.35
+vt11:
+  architecture: shared_core_plus_day_and_thermal_profiles
+  day_profile: visible appearance/edge/projection/geometry/HSV color
+  thermal_profile: scale-adaptive thermal descriptors + MICRO + conservative ID-first REACQ
+  auto_profile: legacy image-domain inference maps to DAY or THERMAL
+  baseline: VT-10-HOTFIX-6-REV2-IDENTITY-FIRST
+vt11_hotfix1:
+  scope: THERMAL only; DAY profile unchanged
+  thermal_scale: immutable BaseArea + confirmed CurrentArea + separate MICRO_SCALE
+  thermal_identity: peak prominence + core compactness + radial hotspot profile + energy concentration
+  reacq: permissive temporal admission; conservative aggregate confirmation; global scan independent of MOTION_BREAK after
+    15 frames
+  global_scan_interval_frames: 3
+  night_dataset: use docs/THERMAL_DATASET_PROTOCOL_RU.md and scripts/Summarize-Thermal-Diagnostics.py
+
+vt11_hotfix2:
+  scope: THERMAL only; DAY profile unchanged
+  principle: reliable-anchor continuity before far-jump acceptance
+  spatial_guard: normalized ReliableAnchor innovation + prediction error
+  jump_quarantine_px: 55.0
+  extreme_jump_px: 80.0
+  local_identity_deficit_max: 0.35
+  single_candidate_gap: neutral
+  scale_updates_require_prediction_error_px_max: 30.0
+  background_clutter: robust immediate-ring heterogeneity soft penalty
+  source_diagnostics: diagnostic_bundle(20260909-031650) and diagnostic_bundle(20260909-031659)
+
+vt11_hotfix3:
+  scope: THERMAL only; DAY profile unchanged
+  anti_function: learned static HUD mask becomes explicit negative evidence independent of motion self-consistency
+  reticle_occlusion: freeze ReliableAnchor, scale and adaptation while predicted target crosses HUD; require temporal exit confirmation
+  reacq: HUD hard-negative candidates cannot confirm REACQ/tracklets
+
+# REV1 closure note / future work
+future_operator_selected_suppression:
+  planned: true
+  concept: operator selects a nuisance object/ROI and the system builds a negative reference/mask for that object
+  implemented_now: false

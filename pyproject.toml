@@ -8,6 +8,8 @@ version = "0.1.0"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
+    "numpy>=2.0,<3",
+    "PyYAML>=6.0,<7",
     "pyserial>=3.5",
     "opencv-python>=4.8",
     "PyQt6>=6.5",
@@ -34,8 +36,41 @@ package-dir = {"" = "src"}
 [tool.setuptools.packages.find]
 where = ["src"]
 
+[tool.setuptools.package-data]
+"navmin.vision.processors.vt11.config" = ["*.yaml"]
+
 [tool.ruff]
 target-version = "py313"
+
+# VT11 REV5 is imported source-preservingly in Stage 2A. Keep the original
+# algorithm and regression-test style while continuing to run every other rule.
+[tool.ruff.lint.per-file-ignores]
+"src/navmin/vision/processors/vt11/**/*.py" = [
+    "B023",
+    "BLE001",
+    "C408",
+    "DTZ005",
+    "F401",
+    "I001",
+    "PIE810",
+    "RUF007",
+    "RUF012",
+    "RUF022",
+    "RUF046",
+    "RUF059",
+    "TRY004",
+    "UP024",
+    "UP035",
+    "UP037",
+]
+"tests/vt11/**/*.py" = [
+    "C408",
+    "F401",
+    "F841",
+    "I001",
+    "PIE808",
+    "RUF059",
+]
 
 [tool.pytest.ini_options]
 minversion = "7.0"

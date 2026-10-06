@@ -1,0 +1,68 @@
+profile: day
+label: DAY — дневное / видимый диапазон
+video_mode: visible
+summary: appearance + edge + projection + geometry + HSV color; conservative motion aid
+overrides:
+  thermal:
+    video_mode: visible
+    reticle_mode: 'off'
+  identity:
+    weights:
+      appearance: 0.5
+      edge: 0.24
+      projection: 0.09
+      geometry: 0.07
+      color: 0.1
+      thermal_contrast: 0.0
+      hot_area: 0.0
+  acquire:
+    candidate_detector:
+      method: local_contrast_components
+      micro_enabled: false
+      adaptive_min_area_ratio: 0.12
+      adaptive_max_area_ratio: 4.5
+    initial_train:
+      identity_weight: 0.6
+      motion_weight: 0.3
+      size_weight: 0.1
+      motion_sigma_px: 28.0
+      bank_update_min_score: 0.62
+  tracking:
+    identity_weight: 0.6
+    motion_weight: 0.3
+    size_weight: 0.1
+    min_track_score: 0.48
+    min_identity_similarity: 0.42
+    motion_sigma_px: 30.0
+    prediction_error_warn_px: 35.0
+    drift_rescue_min_motion_score: 0.92
+    motion_break_error_px: 105.0
+    global_shift_trigger_error_px: 70.0
+    warmup_max_unexplained_jump_px: 75.0
+  reacquisition:
+    identity_weight: 0.74
+    motion_weight: 0.16
+    size_weight: 0.1
+    min_score: 0.5
+    min_identity_similarity: 0.46
+    broken_identity_weight: 0.9
+    broken_motion_weight: 0.03
+    broken_size_weight: 0.07
+    auto_promote_hits_required: 3
+    auto_promote_window_frames: 4
+    far_jump_distance_px: 115.0
+    far_jump_min_identity: 0.92
+    far_jump_min_gap: 0.12
+    far_jump_confirm_hits: 6
+    micro_detector_enabled: false
+    global_emergency_after_frames: 20
+    full_frame_after_frames: 20
+  adaptation:
+    ema:
+      alpha: 0.05
+      fast_alpha: 0.22
+      shape_alpha_multiplier: 1.0
+      thermal_alpha_multiplier: 1.0
+      color_alpha_multiplier: 1.0
+      drift_similarity_trigger: 0.56
+      drift_size_ratio_trigger: 1.4

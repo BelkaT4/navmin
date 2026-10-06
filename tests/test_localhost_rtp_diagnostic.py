@@ -340,7 +340,7 @@ def test_detector_friendly_scene_survives_jpeg_and_keeps_stable_track() -> None:
                     receive_timestamp_ns=frame_id * 50_000_000,
                     image=corrector.correct(decoded),
                 )
-            )
+            ).result
             tracked_by_frame.append(result.tracked_objects)
 
         settled = tracked_by_frame[20:]

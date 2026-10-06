@@ -285,6 +285,7 @@ class ApplicationRuntime:
         return CameraUiBinding(
             camera=pipeline.camera,
             session_barriers=pipeline.session_barriers,
+            target_events=pipeline.target_events,
             latest_result=pipeline.latest_result,
             status=pipeline.status,
         )
@@ -331,6 +332,16 @@ def build_application_runtime(
         aiming_config=config.aiming,
         ui_config=config.ui,
         turret=turret_worker,
+        target_controls={
+            CameraRole.OVERVIEW: overview_worker.pipeline.target_control,
+            CameraRole.STEREO_LEFT: stereo_left_worker.pipeline.target_control,
+        },
+        vision_processing_enabled={
+            CameraRole.OVERVIEW: config.vision.cameras.overview.processing_enabled,
+            CameraRole.STEREO_LEFT: (
+                config.vision.cameras.stereo_left.processing_enabled
+            ),
+        },
     )
     return ApplicationRuntime(
         overview_worker=overview_worker,

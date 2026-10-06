@@ -127,7 +127,7 @@ def test_synthetic_scenes_produce_one_stable_real_track_per_camera() -> None:
                     receive_timestamp_ns=round(frame_id * 1_000_000_000 / fps),
                     image=image,
                 )
-            )
+            ).result
             tracked_by_frame.append(result.tracked_objects)
 
         settled_tracks = tracked_by_frame[12:]
@@ -552,6 +552,11 @@ def test_tracking_ui_selection_drives_real_velocity_loop_to_fake_stm32() -> None
             pos=click,
         )
         application.processEvents()
+        pump_until(
+            lambda: runtime.mediator.selected_target is not None,
+            timeout=1.0,
+            message="Vision lifecycle did not confirm selected target",
+        )
         selected = runtime.mediator.selected_target
         assert selected is not None
         assert selected.camera is CameraRole.OVERVIEW
@@ -795,6 +800,13 @@ def _activate_real_overview_tracking(runtime, window, application, endpoint):
     velocity_baseline = len(_executed(endpoint, CommandCode.SET_VELOCITY))
     QTest.mouseClick(window.main_view, Qt.MouseButton.LeftButton, pos=click)
     application.processEvents()
+    _pump_qt_until(
+        window,
+        application,
+        lambda: runtime.mediator.selected_target is not None,
+        timeout=1.0,
+        message="Vision lifecycle did not confirm selected target",
+    )
     selected = runtime.mediator.selected_target
     assert selected is not None
     _pump_qt_until(

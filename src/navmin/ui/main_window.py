@@ -25,7 +25,6 @@ from navmin.contracts import (
     CameraSessionStarted,
     CameraStatus,
     MotorState,
-    TargetRef,
     TurretControlMode,
     TurretState,
     VisionResult,
@@ -321,34 +320,12 @@ class MainWindow(QMainWindow):
         if mode is TurretControlMode.RELATIVE:
             self._mediator.handle_relative_click(displayed_result, x_px, y_px)
         elif mode is TurretControlMode.TRACKING:
-            tracked = self._hit_test(displayed_result, x_px, y_px)
-            if tracked is None:
-                self._mediator.deselect_target()
-            else:
-                self._mediator.select_target(
-                    TargetRef(
-                        camera=displayed_result.frame.camera,
-                        generation=displayed_result.frame.generation,
-                        track_id=tracked,
-                    )
-                )
+            self._mediator.request_target_selection(
+                displayed_result,
+                x_px,
+                y_px,
+            )
         self.refresh_presentation()
-
-    @staticmethod
-    def _hit_test(result: VisionResult, x_px: float, y_px: float) -> int | None:
-        candidates: list[tuple[float, int]] = []
-        for tracked in result.tracked_objects:
-            bbox = tracked.bbox
-            if not (
-                bbox.x <= x_px < bbox.x + bbox.width
-                and bbox.y <= y_px < bbox.y + bbox.height
-            ):
-                continue
-            center_x = bbox.x + bbox.width / 2.0
-            center_y = bbox.y + bbox.height / 2.0
-            distance_squared = (center_x - x_px) ** 2 + (center_y - y_px) ** 2
-            candidates.append((distance_squared, tracked.track_id))
-        return min(candidates)[1] if candidates else None
 
     def _request_other_mode(self) -> None:
         current = self._mediator.turret_state.control_mode

@@ -97,6 +97,70 @@ class TargetRef:
     track_id: int
 
 
+@dataclass(frozen=True)
+class TargetSelectionRequest:
+    selection_id: int
+    camera: CameraRole
+    generation: int
+    frame_id: int
+    x_px: float
+    y_px: float
+
+
+@dataclass(frozen=True)
+class ClearTargetSelection:
+    camera: CameraRole
+    generation: int
+
+
+VisionTargetControlCommand = TargetSelectionRequest | ClearTargetSelection
+
+
+class TargetAcquisitionFailureReason(Enum):
+    NO_TARGET_AT_POINT = "no_target_at_point"
+    STALE_SELECTION = "stale_selection"
+    AMBIGUOUS = "ambiguous"
+    INSUFFICIENT_EVIDENCE = "insufficient_evidence"
+    ACQUISITION_FAILED = "acquisition_failed"
+
+
+@dataclass(frozen=True)
+class TargetAcquired:
+    selection_id: int
+    target: TargetRef
+    request_frame_id: int
+    decision_frame_id: int
+    decision_frame_timestamp_ns: int
+
+
+@dataclass(frozen=True)
+class TargetAcquisitionFailed:
+    selection_id: int
+    camera: CameraRole
+    generation: int
+    request_frame_id: int
+    reason: TargetAcquisitionFailureReason
+    decision_frame_id: int | None
+    decision_frame_timestamp_ns: int | None
+
+
+class TargetTrackingEndReason(Enum):
+    LOST_UNRECOVERED = "lost_unrecovered"
+
+
+@dataclass(frozen=True)
+class TargetTrackingEnded:
+    target: TargetRef
+    reason: TargetTrackingEndReason
+    decision_frame_id: int
+    decision_frame_timestamp_ns: int
+
+
+TargetLifecycleEvent = (
+    TargetAcquired | TargetAcquisitionFailed | TargetTrackingEnded
+)
+
+
 class DistanceSource(Enum):
     STEREO = "stereo"
     MANUAL = "manual"

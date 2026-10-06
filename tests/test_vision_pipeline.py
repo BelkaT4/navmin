@@ -25,6 +25,7 @@ from navmin.vision.pipeline import (
     overview_corrector,
     stereo_left_corrector,
 )
+from navmin.vision.processor import VisionProcessorOutput
 
 WIDTH = 32
 HEIGHT = 24
@@ -91,10 +92,12 @@ class _RecordingProcessor:
         frame: FramePacket,
         *,
         processing_enabled: bool = True,
-    ) -> VisionResult:
+    ) -> VisionProcessorOutput:
         self.frames.append(frame)
         self.processing_flags.append(processing_enabled)
-        return VisionResult(frame=frame, tracked_objects=(), processing_time_ns=0)
+        return VisionProcessorOutput(
+            result=VisionResult(frame=frame, tracked_objects=(), processing_time_ns=0)
+        )
 
 
 class _Clock:

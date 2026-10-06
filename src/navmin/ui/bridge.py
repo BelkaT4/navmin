@@ -8,7 +8,11 @@ from queue import Empty
 
 from PyQt6.QtCore import QObject, QTimer
 
-from navmin.concurrency import CameraSessionBarrierChannel, LatestValue
+from navmin.concurrency import (
+    CameraSessionBarrierChannel,
+    LatestValue,
+    TargetLifecycleEventChannel,
+)
 from navmin.contracts import (
     CameraRole,
     CameraSessionStarted,
@@ -25,6 +29,7 @@ class CameraUiBinding:
 
     camera: CameraRole
     session_barriers: CameraSessionBarrierChannel
+    target_events: TargetLifecycleEventChannel
     latest_result: LatestValue[VisionResult]
     status: LatestValue[CameraStatus]
 
@@ -71,10 +76,12 @@ class UiStatePump(QObject):
         self.timer.stop()
 
     def pump_once(self) -> None:
-        """Drain every barrier first, then process each freshest latest value."""
+        """Apply barriers, lifecycle FIFO, latest results, then ordinary state."""
         for binding in self._camera_bindings.values():
             self._drain_barriers(binding)
 
+        for binding in self._camera_bindings.values():
+            self._drain_target_events(binding)
         for binding in self._camera_bindings.values():
             self._process_vision(binding)
         self._process_turret_state()
@@ -90,6 +97,14 @@ class UiStatePump(QObject):
                 return
             if self._mediator.accept_camera_session(session):
                 self._on_camera_session(session)
+
+    def _drain_target_events(self, binding: CameraUiBinding) -> None:
+        while True:
+            try:
+                event = binding.target_events.receive_nowait()
+            except Empty:
+                return
+            self._mediator.accept_target_lifecycle_event(event)
 
     def _process_vision(self, binding: CameraUiBinding) -> None:
         snapshot = binding.latest_result.snapshot()
@@ -129,7 +144,10 @@ class UiStatePump(QObject):
         if snapshot.revision <= self._status_revisions[binding.camera]:
             return
         self._status_revisions[binding.camera] = snapshot.revision
-        if snapshot.value is not None:
+        if (
+            snapshot.value is not None
+            and self._mediator.accept_camera_status(snapshot.value)
+        ):
             self._on_camera_status(snapshot.value)
 
 
