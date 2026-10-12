@@ -10,7 +10,7 @@ usage() {
 Usage:
   sudo tools/platform/linux/setup_camera_network.sh
 
-Reads the local host settings from config/host.local.env (or NAVMIN_HOST_CONFIG),
+Reads the local host settings from config/host.env (or NAVMIN_HOST_CONFIG),
 clones the currently active NetworkManager connection on the configured
 interface when necessary, and applies the configured static PC IPv4 address.
 
@@ -40,12 +40,12 @@ case "${1:-}" in
     exit 0
     ;;
   *)
-    fail "this script takes no positional arguments; edit config/host.local.env"
+    fail "this script takes no positional arguments; edit config/host.env"
     ;;
 esac
 
 CONFIG_FILE=$(navmin_host_config_path "$repo_root")
-[ -f "$CONFIG_FILE" ] || fail "host config not found: $CONFIG_FILE; copy config/host.example.env to config/host.local.env and edit it"
+[ -f "$CONFIG_FILE" ] || fail "host config not found: $CONFIG_FILE; copy config/defaults/host.env to config/host.env and edit it"
 INTERFACE=$(navmin_host_config_get CAMERA_INTERFACE "$CONFIG_FILE") || fail "CAMERA_INTERFACE is missing or duplicated in $CONFIG_FILE"
 ADDRESS=$(navmin_host_config_get CAMERA_HOST_ADDRESS "$CONFIG_FILE") || fail "CAMERA_HOST_ADDRESS is missing or duplicated in $CONFIG_FILE"
 PROFILE=$(navmin_host_config_get CAMERA_PROFILE_NAME "$CONFIG_FILE") || fail "CAMERA_PROFILE_NAME is missing or duplicated in $CONFIG_FILE"

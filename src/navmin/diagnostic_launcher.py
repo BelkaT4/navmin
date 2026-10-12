@@ -18,6 +18,7 @@ from navmin.config import (
     AxesConfig,
     AxisMechanicsConfig,
     CamerasConfig,
+    OverviewCameraConfig,
     PidControllerConfig,
     ProcessingScope,
     RtpJpegSourceConfig,
@@ -51,11 +52,7 @@ from navmin.preflight import (
     format_preflight_summary,
     run_startup_preflight,
 )
-from navmin.session_artifacts import (
-    SessionArtifacts,
-    SessionStatus,
-    SourceInputPaths,
-)
+from navmin.session_artifacts import SessionArtifacts, SessionStatus
 
 LOGGER = logging.getLogger(__name__)
 
@@ -201,11 +198,18 @@ def _synthetic_diagnostic_inputs() -> LoadedApplicationInputs:
         microstep_divider=16,
         max_relative_move_deg=45.0,
     )
-    overview = replace(diagnostic_camera_config(8888), processing_enabled=True)
+    overview_base = replace(diagnostic_camera_config(8888), processing_enabled=True)
+    overview = OverviewCameraConfig(
+        enabled=overview_base.enabled,
+        source=overview_base.source,
+        processing_enabled=overview_base.processing_enabled,
+        vision_processor_class=overview_base.vision_processor_class,
+        calibration_file="calibration/overview.json",
+    )
     stereo_left = replace(diagnostic_camera_config(8889), processing_enabled=True)
     stereo_right = diagnostic_camera_config(8890)
     config = AppConfig(
-        schema_version=1,
+        schema_version=2,
         vision=VisionConfig(
             processing_scope=ProcessingScope.MAIN_AND_PREVIEW,
             cameras=CamerasConfig(
@@ -221,6 +225,7 @@ def _synthetic_diagnostic_inputs() -> LoadedApplicationInputs:
                     stereo_enabled=False,
                     right_frame_buffer_size=4,
                     pair_timeout_ms=100,
+                    calibration_file="calibration/stereo.json",
                 ),
             ),
             camera_stale_timeout_ms=500,
@@ -317,16 +322,16 @@ def _parser() -> argparse.ArgumentParser:
             "endpoints and a real/PTY controller endpoint."
         ),
     )
-    parser.add_argument("--config", type=Path, default=Path("config.json"))
+    parser.add_argument("--config", type=Path, default=Path("config/navmin.json"))
     parser.add_argument(
         "--overview-calibration",
         type=Path,
-        default=Path("calibration/overview.json"),
+        default=None,
     )
     parser.add_argument(
         "--stereo-calibration",
         type=Path,
-        default=Path("calibration/stereo.json"),
+        default=None,
     )
     parser.add_argument(
         "--log-dir",
@@ -398,19 +403,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         turret_backend=selection.turret.value,
         input_mode="synthetic" if args.synthetic_inputs else "files",
     )
-    source_paths = None
-    if not args.synthetic_inputs:
-        source_paths = SourceInputPaths(
-            config=paths.config,
-            overview_calibration=paths.overview_calibration,
-            stereo_calibration=paths.stereo_calibration,
-        )
-
     with session_file_logging(artifacts.runtime_log_path, level=logging.DEBUG):
         LOGGER.info(
             "Diagnostic launcher selected overview=%s stereo_left=%s turret=%s; "
-            "inputs=%s config=%s overview_calibration=%s "
-            "stereo_calibration=%s session=%s",
+            "inputs=%s config=%s overview_calibration_override=%s "
+            "stereo_calibration_override=%s session=%s",
             selection.overview.value,
             selection.stereo_left.value,
             selection.turret.value,
@@ -483,7 +480,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 config=effective_inputs.config,
                 overview_calibration=effective_inputs.overview_calibration,
                 stereo_calibration=effective_inputs.stereo_calibration,
-                source_paths=source_paths,
+                source_paths=effective_inputs.source_paths,
             )
             exit_code = run_loaded_application(
                 effective_inputs,

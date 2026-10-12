@@ -21,6 +21,7 @@ from navmin.config.models import (
     AxisMechanicsConfig,
     CameraConfig,
     CamerasConfig,
+    OverviewCameraConfig,
     PidControllerConfig,
     ProcessingScope,
     RtpJpegSourceConfig,
@@ -74,6 +75,17 @@ def _camera(port: int, *, enabled: bool = True) -> CameraConfig:
     )
 
 
+def _overview_camera(port: int) -> OverviewCameraConfig:
+    camera = _camera(port)
+    return OverviewCameraConfig(
+        enabled=camera.enabled,
+        source=camera.source,
+        processing_enabled=camera.processing_enabled,
+        vision_processor_class=camera.vision_processor_class,
+        calibration_file="calibration/overview.json",
+    )
+
+
 def _rtsp_camera(uri: str) -> CameraConfig:
     return CameraConfig(
         enabled=True,
@@ -99,11 +111,11 @@ def _config() -> AppConfig:
         max_relative_move_deg=45.0,
     )
     return AppConfig(
-        schema_version=1,
+        schema_version=2,
         vision=VisionConfig(
             processing_scope=ProcessingScope.MAIN_AND_PREVIEW,
             cameras=CamerasConfig(
-                overview=_camera(8888),
+                overview=_overview_camera(8888),
                 stereo_left=_camera(8889),
                 stereo_right=_camera(8890),
             ),
@@ -115,6 +127,7 @@ def _config() -> AppConfig:
                     stereo_enabled=False,
                     right_frame_buffer_size=4,
                     pair_timeout_ms=100,
+                    calibration_file="calibration/stereo.json",
                 ),
             ),
             camera_stale_timeout_ms=500,

@@ -15,6 +15,7 @@ from navmin.config import (
     UnsupportedConfigSchemaError,
     changed_config_paths,
     config_apply_policy,
+    config_to_mapping,
     load_config,
     parse_config,
     save_config,
@@ -24,7 +25,7 @@ from navmin.contracts import CameraRole, DistanceSource
 
 def _valid_config() -> dict:
     return {
-        "schema-version": 1,
+        "schema-version": 2,
         "vision": {
             "processing-scope": "main-only",
             "cameras": {
@@ -38,6 +39,7 @@ def _valid_config() -> dict:
                     },
                     "processing-enabled": True,
                     "vision-processor-class": "DefaultVisionProcessor",
+                    "calibration-file": "calibration/overview.json",
                 },
                 "stereo-left": {
                     "enabled": True,
@@ -70,6 +72,7 @@ def _valid_config() -> dict:
                     "stereo-enabled": False,
                     "right-frame-buffer-size": 4,
                     "pair-timeout-ms": 100,
+                    "calibration-file": "calibration/stereo.json",
                 },
             },
             "camera-stale-timeout-ms": 500,
@@ -134,10 +137,13 @@ def _write_json(path, data) -> None:
     path.write_text(json.dumps(data), encoding="utf-8")
 
 
-def test_valid_schema_v1_builds_typed_immutable_snapshot() -> None:
+def test_valid_schema_v2_builds_typed_immutable_snapshot() -> None:
     config = parse_config(_valid_config())
 
-    assert config.schema_version == 1
+    assert config.schema_version == 2
+    assert config.vision.cameras.overview.calibration_file == "calibration/overview.json"
+    assert not hasattr(config.vision.cameras.stereo_left, "calibration_file")
+    assert not hasattr(config.vision.cameras.stereo_right, "calibration_file")
     assert config.vision.distance.source is DistanceSource.MANUAL
     assert config.ui.default_camera is CameraRole.OVERVIEW
     assert config.turret.serial.baudrate == 115200
@@ -300,7 +306,7 @@ def test_missing_config_is_explicit_error(tmp_path) -> None:
 
 def test_malformed_json_is_preserved(tmp_path) -> None:
     path = tmp_path / "config.json"
-    original = b'{"schema-version": 1, broken}'
+    original = b'{"schema-version": 2, broken}'
     path.write_bytes(original)
 
     with pytest.raises(ConfigJsonError):
@@ -314,7 +320,7 @@ def test_malformed_json_is_preserved(tmp_path) -> None:
     [
         (lambda data: data.pop("schema-version"), "schema-version"),
         (lambda data: data.__setitem__("schema-version", True), "schema-version"),
-        (lambda data: data.__setitem__("schema-version", "1"), "schema-version"),
+        (lambda data: data.__setitem__("schema-version", "2"), "schema-version"),
     ],
 )
 def test_missing_or_invalid_schema_version_is_validation_error(mutation, path) -> None:
@@ -328,15 +334,17 @@ def test_missing_or_invalid_schema_version_is_validation_error(mutation, path) -
     assert not isinstance(exc_info.value, UnsupportedConfigSchemaError)
 
 
-def test_unsupported_schema_is_distinct_error() -> None:
+@pytest.mark.parametrize("unsupported", [1, 3])
+def test_unsupported_schema_is_distinct_error(unsupported: int) -> None:
     data = _valid_config()
-    data["schema-version"] = 2
+    data["schema-version"] = unsupported
 
     with pytest.raises(UnsupportedConfigSchemaError) as exc_info:
         parse_config(data)
 
     assert exc_info.value.path == "schema-version"
-    assert exc_info.value.actual == 2
+    assert exc_info.value.actual == unsupported
+    assert "expected 2" in str(exc_info.value)
 
 
 @pytest.mark.parametrize(
@@ -380,6 +388,90 @@ def test_missing_required_field_reports_exact_path() -> None:
 
     assert exc_info.value.path == "turret.serial.response-timeout-ms"
     assert "missing required" in exc_info.value.reason
+
+
+@pytest.mark.parametrize(
+    ("mutate", "expected_path"),
+    [
+        (
+            lambda d: d["vision"]["cameras"]["overview"].pop("calibration-file"),
+            "vision.cameras.overview.calibration-file",
+        ),
+        (
+            lambda d: d["vision"]["cameras"]["overview"].__setitem__(
+                "calibration-file", ""
+            ),
+            "vision.cameras.overview.calibration-file",
+        ),
+        (
+            lambda d: d["vision"]["distance"]["stereo"].pop("calibration-file"),
+            "vision.distance.stereo.calibration-file",
+        ),
+        (
+            lambda d: d["vision"]["distance"]["stereo"].__setitem__(
+                "calibration-file", ""
+            ),
+            "vision.distance.stereo.calibration-file",
+        ),
+        (
+            lambda d: d["vision"]["cameras"]["stereo-left"].__setitem__(
+                "calibration-file", "calibration/left.json"
+            ),
+            "vision.cameras.stereo-left.calibration-file",
+        ),
+        (
+            lambda d: d["vision"]["cameras"]["stereo-right"].__setitem__(
+                "calibration-file", "calibration/right.json"
+            ),
+            "vision.cameras.stereo-right.calibration-file",
+        ),
+    ],
+)
+def test_schema_v2_calibration_references_are_required_and_role_owned(
+    mutate, expected_path
+) -> None:
+    data = _valid_config()
+    mutate(data)
+
+    with pytest.raises(ConfigValidationError) as exc_info:
+        parse_config(data)
+
+    assert exc_info.value.path == expected_path
+
+
+def test_config_to_mapping_round_trips_calibration_references() -> None:
+    config = parse_config(_valid_config())
+    mapped = config_to_mapping(config)
+
+    assert (
+        mapped["vision"]["cameras"]["overview"]["calibration-file"]
+        == "calibration/overview.json"
+    )
+    assert (
+        mapped["vision"]["distance"]["stereo"]["calibration-file"]
+        == "calibration/stereo.json"
+    )
+    assert "calibration-file" not in mapped["vision"]["cameras"]["stereo-left"]
+    assert "calibration-file" not in mapped["vision"]["cameras"]["stereo-right"]
+
+
+def test_repository_defaults_parse_with_production_loaders() -> None:
+    from pathlib import Path
+
+    from navmin.calibration import load_overview_calibration, load_stereo_calibration
+
+    root = Path(__file__).resolve().parents[1]
+    defaults = root / "config" / "defaults"
+
+    config = load_config(defaults / "navmin.json")
+    overview = load_overview_calibration(defaults / "calibration" / "overview.json")
+    stereo = load_stereo_calibration(defaults / "calibration" / "stereo.json")
+
+    assert config.schema_version == 2
+    assert config.vision.cameras.overview.calibration_file == "calibration/overview.json"
+    assert config.vision.distance.stereo.calibration_file == "calibration/stereo.json"
+    assert overview.schema_version == 1
+    assert stereo.schema_version == 1
 
 
 def test_optional_aim_point_missing_and_null_both_mean_center() -> None:
@@ -566,7 +658,7 @@ def test_rtsp_config_round_trip_preserves_source_specific_fields(tmp_path) -> No
     save_config(path, config)
 
     saved = json.loads(path.read_text(encoding="utf-8"))
-    assert saved["schema-version"] == 1
+    assert saved["schema-version"] == 2
     assert saved["vision"]["cameras"]["overview"]["source"] == data["vision"]["cameras"]["overview"]["source"]
     assert load_config(path) == config
 
@@ -589,6 +681,12 @@ def test_change_metadata_reports_only_fixed_architecture_classification() -> Non
     data = _valid_config()
     data["aiming"]["lead-time-ms"] = 250
     data["vision"]["cameras"]["overview"]["vision-processor-class"] = "Other"
+    data["vision"]["cameras"]["overview"]["calibration-file"] = (
+        "calibration/overview-b.json"
+    )
+    data["vision"]["distance"]["stereo"]["calibration-file"] = (
+        "calibration/stereo-b.json"
+    )
     data["turret"]["serial"]["port"] = "/dev/ttyUSB1"
     data["turret"]["serial"]["baudrate"] = 57600
     data["turret"]["serial"]["response-timeout-ms"] = 150
@@ -606,6 +704,8 @@ def test_change_metadata_reports_only_fixed_architecture_classification() -> Non
     assert "aiming.lead-time-ms" in paths
     assert "turret.axes.x.max-relative-move-deg" in paths
     assert "turret.axes.y.max-relative-move-deg" in paths
+    assert "vision.cameras.overview.calibration-file" in paths
+    assert "vision.distance.stereo.calibration-file" in paths
     assert (
         config_apply_policy("aiming.lead-time-ms")
         is ConfigApplyPolicy.DYNAMIC
@@ -613,6 +713,14 @@ def test_change_metadata_reports_only_fixed_architecture_classification() -> Non
     assert (
         config_apply_policy("vision.cameras.overview.vision-processor-class")
         is ConfigApplyPolicy.CAMERA_PIPELINE_RESTART
+    )
+    assert (
+        config_apply_policy("vision.cameras.overview.calibration-file")
+        is ConfigApplyPolicy.APPLICATION_RESTART
+    )
+    assert (
+        config_apply_policy("vision.distance.stereo.calibration-file")
+        is ConfigApplyPolicy.APPLICATION_RESTART
     )
     assert (
         config_apply_policy("vision.cameras.overview.source.type")

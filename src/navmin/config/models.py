@@ -62,8 +62,13 @@ class CameraConfig:
 
 
 @dataclass(frozen=True)
+class OverviewCameraConfig(CameraConfig):
+    calibration_file: str
+
+
+@dataclass(frozen=True)
 class CamerasConfig:
-    overview: CameraConfig
+    overview: OverviewCameraConfig
     stereo_left: CameraConfig
     stereo_right: CameraConfig
 
@@ -73,6 +78,7 @@ class StereoDistanceConfig:
     stereo_enabled: bool
     right_frame_buffer_size: int
     pair_timeout_ms: int
+    calibration_file: str
 
 
 @dataclass(frozen=True)
@@ -197,6 +203,12 @@ def config_apply_policy(path: str) -> ConfigApplyPolicy | None:
     """
     if path in _DYNAMIC_EXACT_PATHS:
         return ConfigApplyPolicy.DYNAMIC
+
+    if path in {
+        "vision.cameras.overview.calibration-file",
+        "vision.distance.stereo.calibration-file",
+    }:
+        return ConfigApplyPolicy.APPLICATION_RESTART
 
     parts = path.split(".")
     if (

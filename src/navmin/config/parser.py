@@ -1,4 +1,4 @@
-"""Strict parser and serializer for NavMin config schema v1."""
+"""Strict parser and serializer for NavMin config schema v2."""
 
 from __future__ import annotations
 
@@ -20,6 +20,7 @@ from .models import (
     AxisMechanicsConfig,
     CameraConfig,
     CamerasConfig,
+    OverviewCameraConfig,
     PidControllerConfig,
     ProcessingScope,
     RtpJpegSourceConfig,
@@ -35,7 +36,7 @@ from .models import (
     VisionDistanceConfig,
 )
 
-SUPPORTED_SCHEMA_VERSION = 1
+SUPPORTED_SCHEMA_VERSION = 2
 SUPPORTED_BAUDRATES = frozenset({9600, 19200, 38400, 57600, 115200})
 
 
@@ -251,6 +252,33 @@ def _parse_camera(value: Any, path: str) -> CameraConfig:
     )
 
 
+def _parse_overview_camera(value: Any, path: str) -> OverviewCameraConfig:
+    obj = _fields(
+        value,
+        path,
+        required={
+            "enabled",
+            "source",
+            "processing-enabled",
+            "vision-processor-class",
+            "calibration-file",
+        },
+    )
+    return OverviewCameraConfig(
+        enabled=_bool(obj["enabled"], f"{path}.enabled"),
+        source=_parse_camera_source(obj["source"], f"{path}.source"),
+        processing_enabled=_bool(
+            obj["processing-enabled"], f"{path}.processing-enabled"
+        ),
+        vision_processor_class=_nonempty_string(
+            obj["vision-processor-class"], f"{path}.vision-processor-class"
+        ),
+        calibration_file=_nonempty_string(
+            obj["calibration-file"], f"{path}.calibration-file"
+        ),
+    )
+
+
 def _parse_vision(value: Any) -> VisionConfig:
     path = "vision"
     obj = _fields(
@@ -276,7 +304,9 @@ def _parse_vision(value: Any) -> VisionConfig:
         required={"overview", "stereo-left", "stereo-right"},
     )
     cameras = CamerasConfig(
-        overview=_parse_camera(cameras_obj["overview"], f"{path}.cameras.overview"),
+        overview=_parse_overview_camera(
+            cameras_obj["overview"], f"{path}.cameras.overview"
+        ),
         stereo_left=_parse_camera(
             cameras_obj["stereo-left"], f"{path}.cameras.stereo-left"
         ),
@@ -303,7 +333,12 @@ def _parse_vision(value: Any) -> VisionConfig:
     stereo_obj = _fields(
         distance_obj["stereo"],
         f"{path}.distance.stereo",
-        required={"stereo-enabled", "right-frame-buffer-size", "pair-timeout-ms"},
+        required={
+            "stereo-enabled",
+            "right-frame-buffer-size",
+            "pair-timeout-ms",
+            "calibration-file",
+        },
     )
     distance = VisionDistanceConfig(
         source=DistanceSource(source),
@@ -331,6 +366,10 @@ def _parse_vision(value: Any) -> VisionConfig:
                 stereo_obj["pair-timeout-ms"],
                 f"{path}.distance.stereo.pair-timeout-ms",
                 minimum=1,
+            ),
+            calibration_file=_nonempty_string(
+                stereo_obj["calibration-file"],
+                f"{path}.distance.stereo.calibration-file",
             ),
         ),
     )
@@ -575,7 +614,7 @@ def _parse_ui(value: Any) -> UiConfig:
 
 
 def parse_config(data: Any) -> AppConfig:
-    """Validate an already decoded JSON value and return schema-v1 snapshot."""
+    """Validate an already decoded JSON value and return schema-v2 snapshot."""
     obj = _fields(
         data,
         "",
@@ -645,18 +684,26 @@ def _camera_to_mapping(config: CameraConfig) -> dict[str, Any]:
     }
 
 
+def _overview_camera_to_mapping(config: OverviewCameraConfig) -> dict[str, Any]:
+    result = _camera_to_mapping(config)
+    result["calibration-file"] = config.calibration_file
+    return result
+
+
 def _aim_point_to_mapping(config: AimPointConfig) -> dict[str, Any]:
     return {"x-px": config.x_px, "y-px": config.y_px}
 
 
 def config_to_mapping(config: AppConfig) -> dict[str, Any]:
-    """Convert a typed schema-v1 snapshot to its persisted JSON structure."""
+    """Convert a typed schema-v2 snapshot to its persisted JSON structure."""
     return {
         "schema-version": config.schema_version,
         "vision": {
             "processing-scope": config.vision.processing_scope.value,
             "cameras": {
-                "overview": _camera_to_mapping(config.vision.cameras.overview),
+                "overview": _overview_camera_to_mapping(
+                    config.vision.cameras.overview
+                ),
                 "stereo-left": _camera_to_mapping(config.vision.cameras.stereo_left),
                 "stereo-right": _camera_to_mapping(config.vision.cameras.stereo_right),
             },
@@ -672,6 +719,9 @@ def config_to_mapping(config: AppConfig) -> dict[str, Any]:
                         config.vision.distance.stereo.right_frame_buffer_size
                     ),
                     "pair-timeout-ms": config.vision.distance.stereo.pair_timeout_ms,
+                    "calibration-file": (
+                        config.vision.distance.stereo.calibration_file
+                    ),
                 },
             },
             "camera-stale-timeout-ms": config.vision.camera_stale_timeout_ms,

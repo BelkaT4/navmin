@@ -186,8 +186,16 @@ def test_effective_synthetic_inputs_and_allowlisted_manifest_evidence(tmp_path) 
 
     assert (artifacts.inputs_dir / "effective-config.json").is_file()
     effective = _read_json(artifacts.inputs_dir / "effective-config.json")
-    assert effective["schema-version"] == 1
+    assert effective["schema-version"] == 2
     assert effective["vision"]["cameras"]["overview"]["source"]["type"] == "rtp-jpeg"
+    assert (
+        effective["vision"]["cameras"]["overview"]["calibration-file"]
+        == "calibration/overview.json"
+    )
+    assert (
+        effective["vision"]["distance"]["stereo"]["calibration-file"]
+        == "calibration/stereo.json"
+    )
     assert (artifacts.inputs_dir / "overview-calibration.json").is_file()
     assert (artifacts.inputs_dir / "stereo-calibration.json").is_file()
     sources = _read_json(artifacts.inputs_dir / "source-hashes.json")

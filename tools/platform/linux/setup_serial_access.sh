@@ -10,7 +10,7 @@ usage() {
 Usage:
   sudo tools/platform/linux/setup_serial_access.sh
 
-Reads the local host settings from config/host.local.env (or NAVMIN_HOST_CONFIG)
+Reads the local host settings from config/host.env (or NAVMIN_HOST_CONFIG)
 and creates a persistent udev rule for the configured USB-UART adapter.
 
 Required settings:
@@ -38,12 +38,12 @@ case "${1:-}" in
     exit 0
     ;;
   *)
-    fail "this script takes no positional arguments; edit config/host.local.env"
+    fail "this script takes no positional arguments; edit config/host.env"
     ;;
 esac
 
 CONFIG_FILE=$(navmin_host_config_path "$repo_root")
-[ -f "$CONFIG_FILE" ] || fail "host config not found: $CONFIG_FILE; copy config/host.example.env to config/host.local.env and edit it"
+[ -f "$CONFIG_FILE" ] || fail "host config not found: $CONFIG_FILE; copy config/defaults/host.env to config/host.env and edit it"
 DEVICE=$(navmin_host_config_get SERIAL_SETUP_DEVICE "$CONFIG_FILE") || fail "SERIAL_SETUP_DEVICE is missing or duplicated in $CONFIG_FILE"
 ALIAS=$(navmin_host_config_get SERIAL_ALIAS "$CONFIG_FILE") || fail "SERIAL_ALIAS is missing or duplicated in $CONFIG_FILE"
 TARGET_USER="${SUDO_USER:-}"

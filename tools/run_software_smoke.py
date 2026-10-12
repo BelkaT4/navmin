@@ -26,6 +26,7 @@ from navmin.config.models import (
     AxisMechanicsConfig,
     CameraConfig,
     CamerasConfig,
+    OverviewCameraConfig,
     PidControllerConfig,
     ProcessingScope,
     RtpJpegSourceConfig,
@@ -314,13 +315,24 @@ def _smoke_camera_config(port: int, *, processing_enabled: bool) -> CameraConfig
     )
 
 
+def _smoke_overview_config(port: int) -> OverviewCameraConfig:
+    camera = _smoke_camera_config(port, processing_enabled=True)
+    return OverviewCameraConfig(
+        enabled=camera.enabled,
+        source=camera.source,
+        processing_enabled=camera.processing_enabled,
+        vision_processor_class=camera.vision_processor_class,
+        calibration_file="calibration/overview.json",
+    )
+
+
 def _smoke_app_config() -> AppConfig:
     return AppConfig(
-        schema_version=1,
+        schema_version=2,
         vision=VisionConfig(
             processing_scope=ProcessingScope.MAIN_AND_PREVIEW,
             cameras=CamerasConfig(
-                overview=_smoke_camera_config(8888, processing_enabled=True),
+                overview=_smoke_overview_config(8888),
                 stereo_left=_smoke_camera_config(8889, processing_enabled=True),
                 stereo_right=_smoke_camera_config(8890, processing_enabled=False),
             ),
@@ -332,6 +344,7 @@ def _smoke_app_config() -> AppConfig:
                     stereo_enabled=False,
                     right_frame_buffer_size=4,
                     pair_timeout_ms=100,
+                    calibration_file="calibration/stereo.json",
                 ),
             ),
             camera_stale_timeout_ms=500,

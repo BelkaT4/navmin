@@ -6,7 +6,7 @@ navmin_host_config_path() {
   if [ -n "${NAVMIN_HOST_CONFIG:-}" ]; then
     printf '%s\n' "$NAVMIN_HOST_CONFIG"
   else
-    printf '%s\n' "$repo_root/config/host.local.env"
+    printf '%s\n' "$repo_root/config/host.env"
   fi
 }
 
@@ -40,4 +40,9 @@ navmin_host_config_get() {
       }
     }
   ' "$config_file"
+}
+
+navmin_default_host_config_path() {
+  repo_root=$1
+  printf '%s\n' "$repo_root/config/defaults/host.env"
 }

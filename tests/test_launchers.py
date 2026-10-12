@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import shutil
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -9,6 +10,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from navmin.__main__ import _parser as normal_parser
 from navmin.__main__ import main as normal_main
 from navmin.calibration import (
     OverviewCalibration,
@@ -26,6 +28,7 @@ from navmin.config.models import (
     AxisMechanicsConfig,
     CameraConfig,
     CamerasConfig,
+    OverviewCameraConfig,
     PidControllerConfig,
     ProcessingScope,
     RtpJpegSourceConfig,
@@ -48,12 +51,16 @@ from navmin.diagnostic_launcher import (
     TurretEndpoint,
     _planned_preflight_inputs,
 )
+from navmin.diagnostic_launcher import (
+    _parser as diagnostic_parser,
+)
 from navmin.diagnostic_launcher import main as diagnostic_main
 from navmin.input_recovery import InputRecoveryError, recover_default_inputs
 from navmin.launcher import (
     ApplicationInputError,
     LauncherPaths,
     LoadedApplicationInputs,
+    load_application_inputs,
     run_loaded_application,
     session_file_logging,
     validate_normal_hardware_config,
@@ -63,6 +70,7 @@ from navmin.preflight import (
     StartupPreflightCheck,
     StartupPreflightReport,
 )
+from navmin.session_artifacts import SessionArtifacts
 
 WIDTH = 64
 HEIGHT = 48
@@ -70,6 +78,7 @@ K = ((50.0, 0.0, 31.5), (0.0, 50.0, 23.5), (0.0, 0.0, 1.0))
 IDENTITY = ((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0))
 TEST_LOCAL_TZ = timezone(timedelta(hours=7))
 RECOVERY_TEST_NOW = datetime(2026, 9, 23, 10, 15, 30, tzinfo=TEST_LOCAL_TZ)
+REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
 def _preflight_report(status: PreflightStatus = PreflightStatus.PASS) -> StartupPreflightReport:
@@ -99,6 +108,17 @@ def _camera(port: int) -> CameraConfig:
     )
 
 
+def _overview_camera(port: int) -> OverviewCameraConfig:
+    camera = _camera(port)
+    return OverviewCameraConfig(
+        enabled=camera.enabled,
+        source=camera.source,
+        processing_enabled=camera.processing_enabled,
+        vision_processor_class=camera.vision_processor_class,
+        calibration_file="calibration/overview.json",
+    )
+
+
 def _config(*, emulate_stm32: bool = False) -> AppConfig:
     center = AimPointConfig(x_px=None, y_px=None)
     axis = AxisMechanicsConfig(
@@ -108,11 +128,11 @@ def _config(*, emulate_stm32: bool = False) -> AppConfig:
         max_relative_move_deg=45.0,
     )
     return AppConfig(
-        schema_version=1,
+        schema_version=2,
         vision=VisionConfig(
             processing_scope=ProcessingScope.MAIN_AND_PREVIEW,
             cameras=CamerasConfig(
-                overview=_camera(8888),
+                overview=_overview_camera(8888),
                 stereo_left=_camera(8889),
                 stereo_right=_camera(8890),
             ),
@@ -124,6 +144,7 @@ def _config(*, emulate_stm32: bool = False) -> AppConfig:
                     stereo_enabled=False,
                     right_frame_buffer_size=4,
                     pair_timeout_ms=100,
+                    calibration_file="calibration/stereo.json",
                 ),
             ),
             camera_stale_timeout_ms=500,
@@ -210,6 +231,166 @@ def _stereo() -> StereoCalibration:
 
 def _inputs(*, emulate_stm32: bool = False) -> LoadedApplicationInputs:
     return LoadedApplicationInputs(_config(emulate_stm32=emulate_stm32), _overview(), _stereo())
+
+
+def _config_with_calibration_refs(
+    overview_ref: str,
+    stereo_ref: str,
+) -> AppConfig:
+    config = _config()
+    cameras = replace(
+        config.vision.cameras,
+        overview=replace(
+            config.vision.cameras.overview,
+            calibration_file=overview_ref,
+        ),
+    )
+    distance = replace(
+        config.vision.distance,
+        stereo=replace(
+            config.vision.distance.stereo,
+            calibration_file=stereo_ref,
+        ),
+    )
+    return replace(config, vision=replace(config.vision, cameras=cameras, distance=distance))
+
+
+def _copy_default_calibrations(target_root: Path) -> tuple[Path, Path]:
+    target_dir = target_root / "calibration"
+    target_dir.mkdir(parents=True, exist_ok=True)
+    source_dir = REPO_ROOT / "config" / "defaults" / "calibration"
+    overview = target_dir / "overview.json"
+    stereo = target_dir / "stereo.json"
+    shutil.copyfile(source_dir / "overview.json", overview)
+    shutil.copyfile(source_dir / "stereo.json", stereo)
+    return overview, stereo
+
+
+def test_normal_and_diagnostic_parsers_share_new_file_defaults() -> None:
+    normal_args = normal_parser().parse_args([])
+    diagnostic_args = diagnostic_parser().parse_args(
+        ["--overview", "real", "--stereo-left", "real", "--turret", "real"]
+    )
+
+    for args in (normal_args, diagnostic_args):
+        assert args.config == Path("config/navmin.json")
+        assert args.overview_calibration is None
+        assert args.stereo_calibration is None
+
+
+def test_config_owned_relative_calibration_paths_follow_selected_config_directory(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    cwd = tmp_path / "cwd"
+    selected_root = tmp_path / "sets" / "test-a"
+    cwd.mkdir()
+    selected_root.mkdir(parents=True)
+    selected_config = selected_root / "navmin.json"
+    save_config(selected_config, _config())
+    overview, stereo = _copy_default_calibrations(selected_root)
+
+    # A decoy relative to CWD must never be used for config-owned references.
+    decoy_dir = cwd / "calibration"
+    decoy_dir.mkdir()
+    (decoy_dir / "overview.json").write_text("{broken", encoding="utf-8")
+    (decoy_dir / "stereo.json").write_text("{broken", encoding="utf-8")
+    monkeypatch.chdir(cwd)
+
+    inputs = load_application_inputs(
+        LauncherPaths(config=Path("../sets/test-a/navmin.json"))
+    )
+
+    assert inputs.source_paths is not None
+    assert inputs.source_paths.config == selected_config.resolve()
+    assert inputs.source_paths.overview_calibration == overview.resolve()
+    assert inputs.source_paths.stereo_calibration == stereo.resolve()
+
+
+def test_absolute_config_owned_calibration_paths_are_used_unchanged(tmp_path) -> None:
+    selected_root = tmp_path / "set"
+    selected_root.mkdir()
+    overview, stereo = _copy_default_calibrations(tmp_path / "absolute")
+    config_path = selected_root / "navmin.json"
+    save_config(
+        config_path,
+        _config_with_calibration_refs(str(overview), str(stereo)),
+    )
+
+    inputs = load_application_inputs(LauncherPaths(config=config_path))
+
+    assert inputs.source_paths is not None
+    assert inputs.source_paths.overview_calibration == overview.resolve()
+    assert inputs.source_paths.stereo_calibration == stereo.resolve()
+
+
+def test_relative_cli_calibration_overrides_win_and_use_cwd_semantics(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    selected_root = tmp_path / "selected"
+    cwd = tmp_path / "cwd"
+    selected_root.mkdir()
+    cwd.mkdir()
+    config_path = selected_root / "navmin.json"
+    save_config(config_path, _config())
+    _copy_default_calibrations(selected_root)
+
+    override_overview, override_stereo = _copy_default_calibrations(cwd / "override")
+    monkeypatch.chdir(cwd)
+    inputs = load_application_inputs(
+        LauncherPaths(
+            config=config_path,
+            overview_calibration=Path("override/calibration/overview.json"),
+            stereo_calibration=Path("override/calibration/stereo.json"),
+        )
+    )
+
+    assert inputs.source_paths is not None
+    assert inputs.source_paths.overview_calibration == override_overview.resolve()
+    assert inputs.source_paths.stereo_calibration == override_stereo.resolve()
+
+
+def test_cli_override_paths_are_the_paths_recorded_in_session_source_hashes(
+    tmp_path,
+) -> None:
+    selected_root = tmp_path / "selected"
+    selected_root.mkdir()
+    config_path = selected_root / "navmin.json"
+    save_config(config_path, _config())
+    _copy_default_calibrations(selected_root)
+    override_overview, override_stereo = _copy_default_calibrations(tmp_path / "override")
+    inputs = load_application_inputs(
+        LauncherPaths(
+            config=config_path,
+            overview_calibration=override_overview,
+            stereo_calibration=override_stereo,
+        )
+    )
+    assert inputs.source_paths is not None
+
+    artifacts = SessionArtifacts.create(
+        tmp_path / "logs",
+        mode="normal",
+        overview_backend="real",
+        stereo_left_backend="real",
+        turret_backend="real",
+        input_mode="files",
+        git_root=tmp_path / "no-git",
+    )
+    artifacts.write_effective_inputs(
+        config=inputs.config,
+        overview_calibration=inputs.overview_calibration,
+        stereo_calibration=inputs.stereo_calibration,
+        source_paths=inputs.source_paths,
+    )
+    sources = json.loads(
+        (artifacts.inputs_dir / "source-hashes.json").read_text(encoding="utf-8")
+    )
+
+    assert sources["config"]["path"] == str(config_path.resolve())
+    assert sources["overview_calibration"]["path"] == str(override_overview.resolve())
+    assert sources["stereo_calibration"]["path"] == str(override_stereo.resolve())
 
 
 def test_run_loaded_application_uses_shared_runtime_ui_surface_and_shutdown() -> None:
@@ -508,8 +689,6 @@ def test_load_application_inputs_identifies_exact_failing_file(tmp_path) -> None
     save_config(paths.config, _config())
     paths.overview_calibration.write_text("{broken", encoding="utf-8")
 
-    from navmin.launcher import load_application_inputs
-
     with pytest.raises(ApplicationInputError) as exc_info:
         load_application_inputs(paths)
 
@@ -517,6 +696,96 @@ def test_load_application_inputs_identifies_exact_failing_file(tmp_path) -> None
     assert exc_info.value.path == paths.overview_calibration
     assert str(paths.overview_calibration) in str(exc_info.value)
     assert "malformed JSON" in str(exc_info.value)
+
+
+@pytest.mark.parametrize(
+    ("flag", "filename", "label"),
+    [
+        ("--overview-calibration", "bad-overview.json", "overview calibration"),
+        ("--stereo-calibration", "bad-stereo.json", "stereo calibration"),
+    ],
+)
+def test_explicit_bad_calibration_override_never_triggers_recovery_or_mutation(
+    monkeypatch,
+    tmp_path,
+    capsys,
+    flag: str,
+    filename: str,
+    label: str,
+) -> None:
+    selected_root = tmp_path / "config-set"
+    selected_root.mkdir()
+    config_path = selected_root / "navmin.json"
+    save_config(config_path, _config())
+    canonical_overview, canonical_stereo = _copy_default_calibrations(selected_root)
+    canonical_before = {
+        canonical_overview: canonical_overview.read_bytes(),
+        canonical_stereo: canonical_stereo.read_bytes(),
+        config_path: config_path.read_bytes(),
+    }
+    bad_override = tmp_path / filename
+    bad_override.write_text("{broken-override", encoding="utf-8")
+    bad_before = bad_override.read_bytes()
+
+    monkeypatch.setattr(
+        "navmin.__main__._prompt_input_recovery",
+        lambda _error: pytest.fail("explicit CLI calibration failure must not recover"),
+    )
+    argv = [
+        "--config",
+        str(config_path),
+        flag,
+        str(bad_override),
+        "--log-dir",
+        str(tmp_path / "logs"),
+    ]
+    exit_code = normal_main(argv)
+
+    captured = capsys.readouterr()
+    assert exit_code == 2
+    assert f"INPUT ERROR: {label}" in captured.err
+    assert str(bad_override) in captured.err
+    assert bad_override.read_bytes() == bad_before
+    for path, content in canonical_before.items():
+        assert path.read_bytes() == content
+    assert not list(tmp_path.rglob("*.bak"))
+
+
+def test_recovery_uses_canonical_targets_and_leaves_custom_calibration_files_untouched(
+    tmp_path,
+) -> None:
+    selected_root = tmp_path / "test-a"
+    selected_root.mkdir()
+    custom_dir = tmp_path / "custom-calibrations"
+    custom_dir.mkdir()
+    custom_overview = custom_dir / "overview-a.json"
+    custom_stereo = custom_dir / "stereo-a.json"
+    custom_overview.write_bytes(b"operator-overview-custom")
+    custom_stereo.write_bytes(b"operator-stereo-custom")
+
+    config_path = selected_root / "navmin.json"
+    save_config(
+        config_path,
+        _config_with_calibration_refs(str(custom_overview), str(custom_stereo)),
+    )
+    custom_before = (custom_overview.read_bytes(), custom_stereo.read_bytes())
+
+    result = recover_default_inputs(LauncherPaths(config=config_path), now=RECOVERY_TEST_NOW)
+
+    canonical_overview = selected_root / "calibration" / "overview.json"
+    canonical_stereo = selected_root / "calibration" / "stereo.json"
+    assert result.restored_paths == (
+        config_path.resolve(),
+        canonical_overview,
+        canonical_stereo,
+    )
+    assert custom_overview.read_bytes() == custom_before[0]
+    assert custom_stereo.read_bytes() == custom_before[1]
+    recovered = load_config(config_path)
+    assert recovered.vision.cameras.overview.calibration_file == "calibration/overview.json"
+    assert recovered.vision.distance.stereo.calibration_file == "calibration/stereo.json"
+    load_overview_calibration(canonical_overview)
+    load_stereo_calibration(canonical_stereo)
 
 
 def test_input_recovery_creates_valid_safe_defaults_without_existing_files(
@@ -537,6 +806,9 @@ def test_input_recovery_creates_valid_safe_defaults_without_existing_files(
     overview = load_overview_calibration(paths.overview_calibration)
     stereo = load_stereo_calibration(paths.stereo_calibration)
     assert config.turret.serial.port == "/dev/navmin-configure-serial-port"
+    assert config.schema_version == 2
+    assert config.vision.cameras.overview.calibration_file == "calibration/overview.json"
+    assert config.vision.distance.stereo.calibration_file == "calibration/stereo.json"
     assert isinstance(config.vision.cameras.overview.source, RtpJpegSourceConfig)
     assert config.vision.cameras.overview.source.bind_address == "0.0.0.0"
     assert config.vision.cameras.overview.source.port == 8888
@@ -551,6 +823,26 @@ def test_input_recovery_creates_valid_safe_defaults_without_existing_files(
     assert stereo.image_width == 320
     assert stereo.image_height == 240
     assert stereo.T == (0.0, 0.0, 0.0)
+
+
+def test_input_recovery_replaces_malformed_root_and_invalid_canonical_calibrations(
+    tmp_path,
+) -> None:
+    paths = _recovery_paths(tmp_path)
+    paths.overview_calibration.parent.mkdir(parents=True)
+    paths.config.write_text("{malformed-root", encoding="utf-8")
+    paths.overview_calibration.write_text("{invalid-overview", encoding="utf-8")
+    paths.stereo_calibration.write_text("{invalid-stereo", encoding="utf-8")
+
+    result = recover_default_inputs(paths, now=RECOVERY_TEST_NOW)
+
+    assert len(result.backups) == 3
+    recovered = load_config(paths.config)
+    assert recovered.schema_version == 2
+    assert recovered.vision.cameras.overview.calibration_file == "calibration/overview.json"
+    assert recovered.vision.distance.stereo.calibration_file == "calibration/stereo.json"
+    assert load_overview_calibration(paths.overview_calibration).schema_version == 1
+    assert load_stereo_calibration(paths.stereo_calibration).schema_version == 1
 
 
 def test_input_recovery_uses_common_local_timestamp_and_collision_suffix(
