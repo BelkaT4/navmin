@@ -510,6 +510,8 @@ def _run_qt_smoke(runtime: SoftwareSmokeRuntime, auto_close_seconds: float | Non
         camera_bindings=ui.camera_bindings,
         turret_states=ui.turret_states,
         camera_stale_timeout_ms=ui.camera_stale_timeout_ms,
+        pid_controller_config=ui.pid_controller_config,
+        apply_pid_tuning=ui.apply_pid_tuning,
     )
 
 

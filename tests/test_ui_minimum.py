@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+from collections.abc import Callable
 from datetime import UTC, datetime
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -18,7 +19,13 @@ from navmin.concurrency import (
     TargetControlChannel,
     TargetLifecycleEventChannel,
 )
-from navmin.config.models import AimingConfig, AimPointConfig, AimPointsConfig, UiConfig
+from navmin.config.models import (
+    AimingConfig,
+    AimPointConfig,
+    AimPointsConfig,
+    PidControllerConfig,
+    UiConfig,
+)
 from navmin.contracts import (
     BBox,
     CameraRay,
@@ -236,6 +243,17 @@ def _bindings() -> dict[CameraRole, CameraUiBinding]:
     }
 
 
+def _pid_config() -> PidControllerConfig:
+    return PidControllerConfig(
+        pid_kp_x=0.25,
+        pid_ki_x=0.01,
+        pid_kd_x=0.04,
+        pid_kp_y=0.30,
+        pid_ki_y=0.02,
+        pid_kd_y=0.05,
+    )
+
+
 def _window(
     qt_application: QApplication,
     *,
@@ -247,6 +265,8 @@ def _window(
     frame_preparer=prepare_vision_frame,
     camera_stale_timeout_ms: int = 500,
     aim_points: AimPointsConfig | None = None,
+    pid_controller_config: PidControllerConfig | None = None,
+    apply_pid_tuning: Callable[[PidControllerConfig], None] | None = None,
 ) -> tuple[
     MainWindow,
     Mediator,
@@ -264,6 +284,8 @@ def _window(
         camera_bindings=bindings,
         turret_states=turret_states,
         camera_stale_timeout_ms=camera_stale_timeout_ms,
+        pid_controller_config=pid_controller_config or _pid_config(),
+        apply_pid_tuning=apply_pid_tuning or (lambda _config: None),
         clock_ns=clock or _Clock(),
         wall_clock=wall_clock
         or _WallClock(datetime(2026, 9, 22, 12, 0, 0, tzinfo=UTC)),
@@ -1088,6 +1110,83 @@ def test_operator_window_statuses_follow_existing_ui_update_path(
     window.close()
 
 
+def test_operator_pid_panel_uses_initial_values_and_queues_full_typed_update(
+    qt_application: QApplication,
+) -> None:
+    initial = _pid_config()
+    queued: list[PidControllerConfig] = []
+    window, _mediator_value, _turret, _bindings_value, _states = _window(
+        qt_application,
+        pid_controller_config=initial,
+        apply_pid_tuning=queued.append,
+    )
+    operator = window.operator_window
+
+    assert operator.pid_inputs["pid_kp_x"].text() == "0.25"
+    assert operator.pid_inputs["pid_ki_x"].text() == "0.01"
+    assert operator.pid_inputs["pid_kd_x"].text() == "0.04"
+    assert operator.pid_inputs["pid_kp_y"].text() == "0.3"
+    assert operator.pid_inputs["pid_ki_y"].text() == "0.02"
+    assert operator.pid_inputs["pid_kd_y"].text() == "0.05"
+
+    values = {
+        "pid_kp_x": "1.25",
+        "pid_ki_x": "0.11",
+        "pid_kd_x": "0.14",
+        "pid_kp_y": "1.30",
+        "pid_ki_y": "0.12",
+        "pid_kd_y": "0.15",
+    }
+    for field, text in values.items():
+        operator.pid_inputs[field].setText(text)
+    QTest.mouseClick(operator.pid_apply_button, Qt.MouseButton.LeftButton)
+
+    assert queued == [
+        PidControllerConfig(
+            pid_kp_x=1.25,
+            pid_ki_x=0.11,
+            pid_kd_x=0.14,
+            pid_kp_y=1.30,
+            pid_ki_y=0.12,
+            pid_kd_y=0.15,
+        )
+    ]
+    assert operator.pid_status_label.text().startswith("Отправлено:")
+    assert "Применено" not in operator.pid_status_label.text()
+    assert operator.pid_error_label.text() == ""
+
+    operator.hide()
+    operator.show()
+    qt_application.processEvents()
+    assert operator.pid_inputs["pid_kp_x"].text() == "1.25"
+    window.close()
+
+
+@pytest.mark.parametrize("invalid", ["-0.1", "nan", "inf", "-inf", "", "abc"])
+def test_operator_pid_panel_rejects_invalid_input_without_changing_last_status(
+    qt_application: QApplication,
+    invalid: str,
+) -> None:
+    queued: list[PidControllerConfig] = []
+    window, _mediator_value, _turret, _bindings_value, _states = _window(
+        qt_application,
+        apply_pid_tuning=queued.append,
+    )
+    operator = window.operator_window
+
+    QTest.mouseClick(operator.pid_apply_button, Qt.MouseButton.LeftButton)
+    assert len(queued) == 1
+    successful_status = operator.pid_status_label.text()
+
+    operator.pid_inputs["pid_kp_x"].setText(invalid)
+    QTest.mouseClick(operator.pid_apply_button, Qt.MouseButton.LeftButton)
+
+    assert len(queued) == 1
+    assert operator.pid_status_label.text() == successful_status
+    assert operator.pid_error_label.text().startswith("Ошибка PID:")
+    window.close()
+
+
 def test_operator_fullscreen_button_and_f11_keep_text_synchronized(
     qt_application: QApplication,
 ) -> None:
@@ -1143,6 +1242,8 @@ def test_main_window_can_request_fullscreen_at_startup(qt_application: QApplicat
         camera_bindings=_bindings(),
         turret_states=LatestValue(),
         camera_stale_timeout_ms=500,
+        pid_controller_config=_pid_config(),
+        apply_pid_tuning=lambda _config: None,
         start_timer=False,
         start_fullscreen=True,
     )

@@ -4,16 +4,17 @@ from __future__ import annotations
 
 import logging
 import math
-from collections.abc import Mapping
-from dataclasses import dataclass
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass, replace
 from time import monotonic
 from types import MappingProxyType
 
 from navmin.calibration import OverviewCalibration, StereoCalibration
 from navmin.concurrency import LatestValue
-from navmin.config.models import AppConfig
+from navmin.config.models import AppConfig, PidControllerConfig, TurretConfig
 from navmin.contracts import (
     CameraRole,
+    ConfigUpdate,
     MotorState,
     TurretConnectionState,
     TurretState,
@@ -56,6 +57,8 @@ class UiRuntimeDependencies:
     camera_bindings: Mapping[CameraRole, CameraUiBinding]
     turret_states: LatestValue[TurretState]
     camera_stale_timeout_ms: int
+    pid_controller_config: PidControllerConfig
+    apply_pid_tuning: Callable[[PidControllerConfig], None]
 
 
 @dataclass(frozen=True)
@@ -88,12 +91,17 @@ class ApplicationRuntime:
         turret_worker: TurretWorker,
         mediator: Mediator,
         camera_stale_timeout_ms: int,
+        turret_config: TurretConfig,
     ) -> None:
+        if not isinstance(turret_config, TurretConfig):
+            raise TypeError("turret_config must be TurretConfig")
         self.overview_worker = overview_worker
         self.stereo_left_worker = stereo_left_worker
         self.turret_worker = turret_worker
         self.mediator = mediator
         self.camera_stale_timeout_ms = camera_stale_timeout_ms
+        self._runtime_turret_config = turret_config
+        self._pid_tuning_revision = 0
 
         self._camera_workers = MappingProxyType(
             {
@@ -112,6 +120,8 @@ class ApplicationRuntime:
             camera_bindings=self._camera_bindings,
             turret_states=turret_worker.state_updates,
             camera_stale_timeout_ms=camera_stale_timeout_ms,
+            pid_controller_config=turret_config.controller,
+            apply_pid_tuning=self.apply_pid_tuning,
         )
         self._active_components: set[str] = set()
         self._start_attempted = False
@@ -132,6 +142,52 @@ class ApplicationRuntime:
     @property
     def ui_dependencies(self) -> UiRuntimeDependencies:
         return self._ui_dependencies
+
+    def apply_pid_tuning(self, config: PidControllerConfig) -> None:
+        """Queue a temporary PID-only runtime config update for Turret."""
+        self._validate_pid_tuning(config)
+        next_revision = self._pid_tuning_revision + 1
+        next_turret_config = replace(self._runtime_turret_config, controller=config)
+        self.turret_worker.submit_config_update(
+            ConfigUpdate(revision=next_revision, config=next_turret_config)
+        )
+        self._runtime_turret_config = next_turret_config
+        self._pid_tuning_revision = next_revision
+        LOGGER.info(
+            "PID tuning update queued revision=%d "
+            "x=(kp=%g, ki=%g, kd=%g) y=(kp=%g, ki=%g, kd=%g)",
+            next_revision,
+            config.pid_kp_x,
+            config.pid_ki_x,
+            config.pid_kd_x,
+            config.pid_kp_y,
+            config.pid_ki_y,
+            config.pid_kd_y,
+        )
+
+    @staticmethod
+    def _validate_pid_tuning(config: PidControllerConfig) -> None:
+        if not isinstance(config, PidControllerConfig):
+            raise TypeError("config must be PidControllerConfig")
+        for name in (
+            "pid_kp_x",
+            "pid_ki_x",
+            "pid_kd_x",
+            "pid_kp_y",
+            "pid_ki_y",
+            "pid_kd_y",
+        ):
+            value = getattr(config, name)
+            if type(value) not in (int, float):
+                raise TypeError(f"{name} must be a number")
+            try:
+                numeric = float(value)
+            except OverflowError as exc:
+                raise ValueError(f"{name} must be finite") from exc
+            if not math.isfinite(numeric):
+                raise ValueError(f"{name} must be finite")
+            if numeric < 0:
+                raise ValueError(f"{name} must be >= 0")
 
     def start(self) -> None:
         """Start Turret, Overview, and Stereo Left with automatic rollback."""
@@ -349,6 +405,7 @@ def build_application_runtime(
         turret_worker=turret_worker,
         mediator=mediator,
         camera_stale_timeout_ms=config.vision.camera_stale_timeout_ms,
+        turret_config=config.turret,
     )
 
 

@@ -20,6 +20,7 @@ from PyQt6.QtWidgets import (
 )
 
 from navmin.concurrency import LatestValue
+from navmin.config.models import PidControllerConfig
 from navmin.contracts import (
     CameraRole,
     CameraSessionStarted,
@@ -73,6 +74,8 @@ class MainWindow(QMainWindow):
         camera_bindings: Mapping[CameraRole, CameraUiBinding],
         turret_states: LatestValue[TurretState],
         camera_stale_timeout_ms: int,
+        pid_controller_config: PidControllerConfig,
+        apply_pid_tuning: Callable[[PidControllerConfig], None],
         clock_ns: Callable[[], int] = monotonic_ns,
         wall_clock: Callable[[], datetime] = datetime.now,
         show_diagnostic_clock: bool = False,
@@ -159,6 +162,8 @@ class MainWindow(QMainWindow):
             owner=self,
             on_toggle_fullscreen=self.toggle_fullscreen,
             on_exit=self.request_exit,
+            pid_controller_config=pid_controller_config,
+            on_apply_pid_tuning=apply_pid_tuning,
         )
 
         self.state_pump = UiStatePump(

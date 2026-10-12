@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import replace
 from time import monotonic, sleep
 
@@ -36,6 +37,7 @@ from navmin.config.models import (
 )
 from navmin.contracts import (
     CameraRole,
+    ConfigUpdate,
     DistanceSource,
     MotorState,
     TurretConnectionState,
@@ -287,6 +289,59 @@ def test_default_construction_uses_only_production_transport_boundaries() -> Non
     assert isinstance(runtime.turret_worker, TurretWorker)
     assert factories.turret_transport_factory is None
 
+
+def test_runtime_pid_tuning_dependencies_use_loaded_config_and_monotonic_updates(
+    monkeypatch,
+    caplog,
+) -> None:
+    config = _config()
+    runtime = build_application_runtime(
+        config=config,
+        overview_calibration=_overview_calibration(),
+        stereo_calibration=_stereo_calibration(),
+    )
+    queued: list[ConfigUpdate[TurretConfig]] = []
+    monkeypatch.setattr(runtime.turret_worker, "submit_config_update", queued.append)
+    caplog.set_level(logging.INFO, logger="navmin.application")
+
+    ui = runtime.ui_dependencies
+    assert ui.pid_controller_config is config.turret.controller
+
+    first = PidControllerConfig(0.25, 0.01, 0.04, 0.30, 0.02, 0.05)
+    second = PidControllerConfig(0.35, 0.03, 0.06, 0.40, 0.04, 0.07)
+    third = PidControllerConfig(0.45, 0.05, 0.08, 0.50, 0.06, 0.09)
+    for gains in (first, second, third):
+        ui.apply_pid_tuning(gains)
+
+    assert [update.revision for update in queued] == [1, 2, 3]
+    assert [update.config.controller for update in queued] == [first, second, third]
+    for update in queued:
+        assert update.config.serial == config.turret.serial
+        assert update.config.axes == config.turret.axes
+        assert update.config.stm32 == config.turret.stm32
+        assert update.config.emulate_stm32 == config.turret.emulate_stm32
+    assert queued[-1].config == replace(config.turret, controller=third)
+    assert "PID tuning update queued revision=3" in caplog.text
+
+
+@pytest.mark.parametrize("invalid", [-0.1, float("nan"), float("inf")])
+def test_runtime_pid_tuning_rejects_invalid_gains_without_publishing(
+    monkeypatch,
+    invalid: float,
+) -> None:
+    runtime = build_application_runtime(
+        config=_config(),
+        overview_calibration=_overview_calibration(),
+        stereo_calibration=_stereo_calibration(),
+    )
+    queued: list[ConfigUpdate[TurretConfig]] = []
+    monkeypatch.setattr(runtime.turret_worker, "submit_config_update", queued.append)
+    gains = PidControllerConfig(invalid, 0.0, 0.0, 1.0, 0.0, 0.0)
+
+    with pytest.raises(ValueError):
+        runtime.apply_pid_tuning(gains)
+
+    assert queued == []
 
 
 def test_default_composition_supports_overview_rtsp_and_stereo_left_rtp() -> None:

@@ -215,11 +215,16 @@ def _inputs(*, emulate_stm32: bool = False) -> LoadedApplicationInputs:
 def test_run_loaded_application_uses_shared_runtime_ui_surface_and_shutdown() -> None:
     events: list[str] = []
     inputs = _inputs()
+    pid_config = inputs.config.turret.controller
+    pid_updates: list[PidControllerConfig] = []
+    apply_pid_tuning = pid_updates.append
     ui_dependencies = SimpleNamespace(
         mediator=object(),
         camera_bindings={CameraRole.OVERVIEW: object()},
         turret_states=object(),
         camera_stale_timeout_ms=321,
+        pid_controller_config=pid_config,
+        apply_pid_tuning=apply_pid_tuning,
     )
 
     class FakeRuntime:
@@ -246,6 +251,8 @@ def test_run_loaded_application_uses_shared_runtime_ui_surface_and_shutdown() ->
         assert kwargs["camera_bindings"] is ui_dependencies.camera_bindings
         assert kwargs["turret_states"] is ui_dependencies.turret_states
         assert kwargs["camera_stale_timeout_ms"] == 321
+        assert kwargs["pid_controller_config"] is pid_config
+        assert kwargs["apply_pid_tuning"] is apply_pid_tuning
         assert kwargs["show_diagnostic_clock"] is False
         assert kwargs["argv"] == ("--qt-test",)
         return 7

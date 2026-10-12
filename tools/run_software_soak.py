@@ -278,11 +278,14 @@ class SoftwareSoak:
         result = "FAIL"
         try:
             self.runtime.start()
+            ui = self.runtime.application.ui_dependencies
             self.window = MainWindow(
                 mediator=self.runtime.mediator,
                 camera_bindings=self.runtime.camera_bindings(),
                 turret_states=self.runtime.turret_worker.state_updates,
                 camera_stale_timeout_ms=_STALE_TIMEOUT_MS,
+                pid_controller_config=ui.pid_controller_config,
+                apply_pid_tuning=ui.apply_pid_tuning,
                 start_timer=False,
                 start_fullscreen=False,
             )

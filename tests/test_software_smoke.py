@@ -268,6 +268,10 @@ def test_relative_ui_click_reaches_observable_fake_stm32_for_both_cameras() -> N
             camera_bindings=runtime.camera_bindings(),
             turret_states=runtime.turret_worker.state_updates,
             camera_stale_timeout_ms=500,
+            pid_controller_config=(
+                runtime.application.ui_dependencies.pid_controller_config
+            ),
+            apply_pid_tuning=runtime.application.ui_dependencies.apply_pid_tuning,
             start_timer=False,
             start_fullscreen=False,
         )
@@ -444,6 +448,10 @@ def test_tracking_ui_selection_drives_real_velocity_loop_to_fake_stm32() -> None
             camera_bindings=runtime.camera_bindings(),
             turret_states=runtime.turret_worker.state_updates,
             camera_stale_timeout_ms=500,
+            pid_controller_config=(
+                runtime.application.ui_dependencies.pid_controller_config
+            ),
+            apply_pid_tuning=runtime.application.ui_dependencies.apply_pid_tuning,
             start_timer=False,
             start_fullscreen=False,
         )
@@ -850,6 +858,10 @@ def test_camera_stale_resume_keeps_generation_and_recovers_interaction() -> None
             camera_bindings=runtime.camera_bindings(),
             turret_states=runtime.turret_worker.state_updates,
             camera_stale_timeout_ms=500,
+            pid_controller_config=(
+                runtime.application.ui_dependencies.pid_controller_config
+            ),
+            apply_pid_tuning=runtime.application.ui_dependencies.apply_pid_tuning,
             start_timer=False,
             start_fullscreen=False,
         )
@@ -958,6 +970,10 @@ def test_generation_restart_and_preview_swap_clear_active_tracking() -> None:
             camera_bindings=runtime.camera_bindings(),
             turret_states=runtime.turret_worker.state_updates,
             camera_stale_timeout_ms=500,
+            pid_controller_config=(
+                runtime.application.ui_dependencies.pid_controller_config
+            ),
+            apply_pid_tuning=runtime.application.ui_dependencies.apply_pid_tuning,
             start_timer=False,
             start_fullscreen=False,
         )
@@ -1076,6 +1092,10 @@ def test_turret_disconnect_clears_tracking_recovers_off_and_remains_usable() -> 
             camera_bindings=runtime.camera_bindings(),
             turret_states=runtime.turret_worker.state_updates,
             camera_stale_timeout_ms=500,
+            pid_controller_config=(
+                runtime.application.ui_dependencies.pid_controller_config
+            ),
+            apply_pid_tuning=runtime.application.ui_dependencies.apply_pid_tuning,
             start_timer=False,
             start_fullscreen=False,
         )
@@ -1175,6 +1195,10 @@ def test_emergency_click_during_tracking_crosses_full_stack_and_preserves_motor_
             camera_bindings=runtime.camera_bindings(),
             turret_states=runtime.turret_worker.state_updates,
             camera_stale_timeout_ms=500,
+            pid_controller_config=(
+                runtime.application.ui_dependencies.pid_controller_config
+            ),
+            apply_pid_tuning=runtime.application.ui_dependencies.apply_pid_tuning,
             start_timer=False,
             start_fullscreen=False,
         )
