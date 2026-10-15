@@ -32,6 +32,7 @@ from navmin.vision.pipeline import (
     stereo_right_corrector,
 )
 from navmin.vision.processor import VisionProcessorOutput
+from navmin.vision.stereo_pairing import StereoPairer, StereoPairIdentity
 
 WIDTH = 32
 HEIGHT = 24
@@ -593,3 +594,113 @@ def test_restart_cannot_interleave_after_failure_generation_check_before_error_p
     assert status is not None
     assert status.generation == 2
     assert status.state is CameraState.STARTING
+
+
+def test_corrected_frame_sink_pairs_exact_stereo_frames_by_reference() -> None:
+    stereo_pairer = StereoPairer(right_frame_buffer_size=4, pair_timeout_ms=100)
+    left_pipeline = VisionPipeline(
+        camera=CameraRole.STEREO_LEFT,
+        corrector=stereo_left_corrector(stereo_calibration()),
+        processor=_RecordingProcessor(),
+        corrected_frame_sink=stereo_pairer,
+        timestamp_clock_ns=_Clock(),
+    )
+    right_pipeline = VisionPipeline(
+        camera=CameraRole.STEREO_RIGHT,
+        corrector=stereo_right_corrector(stereo_calibration()),
+        processor=_RecordingProcessor(),
+        corrected_frame_sink=stereo_pairer,
+        timestamp_clock_ns=_Clock(),
+    )
+
+    left_session = left_pipeline.start()
+    right_session = right_pipeline.start()
+    right_pipeline.submit_decoded_frame(source_frame(3), capture_id=42)
+    right_result = right_pipeline.process_latest()
+    left_pipeline.submit_decoded_frame(source_frame(7), capture_id=42)
+    left_result = left_pipeline.process_latest()
+
+    assert right_result is not None
+    assert left_result is not None
+    pair = stereo_pairer.latest_pair
+    assert pair is not None
+    assert pair.identity == StereoPairIdentity(
+        left_generation=left_session.generation,
+        right_generation=right_session.generation,
+        capture_id=42,
+    )
+    assert pair.left is left_result.frame
+    assert pair.right is right_result.frame
+    assert pair.left.image is left_result.frame.image
+    assert pair.right.image is right_result.frame.image
+    assert not pair.left.image.flags.writeable
+    assert not pair.right.image.flags.writeable
+
+
+def test_corrected_frame_sink_generation_boundary_invalidates_latest_pair_immediately() -> None:
+    stereo_pairer = StereoPairer(right_frame_buffer_size=4, pair_timeout_ms=100)
+    left_pipeline = VisionPipeline(
+        camera=CameraRole.STEREO_LEFT,
+        corrector=stereo_left_corrector(stereo_calibration()),
+        processor=_RecordingProcessor(),
+        corrected_frame_sink=stereo_pairer,
+        timestamp_clock_ns=_Clock(),
+    )
+    right_pipeline = VisionPipeline(
+        camera=CameraRole.STEREO_RIGHT,
+        corrector=stereo_right_corrector(stereo_calibration()),
+        processor=_RecordingProcessor(),
+        corrected_frame_sink=stereo_pairer,
+        timestamp_clock_ns=_Clock(),
+    )
+
+    left_pipeline.start()
+    right_pipeline.start()
+    right_pipeline.submit_decoded_frame(source_frame(1), capture_id=9)
+    assert right_pipeline.process_latest() is not None
+    left_pipeline.submit_decoded_frame(source_frame(2), capture_id=9)
+    assert left_pipeline.process_latest() is not None
+    assert stereo_pairer.latest_pair is not None
+
+    restarted = left_pipeline.start()
+
+    assert restarted.generation == 2
+    assert stereo_pairer.latest_pair is None
+    assert stereo_pairer.state.left_generation == 2
+    assert stereo_pairer.state.right_generation == 1
+
+
+def test_stale_corrected_frame_is_not_sent_to_sink_after_concurrent_restart() -> None:
+    base_corrector = stereo_left_corrector(stereo_calibration())
+    stereo_pairer = StereoPairer(right_frame_buffer_size=4, pair_timeout_ms=100)
+
+    class RestartDuringCorrection:
+        camera_model = base_corrector.camera_model
+
+        def __init__(self) -> None:
+            self.pipeline: VisionPipeline | None = None
+
+        def correct(self, image: np.ndarray) -> np.ndarray:
+            assert self.pipeline is not None
+            corrected = base_corrector.correct(image)
+            self.pipeline.start()
+            return corrected
+
+    corrector = RestartDuringCorrection()
+    pipeline = VisionPipeline(
+        camera=CameraRole.STEREO_LEFT,
+        corrector=corrector,
+        processor=_RecordingProcessor(),
+        corrected_frame_sink=stereo_pairer,
+        timestamp_clock_ns=_Clock(),
+    )
+    corrector.pipeline = pipeline
+    pipeline.start()
+    stereo_pairer.start_generation(CameraRole.STEREO_RIGHT, 1)
+    pipeline.submit_decoded_frame(source_frame(5), capture_id=77)
+
+    assert pipeline.process_latest() is None
+    assert pipeline.generation == 2
+    assert stereo_pairer.state.left_generation == 2
+    assert stereo_pairer.state.pending_left_capture_id is None
+    assert stereo_pairer.latest_pair is None

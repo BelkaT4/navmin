@@ -39,6 +39,7 @@ from navmin.vision.pipeline import (
     stereo_left_corrector,
     stereo_right_corrector,
 )
+from navmin.vision.stereo_pairing import StereoPairer
 
 LOGGER = logging.getLogger(__name__)
 
@@ -102,6 +103,7 @@ class ApplicationRuntime:
         overview_worker: CameraWorker,
         stereo_left_worker: CameraWorker,
         stereo_right_worker: CameraWorker | None,
+        stereo_pairer: StereoPairer | None,
         turret_worker: TurretWorker,
         mediator: Mediator,
         camera_stale_timeout_ms: int,
@@ -115,6 +117,7 @@ class ApplicationRuntime:
         self.overview_worker = overview_worker
         self.stereo_left_worker = stereo_left_worker
         self.stereo_right_worker = stereo_right_worker
+        self.stereo_pairer = stereo_pairer
         self.turret_worker = turret_worker
         self.mediator = mediator
         self.camera_stale_timeout_ms = camera_stale_timeout_ms
@@ -314,6 +317,8 @@ class ApplicationRuntime:
                     )
                 )
             self._shutdown_complete = not self._active_components
+            if self.stereo_pairer is not None:
+                self.stereo_pairer.reset()
             raise
 
         LOGGER.info("Application runtime workers started")
@@ -332,6 +337,8 @@ class ApplicationRuntime:
             if safety_failure is not None:
                 failures.append(safety_failure)
         failures.extend(self._stop_active(timeout))
+        if self.stereo_pairer is not None:
+            self.stereo_pairer.reset()
         self._shutdown_complete = not self._active_components
         if failures:
             raise ApplicationShutdownError(tuple(failures))
@@ -466,6 +473,18 @@ def build_application_runtime(
         raise TypeError("config must be AppConfig")
     selected_factories = factories or ApplicationFactories()
 
+    stereo_config = config.vision.distance.stereo
+    stereo_pairer = None
+    if (
+        config.vision.cameras.stereo_left.enabled
+        and config.vision.cameras.stereo_right.enabled
+        and stereo_config.stereo_enabled
+    ):
+        stereo_pairer = StereoPairer(
+            right_frame_buffer_size=stereo_config.right_frame_buffer_size,
+            pair_timeout_ms=stereo_config.pair_timeout_ms,
+        )
+
     overview_worker = build_camera_worker(
         camera=CameraRole.OVERVIEW,
         config=config.vision.cameras.overview,
@@ -477,6 +496,7 @@ def build_application_runtime(
         config=config.vision.cameras.stereo_left,
         corrector=stereo_left_corrector(stereo_calibration),
         source_factory=selected_factories.stereo_left_source_factory,
+        corrected_frame_sink=stereo_pairer,
     )
     stereo_right_worker = None
     if config.vision.cameras.stereo_right.enabled:
@@ -485,6 +505,7 @@ def build_application_runtime(
             config=config.vision.cameras.stereo_right,
             corrector=stereo_right_corrector(stereo_calibration),
             source_factory=selected_factories.stereo_right_source_factory,
+            corrected_frame_sink=stereo_pairer,
         )
     turret_worker = TurretWorker(
         config.turret,
@@ -512,6 +533,7 @@ def build_application_runtime(
         overview_worker=overview_worker,
         stereo_left_worker=stereo_left_worker,
         stereo_right_worker=stereo_right_worker,
+        stereo_pairer=stereo_pairer,
         turret_worker=turret_worker,
         mediator=mediator,
         camera_stale_timeout_ms=config.vision.camera_stale_timeout_ms,

@@ -5,6 +5,7 @@ from dataclasses import replace
 from pathlib import Path
 from time import monotonic, sleep
 
+import numpy as np
 import pytest
 
 from navmin.application import (
@@ -117,7 +118,12 @@ def _default_tracking_control_config():
     return load_config(defaults).tracking_control
 
 
-def _config(*, stereo_right_enabled: bool = False) -> AppConfig:
+def _config(
+    *,
+    stereo_left_enabled: bool = True,
+    stereo_right_enabled: bool = False,
+    stereo_enabled: bool = False,
+) -> AppConfig:
     center = AimPointConfig(x_px=None, y_px=None)
     axis = AxisMechanicsConfig(
         invert=False,
@@ -131,7 +137,7 @@ def _config(*, stereo_right_enabled: bool = False) -> AppConfig:
             processing_scope=ProcessingScope.MAIN_AND_PREVIEW,
             cameras=CamerasConfig(
                 overview=_overview_camera(8888),
-                stereo_left=_camera(8889),
+                stereo_left=_camera(8889, enabled=stereo_left_enabled),
                 stereo_right=_camera(8890, enabled=stereo_right_enabled),
             ),
             distance=VisionDistanceConfig(
@@ -139,7 +145,7 @@ def _config(*, stereo_right_enabled: bool = False) -> AppConfig:
                 manual_distance_m=100.0,
                 distance_stale_timeout_ms=300,
                 stereo=StereoDistanceConfig(
-                    stereo_enabled=False,
+                    stereo_enabled=stereo_enabled,
                     right_frame_buffer_size=4,
                     pair_timeout_ms=100,
                     calibration_file="calibration/stereo.json",
@@ -227,7 +233,12 @@ def _stereo_calibration() -> StereoCalibration:
     )
 
 
-def _injected_runtime(*, stereo_right_enabled: bool = False):
+def _injected_runtime(
+    *,
+    stereo_left_enabled: bool = True,
+    stereo_right_enabled: bool = False,
+    stereo_enabled: bool = False,
+):
     sources = {
         CameraRole.OVERVIEW: InMemoryFrameSource(),
         CameraRole.STEREO_LEFT: InMemoryFrameSource(),
@@ -253,7 +264,11 @@ def _injected_runtime(*, stereo_right_enabled: bool = False):
         return FakeTransport(endpoint, baudrate=baudrate)
 
     runtime = build_application_runtime(
-        config=_config(stereo_right_enabled=stereo_right_enabled),
+        config=_config(
+            stereo_left_enabled=stereo_left_enabled,
+            stereo_right_enabled=stereo_right_enabled,
+            stereo_enabled=stereo_enabled,
+        ),
         overview_calibration=_overview_calibration(),
         stereo_calibration=_stereo_calibration(),
         factories=ApplicationFactories(
@@ -368,6 +383,73 @@ def test_stereo_right_enabled_is_owned_but_excluded_from_ui_and_targeting() -> N
         CameraRole.OVERVIEW,
         CameraRole.STEREO_LEFT,
     }
+
+
+@pytest.mark.parametrize(
+    ("stereo_left_enabled", "stereo_right_enabled", "stereo_enabled"),
+    [
+        (True, False, True),
+        (True, True, False),
+        (False, True, True),
+    ],
+)
+def test_stereo_pairer_is_inactive_when_any_prerequisite_is_disabled(
+    stereo_left_enabled: bool,
+    stereo_right_enabled: bool,
+    stereo_enabled: bool,
+) -> None:
+    runtime, _sources, _endpoint = _injected_runtime(
+        stereo_left_enabled=stereo_left_enabled,
+        stereo_right_enabled=stereo_right_enabled,
+        stereo_enabled=stereo_enabled,
+    )
+
+    assert runtime.stereo_pairer is None
+
+
+def test_enabled_stereo_pairer_receives_both_corrected_frame_paths_and_resets() -> None:
+    runtime, sources, _endpoint = _injected_runtime(
+        stereo_right_enabled=True,
+        stereo_enabled=True,
+    )
+    pairer = runtime.stereo_pairer
+    assert pairer is not None
+    assert runtime.stereo_right_worker is not None
+    assert set(runtime.camera_bindings) == {
+        CameraRole.OVERVIEW,
+        CameraRole.STEREO_LEFT,
+    }
+    assert CameraRole.STEREO_RIGHT not in runtime.mediator._target_controls
+    assert CameraRole.STEREO_RIGHT not in runtime.mediator._vision_processing_enabled
+
+    frame = np.zeros((HEIGHT, WIDTH, 3), dtype=np.uint8)
+    runtime.start()
+    try:
+        sources[CameraRole.STEREO_LEFT].push(
+            frame,
+            capture_id=42,
+            receive_timestamp_ns=1_000_000,
+        )
+        sources[CameraRole.STEREO_RIGHT].push(
+            frame,
+            capture_id=42,
+            receive_timestamp_ns=2_000_000,
+        )
+        _wait_until(lambda: pairer.latest_pair is not None)
+
+        pair = pairer.latest_pair
+        assert pair is not None
+        assert pair.identity.capture_id == 42
+        assert pair.left.camera is CameraRole.STEREO_LEFT
+        assert pair.right.camera is CameraRole.STEREO_RIGHT
+        assert pair.left.generation == runtime.stereo_left_worker.pipeline.generation
+        assert pair.right.generation == runtime.stereo_right_worker.pipeline.generation
+    finally:
+        runtime.shutdown()
+
+    assert pairer.latest_pair is None
+    assert pairer.state.left_generation is None
+    assert pairer.state.right_generation is None
 
 
 def test_stereo_right_enabled_follows_startup_and_reverse_shutdown_order(

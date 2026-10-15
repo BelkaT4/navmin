@@ -56,6 +56,14 @@ class MissingCalibrationError(VisionPipelineError):
     """Required calibration was not supplied for the camera role."""
 
 
+class CorrectedFrameSink(Protocol):
+    """Cheap non-blocking observer for corrected frame/session boundaries."""
+
+    def on_camera_session_started(self, session: CameraSessionStarted) -> None: ...
+
+    def on_corrected_frame(self, frame: FramePacket) -> None: ...
+
+
 class _FrameCorrector(Protocol):
     camera_model: CameraModel
 
@@ -285,6 +293,7 @@ class VisionPipeline:
         session_barriers: CameraSessionBarrierChannel | None = None,
         target_control: TargetControlChannel | None = None,
         target_events: TargetLifecycleEventChannel | None = None,
+        corrected_frame_sink: CorrectedFrameSink | None = None,
         latest_result: InvalidatableLatest[VisionResult] | None = None,
         status: LatestValue[CameraStatus] | None = None,
         timestamp_clock_ns: Callable[[], int] = monotonic_ns,
@@ -304,6 +313,7 @@ class VisionPipeline:
         if self.target_control.camera is not camera:
             raise ValueError("target-control channel belongs to another camera")
         self.target_events = target_events or TargetLifecycleEventChannel()
+        self._corrected_frame_sink = corrected_frame_sink
         self.latest_result = latest_result or InvalidatableLatest()
         self.status = status or LatestValue()
         self._timestamp_clock_ns = timestamp_clock_ns
@@ -346,6 +356,8 @@ class VisionPipeline:
                 camera_model=self._corrector.camera_model,
                 timestamp_ns=timestamp_ns,
             )
+            if self._corrected_frame_sink is not None:
+                self._corrected_frame_sink.on_camera_session_started(session)
             self.session_barriers.publish(session)
         LOGGER.info("Vision pipeline started camera=%s generation=%d", self.camera.value, generation)
         return session
@@ -522,6 +534,11 @@ class VisionPipeline:
                 receive_timestamp_ns=pending.receive_timestamp_ns,
                 image=image,
             )
+            if self._corrected_frame_sink is not None:
+                with self._state_lock:
+                    if pending.generation != self._generation:
+                        return None
+                    self._corrected_frame_sink.on_corrected_frame(packet)
             processor_output = self._processor.process(
                 packet,
                 processing_enabled=self._processing_enabled,
@@ -571,6 +588,7 @@ class VisionPipeline:
 
 
 __all__ = [
+    "CorrectedFrameSink",
     "DecodedFrame",
     "DecodedFrameSource",
     "InMemoryFrameSource",

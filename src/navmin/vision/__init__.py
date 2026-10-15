@@ -12,6 +12,7 @@ from .gstreamer_source import (
     build_rtsp_pipeline_description,
 )
 from .pipeline import (
+    CorrectedFrameSink,
     DecodedFrame,
     DecodedFrameSource,
     InMemoryFrameSource,
@@ -36,6 +37,7 @@ __all__ = [
     "DEFAULT_VISION_PROCESSOR_CLASS",
     "CameraSourceError",
     "CameraWorker",
+    "CorrectedFrameSink",
     "DecodedFrame",
     "DecodedFrameSource",
     "GStreamerRtpJpegSource",
