@@ -9,6 +9,7 @@ import pytest
 
 import navmin.preflight as preflight_module
 from navmin.calibration import OverviewCalibration, StereoCalibration
+from navmin.config import load_config
 from navmin.config.models import (
     AimingConfig,
     AimPointConfig,
@@ -48,6 +49,16 @@ from navmin.preflight import (
 
 K = ((50.0, 0.0, 31.5), (0.0, 50.0, 23.5), (0.0, 0.0, 1.0))
 IDENTITY = ((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0))
+
+
+def _default_tracking_control_config():
+    defaults = (
+        Path(__file__).resolve().parents[1]
+        / "config"
+        / "defaults"
+        / "navmin.json"
+    )
+    return load_config(defaults).tracking_control
 
 
 def _camera(port: int, *, address: str = "127.0.0.1") -> CameraConfig:
@@ -108,7 +119,7 @@ def _inputs(
         max_relative_move_deg=45.0,
     )
     config = AppConfig(
-        schema_version=2,
+        schema_version=3,
         vision=VisionConfig(
             processing_scope=ProcessingScope.MAIN_AND_PREVIEW,
             cameras=CamerasConfig(
@@ -131,10 +142,10 @@ def _inputs(
             simulation_mode=False,
         ),
         aiming=AimingConfig(
-            lead_time_ms=100,
             target_lost_timeout_ms=500,
             aim_points=AimPointsConfig(overview=center, stereo_left=center),
         ),
+        tracking_control=_default_tracking_control_config(),
         turret=TurretConfig(
             serial=SerialConfig(
                 port=serial_port,

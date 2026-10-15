@@ -2,11 +2,13 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import replace
+from pathlib import Path
 from threading import Event
 from time import monotonic
 
 import pytest
 
+from navmin.config import load_config
 from navmin.config.models import (
     AxesConfig,
     AxisMechanicsConfig,
@@ -21,7 +23,7 @@ from navmin.contracts import (
     MotorState,
     MoveRelativeCommand,
     TargetRef,
-    TrackingError,
+    TrackingControlSample,
     TurretConnectionState,
     TurretControlMode,
 )
@@ -33,7 +35,38 @@ from navmin.turret.simulator import (
     FakeTransport,
 )
 from navmin.turret.transport import TransportDisconnectedError
-from navmin.turret.worker import TurretWorker, WorkerShutdownError
+from navmin.turret.worker import TurretWorker as _TurretWorker
+from navmin.turret.worker import WorkerShutdownError
+
+
+def _tracking_control_config():
+    defaults = (
+        Path(__file__).resolve().parents[1]
+        / "config"
+        / "defaults"
+        / "navmin.json"
+    )
+    return load_config(defaults).tracking_control
+
+
+class TurretWorker(_TurretWorker):
+    def __init__(self, config, **kwargs) -> None:
+        super().__init__(config, _tracking_control_config(), **kwargs)
+
+
+def _tracking_sample(error_x_deg: float, timestamp_ns: int) -> TrackingControlSample:
+    return TrackingControlSample(
+        target=TargetRef(CameraRole.OVERVIEW, 1, 1),
+        real_error_x_deg=error_x_deg,
+        real_error_y_deg=0.0,
+        target_rate_x_deg_s=None,
+        target_rate_y_deg_s=None,
+        prediction_offset_x_deg=0.0,
+        prediction_offset_y_deg=0.0,
+        rate_valid_x=False,
+        rate_valid_y=False,
+        observation_timestamp_ns=timestamp_ns,
+    )
 
 
 def _config(
@@ -512,9 +545,7 @@ def test_transport_loss_publishes_unknown_physical_state_and_preserves_mode() ->
             assert monotonic() < deadline
             Event().wait(0.002)
 
-        worker.submit_tracking_error(
-            TrackingError(TargetRef(CameraRole.OVERVIEW, 1, 1), 1.0, 0.0, 1)
-        )
+        worker.submit_tracking_control(_tracking_sample(1.0, 1))
         deadline = monotonic() + 0.5
         while not worker._controller.pid_x.has_sample:
             assert monotonic() < deadline
@@ -524,9 +555,7 @@ def test_transport_loss_publishes_unknown_physical_state_and_preserves_mode() ->
         transport = worker._transport
         assert isinstance(transport, FakeTransport)
         transport.queue_read_failure(FakeReadFailure.DISCONNECT)
-        worker.submit_tracking_error(
-            TrackingError(TargetRef(CameraRole.OVERVIEW, 1, 1), 2.0, 0.0, 2)
-        )
+        worker.submit_tracking_control(_tracking_sample(2.0, 2))
         state = _wait_state(worker, TurretConnectionState.CONNECTING)
         assert state.motor_state is MotorState.UNKNOWN
         assert state.max_speed_x_deg_s is None
@@ -534,6 +563,54 @@ def test_transport_loss_publishes_unknown_physical_state_and_preserves_mode() ->
         assert state.control_mode is TurretControlMode.TRACKING
         assert worker._controller.pending_motion is None
         assert worker._controller.pid_x.has_sample is False
+    finally:
+        _shutdown(worker)
+
+
+def test_tracking_config_update_reaches_controller_without_resetting_pid() -> None:
+    endpoint = FakeStm32Endpoint()
+    factory = _RecordingFactory(endpoint)
+    worker = TurretWorker(_config(), transport_factory=factory)
+    worker.start()
+    try:
+        _wait_state(worker, TurretConnectionState.READY)
+        assert worker.set_control_mode(TurretControlMode.TRACKING)
+        deadline = monotonic() + 0.5
+        while worker.current_state.control_mode is not TurretControlMode.TRACKING:
+            assert monotonic() < deadline
+            Event().wait(0.002)
+
+        worker.submit_tracking_control(_tracking_sample(1.0, 1))
+        deadline = monotonic() + 0.5
+        while not worker._controller.pid_x.has_sample:
+            assert monotonic() < deadline
+            Event().wait(0.002)
+        while not any(
+            request.command is CommandCode.SET_VELOCITY
+            for request in endpoint.executed_request_history
+        ):
+            assert monotonic() < deadline
+            Event().wait(0.002)
+
+        initial = _tracking_control_config()
+        changed = replace(
+            initial,
+            feed_forward=replace(
+                initial.feed_forward,
+                enabled=True,
+                gain_x=0.5,
+            ),
+        )
+        history_start = len(endpoint.executed_request_history)
+        worker.submit_tracking_control_config_update(ConfigUpdate(1, changed))
+        deadline = monotonic() + 0.5
+        while worker._desired_tracking_control_config != changed:
+            assert monotonic() < deadline
+            Event().wait(0.002)
+
+        assert worker._controller.pid_x.has_sample
+        assert worker._tracking_control_config_revision == 1
+        assert len(endpoint.executed_request_history) == history_start
     finally:
         _shutdown(worker)
 
@@ -929,13 +1006,8 @@ def test_high_rate_tracking_path_does_not_emit_info_per_setpoint(caplog) -> None
         caplog.clear()
         with caplog.at_level("INFO", logger="navmin.turret.worker"):
             for revision in range(1, 6):
-                worker.submit_tracking_error(
-                    TrackingError(
-                        TargetRef(CameraRole.OVERVIEW, 1, 1),
-                        0.1 * revision,
-                        0.0,
-                        revision,
-                    )
+                worker.submit_tracking_control(
+                    _tracking_sample(0.1 * revision, revision)
                 )
             deadline = monotonic() + 0.5
             while (

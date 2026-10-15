@@ -11,7 +11,12 @@ from types import MappingProxyType
 
 from navmin.calibration import OverviewCalibration, StereoCalibration
 from navmin.concurrency import LatestValue
-from navmin.config.models import AppConfig, PidControllerConfig, TurretConfig
+from navmin.config.models import (
+    AppConfig,
+    PidControllerConfig,
+    TrackingControlConfig,
+    TurretConfig,
+)
 from navmin.contracts import (
     CameraRole,
     ConfigUpdate,
@@ -59,6 +64,8 @@ class UiRuntimeDependencies:
     camera_stale_timeout_ms: int
     pid_controller_config: PidControllerConfig
     apply_pid_tuning: Callable[[PidControllerConfig], None]
+    tracking_control_config: TrackingControlConfig
+    apply_tracking_control_tuning: Callable[[TrackingControlConfig], None]
 
 
 @dataclass(frozen=True)
@@ -92,9 +99,12 @@ class ApplicationRuntime:
         mediator: Mediator,
         camera_stale_timeout_ms: int,
         turret_config: TurretConfig,
+        tracking_control_config: TrackingControlConfig,
     ) -> None:
         if not isinstance(turret_config, TurretConfig):
             raise TypeError("turret_config must be TurretConfig")
+        if not isinstance(tracking_control_config, TrackingControlConfig):
+            raise TypeError("tracking_control_config must be TrackingControlConfig")
         self.overview_worker = overview_worker
         self.stereo_left_worker = stereo_left_worker
         self.turret_worker = turret_worker
@@ -102,6 +112,8 @@ class ApplicationRuntime:
         self.camera_stale_timeout_ms = camera_stale_timeout_ms
         self._runtime_turret_config = turret_config
         self._pid_tuning_revision = 0
+        self._runtime_tracking_control_config = tracking_control_config
+        self._tracking_tuning_revision = 0
 
         self._camera_workers = MappingProxyType(
             {
@@ -122,6 +134,8 @@ class ApplicationRuntime:
             camera_stale_timeout_ms=camera_stale_timeout_ms,
             pid_controller_config=turret_config.controller,
             apply_pid_tuning=self.apply_pid_tuning,
+            tracking_control_config=tracking_control_config,
+            apply_tracking_control_tuning=self.apply_tracking_control_tuning,
         )
         self._active_components: set[str] = set()
         self._start_attempted = False
@@ -164,6 +178,77 @@ class ApplicationRuntime:
             config.pid_ki_y,
             config.pid_kd_y,
         )
+
+    def apply_tracking_control_tuning(
+        self,
+        config: TrackingControlConfig,
+    ) -> None:
+        """Apply one temporary tracking-control snapshot to both runtime owners."""
+        self._validate_tracking_control_tuning(config)
+        next_revision = self._tracking_tuning_revision + 1
+        update = ConfigUpdate(revision=next_revision, config=config)
+        self.mediator.apply_tracking_control_config_update(update)
+        self.turret_worker.submit_tracking_control_config_update(update)
+        self._runtime_tracking_control_config = config
+        self._tracking_tuning_revision = next_revision
+        LOGGER.info(
+            "Tracking tuning update queued revision=%d "
+            "FF enabled=%s gain=(%g,%g) Prediction enabled=%s "
+            "horizon=%d window=%d",
+            next_revision,
+            config.feed_forward.enabled,
+            config.feed_forward.gain_x,
+            config.feed_forward.gain_y,
+            config.prediction.enabled,
+            config.prediction.horizon_ms,
+            config.velocity_estimator.window_ms,
+        )
+
+    @staticmethod
+    def _validate_tracking_control_tuning(config: TrackingControlConfig) -> None:
+        if not isinstance(config, TrackingControlConfig):
+            raise TypeError("config must be TrackingControlConfig")
+        estimator = config.velocity_estimator
+        prediction = config.prediction
+        feed_forward = config.feed_forward
+        integer_minima = (
+            ("window_ms", estimator.window_ms, 1),
+            ("min_span_ms", estimator.min_span_ms, 1),
+            ("min_samples", estimator.min_samples, 2),
+            ("max_samples", estimator.max_samples, 2),
+            ("horizon_ms", prediction.horizon_ms, 0),
+        )
+        for name, value, minimum in integer_minima:
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise TypeError(f"{name} must be an integer")
+            if value < minimum:
+                raise ValueError(f"{name} must be >= {minimum}")
+        if estimator.min_span_ms > estimator.window_ms:
+            raise ValueError("min_span_ms must be <= window_ms")
+        if estimator.max_samples < estimator.min_samples:
+            raise ValueError("max_samples must be >= min_samples")
+        for name, value, strictly_positive in (
+            ("max_fit_rms_deg", estimator.max_fit_rms_deg, True),
+            ("max_target_rate_x_deg_s", estimator.max_target_rate_x_deg_s, True),
+            ("max_target_rate_y_deg_s", estimator.max_target_rate_y_deg_s, True),
+            ("gain_x", feed_forward.gain_x, False),
+            ("gain_y", feed_forward.gain_y, False),
+            ("max_angle_x_deg", prediction.max_angle_x_deg, True),
+            ("max_angle_y_deg", prediction.max_angle_y_deg, True),
+        ):
+            if isinstance(value, bool) or not isinstance(value, int | float):
+                raise TypeError(f"{name} must be a number")
+            numeric = float(value)
+            if not math.isfinite(numeric):
+                raise ValueError(f"{name} must be finite")
+            if strictly_positive and numeric <= 0:
+                raise ValueError(f"{name} must be > 0")
+            if not strictly_positive and numeric < 0:
+                raise ValueError(f"{name} must be >= 0")
+        if type(feed_forward.enabled) is not bool:
+            raise TypeError("feed_forward.enabled must be bool")
+        if type(prediction.enabled) is not bool:
+            raise TypeError("prediction.enabled must be bool")
 
     @staticmethod
     def _validate_pid_tuning(config: PidControllerConfig) -> None:
@@ -382,10 +467,13 @@ def build_application_runtime(
     )
     turret_worker = TurretWorker(
         config.turret,
+        config.tracking_control,
         transport_factory=selected_factories.turret_transport_factory,
     )
     mediator = Mediator(
         aiming_config=config.aiming,
+        tracking_control_config=config.tracking_control,
+        tracking_gap_timeout_ms=config.turret.stm32.velocity_watchdog_timeout_ms,
         ui_config=config.ui,
         turret=turret_worker,
         target_controls={
@@ -406,6 +494,7 @@ def build_application_runtime(
         mediator=mediator,
         camera_stale_timeout_ms=config.vision.camera_stale_timeout_ms,
         turret_config=config.turret,
+        tracking_control_config=config.tracking_control,
     )
 
 

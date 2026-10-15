@@ -29,6 +29,7 @@ from navmin.config import (
     UiConfig,
     VisionConfig,
     VisionDistanceConfig,
+    load_config,
 )
 from navmin.contracts import CameraRole, DistanceSource
 from navmin.diagnostics.localhost_rtp import (
@@ -189,6 +190,16 @@ class DiagnosticEndpoints:
         self._senders.append(sender)
 
 
+def _default_tracking_control_config():
+    defaults = (
+        Path(__file__).resolve().parents[2]
+        / "config"
+        / "defaults"
+        / "navmin.json"
+    )
+    return load_config(defaults).tracking_control
+
+
 def _synthetic_diagnostic_inputs() -> LoadedApplicationInputs:
     """Build explicit in-memory config/calibration inputs for the all-software profile."""
     center = AimPointConfig(x_px=None, y_px=None)
@@ -209,7 +220,7 @@ def _synthetic_diagnostic_inputs() -> LoadedApplicationInputs:
     stereo_left = replace(diagnostic_camera_config(8889), processing_enabled=True)
     stereo_right = diagnostic_camera_config(8890)
     config = AppConfig(
-        schema_version=2,
+        schema_version=3,
         vision=VisionConfig(
             processing_scope=ProcessingScope.MAIN_AND_PREVIEW,
             cameras=CamerasConfig(
@@ -232,10 +243,10 @@ def _synthetic_diagnostic_inputs() -> LoadedApplicationInputs:
             simulation_mode=True,
         ),
         aiming=AimingConfig(
-            lead_time_ms=100,
             target_lost_timeout_ms=500,
             aim_points=AimPointsConfig(overview=center, stereo_left=center),
         ),
+        tracking_control=_default_tracking_control_config(),
         turret=TurretConfig(
             serial=SerialConfig(
                 port="diagnostic-pty",

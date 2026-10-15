@@ -1,4 +1,4 @@
-"""Typed configuration foundation for NavMin schema v2."""
+"""Typed configuration foundation for NavMin schema v3."""
 
 from .manager import ConfigManager, save_config
 from .models import (
@@ -12,8 +12,11 @@ from .models import (
     CamerasConfig,
     CameraSourceConfig,
     ConfigApplyPolicy,
+    FeedForwardConfig,
     OverviewCameraConfig,
     PidControllerConfig,
+    PlatformMotionConfig,
+    PredictionConfig,
     ProcessingScope,
     RtpJpegSourceConfig,
     RtspDecoderMode,
@@ -22,8 +25,10 @@ from .models import (
     SerialConfig,
     StereoDistanceConfig,
     Stm32Config,
+    TrackingControlConfig,
     TurretConfig,
     UiConfig,
+    VelocityEstimatorConfig,
     VisionConfig,
     VisionDistanceConfig,
     changed_config_paths,
@@ -58,8 +63,11 @@ __all__ = [
     "ConfigManager",
     "ConfigPersistenceError",
     "ConfigValidationError",
+    "FeedForwardConfig",
     "OverviewCameraConfig",
     "PidControllerConfig",
+    "PlatformMotionConfig",
+    "PredictionConfig",
     "ProcessingScope",
     "RtpJpegSourceConfig",
     "RtspDecoderMode",
@@ -68,9 +76,11 @@ __all__ = [
     "SerialConfig",
     "StereoDistanceConfig",
     "Stm32Config",
+    "TrackingControlConfig",
     "TurretConfig",
     "UiConfig",
     "UnsupportedConfigSchemaError",
+    "VelocityEstimatorConfig",
     "VisionConfig",
     "VisionDistanceConfig",
     "changed_config_paths",

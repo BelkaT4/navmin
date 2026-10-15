@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from pathlib import Path
 
 import pytest
 
+from navmin.config import load_config
 from navmin.config.models import (
     AxesConfig,
     AxisMechanicsConfig,
@@ -19,7 +21,7 @@ from navmin.contracts import (
     MotorState,
     MoveRelativeCommand,
     TargetRef,
-    TrackingError,
+    TrackingControlSample,
     TurretControlMode,
 )
 from navmin.turret.controller import TurretController
@@ -43,6 +45,14 @@ class _Clock:
         self.now = now
 
     def __call__(self) -> float:
+        return self.now
+
+
+class _NsClock:
+    def __init__(self, now: int = 0) -> None:
+        self.now = now
+
+    def __call__(self) -> int:
         return self.now
 
 
@@ -106,7 +116,9 @@ def _config(
 def _stack(
     config: TurretConfig | None = None,
     *,
+    tracking_control_config=None,
     clock: _Clock | None = None,
+    command_clock: _NsClock | None = None,
     transport: FakeTransport | None = None,
 ) -> tuple[TurretController, TurretHal, TurretSession, FakeTransport, _Clock]:
     cfg = config or _config()
@@ -118,9 +130,14 @@ def _stack(
         max_retries=2,
         inter_request_delay_s=0.0,
     )
-    hal = TurretHal(session, cfg)
+    hal = TurretHal(session, cfg, command_clock_ns=command_clock or _NsClock())
     test_clock = clock or _Clock()
-    controller = TurretController(hal, cfg, clock=test_clock)
+    controller = TurretController(
+        hal,
+        cfg,
+        tracking_control_config or _tracking_control_config(),
+        clock=test_clock,
+    )
     return controller, hal, session, fake, test_clock
 
 
@@ -134,8 +151,35 @@ def _tracking_error(
     y: float = 0.0,
     *,
     timestamp_ns: int = 1,
-) -> TrackingError:
-    return TrackingError(target, x, y, timestamp_ns)
+    target_rate_x: float | None = None,
+    target_rate_y: float | None = None,
+    prediction_x: float = 0.0,
+    prediction_y: float = 0.0,
+    valid_x: bool = False,
+    valid_y: bool = False,
+) -> TrackingControlSample:
+    return TrackingControlSample(
+        target=target,
+        real_error_x_deg=x,
+        real_error_y_deg=y,
+        target_rate_x_deg_s=target_rate_x,
+        target_rate_y_deg_s=target_rate_y,
+        prediction_offset_x_deg=prediction_x,
+        prediction_offset_y_deg=prediction_y,
+        rate_valid_x=valid_x,
+        rate_valid_y=valid_y,
+        observation_timestamp_ns=timestamp_ns,
+    )
+
+
+def _tracking_control_config():
+    defaults = (
+        Path(__file__).resolve().parents[1]
+        / "config"
+        / "defaults"
+        / "navmin.json"
+    )
+    return load_config(defaults).tracking_control
 
 
 def _enter_tracking_off(
@@ -176,6 +220,98 @@ def test_hal_move_and_velocity_reject_int32_overflow_before_transmission() -> No
         hal.set_velocity(AxisVelocitySetpoint(361.0, 0.0, 1))
 
     assert transport.raw_write_history == []
+
+
+def test_successful_velocity_uses_physical_command_timestamp_not_observation() -> None:
+    command_clock = _NsClock(1_000_000_000)
+    controller, hal, _, transport, _ = _stack(command_clock=command_clock)
+    controller.motor_off()
+    controller.set_control_mode(TurretControlMode.TRACKING)
+    controller.motor_on()
+    transport.raw_write_history.clear()
+    command_clock.now = 1_100_000_000
+
+    controller.submit_tracking_control(
+        1,
+        _tracking_error(_target(), 2.0, timestamp_ns=123),
+    )
+    controller.flush_pending_motion()
+
+    snapshot = hal.platform_motion_snapshot
+    assert snapshot.valid
+    assert snapshot.anchors[-1].timestamp_ns == 1_100_000_000
+    assert snapshot.anchors[-1].timestamp_ns != 123
+    assert snapshot.anchors[-1].commanded_rate_x_deg_s == pytest.approx(4.05)
+
+
+def test_successful_velocity_command_model_uses_quantized_logical_rate() -> None:
+    config = _config(
+        invert_x=True,
+        invert_y=False,
+        full_steps_x=200,
+        full_steps_y=200,
+        microstep_x=1,
+        microstep_y=1,
+    )
+    command_clock = _NsClock(1_000_000_000)
+    _, hal, _, transport, _ = _stack(config, command_clock=command_clock)
+    hal.motor_off()
+    transport.raw_write_history.clear()
+    command_clock.now = 1_100_000_000
+
+    result = hal.set_velocity(AxisVelocitySetpoint(1.0, -1.0, 7))
+
+    assert result.response is not None and result.response.result is ResultCode.OK
+    request = decode_request(transport.raw_write_history[-1])
+    assert request.payload == SetVelocityPayload(-1, -1)
+    anchor = hal.platform_motion_snapshot.anchors[-1]
+    assert anchor.commanded_rate_x_deg_s == pytest.approx(1.8)
+    assert anchor.commanded_rate_y_deg_s == pytest.approx(-1.8)
+
+
+def test_command_model_uses_quantized_applied_acceleration() -> None:
+    config = _config(
+        full_steps_x=200,
+        full_steps_y=400,
+        microstep_x=1,
+        microstep_y=1,
+        acceleration_x=2.7,
+        acceleration_y=2.7,
+    )
+    command_clock = _NsClock(1_000_000_000)
+    _, hal, _, transport, _ = _stack(config, command_clock=command_clock)
+    hal.motor_off()
+    command_clock.now = 1_100_000_000
+
+    result = hal.sync_stm32_config()
+
+    assert result is not None and result.response is not None
+    assert result.response.result is ResultCode.OK
+    request = decode_request(transport.raw_write_history[-1])
+    assert request.payload.acceleration_x_steps_s2 == 2
+    assert request.payload.acceleration_y_steps_s2 == 3
+    anchor = hal.platform_motion_snapshot.anchors[-1]
+    assert anchor.acceleration_x_deg_s2 == pytest.approx(3.6)
+    assert anchor.acceleration_y_deg_s2 == pytest.approx(2.7)
+
+
+def test_failed_velocity_does_not_become_command_model_target() -> None:
+    endpoint = FakeStm32Endpoint()
+    command_clock = _NsClock(1_000_000_000)
+    _, hal, _, _, _ = _stack(
+        transport=FakeTransport(endpoint),
+        command_clock=command_clock,
+    )
+    hal.motor_off()
+    before = hal.platform_motion_snapshot
+    endpoint.queue_response(FakeResponseSpec(result=ResultCode.INVALID_STATE))
+    command_clock.now = 1_100_000_000
+
+    result = hal.set_velocity(AxisVelocitySetpoint(20.0, 0.0, 7))
+
+    assert result.response is not None
+    assert result.response.result is ResultCode.INVALID_STATE
+    assert hal.platform_motion_snapshot == before
 
 
 def test_hal_set_config_full_snapshot_uses_positive_unsigned_step_units() -> None:
@@ -328,6 +464,40 @@ def test_axis_pid_conditional_anti_windup_and_integral_limit() -> None:
     assert pid.i_term == pytest.approx(-0.2)
 
 
+def test_axis_pid_prediction_is_p_only_and_ff_is_outside_i_and_d() -> None:
+    pid = AxisPid(PidGains(2.0, 1.0, 3.0), output_limit=50.0)
+
+    assert pid.step(
+        1.0,
+        now_s=0.0,
+        proportional_offset=2.0,
+        feed_forward=4.0,
+    ) == pytest.approx(10.0)
+    assert pid.step(
+        1.0,
+        now_s=1.0,
+        proportional_offset=-1.0,
+        feed_forward=4.0,
+    ) == pytest.approx(5.0)
+    assert pid.i_term == pytest.approx(1.0)
+
+
+def test_axis_pid_full_candidate_saturation_blocks_real_error_windup() -> None:
+    pid = AxisPid(PidGains(0.0, 1.0, 0.0), output_limit=5.0)
+    pid.step(1.0, now_s=0.0, feed_forward=10.0)
+
+    assert pid.step(1.0, now_s=1.0, feed_forward=10.0) == 5.0
+    assert pid.i_term == 0.0
+    assert pid.step(-1.0, now_s=2.0, feed_forward=10.0) == 5.0
+    assert pid.i_term == pytest.approx(-1.0)
+
+
+def test_axis_pid_sums_opposite_sign_pid_and_ff_before_one_final_clamp() -> None:
+    pid = AxisPid(PidGains(2.0, 0.0, 0.0), output_limit=5.0)
+
+    assert pid.step(4.0, now_s=0.0, feed_forward=-6.0) == pytest.approx(2.0)
+
+
 def test_axis_pid_limit_decrease_clamps_i_and_increase_preserves_it() -> None:
     pid = AxisPid(PidGains(0.0, 1.0, 0.0), output_limit=10.0)
     pid.step(2.0, now_s=0.0)
@@ -357,17 +527,28 @@ def test_controller_relative_pending_motion_is_latest_only() -> None:
     assert controller.pending_motion is None
 
 
+def test_successful_relative_motion_invalidates_command_rate_model() -> None:
+    controller, hal, _, _, _ = _stack()
+    controller.motor_off()
+    assert hal.platform_motion_snapshot.valid
+
+    controller.submit_move_relative(MoveRelativeCommand(1.0, 0.0))
+    controller.flush_pending_motion()
+
+    assert not hal.platform_motion_snapshot.valid
+
+
 def test_controller_tracking_pending_is_latest_and_revision_processed_once() -> None:
     controller, _, _, transport, clock = _stack()
     _enter_tracking_off(controller, transport)
     target = _target()
 
-    assert controller.submit_tracking_error(1, _tracking_error(target, 1.0))
+    assert controller.submit_tracking_control(1, _tracking_error(target, 1.0))
     first_pending = controller.pending_motion
     clock.now = 0.05
-    assert not controller.submit_tracking_error(1, _tracking_error(target, 10.0))
+    assert not controller.submit_tracking_control(1, _tracking_error(target, 10.0))
     assert controller.pending_motion == first_pending
-    assert controller.submit_tracking_error(2, _tracking_error(target, 2.0))
+    assert controller.submit_tracking_control(2, _tracking_error(target, 2.0))
 
     controller.flush_pending_motion()
 
@@ -376,17 +557,124 @@ def test_controller_tracking_pending_is_latest_and_revision_processed_once() -> 
     assert controller.last_processed_revision == 2
 
 
+def test_controller_applies_valid_prediction_and_velocity_feed_forward() -> None:
+    tracking = _tracking_control_config()
+    tracking = replace(
+        tracking,
+        feed_forward=replace(
+            tracking.feed_forward,
+            enabled=True,
+            gain_x=0.5,
+            gain_y=0.25,
+        ),
+        prediction=replace(tracking.prediction, enabled=True),
+    )
+    config = _config(
+        kp_x=2.0,
+        ki_x=0.0,
+        kd_x=0.0,
+        kp_y=2.0,
+        ki_y=0.0,
+        kd_y=0.0,
+    )
+    controller, _, _, transport, _ = _stack(
+        config,
+        tracking_control_config=tracking,
+    )
+    _enter_tracking_off(controller, transport)
+
+    controller.submit_tracking_control(
+        1,
+        _tracking_error(
+            _target(),
+            1.0,
+            -1.0,
+            target_rate_x=4.0,
+            target_rate_y=-8.0,
+            prediction_x=0.5,
+            prediction_y=-0.25,
+            valid_x=True,
+            valid_y=True,
+        ),
+    )
+
+    assert controller.pending_motion == AxisVelocitySetpoint(5.0, -4.5, 1)
+
+
+def test_invalid_axis_suppresses_prediction_and_ff_but_keeps_pid() -> None:
+    tracking = _tracking_control_config()
+    tracking = replace(
+        tracking,
+        feed_forward=replace(
+            tracking.feed_forward, enabled=True, gain_x=10.0
+        ),
+        prediction=replace(tracking.prediction, enabled=True),
+    )
+    config = _config(kp_x=2.0, ki_x=0.0, kd_x=0.0)
+    controller, _, _, transport, _ = _stack(
+        config,
+        tracking_control_config=tracking,
+    )
+    _enter_tracking_off(controller, transport)
+
+    controller.submit_tracking_control(
+        1,
+        _tracking_error(
+            _target(),
+            1.0,
+            target_rate_x=20.0,
+            prediction_x=1.0,
+            valid_x=False,
+        ),
+    )
+
+    assert controller.pending_motion == AxisVelocitySetpoint(2.0, 0.0, 1)
+
+
+def test_ff_config_replacement_does_not_reset_pid_state() -> None:
+    tracking = _tracking_control_config()
+    config = _config(kp_x=0.0, ki_x=1.0, kd_x=0.0, watchdog_ms=1000)
+    controller, _, _, transport, clock = _stack(
+        config,
+        tracking_control_config=tracking,
+    )
+    _enter_tracking_off(controller, transport)
+    target = _target()
+    controller.submit_tracking_control(1, _tracking_error(target, 1.0))
+    clock.now = 0.5
+    controller.submit_tracking_control(2, _tracking_error(target, 1.0))
+    before = controller.pid_x.i_term
+
+    controller.apply_tracking_control_config(
+        replace(
+            tracking,
+            feed_forward=replace(
+                tracking.feed_forward,
+                enabled=True,
+                gain_x=0.5,
+            ),
+        )
+    )
+
+    assert controller.pid_x.has_sample
+    assert controller.pid_x.i_term == before
+
+    controller.apply_tracking_control_config(tracking)
+    assert controller.pid_x.has_sample
+    assert controller.pid_x.i_term == before
+
+
 def test_target_change_resets_pid_before_new_tracking_sample() -> None:
     controller, _, _, transport, clock = _stack()
     _enter_tracking_off(controller, transport)
 
-    controller.submit_tracking_error(1, _tracking_error(_target(1), 1.0))
+    controller.submit_tracking_control(1, _tracking_error(_target(1), 1.0))
     clock.now = 0.05
-    controller.submit_tracking_error(2, _tracking_error(_target(1), 2.0))
+    controller.submit_tracking_control(2, _tracking_error(_target(1), 2.0))
     assert controller.pid_x.i_term != 0.0
 
     clock.now = 0.06
-    controller.submit_tracking_error(3, _tracking_error(_target(2), 1.0))
+    controller.submit_tracking_control(3, _tracking_error(_target(2), 1.0))
 
     assert controller.pid_x.i_term == 0.0
     assert controller.pending_motion == AxisVelocitySetpoint(2.0, 0.0, 1)
@@ -397,13 +685,13 @@ def test_long_tracking_gap_resets_pid_before_next_sample() -> None:
     _enter_tracking_off(controller, transport)
     target = _target()
 
-    controller.submit_tracking_error(1, _tracking_error(target, 1.0))
+    controller.submit_tracking_control(1, _tracking_error(target, 1.0))
     clock.now = 0.05
-    controller.submit_tracking_error(2, _tracking_error(target, 2.0))
+    controller.submit_tracking_control(2, _tracking_error(target, 2.0))
     assert controller.pid_x.i_term != 0.0
 
     clock.now = 0.2
-    controller.submit_tracking_error(3, _tracking_error(target, 1.0))
+    controller.submit_tracking_control(3, _tracking_error(target, 1.0))
 
     assert controller.pid_x.i_term == 0.0
     assert controller.pending_motion == AxisVelocitySetpoint(2.0, 0.0, 1)
@@ -414,9 +702,9 @@ def test_runtime_gain_change_resets_only_changed_axis_in_tracking() -> None:
     controller, _, _, transport, clock = _stack(config)
     _enter_tracking_off(controller, transport)
     target = _target()
-    controller.submit_tracking_error(1, _tracking_error(target, 1.0, 1.0))
+    controller.submit_tracking_control(1, _tracking_error(target, 1.0, 1.0))
     clock.now = 0.05
-    controller.submit_tracking_error(2, _tracking_error(target, 1.0, 1.0))
+    controller.submit_tracking_control(2, _tracking_error(target, 1.0, 1.0))
     assert controller.pid_x.i_term > 0
     assert controller.pid_y.i_term > 0
 
@@ -436,9 +724,9 @@ def test_runtime_limit_decrease_clamps_i_increase_preserves_and_gain_reset_wins(
     controller, _, _, transport, clock = _stack(config)
     _enter_tracking_off(controller, transport)
     target = _target()
-    controller.submit_tracking_error(1, _tracking_error(target, 4.0))
+    controller.submit_tracking_control(1, _tracking_error(target, 4.0))
     clock.now = 0.5
-    controller.submit_tracking_error(2, _tracking_error(target, 4.0))
+    controller.submit_tracking_control(2, _tracking_error(target, 4.0))
     assert controller.pid_x.i_term == pytest.approx(2.0)
 
     lower = replace(config, stm32=replace(config.stm32, max_speed_x_deg_s=0.5))
@@ -497,6 +785,23 @@ def test_mode_transition_zero_handshake_applies_only_after_ok() -> None:
     assert hal.motor_state is MotorState.ON
 
 
+def test_mode_transition_zero_updates_command_model_target() -> None:
+    command_clock = _NsClock(1_000_000_000)
+    controller, hal, _, _, _ = _stack(command_clock=command_clock)
+    controller.motor_off()
+    controller.motor_on()
+    command_clock.now = 1_100_000_000
+    hal.set_velocity(AxisVelocitySetpoint(10.0, 0.0, 5))
+    command_clock.now = 1_200_000_000
+
+    controller.set_control_mode(TurretControlMode.TRACKING)
+
+    anchor = hal.platform_motion_snapshot.anchors[-1]
+    assert anchor.timestamp_ns == 1_200_000_000
+    assert anchor.commanded_rate_x_deg_s == 0.0
+    assert anchor.commanded_rate_y_deg_s == 0.0
+
+
 @pytest.mark.parametrize("mode", [TurretControlMode.RELATIVE, TurretControlMode.TRACKING])
 def test_stop_motion_invalidates_pending_keeps_mode_and_sends_zero_when_on(
     mode: TurretControlMode,
@@ -505,7 +810,7 @@ def test_stop_motion_invalidates_pending_keeps_mode_and_sends_zero_when_on(
     controller.motor_on()
     if mode is TurretControlMode.TRACKING:
         controller.set_control_mode(mode)
-        controller.submit_tracking_error(1, _tracking_error(_target(), 1.0))
+        controller.submit_tracking_control(1, _tracking_error(_target(), 1.0))
     else:
         controller.submit_move_relative(MoveRelativeCommand(1.0, 0.0))
     transport.raw_write_history.clear()
@@ -519,6 +824,25 @@ def test_stop_motion_invalidates_pending_keeps_mode_and_sends_zero_when_on(
     request = decode_request(transport.raw_write_history[-1])
     assert request.command is CommandCode.SET_VELOCITY
     assert request.payload == SetVelocityPayload(0, 0)
+
+
+def test_stop_motion_zero_updates_command_model_target() -> None:
+    command_clock = _NsClock(1_000_000_000)
+    controller, hal, _, _transport, _ = _stack(command_clock=command_clock)
+    controller.motor_off()
+    controller.motor_on()
+    controller.set_control_mode(TurretControlMode.TRACKING)
+    command_clock.now = 1_100_000_000
+    controller.submit_tracking_control(1, _tracking_error(_target(), 2.0))
+    controller.flush_pending_motion()
+    command_clock.now = 1_200_000_000
+
+    controller.stop_motion()
+
+    anchor = hal.platform_motion_snapshot.anchors[-1]
+    assert anchor.timestamp_ns == 1_200_000_000
+    assert anchor.commanded_rate_x_deg_s == 0.0
+    assert anchor.commanded_rate_y_deg_s == 0.0
 
 
 def test_motor_off_invalidates_motion_and_motor_on_does_not_replay_it() -> None:
@@ -544,7 +868,7 @@ def test_zero_velocity_tracking_setpoint_is_ordinary_motion_not_hidden_stop() ->
     controller, _, _, transport, _ = _stack()
     _enter_tracking_off(controller, transport)
 
-    controller.submit_tracking_error(1, _tracking_error(_target(), 0.0, 0.0))
+    controller.submit_tracking_control(1, _tracking_error(_target(), 0.0, 0.0))
     assert controller.pid_x.has_sample and controller.pid_y.has_sample
     controller.flush_pending_motion()
 
@@ -558,7 +882,7 @@ def test_zero_velocity_tracking_setpoint_is_ordinary_motion_not_hidden_stop() ->
 def test_emergency_clears_pending_and_resets_pid_via_existing_session_path() -> None:
     controller, _, session, transport, _ = _stack()
     _enter_tracking_off(controller, transport)
-    controller.submit_tracking_error(1, _tracking_error(_target(), 1.0))
+    controller.submit_tracking_control(1, _tracking_error(_target(), 1.0))
     transport.raw_write_history.clear()
 
     response = controller.emergency_stop()
@@ -572,17 +896,45 @@ def test_emergency_clears_pending_and_resets_pid_via_existing_session_path() -> 
     assert session.next_request_id == 2
 
 
+def test_emergency_motor_off_and_transport_loss_update_model_validity() -> None:
+    command_clock = _NsClock(1_000_000_000)
+    controller, hal, _, _transport, _ = _stack(command_clock=command_clock)
+    controller.motor_off()
+    controller.motor_on()
+    controller.set_control_mode(TurretControlMode.TRACKING)
+    command_clock.now = 1_100_000_000
+    controller.submit_tracking_control(1, _tracking_error(_target(), 2.0))
+    controller.flush_pending_motion()
+    assert hal.platform_motion_snapshot.valid
+
+    command_clock.now = 1_200_000_000
+    response = controller.emergency_stop()
+    assert response is not None and response.result is ResultCode.OK
+    emergency_anchor = hal.platform_motion_snapshot.anchors[-1]
+    assert emergency_anchor.modeled_rate_x_deg_s == 0.0
+
+    command_clock.now = 1_300_000_000
+    controller.motor_off()
+    motor_off_anchor = hal.platform_motion_snapshot.anchors[-1]
+    assert motor_off_anchor.timestamp_ns == 1_300_000_000
+    assert motor_off_anchor.modeled_rate_x_deg_s == 0.0
+
+    controller.reset_for_transport_recovery()
+    assert not hal.platform_motion_snapshot.valid
+    assert hal.platform_motion_snapshot.anchors == ()
+
+
 def test_tracking_invalidation_and_recovery_boundary_reset_controller_state() -> None:
     controller, hal, _, transport, _ = _stack()
     _enter_tracking_off(controller, transport)
-    controller.submit_tracking_error(4, _tracking_error(_target(), 1.0))
+    controller.submit_tracking_control(4, _tracking_error(_target(), 1.0))
 
-    assert controller.invalidate_tracking_error(5)
+    assert controller.invalidate_tracking_control(5)
     assert controller.pending_motion is None
     assert not controller.pid_x.has_sample
     assert controller.last_processed_revision == 5
 
-    controller.submit_tracking_error(6, _tracking_error(_target(), 1.0))
+    controller.submit_tracking_control(6, _tracking_error(_target(), 1.0))
     controller.reset_for_transport_recovery()
     assert controller.pending_motion is None
     assert not controller.pid_x.has_sample
@@ -594,9 +946,9 @@ def test_gain_change_outside_tracking_does_not_force_immediate_pid_reset() -> No
     controller, _, _, transport, clock = _stack(config)
     _enter_tracking_off(controller, transport)
     target = _target()
-    controller.submit_tracking_error(1, _tracking_error(target, 2.0))
+    controller.submit_tracking_control(1, _tracking_error(target, 2.0))
     clock.now = 0.5
-    controller.submit_tracking_error(2, _tracking_error(target, 2.0))
+    controller.submit_tracking_control(2, _tracking_error(target, 2.0))
     assert controller.pid_x.i_term == pytest.approx(1.0)
 
     controller.set_control_mode(TurretControlMode.RELATIVE)
@@ -641,7 +993,7 @@ def test_motor_off_invalidates_tracking_motion_and_resets_pid() -> None:
     controller, hal, _, transport, _ = _stack()
     controller.motor_on()
     controller.set_control_mode(TurretControlMode.TRACKING)
-    controller.submit_tracking_error(1, _tracking_error(_target(), 1.0))
+    controller.submit_tracking_control(1, _tracking_error(_target(), 1.0))
     assert controller.pid_x.has_sample
     assert controller.pending_motion is not None
     transport.raw_write_history.clear()

@@ -6,16 +6,18 @@ from collections.abc import Mapping
 from typing import Protocol
 
 from navmin.concurrency import TargetControlChannel
-from navmin.config.models import AimingConfig, UiConfig
+from navmin.config.models import AimingConfig, TrackingControlConfig, UiConfig
 from navmin.contracts import (
     CameraRole,
     CameraSessionStarted,
     CameraState,
     CameraStatus,
     ClearTargetSelection,
+    ConfigUpdate,
     FramePacket,
     MotorState,
     MoveRelativeCommand,
+    PlatformMotionSnapshot,
     TargetAcquired,
     TargetAcquisitionFailed,
     TargetLifecycleEvent,
@@ -23,7 +25,7 @@ from navmin.contracts import (
     TargetSelectionRequest,
     TargetTrackingEnded,
     TrackedObject,
-    TrackingError,
+    TrackingControlSample,
     TurretConnectionState,
     TurretControlMode,
     TurretState,
@@ -32,6 +34,7 @@ from navmin.contracts import (
 
 from .aiming import Aiming
 from .session_gate import CameraSessionGate
+from .tracking_estimator import TrackingEstimator, TrackingEstimatorDiagnostics
 
 _NORMAL_CAMERAS = (CameraRole.OVERVIEW, CameraRole.STEREO_LEFT)
 _DISCONNECTED_CAMERA_STATES = (
@@ -49,9 +52,11 @@ class TurretPort(Protocol):
 
     def submit_move_relative(self, command: MoveRelativeCommand) -> None: ...
 
-    def submit_tracking_error(self, error: TrackingError) -> None: ...
+    def submit_tracking_control(self, sample: TrackingControlSample) -> None: ...
 
-    def invalidate_tracking_error(self) -> None: ...
+    def invalidate_tracking_control(self) -> None: ...
+
+    def platform_motion_snapshot(self) -> PlatformMotionSnapshot: ...
 
     def set_control_mode(self, mode: TurretControlMode) -> bool: ...
 
@@ -71,6 +76,8 @@ class Mediator:
         self,
         *,
         aiming_config: AimingConfig,
+        tracking_control_config: TrackingControlConfig,
+        tracking_gap_timeout_ms: int,
         ui_config: UiConfig,
         turret: TurretPort,
         target_controls: Mapping[CameraRole, TargetControlChannel],
@@ -95,12 +102,21 @@ class Mediator:
             raise ValueError(
                 "vision_processing_enabled must contain Overview and Stereo Left"
             )
+        if (
+            isinstance(tracking_gap_timeout_ms, bool)
+            or not isinstance(tracking_gap_timeout_ms, int)
+            or tracking_gap_timeout_ms <= 0
+        ):
+            raise ValueError("tracking_gap_timeout_ms must be a positive integer")
 
         self._turret = turret
         self._target_controls = dict(target_controls)
         self._vision_processing_enabled = enabled
         self._session_gate = session_gate or CameraSessionGate()
         self._aiming = Aiming(aiming_config)
+        self._tracking_estimator = TrackingEstimator(tracking_control_config)
+        self._tracking_control_config_revision = 0
+        self._tracking_gap_timeout_ns = tracking_gap_timeout_ms * 1_000_000
         self._main_camera = ui_config.default_camera
         self._pending_selection: TargetSelectionRequest | None = None
         self._selected_target: TargetRef | None = None
@@ -118,6 +134,14 @@ class Mediator:
     @property
     def aiming(self) -> Aiming:
         return self._aiming
+
+    @property
+    def tracking_estimator(self) -> TrackingEstimator:
+        return self._tracking_estimator
+
+    @property
+    def tracking_diagnostics(self) -> TrackingEstimatorDiagnostics:
+        return self._tracking_estimator.diagnostics
 
     @property
     def main_camera(self) -> CameraRole:
@@ -141,6 +165,21 @@ class Mediator:
 
     def latest_vision_result(self, camera: CameraRole) -> VisionResult | None:
         return self._latest_results.get(camera)
+
+    def apply_tracking_control_config_update(
+        self,
+        update: ConfigUpdate[TrackingControlConfig],
+    ) -> bool:
+        """Apply the newest runtime estimator policy without changing target state."""
+        if not isinstance(update, ConfigUpdate):
+            raise TypeError("update must be ConfigUpdate[TrackingControlConfig]")
+        if not isinstance(update.config, TrackingControlConfig):
+            raise TypeError("update.config must be TrackingControlConfig")
+        if update.revision <= self._tracking_control_config_revision:
+            return False
+        self._tracking_estimator.replace_config(update.config)
+        self._tracking_control_config_revision = update.revision
+        return True
 
     def accept_camera_session(self, session: CameraSessionStarted) -> bool:
         """Accept a generation barrier before any data from that generation."""
@@ -293,7 +332,8 @@ class Mediator:
         had_selected_target = self._selected_target is not None
         self._pending_selection = request
         self._selected_target = None
-        self._turret.invalidate_tracking_error()
+        self._tracking_estimator.reset()
+        self._turret.invalidate_tracking_control()
         if had_selected_target:
             self._turret.stop_motion()
         self._target_controls[frame.camera].publish(request)
@@ -383,6 +423,7 @@ class Mediator:
 
         self._pending_selection = None
         self._selected_target = target
+        self._tracking_estimator.reset()
         result = self._latest_results.get(target.camera)
         if result is not None:
             self._update_tracking_from_result(result)
@@ -404,7 +445,8 @@ class Mediator:
             return False
         self._pending_selection = None
         self._selected_target = None
-        self._turret.invalidate_tracking_error()
+        self._tracking_estimator.reset()
+        self._turret.invalidate_tracking_control()
         return True
 
     def _accept_target_tracking_ended(self, event: TargetTrackingEnded) -> bool:
@@ -417,7 +459,8 @@ class Mediator:
         ):
             return False
         self._selected_target = None
-        self._turret.invalidate_tracking_error()
+        self._tracking_estimator.reset()
+        self._turret.invalidate_tracking_control()
         self._turret.stop_motion()
         return True
 
@@ -435,11 +478,12 @@ class Mediator:
             return
         tracked = self._find_track(result, target.track_id)
         if tracked is None:
-            self._turret.invalidate_tracking_error()
+            self._tracking_estimator.reset_history()
+            self._turret.invalidate_tracking_control()
             return
-        self._submit_tracking_error(result, tracked, target)
+        self._submit_tracking_control(result, tracked, target)
 
-    def _submit_tracking_error(
+    def _submit_tracking_control(
         self,
         result: VisionResult,
         tracked: TrackedObject,
@@ -447,7 +491,8 @@ class Mediator:
     ) -> None:
         model = self._session_gate.camera_model(target.camera, target.generation)
         if model is None:
-            self._turret.invalidate_tracking_error()
+            self._tracking_estimator.reset_history()
+            self._turret.invalidate_tracking_control()
             return
         error = self._aiming.tracking_error(
             camera_model=model,
@@ -455,12 +500,38 @@ class Mediator:
             tracked=tracked,
             target=target,
         )
-        self._turret.submit_tracking_error(error)
+        previous_timestamp = self._tracking_estimator.diagnostics.observation_timestamp_ns
+        if (
+            previous_timestamp is not None
+            and error.timestamp_ns > previous_timestamp
+            and error.timestamp_ns - previous_timestamp
+            > self._tracking_gap_timeout_ns
+        ):
+            self._tracking_estimator.reset_history()
+        platform_rate = self._turret.platform_motion_snapshot().rate_at(
+            error.timestamp_ns
+        )
+        diagnostics = self._tracking_estimator.observe(error, platform_rate)
+        self._turret.submit_tracking_control(
+            TrackingControlSample(
+                target=error.target,
+                real_error_x_deg=error.error_x_deg,
+                real_error_y_deg=error.error_y_deg,
+                target_rate_x_deg_s=diagnostics.x.target_rate_deg_s,
+                target_rate_y_deg_s=diagnostics.y.target_rate_deg_s,
+                prediction_offset_x_deg=diagnostics.x.prediction_offset_deg,
+                prediction_offset_y_deg=diagnostics.y.prediction_offset_deg,
+                rate_valid_x=diagnostics.x.valid,
+                rate_valid_y=diagnostics.y.valid,
+                observation_timestamp_ns=error.timestamp_ns,
+            )
+        )
 
     def _invalidate_target_intent(self, *, stop_motion: bool) -> None:
         self._pending_selection = None
         self._selected_target = None
-        self._turret.invalidate_tracking_error()
+        self._tracking_estimator.reset()
+        self._turret.invalidate_tracking_control()
         if stop_motion:
             self._turret.stop_motion()
 

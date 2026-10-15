@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import replace
+from pathlib import Path
 from time import monotonic, sleep
 
 import pytest
@@ -12,6 +13,7 @@ from navmin.application import (
     build_application_runtime,
 )
 from navmin.calibration import OverviewCalibration, StereoCalibration
+from navmin.config import load_config
 from navmin.config.models import (
     AimingConfig,
     AimPointConfig,
@@ -41,6 +43,9 @@ from navmin.contracts import (
     ConfigUpdate,
     DistanceSource,
     MotorState,
+    PlatformMotionRate,
+    TargetRef,
+    TrackingError,
     TurretConnectionState,
 )
 from navmin.turret.protocol import CommandCode
@@ -102,6 +107,16 @@ def _rtsp_camera(uri: str) -> CameraConfig:
     )
 
 
+def _default_tracking_control_config():
+    defaults = (
+        Path(__file__).resolve().parents[1]
+        / "config"
+        / "defaults"
+        / "navmin.json"
+    )
+    return load_config(defaults).tracking_control
+
+
 def _config() -> AppConfig:
     center = AimPointConfig(x_px=None, y_px=None)
     axis = AxisMechanicsConfig(
@@ -111,7 +126,7 @@ def _config() -> AppConfig:
         max_relative_move_deg=45.0,
     )
     return AppConfig(
-        schema_version=2,
+        schema_version=3,
         vision=VisionConfig(
             processing_scope=ProcessingScope.MAIN_AND_PREVIEW,
             cameras=CamerasConfig(
@@ -134,10 +149,10 @@ def _config() -> AppConfig:
             simulation_mode=False,
         ),
         aiming=AimingConfig(
-            lead_time_ms=100,
             target_lost_timeout_ms=500,
             aim_points=AimPointsConfig(overview=center, stereo_left=center),
         ),
+        tracking_control=_default_tracking_control_config(),
         turret=TurretConfig(
             serial=SerialConfig(
                 port="/dev/ttyUSB0",
@@ -355,6 +370,74 @@ def test_runtime_pid_tuning_rejects_invalid_gains_without_publishing(
         runtime.apply_pid_tuning(gains)
 
     assert queued == []
+
+
+def test_runtime_tracking_tuning_uses_one_revision_for_core_and_turret(
+    monkeypatch,
+    caplog,
+) -> None:
+    config = _config()
+    runtime = build_application_runtime(
+        config=config,
+        overview_calibration=_overview_calibration(),
+        stereo_calibration=_stereo_calibration(),
+    )
+    queued: list[ConfigUpdate] = []
+    monkeypatch.setattr(
+        runtime.turret_worker,
+        "submit_tracking_control_config_update",
+        queued.append,
+    )
+    caplog.set_level(logging.INFO, logger="navmin.application")
+    estimator = runtime.mediator.tracking_estimator
+    target = TargetRef(CameraRole.OVERVIEW, 1, 7)
+    estimator.observe(
+        TrackingError(target, 1.0, 2.0, 1_000_000_000),
+        PlatformMotionRate(1_000_000_000, 0.0, 0.0),
+    )
+
+    control_only = replace(
+        config.tracking_control,
+        feed_forward=replace(
+            config.tracking_control.feed_forward,
+            enabled=True,
+            gain_x=0.4,
+            gain_y=0.5,
+        ),
+        prediction=replace(
+            config.tracking_control.prediction,
+            enabled=True,
+            horizon_ms=75,
+        ),
+    )
+    runtime.apply_tracking_control_tuning(control_only)
+
+    assert estimator.sample_count == 1
+    assert estimator.diagnostics.target == target
+    assert queued == [ConfigUpdate(1, control_only)]
+
+    estimator_change = replace(
+        control_only,
+        velocity_estimator=replace(
+            control_only.velocity_estimator,
+            window_ms=250,
+        ),
+    )
+    runtime.apply_tracking_control_tuning(estimator_change)
+
+    assert estimator.sample_count == 0
+    assert estimator.diagnostics.target == target
+    assert queued == [ConfigUpdate(1, control_only), ConfigUpdate(2, estimator_change)]
+    messages = [
+        record.getMessage()
+        for record in caplog.records
+        if "Tracking tuning update queued" in record.getMessage()
+    ]
+    assert len(messages) == 2
+    assert "revision=2" in messages[-1]
+    assert "gain=(0.4,0.5)" in messages[-1]
+    assert "horizon=75" in messages[-1]
+    assert "window=250" in messages[-1]
 
 
 def test_default_composition_supports_overview_rtsp_and_stereo_left_rtp() -> None:

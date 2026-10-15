@@ -10,12 +10,14 @@ from enum import Enum
 from threading import Event, Lock, Thread
 
 from navmin.concurrency import InvalidatableLatest, LatestValue
-from navmin.config.models import SerialConfig, TurretConfig
+from navmin.config.models import SerialConfig, TrackingControlConfig, TurretConfig
 from navmin.contracts import (
     ConfigUpdate,
     MotorState,
     MoveRelativeCommand,
-    TrackingError,
+    PlatformMotionSnapshot,
+    PlatformMotionSource,
+    TrackingControlSample,
     TurretConnectionState,
     TurretControlMode,
     TurretState,
@@ -62,7 +64,7 @@ class _ControlIntent:
     mode: TurretControlMode | None = None
 
 
-type MotionInput = MoveRelativeCommand | TrackingError
+type MotionInput = MoveRelativeCommand | TrackingControlSample
 type TransportFactory = Callable[[str, int, bool], PhysicalTransport]
 type CooperativeWait = Callable[[StopToken, float], bool]
 
@@ -103,14 +105,19 @@ class TurretWorker:
     def __init__(
         self,
         config: TurretConfig,
+        tracking_control_config: TrackingControlConfig,
         *,
         transport_factory: TransportFactory | None = None,
         cooperative_wait: CooperativeWait = _default_wait,
     ) -> None:
         if not isinstance(config, TurretConfig):
             raise TypeError("config must be TurretConfig")
+        if not isinstance(tracking_control_config, TrackingControlConfig):
+            raise TypeError("tracking_control_config must be TrackingControlConfig")
         self._startup_config = config
         self._desired_config = config
+        self._startup_tracking_control_config = tracking_control_config
+        self._desired_tracking_control_config = tracking_control_config
         self._startup_emulate_stm32 = config.emulate_stm32
         self._fake_endpoint = (
             FakeStm32Endpoint() if self._startup_emulate_stm32 else None
@@ -133,12 +140,18 @@ class TurretWorker:
         self._control_mailbox: deque[_ControlIntent] = deque()
         self._config_updates: LatestValue[ConfigUpdate[TurretConfig]] = LatestValue()
         self._config_updates.publish(ConfigUpdate(0, config))
+        self._tracking_config_updates: LatestValue[
+            ConfigUpdate[TrackingControlConfig]
+        ] = LatestValue()
+        self._tracking_config_updates.publish(ConfigUpdate(0, tracking_control_config))
         self._emergency_signal = Event()
         self._emergency_signal_lock = Lock()
         self._normal_ingress_lock = Lock()
         self._normal_ingress_open = False
         self._last_motion_revision = 0
         self._last_config_revision = 0
+        self._last_tracking_config_slot_revision = 0
+        self._tracking_control_config_revision = 0
 
         self._state_updates: LatestValue[TurretState] = LatestValue()
         self._publish_state(TurretConnectionState.DISCONNECTED)
@@ -157,6 +170,16 @@ class TurretWorker:
     @property
     def ready(self) -> bool:
         return self._ready
+
+    def platform_motion_snapshot(self) -> PlatformMotionSnapshot:
+        hal = self._hal
+        if hal is None:
+            return PlatformMotionSnapshot(
+                source=PlatformMotionSource.COMMAND_MODEL,
+                valid=False,
+                anchors=(),
+            )
+        return hal.platform_motion_snapshot
 
     def start(self) -> None:
         if self._thread is not None:
@@ -193,14 +216,14 @@ class TurretWorker:
             if self._normal_ingress_open:
                 self._motion_inputs.publish(command)
 
-    def submit_tracking_error(self, error: TrackingError) -> None:
-        if not isinstance(error, TrackingError):
-            raise TypeError("error must be TrackingError")
+    def submit_tracking_control(self, sample: TrackingControlSample) -> None:
+        if not isinstance(sample, TrackingControlSample):
+            raise TypeError("sample must be TrackingControlSample")
         with self._normal_ingress_lock:
             if self._normal_ingress_open:
-                self._motion_inputs.publish(error)
+                self._motion_inputs.publish(sample)
 
-    def invalidate_tracking_error(self) -> None:
+    def invalidate_tracking_control(self) -> None:
         with self._normal_ingress_lock:
             if self._normal_ingress_open:
                 self._motion_inputs.invalidate()
@@ -251,6 +274,16 @@ class TurretWorker:
         if not isinstance(update.config, TurretConfig):
             raise TypeError("update.config must be TurretConfig")
         self._config_updates.publish(update)
+
+    def submit_tracking_control_config_update(
+        self,
+        update: ConfigUpdate[TrackingControlConfig],
+    ) -> None:
+        if not isinstance(update, ConfigUpdate):
+            raise TypeError("update must be ConfigUpdate[TrackingControlConfig]")
+        if not isinstance(update.config, TrackingControlConfig):
+            raise TypeError("update.config must be TrackingControlConfig")
+        self._tracking_config_updates.publish(update)
 
     def _run(self) -> None:
         _LOGGER.info("Turret worker started")
@@ -482,6 +515,17 @@ class TurretWorker:
             self._service_emergency()
             return True
 
+        tracking_config_snapshot = self._tracking_config_updates.snapshot()
+        if (
+            tracking_config_snapshot.revision
+            > self._last_tracking_config_slot_revision
+        ):
+            self._last_tracking_config_slot_revision = tracking_config_snapshot.revision
+            update = tracking_config_snapshot.value
+            if update is not None:
+                self._handle_tracking_control_config_update(update)
+            return True
+
         config_snapshot = self._config_updates.snapshot()
         if config_snapshot.revision > self._last_config_revision:
             self._last_config_revision = config_snapshot.revision
@@ -505,6 +549,16 @@ class TurretWorker:
             return True
 
         return False
+
+    def _handle_tracking_control_config_update(
+        self,
+        update: ConfigUpdate[TrackingControlConfig],
+    ) -> None:
+        if update.revision <= self._tracking_control_config_revision:
+            return
+        self._desired_tracking_control_config = update.config
+        self._controller_required().apply_tracking_control_config(update.config)
+        self._tracking_control_config_revision = update.revision
 
     def _handle_config_update(self, update: ConfigUpdate[TurretConfig]) -> None:
         old = self._desired_config
@@ -575,12 +629,12 @@ class TurretWorker:
         controller = self._controller_required()
         if motion is None:
             if controller.control_mode is TurretControlMode.TRACKING:
-                controller.invalidate_tracking_error(revision)
+                controller.invalidate_tracking_control(revision)
             return
         if isinstance(motion, MoveRelativeCommand):
             controller.submit_move_relative(motion)
         else:
-            controller.submit_tracking_error(revision, motion)
+            controller.submit_tracking_control(revision, motion)
         result = controller.flush_pending_motion()
         if result is not None:
             self._handle_session_result(result)
@@ -656,15 +710,34 @@ class TurretWorker:
     def _bind_stack(self, session: TurretSession) -> None:
         if self._hal is None or self._controller is None:
             self._hal = TurretHal(session, self._startup_config)
-            self._controller = TurretController(self._hal, self._startup_config)
+            self._controller = TurretController(
+                self._hal,
+                self._startup_config,
+                self._startup_tracking_control_config,
+            )
         else:
             self._hal.rebind_session(session)
         self._stage_latest_config(self._latest_config_update())
+        self._stage_latest_tracking_control_config(
+            self._latest_tracking_control_config_update()
+        )
 
     def _stage_latest_config(self, update: ConfigUpdate[TurretConfig]) -> None:
         controller = self._controller
         if controller is not None:
             controller.apply_config_update(update, defer_stm32=True)
+
+    def _stage_latest_tracking_control_config(
+        self,
+        update: ConfigUpdate[TrackingControlConfig],
+    ) -> None:
+        if update.revision <= self._tracking_control_config_revision:
+            return
+        self._desired_tracking_control_config = update.config
+        controller = self._controller
+        if controller is not None:
+            controller.apply_tracking_control_config(update.config)
+        self._tracking_control_config_revision = update.revision
 
     def _make_session(
         self, transport: PhysicalTransport, config: TurretConfig
@@ -685,6 +758,14 @@ class TurretWorker:
         update = self._config_updates.get()
         if update is None:
             raise RuntimeError("Turret config update slot is empty")
+        return update
+
+    def _latest_tracking_control_config_update(
+        self,
+    ) -> ConfigUpdate[TrackingControlConfig]:
+        update = self._tracking_config_updates.get()
+        if update is None:
+            raise RuntimeError("Turret tracking config update slot is empty")
         return update
 
     def _session_config_required(self) -> TurretConfig:

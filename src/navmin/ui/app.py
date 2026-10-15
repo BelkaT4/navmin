@@ -7,7 +7,7 @@ from collections.abc import Callable, Mapping, Sequence
 from PyQt6.QtWidgets import QApplication
 
 from navmin.concurrency import LatestValue
-from navmin.config.models import PidControllerConfig
+from navmin.config.models import PidControllerConfig, TrackingControlConfig
 from navmin.contracts import CameraRole, TurretState
 from navmin.core import Mediator
 
@@ -23,6 +23,8 @@ def run_ui(
     camera_stale_timeout_ms: int,
     pid_controller_config: PidControllerConfig,
     apply_pid_tuning: Callable[[PidControllerConfig], None],
+    tracking_control_config: TrackingControlConfig,
+    apply_tracking_control_tuning: Callable[[TrackingControlConfig], None],
     show_diagnostic_clock: bool = False,
     argv: Sequence[str] = (),
 ) -> int:
@@ -37,6 +39,8 @@ def run_ui(
         camera_stale_timeout_ms=camera_stale_timeout_ms,
         pid_controller_config=pid_controller_config,
         apply_pid_tuning=apply_pid_tuning,
+        tracking_control_config=tracking_control_config,
+        apply_tracking_control_tuning=apply_tracking_control_tuning,
         show_diagnostic_clock=show_diagnostic_clock,
     )
     window.showFullScreen()

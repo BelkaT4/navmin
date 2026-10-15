@@ -25,7 +25,7 @@ from navmin.contracts import CameraRole, DistanceSource
 
 def _valid_config() -> dict:
     return {
-        "schema-version": 2,
+        "schema-version": 3,
         "vision": {
             "processing-scope": "main-only",
             "cameras": {
@@ -79,12 +79,34 @@ def _valid_config() -> dict:
             "simulation-mode": False,
         },
         "aiming": {
-            "lead-time-ms": 150,
             "target-lost-timeout-ms": 500,
             "aim-points": {
                 "overview": {"x-px": None, "y-px": None},
                 "stereo-left": {"x-px": None, "y-px": None},
             },
+        },
+        "tracking-control": {
+            "velocity-estimator": {
+                "window-ms": 200,
+                "min-span-ms": 100,
+                "min-samples": 4,
+                "max-samples": 16,
+                "max-fit-rms-deg": 1.0,
+                "max-target-rate-x-deg-s": 90.0,
+                "max-target-rate-y-deg-s": 90.0,
+            },
+            "feed-forward": {
+                "enabled": False,
+                "gain-x": 0.0,
+                "gain-y": 0.0,
+            },
+            "prediction": {
+                "enabled": False,
+                "horizon-ms": 0,
+                "max-angle-x-deg": 1.0,
+                "max-angle-y-deg": 1.0,
+            },
+            "platform-motion": {"source": "command-model"},
         },
         "turret": {
             "serial": {
@@ -137,11 +159,13 @@ def _write_json(path, data) -> None:
     path.write_text(json.dumps(data), encoding="utf-8")
 
 
-def test_valid_schema_v2_builds_typed_immutable_snapshot() -> None:
+def test_valid_schema_v3_builds_typed_immutable_snapshot() -> None:
     config = parse_config(_valid_config())
 
-    assert config.schema_version == 2
-    assert config.vision.cameras.overview.calibration_file == "calibration/overview.json"
+    assert config.schema_version == 3
+    assert (
+        config.vision.cameras.overview.calibration_file == "calibration/overview.json"
+    )
     assert not hasattr(config.vision.cameras.stereo_left, "calibration_file")
     assert not hasattr(config.vision.cameras.stereo_right, "calibration_file")
     assert config.vision.distance.source is DistanceSource.MANUAL
@@ -149,8 +173,83 @@ def test_valid_schema_v2_builds_typed_immutable_snapshot() -> None:
     assert config.turret.serial.baudrate == 115200
 
     with pytest.raises(FrozenInstanceError):
-        config.aiming.lead_time_ms = 10  # type: ignore[misc]
+        config.tracking_control.velocity_estimator.window_ms = 10  # type: ignore[misc]
 
+
+def test_tracking_control_round_trips_through_mapping() -> None:
+    config = parse_config(_valid_config())
+
+    assert parse_config(config_to_mapping(config)) == config
+
+
+def test_schema_v3_requires_tracking_control_and_rejects_old_pixel_lead() -> None:
+    missing = _valid_config()
+    missing.pop("tracking-control")
+    with pytest.raises(ConfigValidationError) as exc_info:
+        parse_config(missing)
+    assert exc_info.value.path == "tracking-control"
+
+    old_lead = _valid_config()
+    old_lead["aiming"]["lead-time-ms"] = 100
+    with pytest.raises(ConfigValidationError) as exc_info:
+        parse_config(old_lead)
+    assert exc_info.value.path == "aiming.lead-time-ms"
+    assert exc_info.value.reason == "unknown field"
+
+
+@pytest.mark.parametrize(
+    ("path", "value"),
+    [
+        (("velocity-estimator", "window-ms"), 0),
+        (("velocity-estimator", "min-span-ms"), 0),
+        (("velocity-estimator", "min-samples"), 1),
+        (("velocity-estimator", "max-samples"), 1),
+        (("velocity-estimator", "max-fit-rms-deg"), 0),
+        (("velocity-estimator", "max-target-rate-x-deg-s"), 0),
+        (("velocity-estimator", "max-target-rate-y-deg-s"), 0),
+        (("feed-forward", "enabled"), 1),
+        (("feed-forward", "gain-x"), -0.1),
+        (("feed-forward", "gain-y"), -0.1),
+        (("prediction", "enabled"), 1),
+        (("prediction", "horizon-ms"), -1),
+        (("prediction", "max-angle-x-deg"), 0),
+        (("prediction", "max-angle-y-deg"), 0),
+        (("platform-motion", "source"), "gyro"),
+    ],
+)
+def test_tracking_control_field_validation(path, value) -> None:
+    data = _valid_config()
+    section, field = path
+    data["tracking-control"][section][field] = value
+
+    with pytest.raises(ConfigValidationError) as exc_info:
+        parse_config(data)
+
+    assert exc_info.value.path == f"tracking-control.{section}.{field}"
+
+
+def test_tracking_control_cross_field_validation() -> None:
+    min_span = _valid_config()
+    min_span["tracking-control"]["velocity-estimator"]["min-span-ms"] = 201
+    with pytest.raises(ConfigValidationError) as exc_info:
+        parse_config(min_span)
+    assert exc_info.value.path == "tracking-control.velocity-estimator.min-span-ms"
+
+    max_samples = _valid_config()
+    max_samples["tracking-control"]["velocity-estimator"]["max-samples"] = 3
+    with pytest.raises(ConfigValidationError) as exc_info:
+        parse_config(max_samples)
+    assert exc_info.value.path == "tracking-control.velocity-estimator.max-samples"
+
+
+def test_tracking_control_unknown_field_is_rejected() -> None:
+    data = _valid_config()
+    data["tracking-control"]["prediction"]["surprise"] = 1
+
+    with pytest.raises(ConfigValidationError) as exc_info:
+        parse_config(data)
+
+    assert exc_info.value.path == "tracking-control.prediction.surprise"
 
 
 def test_rtsp_camera_source_is_strict_typed_union() -> None:
@@ -248,7 +347,6 @@ def test_rtsp_unsupported_modes_and_codec_field_are_rejected(field, value) -> No
         parse_config(data)
 
 
-
 def test_legacy_flat_camera_schema_is_rejected_without_migration() -> None:
     data = _valid_config()
     data["vision"]["cameras"]["overview"] = {
@@ -306,7 +404,7 @@ def test_missing_config_is_explicit_error(tmp_path) -> None:
 
 def test_malformed_json_is_preserved(tmp_path) -> None:
     path = tmp_path / "config.json"
-    original = b'{"schema-version": 2, broken}'
+    original = b'{"schema-version": 3, broken}'
     path.write_bytes(original)
 
     with pytest.raises(ConfigJsonError):
@@ -320,7 +418,7 @@ def test_malformed_json_is_preserved(tmp_path) -> None:
     [
         (lambda data: data.pop("schema-version"), "schema-version"),
         (lambda data: data.__setitem__("schema-version", True), "schema-version"),
-        (lambda data: data.__setitem__("schema-version", "2"), "schema-version"),
+        (lambda data: data.__setitem__("schema-version", "3"), "schema-version"),
     ],
 )
 def test_missing_or_invalid_schema_version_is_validation_error(mutation, path) -> None:
@@ -334,7 +432,7 @@ def test_missing_or_invalid_schema_version_is_validation_error(mutation, path) -
     assert not isinstance(exc_info.value, UnsupportedConfigSchemaError)
 
 
-@pytest.mark.parametrize("unsupported", [1, 3])
+@pytest.mark.parametrize("unsupported", [1, 2, 4])
 def test_unsupported_schema_is_distinct_error(unsupported: int) -> None:
     data = _valid_config()
     data["schema-version"] = unsupported
@@ -344,7 +442,7 @@ def test_unsupported_schema_is_distinct_error(unsupported: int) -> None:
 
     assert exc_info.value.path == "schema-version"
     assert exc_info.value.actual == unsupported
-    assert "expected 2" in str(exc_info.value)
+    assert "expected 3" in str(exc_info.value)
 
 
 @pytest.mark.parametrize(
@@ -356,15 +454,11 @@ def test_unsupported_schema_is_distinct_error(unsupported: int) -> None:
             "vision.surprise",
         ),
         (
-            lambda d: d["vision"]["cameras"]["overview"].__setitem__(
-                "surprise", 1
-            ),
+            lambda d: d["vision"]["cameras"]["overview"].__setitem__("surprise", 1),
             "vision.cameras.overview.surprise",
         ),
         (
-            lambda d: d["aiming"]["aim-points"]["overview"].__setitem__(
-                "surprise", 1
-            ),
+            lambda d: d["aiming"]["aim-points"]["overview"].__setitem__("surprise", 1),
             "aiming.aim-points.overview.surprise",
         ),
     ],
@@ -427,7 +521,7 @@ def test_missing_required_field_reports_exact_path() -> None:
         ),
     ],
 )
-def test_schema_v2_calibration_references_are_required_and_role_owned(
+def test_schema_v3_calibration_references_are_required_and_role_owned(
     mutate, expected_path
 ) -> None:
     data = _valid_config()
@@ -467,9 +561,16 @@ def test_repository_defaults_parse_with_production_loaders() -> None:
     overview = load_overview_calibration(defaults / "calibration" / "overview.json")
     stereo = load_stereo_calibration(defaults / "calibration" / "stereo.json")
 
-    assert config.schema_version == 2
-    assert config.vision.cameras.overview.calibration_file == "calibration/overview.json"
+    assert config.schema_version == 3
+    assert (
+        config.vision.cameras.overview.calibration_file == "calibration/overview.json"
+    )
     assert config.vision.distance.stereo.calibration_file == "calibration/stereo.json"
+    assert not config.tracking_control.feed_forward.enabled
+    assert config.tracking_control.feed_forward.gain_x == 0.0
+    assert config.tracking_control.feed_forward.gain_y == 0.0
+    assert not config.tracking_control.prediction.enabled
+    assert config.tracking_control.prediction.horizon_ms == 0
     assert overview.schema_version == 1
     assert stereo.schema_version == 1
 
@@ -493,7 +594,9 @@ def test_optional_aim_point_missing_and_null_both_mean_center() -> None:
     ("mutate", "expected_path"),
     [
         (
-            lambda d: d["vision"]["cameras"]["overview"]["source"].__setitem__("port", True),
+            lambda d: d["vision"]["cameras"]["overview"]["source"].__setitem__(
+                "port", True
+            ),
             "vision.cameras.overview.source.port",
         ),
         (
@@ -501,9 +604,7 @@ def test_optional_aim_point_missing_and_null_both_mean_center() -> None:
             "turret.controller.pid-kp-x",
         ),
         (
-            lambda d: d["aiming"]["aim-points"]["overview"].__setitem__(
-                "x-px", True
-            ),
+            lambda d: d["aiming"]["aim-points"]["overview"].__setitem__("x-px", True),
             "aiming.aim-points.overview.x-px",
         ),
     ],
@@ -538,7 +639,9 @@ def test_non_finite_numbers_are_rejected_with_field_path(invalid) -> None:
             "vision.processing-scope",
         ),
         (
-            lambda d: d["vision"]["cameras"]["overview"]["source"].__setitem__("port", 0),
+            lambda d: d["vision"]["cameras"]["overview"]["source"].__setitem__(
+                "port", 0
+            ),
             "vision.cameras.overview.source.port",
         ),
         (
@@ -600,7 +703,7 @@ def test_revision_advances_only_for_actual_accepted_changes(tmp_path) -> None:
     assert manager.aiming_updates.get().revision == 0  # type: ignore[union-attr]
 
     changed = copy.deepcopy(initial_data)
-    changed["aiming"]["lead-time-ms"] = 200
+    changed["aiming"]["target-lost-timeout-ms"] = 600
     assert manager.apply_runtime_update(changed, persist=False)
     assert manager.revision == 1
     assert manager.aiming_updates.get().revision == 1  # type: ignore[union-attr]
@@ -658,8 +761,11 @@ def test_rtsp_config_round_trip_preserves_source_specific_fields(tmp_path) -> No
     save_config(path, config)
 
     saved = json.loads(path.read_text(encoding="utf-8"))
-    assert saved["schema-version"] == 2
-    assert saved["vision"]["cameras"]["overview"]["source"] == data["vision"]["cameras"]["overview"]["source"]
+    assert saved["schema-version"] == 3
+    assert (
+        saved["vision"]["cameras"]["overview"]["source"]
+        == data["vision"]["cameras"]["overview"]["source"]
+    )
     assert load_config(path) == config
 
 
@@ -679,7 +785,7 @@ def test_loading_valid_config_does_not_rewrite_optional_fields(tmp_path) -> None
 def test_change_metadata_reports_only_fixed_architecture_classification() -> None:
     old = parse_config(_valid_config())
     data = _valid_config()
-    data["aiming"]["lead-time-ms"] = 250
+    data["aiming"]["target-lost-timeout-ms"] = 600
     data["vision"]["cameras"]["overview"]["vision-processor-class"] = "Other"
     data["vision"]["cameras"]["overview"]["calibration-file"] = (
         "calibration/overview-b.json"
@@ -701,13 +807,13 @@ def test_change_metadata_reports_only_fixed_architecture_classification() -> Non
 
     paths = changed_config_paths(old, new)
 
-    assert "aiming.lead-time-ms" in paths
+    assert "aiming.target-lost-timeout-ms" in paths
     assert "turret.axes.x.max-relative-move-deg" in paths
     assert "turret.axes.y.max-relative-move-deg" in paths
     assert "vision.cameras.overview.calibration-file" in paths
     assert "vision.distance.stereo.calibration-file" in paths
     assert (
-        config_apply_policy("aiming.lead-time-ms")
+        config_apply_policy("aiming.target-lost-timeout-ms")
         is ConfigApplyPolicy.DYNAMIC
     )
     assert (
@@ -731,8 +837,7 @@ def test_change_metadata_reports_only_fixed_architecture_classification() -> Non
         is ConfigApplyPolicy.CAMERA_PIPELINE_RESTART
     )
     assert (
-        config_apply_policy("turret.serial.port")
-        is ConfigApplyPolicy.TURRET_RECONNECT
+        config_apply_policy("turret.serial.port") is ConfigApplyPolicy.TURRET_RECONNECT
     )
     assert (
         config_apply_policy("turret.serial.baudrate")
@@ -763,6 +868,45 @@ def test_change_metadata_reports_only_fixed_architecture_classification() -> Non
     assert config_apply_policy("vision.camera-stale-timeout-ms") is None
 
 
+@pytest.mark.parametrize(
+    "path",
+    [
+        "tracking-control.velocity-estimator.window-ms",
+        "tracking-control.velocity-estimator.min-span-ms",
+        "tracking-control.velocity-estimator.min-samples",
+        "tracking-control.velocity-estimator.max-samples",
+        "tracking-control.velocity-estimator.max-fit-rms-deg",
+        "tracking-control.velocity-estimator.max-target-rate-x-deg-s",
+        "tracking-control.velocity-estimator.max-target-rate-y-deg-s",
+        "tracking-control.feed-forward.enabled",
+        "tracking-control.feed-forward.gain-x",
+        "tracking-control.feed-forward.gain-y",
+        "tracking-control.prediction.enabled",
+        "tracking-control.prediction.horizon-ms",
+        "tracking-control.prediction.max-angle-x-deg",
+        "tracking-control.prediction.max-angle-y-deg",
+    ],
+)
+def test_tracking_control_runtime_fields_are_dynamic(path: str) -> None:
+    assert config_apply_policy(path) is ConfigApplyPolicy.DYNAMIC
+
+
+def test_tracking_control_unknown_fields_have_no_implicit_apply_policy() -> None:
+    assert config_apply_policy("tracking-control.prediction.future-field") is None
+    assert config_apply_policy("tracking-control.feed-forward.future-field") is None
+    assert (
+        config_apply_policy("tracking-control.velocity-estimator.future-field")
+        is None
+    )
+
+
+def test_platform_motion_source_requires_application_restart() -> None:
+    assert (
+        config_apply_policy("tracking-control.platform-motion.source")
+        is ConfigApplyPolicy.APPLICATION_RESTART
+    )
+
+
 def test_persistence_failure_does_not_publish_partial_runtime_update(
     tmp_path, monkeypatch
 ) -> None:
@@ -776,7 +920,7 @@ def test_persistence_failure_does_not_publish_partial_runtime_update(
     before_update = manager.aiming_updates.get()
 
     changed = copy.deepcopy(data)
-    changed["aiming"]["lead-time-ms"] = 250
+    changed["aiming"]["target-lost-timeout-ms"] = 600
 
     def fail_save(*args, **kwargs) -> None:
         raise ConfigPersistenceError("simulated persistence failure")

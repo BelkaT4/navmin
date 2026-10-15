@@ -119,6 +119,16 @@ def _overview_camera(port: int) -> OverviewCameraConfig:
     )
 
 
+def _default_tracking_control_config():
+    defaults = (
+        Path(__file__).resolve().parents[1]
+        / "config"
+        / "defaults"
+        / "navmin.json"
+    )
+    return load_config(defaults).tracking_control
+
+
 def _config(*, emulate_stm32: bool = False) -> AppConfig:
     center = AimPointConfig(x_px=None, y_px=None)
     axis = AxisMechanicsConfig(
@@ -128,7 +138,7 @@ def _config(*, emulate_stm32: bool = False) -> AppConfig:
         max_relative_move_deg=45.0,
     )
     return AppConfig(
-        schema_version=2,
+        schema_version=3,
         vision=VisionConfig(
             processing_scope=ProcessingScope.MAIN_AND_PREVIEW,
             cameras=CamerasConfig(
@@ -151,10 +161,10 @@ def _config(*, emulate_stm32: bool = False) -> AppConfig:
             simulation_mode=False,
         ),
         aiming=AimingConfig(
-            lead_time_ms=100,
             target_lost_timeout_ms=500,
             aim_points=AimPointsConfig(overview=center, stereo_left=center),
         ),
+        tracking_control=_default_tracking_control_config(),
         turret=TurretConfig(
             serial=SerialConfig(
                 port="/dev/ttyUSB0",
@@ -406,6 +416,8 @@ def test_run_loaded_application_uses_shared_runtime_ui_surface_and_shutdown() ->
         camera_stale_timeout_ms=321,
         pid_controller_config=pid_config,
         apply_pid_tuning=apply_pid_tuning,
+        tracking_control_config=inputs.config.tracking_control,
+        apply_tracking_control_tuning=lambda _config: None,
     )
 
     class FakeRuntime:
@@ -434,6 +446,11 @@ def test_run_loaded_application_uses_shared_runtime_ui_surface_and_shutdown() ->
         assert kwargs["camera_stale_timeout_ms"] == 321
         assert kwargs["pid_controller_config"] is pid_config
         assert kwargs["apply_pid_tuning"] is apply_pid_tuning
+        assert kwargs["tracking_control_config"] is inputs.config.tracking_control
+        assert (
+            kwargs["apply_tracking_control_tuning"]
+            is ui_dependencies.apply_tracking_control_tuning
+        )
         assert kwargs["show_diagnostic_clock"] is False
         assert kwargs["argv"] == ("--qt-test",)
         return 7
@@ -806,7 +823,7 @@ def test_input_recovery_creates_valid_safe_defaults_without_existing_files(
     overview = load_overview_calibration(paths.overview_calibration)
     stereo = load_stereo_calibration(paths.stereo_calibration)
     assert config.turret.serial.port == "/dev/navmin-configure-serial-port"
-    assert config.schema_version == 2
+    assert config.schema_version == 3
     assert config.vision.cameras.overview.calibration_file == "calibration/overview.json"
     assert config.vision.distance.stereo.calibration_file == "calibration/stereo.json"
     assert isinstance(config.vision.cameras.overview.source, RtpJpegSourceConfig)
@@ -838,7 +855,7 @@ def test_input_recovery_replaces_malformed_root_and_invalid_canonical_calibratio
 
     assert len(result.backups) == 3
     recovered = load_config(paths.config)
-    assert recovered.schema_version == 2
+    assert recovered.schema_version == 3
     assert recovered.vision.cameras.overview.calibration_file == "calibration/overview.json"
     assert recovered.vision.distance.stereo.calibration_file == "calibration/stereo.json"
     assert load_overview_calibration(paths.overview_calibration).schema_version == 1

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
+from math import isfinite
 from typing import Protocol
 
 import numpy as np
@@ -156,14 +157,16 @@ class TargetTrackingEnded:
     decision_frame_timestamp_ns: int
 
 
-TargetLifecycleEvent = (
-    TargetAcquired | TargetAcquisitionFailed | TargetTrackingEnded
-)
+TargetLifecycleEvent = TargetAcquired | TargetAcquisitionFailed | TargetTrackingEnded
 
 
 class DistanceSource(Enum):
     STEREO = "stereo"
     MANUAL = "manual"
+
+
+class PlatformMotionSource(Enum):
+    COMMAND_MODEL = "command-model"
 
 
 @dataclass(frozen=True)
@@ -193,6 +196,95 @@ class TrackingError:
     error_x_deg: float
     error_y_deg: float
     timestamp_ns: int
+
+
+@dataclass(frozen=True)
+class TrackingControlSample:
+    target: TargetRef
+    real_error_x_deg: float
+    real_error_y_deg: float
+    target_rate_x_deg_s: float | None
+    target_rate_y_deg_s: float | None
+    prediction_offset_x_deg: float
+    prediction_offset_y_deg: float
+    rate_valid_x: bool
+    rate_valid_y: bool
+    observation_timestamp_ns: int
+
+
+@dataclass(frozen=True)
+class PlatformMotionRate:
+    timestamp_ns: int
+    rate_x_deg_s: float | None
+    rate_y_deg_s: float | None
+
+
+@dataclass(frozen=True)
+class PlatformMotionAnchor:
+    timestamp_ns: int
+    modeled_rate_x_deg_s: float
+    modeled_rate_y_deg_s: float
+    commanded_rate_x_deg_s: float
+    commanded_rate_y_deg_s: float
+    acceleration_x_deg_s2: float
+    acceleration_y_deg_s2: float
+
+
+@dataclass(frozen=True)
+class PlatformMotionSnapshot:
+    source: PlatformMotionSource
+    valid: bool
+    anchors: tuple[PlatformMotionAnchor, ...]
+
+    def rate_at(self, timestamp_ns: int) -> PlatformMotionRate | None:
+        """Reconstruct command-modeled platform rate at an observation time."""
+        if (
+            isinstance(timestamp_ns, bool)
+            or not isinstance(timestamp_ns, int)
+            or timestamp_ns < 0
+            or not self.valid
+            or not self.anchors
+            or timestamp_ns < self.anchors[0].timestamp_ns
+        ):
+            return None
+
+        anchor = self.anchors[0]
+        for candidate in self.anchors[1:]:
+            if candidate.timestamp_ns > timestamp_ns:
+                break
+            anchor = candidate
+        elapsed_s = (timestamp_ns - anchor.timestamp_ns) / 1_000_000_000.0
+        if not all(
+            isfinite(value)
+            for value in (
+                anchor.modeled_rate_x_deg_s,
+                anchor.modeled_rate_y_deg_s,
+                anchor.commanded_rate_x_deg_s,
+                anchor.commanded_rate_y_deg_s,
+                anchor.acceleration_x_deg_s2,
+                anchor.acceleration_y_deg_s2,
+            )
+        ):
+            return None
+        return PlatformMotionRate(
+            timestamp_ns=timestamp_ns,
+            rate_x_deg_s=_approach_rate(
+                anchor.modeled_rate_x_deg_s,
+                anchor.commanded_rate_x_deg_s,
+                anchor.acceleration_x_deg_s2 * elapsed_s,
+            ),
+            rate_y_deg_s=_approach_rate(
+                anchor.modeled_rate_y_deg_s,
+                anchor.commanded_rate_y_deg_s,
+                anchor.acceleration_y_deg_s2 * elapsed_s,
+            ),
+        )
+
+
+def _approach_rate(current: float, target: float, maximum_delta: float) -> float:
+    if current < target:
+        return min(target, current + maximum_delta)
+    return max(target, current - maximum_delta)
 
 
 @dataclass(frozen=True)

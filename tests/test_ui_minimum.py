@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import os
 from collections.abc import Callable
+from dataclasses import replace
 from datetime import UTC, datetime
+from pathlib import Path
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -19,11 +21,13 @@ from navmin.concurrency import (
     TargetControlChannel,
     TargetLifecycleEventChannel,
 )
+from navmin.config import load_config
 from navmin.config.models import (
     AimingConfig,
     AimPointConfig,
     AimPointsConfig,
     PidControllerConfig,
+    TrackingControlConfig,
     UiConfig,
 )
 from navmin.contracts import (
@@ -36,16 +40,23 @@ from navmin.contracts import (
     FramePacket,
     MotorState,
     MoveRelativeCommand,
+    PlatformMotionSnapshot,
+    PlatformMotionSource,
     TargetAcquired,
     TargetRef,
     TrackedObject,
-    TrackingError,
+    TrackingControlSample,
     TurretConnectionState,
     TurretControlMode,
     TurretState,
     VisionResult,
 )
-from navmin.core import Mediator
+from navmin.core import (
+    AxisTrackingEstimate,
+    Mediator,
+    TrackingEstimateInvalidReason,
+    TrackingEstimatorDiagnostics,
+)
 from navmin.ui import (
     CameraUiBinding,
     MainWindow,
@@ -85,7 +96,7 @@ class _FakeTurret:
     def __init__(self, state: TurretState) -> None:
         self._state = state
         self.relative_commands: list[MoveRelativeCommand] = []
-        self.tracking_errors: list[TrackingError] = []
+        self.tracking_controls: list[TrackingControlSample] = []
         self.invalidations = 0
         self.mode_requests: list[TurretControlMode] = []
         self.stop_requests = 0
@@ -100,11 +111,14 @@ class _FakeTurret:
     def submit_move_relative(self, command: MoveRelativeCommand) -> None:
         self.relative_commands.append(command)
 
-    def submit_tracking_error(self, error: TrackingError) -> None:
-        self.tracking_errors.append(error)
+    def submit_tracking_control(self, sample: TrackingControlSample) -> None:
+        self.tracking_controls.append(sample)
 
-    def invalidate_tracking_error(self) -> None:
+    def invalidate_tracking_control(self) -> None:
         self.invalidations += 1
+
+    def platform_motion_snapshot(self) -> PlatformMotionSnapshot:
+        return PlatformMotionSnapshot(PlatformMotionSource.COMMAND_MODEL, False, ())
 
     def set_control_mode(self, mode: TurretControlMode) -> bool:
         self.mode_requests.append(mode)
@@ -177,7 +191,6 @@ def _mediator(
     mediator_type = _CountingMediator if counting else Mediator
     mediator = mediator_type(
         aiming_config=AimingConfig(
-            lead_time_ms=100,
             target_lost_timeout_ms=500,
             aim_points=aim_points
             or AimPointsConfig(
@@ -185,6 +198,13 @@ def _mediator(
                 stereo_left=AimPointConfig(50, 25),
             ),
         ),
+        tracking_control_config=load_config(
+            Path(__file__).resolve().parents[1]
+            / "config"
+            / "defaults"
+            / "navmin.json"
+        ).tracking_control,
+        tracking_gap_timeout_ms=200,
         ui_config=UiConfig(CameraRole.OVERVIEW, False, False),
         turret=turret,
         target_controls={
@@ -267,6 +287,9 @@ def _window(
     aim_points: AimPointsConfig | None = None,
     pid_controller_config: PidControllerConfig | None = None,
     apply_pid_tuning: Callable[[PidControllerConfig], None] | None = None,
+    apply_tracking_control_tuning: (
+        Callable[[TrackingControlConfig], None] | None
+    ) = None,
 ) -> tuple[
     MainWindow,
     Mediator,
@@ -286,6 +309,10 @@ def _window(
         camera_stale_timeout_ms=camera_stale_timeout_ms,
         pid_controller_config=pid_controller_config or _pid_config(),
         apply_pid_tuning=apply_pid_tuning or (lambda _config: None),
+        tracking_control_config=mediator.tracking_estimator.config,
+        apply_tracking_control_tuning=(
+            apply_tracking_control_tuning or (lambda _config: None)
+        ),
         clock_ns=clock or _Clock(),
         wall_clock=wall_clock
         or _WallClock(datetime(2026, 9, 22, 12, 0, 0, tzinfo=UTC)),
@@ -465,7 +492,6 @@ def test_main_reticle_follows_camera_swap_and_dynamic_aiming_config(
 
     mediator.aiming.replace_config(
         AimingConfig(
-            lead_time_ms=100,
             target_lost_timeout_ms=500,
             aim_points=AimPointsConfig(
                 overview=AimPointConfig(25, 15),
@@ -1187,6 +1213,107 @@ def test_operator_pid_panel_rejects_invalid_input_without_changing_last_status(
     window.close()
 
 
+def test_operator_tracking_panel_queues_only_exposed_typed_runtime_fields(
+    qt_application: QApplication,
+) -> None:
+    queued: list[TrackingControlConfig] = []
+    window, mediator, _turret, _bindings_value, _states = _window(
+        qt_application,
+        apply_tracking_control_tuning=queued.append,
+    )
+    operator = window.operator_window
+    initial = mediator.tracking_estimator.config
+
+    assert not operator.ff_enabled_checkbox.isChecked()
+    assert operator.tracking_inputs["gain_x"].text() == "0"
+    assert operator.tracking_inputs["gain_y"].text() == "0"
+    assert not operator.prediction_enabled_checkbox.isChecked()
+    assert operator.tracking_inputs["horizon_ms"].text() == "0"
+    assert operator.tracking_inputs["window_ms"].text() == "200"
+
+    operator.ff_enabled_checkbox.setChecked(True)
+    operator.tracking_inputs["gain_x"].setText("0.4")
+    operator.tracking_inputs["gain_y"].setText("0.5")
+    operator.prediction_enabled_checkbox.setChecked(True)
+    operator.tracking_inputs["horizon_ms"].setText("75")
+    operator.tracking_inputs["window_ms"].setText("250")
+    QTest.mouseClick(operator.tracking_apply_button, Qt.MouseButton.LeftButton)
+
+    assert len(queued) == 1
+    update = queued[0]
+    assert update.feed_forward == replace(
+        initial.feed_forward,
+        enabled=True,
+        gain_x=0.4,
+        gain_y=0.5,
+    )
+    assert update.prediction == replace(
+        initial.prediction,
+        enabled=True,
+        horizon_ms=75,
+    )
+    assert update.velocity_estimator == replace(
+        initial.velocity_estimator,
+        window_ms=250,
+    )
+    assert update.platform_motion == initial.platform_motion
+    assert operator.tracking_status_label.text().startswith("Отправлено:")
+    assert "сохран" not in operator.tracking_status_label.text().lower()
+    assert operator.tracking_error_label.text() == ""
+    window.close()
+
+
+def test_operator_tracking_diagnostics_render_typed_axis_state(
+    qt_application: QApplication,
+) -> None:
+    window, _mediator_value, _turret, _bindings_value, _states = _window(
+        qt_application
+    )
+    operator = window.operator_window
+    diagnostics = TrackingEstimatorDiagnostics(
+        target=None,
+        observation_timestamp_ns=123,
+        platform_source=PlatformMotionSource.COMMAND_MODEL,
+        x=AxisTrackingEstimate(
+            relative_rate_deg_s=1.5,
+            platform_rate_deg_s=2.0,
+            target_rate_deg_s=3.5,
+            fit_rms_deg=0.125,
+            sample_count=5,
+            actual_span_ms=160.0,
+            valid=True,
+            invalid_reason=None,
+            prediction_offset_deg=0.25,
+        ),
+        y=AxisTrackingEstimate(
+            relative_rate_deg_s=-1.0,
+            platform_rate_deg_s=None,
+            target_rate_deg_s=None,
+            fit_rms_deg=0.5,
+            sample_count=5,
+            actual_span_ms=160.0,
+            valid=False,
+            invalid_reason=TrackingEstimateInvalidReason.PLATFORM_UNAVAILABLE,
+            prediction_offset_deg=0.0,
+        ),
+    )
+
+    operator.set_tracking_diagnostics(diagnostics)
+
+    assert operator.platform_source_label.text() == "Platform source: COMMAND_MODEL"
+    assert operator.tracking_diagnostic_labels["relative_rate_x"].text() == "1.5 deg/s"
+    assert operator.tracking_diagnostic_labels["platform_rate_y"].text() == "—"
+    assert operator.tracking_diagnostic_labels["sample_count_x"].text() == "5"
+    assert operator.tracking_diagnostic_labels["actual_span_y"].text() == "160 ms"
+    assert operator.tracking_diagnostic_labels["validity_x"].text() == "VALID"
+    assert (
+        operator.tracking_diagnostic_labels["validity_y"].text()
+        == "INVALID (platform_unavailable)"
+    )
+    assert operator.tracking_diagnostic_labels["prediction_offset_x"].text() == "0.25 deg"
+    window.close()
+
+
 def test_operator_fullscreen_button_and_f11_keep_text_synchronized(
     qt_application: QApplication,
 ) -> None:
@@ -1244,6 +1371,8 @@ def test_main_window_can_request_fullscreen_at_startup(qt_application: QApplicat
         camera_stale_timeout_ms=500,
         pid_controller_config=_pid_config(),
         apply_pid_tuning=lambda _config: None,
+        tracking_control_config=mediator.tracking_estimator.config,
+        apply_tracking_control_tuning=lambda _config: None,
         start_timer=False,
         start_fullscreen=True,
     )

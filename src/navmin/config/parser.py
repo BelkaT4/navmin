@@ -1,4 +1,4 @@
-"""Strict parser and serializer for NavMin config schema v2."""
+"""Strict parser and serializer for NavMin config schema v3."""
 
 from __future__ import annotations
 
@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any, NoReturn
 from urllib.parse import urlsplit
 
-from navmin.contracts import CameraRole, DistanceSource
+from navmin.contracts import CameraRole, DistanceSource, PlatformMotionSource
 
 from .models import (
     AimingConfig,
@@ -20,8 +20,11 @@ from .models import (
     AxisMechanicsConfig,
     CameraConfig,
     CamerasConfig,
+    FeedForwardConfig,
     OverviewCameraConfig,
     PidControllerConfig,
+    PlatformMotionConfig,
+    PredictionConfig,
     ProcessingScope,
     RtpJpegSourceConfig,
     RtspDecoderMode,
@@ -30,13 +33,15 @@ from .models import (
     SerialConfig,
     StereoDistanceConfig,
     Stm32Config,
+    TrackingControlConfig,
     TurretConfig,
     UiConfig,
+    VelocityEstimatorConfig,
     VisionConfig,
     VisionDistanceConfig,
 )
 
-SUPPORTED_SCHEMA_VERSION = 2
+SUPPORTED_SCHEMA_VERSION = 3
 SUPPORTED_BAUDRATES = frozenset({9600, 19200, 38400, 57600, 115200})
 
 
@@ -159,7 +164,9 @@ def _enum_string(value: Any, path: str, allowed: set[str]) -> str:
     return value
 
 
-def _parse_camera_source(value: Any, path: str) -> RtpJpegSourceConfig | RtspSourceConfig:
+def _parse_camera_source(
+    value: Any, path: str
+) -> RtpJpegSourceConfig | RtspSourceConfig:
     obj = _object(value, path)
     if "type" not in obj:
         _validation(f"{path}.type", "missing required field")
@@ -175,13 +182,9 @@ def _parse_camera_source(value: Any, path: str) -> RtpJpegSourceConfig | RtspSou
         if port > 65535:
             _validation(f"{path}.port", "must be <= 65535")
         return RtpJpegSourceConfig(
-            bind_address=_nonempty_string(
-                obj["bind-address"], f"{path}.bind-address"
-            ),
+            bind_address=_nonempty_string(obj["bind-address"], f"{path}.bind-address"),
             port=port,
-            buffer_size=_int(
-                obj["buffer-size"], f"{path}.buffer-size", minimum=1
-            ),
+            buffer_size=_int(obj["buffer-size"], f"{path}.buffer-size", minimum=1),
         )
 
     obj = _fields(
@@ -222,9 +225,7 @@ def _parse_camera_source(value: Any, path: str) -> RtpJpegSourceConfig | RtspSou
         protocol=RtspProtocol(protocol),
         decoder_mode=RtspDecoderMode(decoder_mode),
         latency_ms=_int(obj["latency-ms"], f"{path}.latency-ms", minimum=0),
-        drop_on_latency=_bool(
-            obj["drop-on-latency"], f"{path}.drop-on-latency"
-        ),
+        drop_on_latency=_bool(obj["drop-on-latency"], f"{path}.drop-on-latency"),
         buffer_size=_int(obj["buffer-size"], f"{path}.buffer-size", minimum=1),
     )
 
@@ -403,7 +404,7 @@ def _parse_aiming(value: Any) -> AimingConfig:
     obj = _fields(
         value,
         path,
-        required={"lead-time-ms", "target-lost-timeout-ms", "aim-points"},
+        required={"target-lost-timeout-ms", "aim-points"},
     )
     aim_points_obj = _fields(
         obj["aim-points"],
@@ -411,7 +412,6 @@ def _parse_aiming(value: Any) -> AimingConfig:
         required={"overview", "stereo-left"},
     )
     return AimingConfig(
-        lead_time_ms=_int(obj["lead-time-ms"], f"{path}.lead-time-ms", minimum=0),
         target_lost_timeout_ms=_int(
             obj["target-lost-timeout-ms"],
             f"{path}.target-lost-timeout-ms",
@@ -425,6 +425,147 @@ def _parse_aiming(value: Any) -> AimingConfig:
                 aim_points_obj["stereo-left"], f"{path}.aim-points.stereo-left"
             ),
         ),
+    )
+
+
+def _parse_tracking_control(value: Any) -> TrackingControlConfig:
+    path = "tracking-control"
+    obj = _fields(
+        value,
+        path,
+        required={
+            "velocity-estimator",
+            "feed-forward",
+            "prediction",
+            "platform-motion",
+        },
+    )
+
+    estimator_path = f"{path}.velocity-estimator"
+    estimator_obj = _fields(
+        obj["velocity-estimator"],
+        estimator_path,
+        required={
+            "window-ms",
+            "min-span-ms",
+            "min-samples",
+            "max-samples",
+            "max-fit-rms-deg",
+            "max-target-rate-x-deg-s",
+            "max-target-rate-y-deg-s",
+        },
+    )
+    window_ms = _int(
+        estimator_obj["window-ms"], f"{estimator_path}.window-ms", minimum=1
+    )
+    min_span_ms = _int(
+        estimator_obj["min-span-ms"],
+        f"{estimator_path}.min-span-ms",
+        minimum=1,
+    )
+    if min_span_ms > window_ms:
+        _validation(f"{estimator_path}.min-span-ms", "must be <= window-ms")
+    min_samples = _int(
+        estimator_obj["min-samples"],
+        f"{estimator_path}.min-samples",
+        minimum=2,
+    )
+    max_samples = _int(
+        estimator_obj["max-samples"],
+        f"{estimator_path}.max-samples",
+        minimum=2,
+    )
+    if max_samples < min_samples:
+        _validation(f"{estimator_path}.max-samples", "must be >= min-samples")
+    velocity_estimator = VelocityEstimatorConfig(
+        window_ms=window_ms,
+        min_span_ms=min_span_ms,
+        min_samples=min_samples,
+        max_samples=max_samples,
+        max_fit_rms_deg=_number(
+            estimator_obj["max-fit-rms-deg"],
+            f"{estimator_path}.max-fit-rms-deg",
+            strictly_positive=True,
+        ),
+        max_target_rate_x_deg_s=_number(
+            estimator_obj["max-target-rate-x-deg-s"],
+            f"{estimator_path}.max-target-rate-x-deg-s",
+            strictly_positive=True,
+        ),
+        max_target_rate_y_deg_s=_number(
+            estimator_obj["max-target-rate-y-deg-s"],
+            f"{estimator_path}.max-target-rate-y-deg-s",
+            strictly_positive=True,
+        ),
+    )
+
+    feed_forward_path = f"{path}.feed-forward"
+    feed_forward_obj = _fields(
+        obj["feed-forward"],
+        feed_forward_path,
+        required={"enabled", "gain-x", "gain-y"},
+    )
+    feed_forward = FeedForwardConfig(
+        enabled=_bool(feed_forward_obj["enabled"], f"{feed_forward_path}.enabled"),
+        gain_x=_number(
+            feed_forward_obj["gain-x"],
+            f"{feed_forward_path}.gain-x",
+            minimum=0,
+        ),
+        gain_y=_number(
+            feed_forward_obj["gain-y"],
+            f"{feed_forward_path}.gain-y",
+            minimum=0,
+        ),
+    )
+
+    prediction_path = f"{path}.prediction"
+    prediction_obj = _fields(
+        obj["prediction"],
+        prediction_path,
+        required={
+            "enabled",
+            "horizon-ms",
+            "max-angle-x-deg",
+            "max-angle-y-deg",
+        },
+    )
+    prediction = PredictionConfig(
+        enabled=_bool(prediction_obj["enabled"], f"{prediction_path}.enabled"),
+        horizon_ms=_int(
+            prediction_obj["horizon-ms"],
+            f"{prediction_path}.horizon-ms",
+            minimum=0,
+        ),
+        max_angle_x_deg=_number(
+            prediction_obj["max-angle-x-deg"],
+            f"{prediction_path}.max-angle-x-deg",
+            strictly_positive=True,
+        ),
+        max_angle_y_deg=_number(
+            prediction_obj["max-angle-y-deg"],
+            f"{prediction_path}.max-angle-y-deg",
+            strictly_positive=True,
+        ),
+    )
+
+    platform_path = f"{path}.platform-motion"
+    platform_obj = _fields(
+        obj["platform-motion"],
+        platform_path,
+        required={"source"},
+    )
+    source = _enum_string(
+        platform_obj["source"],
+        f"{platform_path}.source",
+        {PlatformMotionSource.COMMAND_MODEL.value},
+    )
+
+    return TrackingControlConfig(
+        velocity_estimator=velocity_estimator,
+        feed_forward=feed_forward,
+        prediction=prediction,
+        platform_motion=PlatformMotionConfig(source=PlatformMotionSource(source)),
     )
 
 
@@ -599,9 +740,7 @@ def _parse_ui(value: Any) -> UiConfig:
         {"overview", "stereo-left"},
     )
     camera_role = (
-        CameraRole.OVERVIEW
-        if default_camera == "overview"
-        else CameraRole.STEREO_LEFT
+        CameraRole.OVERVIEW if default_camera == "overview" else CameraRole.STEREO_LEFT
     )
     return UiConfig(
         default_camera=camera_role,
@@ -614,11 +753,18 @@ def _parse_ui(value: Any) -> UiConfig:
 
 
 def parse_config(data: Any) -> AppConfig:
-    """Validate an already decoded JSON value and return schema-v2 snapshot."""
+    """Validate an already decoded JSON value and return schema-v3 snapshot."""
     obj = _fields(
         data,
         "",
-        required={"schema-version", "vision", "aiming", "turret", "ui"},
+        required={
+            "schema-version",
+            "vision",
+            "aiming",
+            "tracking-control",
+            "turret",
+            "ui",
+        },
     )
     schema_version = _int(obj["schema-version"], "schema-version")
     if schema_version != SUPPORTED_SCHEMA_VERSION:
@@ -628,6 +774,7 @@ def parse_config(data: Any) -> AppConfig:
         schema_version=schema_version,
         vision=_parse_vision(obj["vision"]),
         aiming=_parse_aiming(obj["aiming"]),
+        tracking_control=_parse_tracking_control(obj["tracking-control"]),
         turret=_parse_turret(obj["turret"]),
         ui=_parse_ui(obj["ui"]),
     )
@@ -695,15 +842,13 @@ def _aim_point_to_mapping(config: AimPointConfig) -> dict[str, Any]:
 
 
 def config_to_mapping(config: AppConfig) -> dict[str, Any]:
-    """Convert a typed schema-v2 snapshot to its persisted JSON structure."""
+    """Convert a typed schema-v3 snapshot to its persisted JSON structure."""
     return {
         "schema-version": config.schema_version,
         "vision": {
             "processing-scope": config.vision.processing_scope.value,
             "cameras": {
-                "overview": _overview_camera_to_mapping(
-                    config.vision.cameras.overview
-                ),
+                "overview": _overview_camera_to_mapping(config.vision.cameras.overview),
                 "stereo-left": _camera_to_mapping(config.vision.cameras.stereo_left),
                 "stereo-right": _camera_to_mapping(config.vision.cameras.stereo_right),
             },
@@ -728,11 +873,43 @@ def config_to_mapping(config: AppConfig) -> dict[str, Any]:
             "simulation-mode": config.vision.simulation_mode,
         },
         "aiming": {
-            "lead-time-ms": config.aiming.lead_time_ms,
             "target-lost-timeout-ms": config.aiming.target_lost_timeout_ms,
             "aim-points": {
                 "overview": _aim_point_to_mapping(config.aiming.aim_points.overview),
-                "stereo-left": _aim_point_to_mapping(config.aiming.aim_points.stereo_left),
+                "stereo-left": _aim_point_to_mapping(
+                    config.aiming.aim_points.stereo_left
+                ),
+            },
+        },
+        "tracking-control": {
+            "velocity-estimator": {
+                "window-ms": config.tracking_control.velocity_estimator.window_ms,
+                "min-span-ms": (config.tracking_control.velocity_estimator.min_span_ms),
+                "min-samples": (config.tracking_control.velocity_estimator.min_samples),
+                "max-samples": (config.tracking_control.velocity_estimator.max_samples),
+                "max-fit-rms-deg": (
+                    config.tracking_control.velocity_estimator.max_fit_rms_deg
+                ),
+                "max-target-rate-x-deg-s": (
+                    config.tracking_control.velocity_estimator.max_target_rate_x_deg_s
+                ),
+                "max-target-rate-y-deg-s": (
+                    config.tracking_control.velocity_estimator.max_target_rate_y_deg_s
+                ),
+            },
+            "feed-forward": {
+                "enabled": config.tracking_control.feed_forward.enabled,
+                "gain-x": config.tracking_control.feed_forward.gain_x,
+                "gain-y": config.tracking_control.feed_forward.gain_y,
+            },
+            "prediction": {
+                "enabled": config.tracking_control.prediction.enabled,
+                "horizon-ms": config.tracking_control.prediction.horizon_ms,
+                "max-angle-x-deg": (config.tracking_control.prediction.max_angle_x_deg),
+                "max-angle-y-deg": (config.tracking_control.prediction.max_angle_y_deg),
+            },
+            "platform-motion": {
+                "source": config.tracking_control.platform_motion.source.value,
             },
         },
         "turret": {

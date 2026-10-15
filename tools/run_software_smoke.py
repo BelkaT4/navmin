@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+from pathlib import Path
 from threading import Event, Lock, Thread
 from time import monotonic
 
@@ -17,6 +18,7 @@ from navmin.application import (
     build_application_runtime,
 )
 from navmin.calibration import OverviewCalibration, StereoCalibration
+from navmin.config import load_config
 from navmin.config.models import (
     AimingConfig,
     AimPointConfig,
@@ -253,7 +255,6 @@ class SyntheticFrameProducer:
 def _smoke_aiming_config() -> AimingConfig:
     center = AimPointConfig(x_px=None, y_px=None)
     return AimingConfig(
-        lead_time_ms=100,
         target_lost_timeout_ms=500,
         aim_points=AimPointsConfig(overview=center, stereo_left=center),
     )
@@ -328,7 +329,7 @@ def _smoke_overview_config(port: int) -> OverviewCameraConfig:
 
 def _smoke_app_config() -> AppConfig:
     return AppConfig(
-        schema_version=2,
+        schema_version=3,
         vision=VisionConfig(
             processing_scope=ProcessingScope.MAIN_AND_PREVIEW,
             cameras=CamerasConfig(
@@ -351,6 +352,12 @@ def _smoke_app_config() -> AppConfig:
             simulation_mode=True,
         ),
         aiming=_smoke_aiming_config(),
+        tracking_control=load_config(
+            Path(__file__).resolve().parents[1]
+            / "config"
+            / "defaults"
+            / "navmin.json"
+        ).tracking_control,
         turret=_smoke_turret_config(),
         ui=_smoke_ui_config(),
     )
@@ -525,6 +532,8 @@ def _run_qt_smoke(runtime: SoftwareSmokeRuntime, auto_close_seconds: float | Non
         camera_stale_timeout_ms=ui.camera_stale_timeout_ms,
         pid_controller_config=ui.pid_controller_config,
         apply_pid_tuning=ui.apply_pid_tuning,
+        tracking_control_config=ui.tracking_control_config,
+        apply_tracking_control_tuning=ui.apply_tracking_control_tuning,
     )
 
 

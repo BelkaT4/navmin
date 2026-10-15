@@ -196,6 +196,8 @@ def run_loaded_application(
             camera_stale_timeout_ms=ui.camera_stale_timeout_ms,
             pid_controller_config=ui.pid_controller_config,
             apply_pid_tuning=ui.apply_pid_tuning,
+            tracking_control_config=ui.tracking_control_config,
+            apply_tracking_control_tuning=ui.apply_tracking_control_tuning,
             show_diagnostic_clock=show_diagnostic_clock,
             argv=qt_argv,
         )

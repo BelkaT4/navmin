@@ -20,7 +20,7 @@ from PyQt6.QtWidgets import (
 )
 
 from navmin.concurrency import LatestValue
-from navmin.config.models import PidControllerConfig
+from navmin.config.models import PidControllerConfig, TrackingControlConfig
 from navmin.contracts import (
     CameraRole,
     CameraSessionStarted,
@@ -76,6 +76,8 @@ class MainWindow(QMainWindow):
         camera_stale_timeout_ms: int,
         pid_controller_config: PidControllerConfig,
         apply_pid_tuning: Callable[[PidControllerConfig], None],
+        tracking_control_config: TrackingControlConfig,
+        apply_tracking_control_tuning: Callable[[TrackingControlConfig], None],
         clock_ns: Callable[[], int] = monotonic_ns,
         wall_clock: Callable[[], datetime] = datetime.now,
         show_diagnostic_clock: bool = False,
@@ -164,6 +166,8 @@ class MainWindow(QMainWindow):
             on_exit=self.request_exit,
             pid_controller_config=pid_controller_config,
             on_apply_pid_tuning=apply_pid_tuning,
+            tracking_control_config=tracking_control_config,
+            on_apply_tracking_control_tuning=apply_tracking_control_tuning,
         )
 
         self.state_pump = UiStatePump(
@@ -245,6 +249,9 @@ class MainWindow(QMainWindow):
         self.refresh_presentation()
 
     def refresh_presentation(self) -> None:
+        self.operator_window.set_tracking_diagnostics(
+            self._mediator.tracking_diagnostics
+        )
         if self._mediator.main_camera is not self._shown_main_camera:
             self._shown_main_camera = self._mediator.main_camera
             self._refresh_view_roles()

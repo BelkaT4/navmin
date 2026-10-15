@@ -272,6 +272,12 @@ def test_relative_ui_click_reaches_observable_fake_stm32_for_both_cameras() -> N
                 runtime.application.ui_dependencies.pid_controller_config
             ),
             apply_pid_tuning=runtime.application.ui_dependencies.apply_pid_tuning,
+            tracking_control_config=(
+                runtime.application.ui_dependencies.tracking_control_config
+            ),
+            apply_tracking_control_tuning=(
+                runtime.application.ui_dependencies.apply_tracking_control_tuning
+            ),
             start_timer=False,
             start_fullscreen=False,
         )
@@ -452,6 +458,12 @@ def test_tracking_ui_selection_drives_real_velocity_loop_to_fake_stm32() -> None
                 runtime.application.ui_dependencies.pid_controller_config
             ),
             apply_pid_tuning=runtime.application.ui_dependencies.apply_pid_tuning,
+            tracking_control_config=(
+                runtime.application.ui_dependencies.tracking_control_config
+            ),
+            apply_tracking_control_tuning=(
+                runtime.application.ui_dependencies.apply_tracking_control_tuning
+            ),
             start_timer=False,
             start_fullscreen=False,
         )
@@ -540,9 +552,8 @@ def test_tracking_ui_selection_drives_real_velocity_loop_to_fake_stm32() -> None
             tracked.bbox.x + tracked.bbox.width / 2.0,
             tracked.bbox.y + tracked.bbox.height / 2.0,
         )
-        assert runtime.mediator.aiming.config.lead_time_ms > 0
-        lead_point = runtime.mediator.aiming.lead_point(tracked)
-        assert lead_point[0] != bbox_center[0]
+        tracked_center = runtime.mediator.aiming.tracked_center(tracked)
+        assert tracked_center == bbox_center
 
         rendered = window.main_view.rendered_rect()
         assert not rendered.isEmpty()
@@ -862,6 +873,12 @@ def test_camera_stale_resume_keeps_generation_and_recovers_interaction() -> None
                 runtime.application.ui_dependencies.pid_controller_config
             ),
             apply_pid_tuning=runtime.application.ui_dependencies.apply_pid_tuning,
+            tracking_control_config=(
+                runtime.application.ui_dependencies.tracking_control_config
+            ),
+            apply_tracking_control_tuning=(
+                runtime.application.ui_dependencies.apply_tracking_control_tuning
+            ),
             start_timer=False,
             start_fullscreen=False,
         )
@@ -974,6 +991,12 @@ def test_generation_restart_and_preview_swap_clear_active_tracking() -> None:
                 runtime.application.ui_dependencies.pid_controller_config
             ),
             apply_pid_tuning=runtime.application.ui_dependencies.apply_pid_tuning,
+            tracking_control_config=(
+                runtime.application.ui_dependencies.tracking_control_config
+            ),
+            apply_tracking_control_tuning=(
+                runtime.application.ui_dependencies.apply_tracking_control_tuning
+            ),
             start_timer=False,
             start_fullscreen=False,
         )
@@ -1096,6 +1119,12 @@ def test_turret_disconnect_clears_tracking_recovers_off_and_remains_usable() -> 
                 runtime.application.ui_dependencies.pid_controller_config
             ),
             apply_pid_tuning=runtime.application.ui_dependencies.apply_pid_tuning,
+            tracking_control_config=(
+                runtime.application.ui_dependencies.tracking_control_config
+            ),
+            apply_tracking_control_tuning=(
+                runtime.application.ui_dependencies.apply_tracking_control_tuning
+            ),
             start_timer=False,
             start_fullscreen=False,
         )
@@ -1199,6 +1228,12 @@ def test_emergency_click_during_tracking_crosses_full_stack_and_preserves_motor_
                 runtime.application.ui_dependencies.pid_controller_config
             ),
             apply_pid_tuning=runtime.application.ui_dependencies.apply_pid_tuning,
+            tracking_control_config=(
+                runtime.application.ui_dependencies.tracking_control_config
+            ),
+            apply_tracking_control_tuning=(
+                runtime.application.ui_dependencies.apply_tracking_control_tuning
+            ),
             start_timer=False,
             start_fullscreen=False,
         )

@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from pathlib import Path
 
 import numpy as np
 import pytest
 
 from navmin.concurrency import TargetControlChannel
+from navmin.config import load_config
 from navmin.config.models import AimingConfig, AimPointConfig, AimPointsConfig, UiConfig
 from navmin.contracts import (
     BBox,
@@ -18,6 +20,9 @@ from navmin.contracts import (
     FramePacket,
     MotorState,
     MoveRelativeCommand,
+    PlatformMotionAnchor,
+    PlatformMotionSnapshot,
+    PlatformMotionSource,
     TargetAcquired,
     TargetAcquisitionFailed,
     TargetAcquisitionFailureReason,
@@ -26,7 +31,7 @@ from navmin.contracts import (
     TargetTrackingEnded,
     TargetTrackingEndReason,
     TrackedObject,
-    TrackingError,
+    TrackingControlSample,
     TurretConnectionState,
     TurretControlMode,
     TurretState,
@@ -48,7 +53,7 @@ class _FakeTurret:
     def __init__(self, state: TurretState | None = None) -> None:
         self._state = state or _turret_state()
         self.relative_commands: list[MoveRelativeCommand] = []
-        self.tracking_errors: list[TrackingError] = []
+        self.tracking_controls: list[TrackingControlSample] = []
         self.invalidations = 0
         self.mode_requests: list[TurretControlMode] = []
         self.stop_requests = 0
@@ -56,6 +61,21 @@ class _FakeTurret:
         self.motor_off_requests = 0
         self.emergency_requests = 0
         self.control_ingress_open = True
+        self.platform_snapshot = PlatformMotionSnapshot(
+            source=PlatformMotionSource.COMMAND_MODEL,
+            valid=True,
+            anchors=(
+                PlatformMotionAnchor(
+                    timestamp_ns=0,
+                    modeled_rate_x_deg_s=0.0,
+                    modeled_rate_y_deg_s=0.0,
+                    commanded_rate_x_deg_s=0.0,
+                    commanded_rate_y_deg_s=0.0,
+                    acceleration_x_deg_s2=100.0,
+                    acceleration_y_deg_s2=100.0,
+                ),
+            ),
+        )
 
     @property
     def current_state(self) -> TurretState:
@@ -64,11 +84,14 @@ class _FakeTurret:
     def submit_move_relative(self, command: MoveRelativeCommand) -> None:
         self.relative_commands.append(command)
 
-    def submit_tracking_error(self, error: TrackingError) -> None:
-        self.tracking_errors.append(error)
+    def submit_tracking_control(self, sample: TrackingControlSample) -> None:
+        self.tracking_controls.append(sample)
 
-    def invalidate_tracking_error(self) -> None:
+    def invalidate_tracking_control(self) -> None:
         self.invalidations += 1
+
+    def platform_motion_snapshot(self) -> PlatformMotionSnapshot:
+        return self.platform_snapshot
 
     def set_control_mode(self, mode: TurretControlMode) -> bool:
         if not self.control_ingress_open:
@@ -117,7 +140,6 @@ def _turret_state(
 
 def _aiming_config() -> AimingConfig:
     return AimingConfig(
-        lead_time_ms=100,
         target_lost_timeout_ms=500,
         aim_points=AimPointsConfig(
             overview=AimPointConfig(50, 40),
@@ -128,6 +150,16 @@ def _aiming_config() -> AimingConfig:
 
 def _ui_config(camera: CameraRole = CameraRole.OVERVIEW) -> UiConfig:
     return UiConfig(camera, False, False)
+
+
+def _tracking_control_config():
+    defaults = (
+        Path(__file__).resolve().parents[1]
+        / "config"
+        / "defaults"
+        / "navmin.json"
+    )
+    return load_config(defaults).tracking_control
 
 
 def _session(camera: CameraRole, generation: int) -> CameraSessionStarted:
@@ -177,6 +209,8 @@ def _mediator(
     controls = _controls()
     mediator = Mediator(
         aiming_config=_aiming_config(),
+        tracking_control_config=_tracking_control_config(),
+        tracking_gap_timeout_ms=200,
         ui_config=_ui_config(main),
         turret=turret,
         target_controls=controls,
@@ -284,8 +318,109 @@ def test_point_request_allocates_pending_and_acquired_accepts_target() -> None:
     assert mediator.accept_target_lifecycle_event(_acquired(request))
     assert mediator.pending_selection is None
     assert mediator.selected_target == TargetRef(CameraRole.OVERVIEW, 1, 7)
-    assert turret.tracking_errors[-1].target == mediator.selected_target
-    assert all(isinstance(item, TrackingError) for item in turret.tracking_errors)
+    assert turret.tracking_controls[-1].target == mediator.selected_target
+    assert all(
+        isinstance(item, TrackingControlSample) for item in turret.tracking_controls
+    )
+
+
+def test_core_uses_platform_rate_at_observation_timestamp_not_latest_anchor() -> None:
+    mediator, turret, _controls_value = _mediator(
+        mode=TurretControlMode.TRACKING
+    )
+    initial = _accept_main(mediator)
+    turret.platform_snapshot = PlatformMotionSnapshot(
+        source=PlatformMotionSource.COMMAND_MODEL,
+        valid=True,
+        anchors=(
+            PlatformMotionAnchor(0, 2.0, 0.0, 2.0, 0.0, 100.0, 100.0),
+            PlatformMotionAnchor(
+                200_000_000,
+                30.0,
+                0.0,
+                30.0,
+                0.0,
+                100.0,
+                100.0,
+            ),
+        ),
+    )
+    request = _request(mediator, initial)
+    assert mediator.accept_target_lifecycle_event(_acquired(request))
+
+    for timestamp_ns in (50_000_000, 100_000_000, 150_000_000):
+        assert mediator.accept_vision_result(
+            _result(
+                CameraRole.OVERVIEW,
+                1,
+                timestamp_ns=timestamp_ns,
+            )
+        )
+
+    sample = turret.tracking_controls[-1]
+    assert sample.rate_valid_x
+    assert sample.target_rate_x_deg_s == pytest.approx(2.0)
+    assert turret.platform_snapshot.anchors[-1].modeled_rate_x_deg_s == 30.0
+
+
+def test_uncovered_platform_history_disables_contributions_but_submits_pid_error() -> (
+    None
+):
+    mediator, turret, _controls_value = _mediator(
+        mode=TurretControlMode.TRACKING
+    )
+    initial = _accept_main(mediator)
+    turret.platform_snapshot = PlatformMotionSnapshot(
+        source=PlatformMotionSource.COMMAND_MODEL,
+        valid=True,
+        anchors=(
+            PlatformMotionAnchor(
+                1_000_000_000,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                100.0,
+                100.0,
+            ),
+        ),
+    )
+    request = _request(mediator, initial)
+    assert mediator.accept_target_lifecycle_event(_acquired(request))
+
+    sample = turret.tracking_controls[-1]
+    assert sample.real_error_x_deg != 0.0
+    assert not sample.rate_valid_x and not sample.rate_valid_y
+    assert sample.prediction_offset_x_deg == 0.0
+    assert sample.prediction_offset_y_deg == 0.0
+
+
+def test_new_target_requires_estimator_history_to_be_collected_again() -> None:
+    mediator, turret, _controls_value = _mediator(
+        mode=TurretControlMode.TRACKING
+    )
+    initial = _accept_main(mediator)
+    first_request = _request(mediator, initial)
+    assert mediator.accept_target_lifecycle_event(_acquired(first_request))
+    for timestamp_ns in (50_000_000, 100_000_000, 150_000_000):
+        assert mediator.accept_vision_result(
+            _result(CameraRole.OVERVIEW, 1, timestamp_ns=timestamp_ns)
+        )
+    assert turret.tracking_controls[-1].rate_valid_x
+
+    latest = _result(
+        CameraRole.OVERVIEW,
+        1,
+        frame_id=5,
+        track_ids=(7, 8),
+        timestamp_ns=160_000_000,
+    )
+    assert mediator.accept_vision_result(latest)
+    second_request = _request(mediator, latest, x_px=75.0)
+    assert mediator.accept_target_lifecycle_event(_acquired(second_request, track_id=8))
+
+    assert turret.tracking_controls[-1].target.track_id == 8
+    assert not turret.tracking_controls[-1].rate_valid_x
 
 
 def test_new_click_replaces_active_target_with_select_only_and_stops_motion() -> None:
@@ -558,7 +693,7 @@ def test_temporary_track_miss_keeps_target_and_invalidates_tracking_error() -> N
         _result(CameraRole.OVERVIEW, 1, frame_id=6, timestamp_ns=3000)
     )
     assert mediator.selected_target == selected
-    assert turret.tracking_errors[-1].timestamp_ns == 3000
+    assert turret.tracking_controls[-1].observation_timestamp_ns == 3000
 
 
 def test_turret_connection_loss_clears_tracking_intent() -> None:
@@ -616,6 +751,8 @@ def test_startup_main_camera_and_target_channel_validation() -> None:
     with pytest.raises(ValueError):
         Mediator(
             aiming_config=_aiming_config(),
+            tracking_control_config=_tracking_control_config(),
+            tracking_gap_timeout_ms=200,
             ui_config=_ui_config(CameraRole.STEREO_RIGHT),
             turret=turret,
             target_controls=_controls(),
@@ -623,6 +760,8 @@ def test_startup_main_camera_and_target_channel_validation() -> None:
     with pytest.raises(ValueError):
         Mediator(
             aiming_config=_aiming_config(),
+            tracking_control_config=_tracking_control_config(),
+            tracking_gap_timeout_ms=200,
             ui_config=_ui_config(),
             turret=turret,
             target_controls={CameraRole.OVERVIEW: TargetControlChannel(CameraRole.OVERVIEW)},

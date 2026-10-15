@@ -286,6 +286,8 @@ class SoftwareSoak:
                 camera_stale_timeout_ms=_STALE_TIMEOUT_MS,
                 pid_controller_config=ui.pid_controller_config,
                 apply_pid_tuning=ui.apply_pid_tuning,
+                tracking_control_config=ui.tracking_control_config,
+                apply_tracking_control_tuning=ui.apply_tracking_control_tuning,
                 start_timer=False,
                 start_fullscreen=False,
             )

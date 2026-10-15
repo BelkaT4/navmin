@@ -1,5 +1,5 @@
 {
-  "schema-version": 2,
+  "schema-version": 3,
   "vision": {
     "processing-scope": "main-and-preview",
     "cameras": {
@@ -53,7 +53,6 @@
     "simulation-mode": false
   },
   "aiming": {
-    "lead-time-ms": 0,
     "target-lost-timeout-ms": 500,
     "aim-points": {
       "overview": {
@@ -64,6 +63,31 @@
         "x-px": null,
         "y-px": null
       }
+    }
+  },
+  "tracking-control": {
+    "velocity-estimator": {
+      "window-ms": 200,
+      "min-span-ms": 100,
+      "min-samples": 4,
+      "max-samples": 16,
+      "max-fit-rms-deg": 1.0,
+      "max-target-rate-x-deg-s": 90.0,
+      "max-target-rate-y-deg-s": 90.0
+    },
+    "feed-forward": {
+      "enabled": false,
+      "gain-x": 0.0,
+      "gain-y": 0.0
+    },
+    "prediction": {
+      "enabled": false,
+      "horizon-ms": 0,
+      "max-angle-x-deg": 1.0,
+      "max-angle-y-deg": 1.0
+    },
+    "platform-motion": {
+      "source": "command-model"
     }
   },
   "turret": {
