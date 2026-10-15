@@ -114,7 +114,7 @@ def main() -> int:
 
     files = _collect_files(root)
 
-    timestamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+    timestamp = dt.datetime.now(dt.UTC).astimezone().strftime("%Y%m%d-%H%M%S")
     project_name = root.name.replace(" ", "_") or "project"
     archive_path = export_dir / f"{project_name}_for_chat_{timestamp}.zip"
 
