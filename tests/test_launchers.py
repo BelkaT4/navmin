@@ -513,6 +513,7 @@ def test_diagnostic_selection_overrides_only_requested_external_endpoints(monkey
         assert effective.config.vision.cameras.overview.source.bind_address == "127.0.0.1"
         assert effective.config.vision.cameras.overview.source.port == 8888
         assert effective.config.vision.cameras.stereo_left.source.bind_address == "0.0.0.0"
+        assert effective.config.vision.cameras.stereo_right.enabled is False
         assert effective.config.turret.serial.port == "/tmp/navmin-test-pty/stm32"
         assert effective.config.turret.emulate_stm32 is False
         assert len(sender_configs) == 1
@@ -542,7 +543,18 @@ def test_diagnostic_real_selection_still_disables_fake_transport() -> None:
     try:
         assert effective.config.turret.emulate_stm32 is False
         assert effective.config.turret.serial.port == inputs.config.turret.serial.port
-        assert effective.config.vision.cameras == inputs.config.vision.cameras
+        assert (
+            effective.config.vision.cameras.overview
+            == inputs.config.vision.cameras.overview
+        )
+        assert (
+            effective.config.vision.cameras.stereo_left
+            == inputs.config.vision.cameras.stereo_left
+        )
+        assert effective.config.vision.cameras.stereo_right == replace(
+            inputs.config.vision.cameras.stereo_right,
+            enabled=False,
+        )
     finally:
         endpoints.stop()
 
@@ -1240,6 +1252,7 @@ def test_planned_localhost_backend_replaces_rtsp_source_with_rtp_jpeg() -> None:
     assert source.bind_address == "127.0.0.1"
     assert source.port == 8888
     assert source.buffer_size == 3
+    assert planned.config.vision.cameras.stereo_right.enabled is False
 
 
 def test_diagnostic_preflight_only_uses_planned_localhost_endpoints_without_starting(
@@ -1287,6 +1300,7 @@ def test_diagnostic_preflight_only_uses_planned_localhost_endpoints_without_star
     planned = captured[0]
     assert planned.config.vision.cameras.overview.source.bind_address == "127.0.0.1"
     assert planned.config.vision.cameras.stereo_left.source.bind_address == "127.0.0.1"
+    assert planned.config.vision.cameras.stereo_right.enabled is False
     assert planned.config.turret.serial.port == "diagnostic-pty"
 
     session = _single_session(log_dir)
@@ -1381,7 +1395,8 @@ def test_diagnostic_full_launch_orders_preflight_before_endpoints_and_runtime(
     events: list[str] = []
 
     def preflight(inputs, **kwargs):
-        del inputs, kwargs
+        assert inputs.config.vision.cameras.stereo_right.enabled is False
+        assert kwargs["selection"].stereo_right is None
         events.append("preflight")
         return _preflight_report()
 
@@ -1436,7 +1451,8 @@ def test_normal_full_launch_orders_preflight_before_runtime(monkeypatch, tmp_pat
     monkeypatch.setattr("navmin.__main__.load_application_inputs", lambda _paths: _inputs())
 
     def preflight(inputs, **kwargs):
-        del inputs, kwargs
+        assert inputs.config.vision.cameras.stereo_right.enabled is True
+        assert kwargs["selection"].stereo_right == "real"
         events.append("preflight")
         return _preflight_report()
 
@@ -1460,6 +1476,52 @@ def test_normal_full_launch_orders_preflight_before_runtime(monkeypatch, tmp_pat
         ]
     ) == 0
     assert events == ["preflight", "runtime"]
+
+
+def test_normal_launcher_omits_disabled_stereo_right_from_preflight(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    config_path, overview_path, stereo_path = _write_source_placeholders(tmp_path)
+    inputs = _inputs()
+    cameras = replace(
+        inputs.config.vision.cameras,
+        stereo_right=replace(
+            inputs.config.vision.cameras.stereo_right,
+            enabled=False,
+        ),
+    )
+    disabled_inputs = replace(
+        inputs,
+        config=replace(
+            inputs.config,
+            vision=replace(inputs.config.vision, cameras=cameras),
+        ),
+    )
+    monkeypatch.setattr(
+        "navmin.__main__.load_application_inputs",
+        lambda _paths: disabled_inputs,
+    )
+
+    def preflight(_inputs, **kwargs):
+        assert kwargs["selection"].stereo_right is None
+        return _preflight_report()
+
+    monkeypatch.setattr("navmin.__main__.run_startup_preflight", preflight)
+    monkeypatch.setattr("navmin.__main__.run_loaded_application", lambda _inputs: 0)
+
+    assert normal_main(
+        [
+            "--config",
+            str(config_path),
+            "--overview-calibration",
+            str(overview_path),
+            "--stereo-calibration",
+            str(stereo_path),
+            "--log-dir",
+            str(tmp_path / "logs"),
+        ]
+    ) == 0
 
 
 def test_preflight_only_warn_is_success(monkeypatch, tmp_path) -> None:

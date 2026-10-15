@@ -61,9 +61,14 @@ def _default_tracking_control_config():
     return load_config(defaults).tracking_control
 
 
-def _camera(port: int, *, address: str = "127.0.0.1") -> CameraConfig:
+def _camera(
+    port: int,
+    *,
+    address: str = "127.0.0.1",
+    enabled: bool = True,
+) -> CameraConfig:
     return CameraConfig(
-        enabled=True,
+        enabled=enabled,
         source=RtpJpegSourceConfig(
             bind_address=address,
             port=port,
@@ -487,6 +492,111 @@ def test_duplicate_camera_endpoint_fails_before_runtime(tmp_path) -> None:
     )
     assert "Overview and Stereo Left" in failure.detail
     assert f"127.0.0.1:{port}" in failure.detail
+
+
+def test_stereo_right_disabled_has_no_mandatory_preflight_checks(tmp_path) -> None:
+    inputs = _inputs(18_896, 18_897)
+    cameras = replace(
+        inputs.config.vision.cameras,
+        stereo_right=_camera(18_898, enabled=False),
+    )
+    config = replace(
+        inputs.config,
+        vision=replace(inputs.config.vision, cameras=cameras),
+    )
+    udp_calls: list[tuple[str, int]] = []
+
+    report = _run(
+        tmp_path,
+        replace(inputs, config=config),
+        StartupBackendSelection("real", "real", "pty", stereo_right="real"),
+        udp_check=lambda address, port: udp_calls.append((address, port)) or None,
+    )
+
+    assert report.ok
+    assert all("Stereo Right" not in check.name for check in report.checks)
+    assert ("127.0.0.1", 18_898) not in udp_calls
+
+
+def test_stereo_right_enabled_rtp_uses_stereo_calibration_and_udp_checks(
+    tmp_path,
+) -> None:
+    inputs = _inputs(18_899, 18_900)
+    udp_calls: list[tuple[str, int]] = []
+
+    report = _run(
+        tmp_path,
+        inputs,
+        StartupBackendSelection("real", "real", "pty", stereo_right="real"),
+        udp_check=lambda address, port: udp_calls.append((address, port)) or None,
+    )
+
+    assert report.ok
+    calibration = next(
+        check for check in report.checks if check.name == "Stereo Right calibration"
+    )
+    assert calibration.detail == "typed calibration loaded (64x48)"
+    assert any(
+        check.name == "Stereo Right RTP/JPEG configuration"
+        for check in report.checks
+    )
+    assert ("127.0.0.1", 18_901) in udp_calls
+
+
+def test_stereo_right_enabled_rtsp_checks_rtsp_dependencies_without_udp(
+    tmp_path,
+) -> None:
+    inputs = _inputs(18_902, 18_903)
+    cameras = replace(
+        inputs.config.vision.cameras,
+        stereo_right=_rtsp_camera("rtsp://stereo-right.local/stream"),
+    )
+    config = replace(
+        inputs.config,
+        vision=replace(inputs.config.vision, cameras=cameras),
+    )
+    element_calls: list[tuple[str, ...]] = []
+    udp_calls: list[tuple[str, int]] = []
+
+    report = _run(
+        tmp_path,
+        replace(inputs, config=config),
+        StartupBackendSelection("real", "real", "pty", stereo_right="real"),
+        receiver_check=lambda elements: element_calls.append(elements) or None,
+        udp_check=lambda address, port: udp_calls.append((address, port)) or None,
+    )
+
+    assert report.ok
+    assert any(
+        check.name == "Stereo Right RTSP configuration" for check in report.checks
+    )
+    assert "rtspsrc" in element_calls[0]
+    assert ("127.0.0.1", 18_904) not in udp_calls
+
+
+def test_duplicate_stereo_right_udp_endpoint_is_detected(tmp_path) -> None:
+    inputs = _inputs(18_905, 18_906)
+    cameras = replace(
+        inputs.config.vision.cameras,
+        stereo_right=_camera(18_906),
+    )
+    config = replace(
+        inputs.config,
+        vision=replace(inputs.config.vision, cameras=cameras),
+    )
+
+    report = _run(
+        tmp_path,
+        replace(inputs, config=config),
+        StartupBackendSelection("real", "real", "pty", stereo_right="real"),
+    )
+
+    assert not report.ok
+    failure = next(
+        check for check in report.checks if check.name == "Camera UDP endpoints"
+    )
+    assert "Stereo Left and Stereo Right" in failure.detail
+    assert "127.0.0.1:18906" in failure.detail
 
 
 def test_mixed_rtsp_and_rtp_preflight_checks_only_relevant_dependencies(

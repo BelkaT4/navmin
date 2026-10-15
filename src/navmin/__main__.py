@@ -182,6 +182,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                     overview="real",
                     stereo_left="real",
                     turret="real",
+                    stereo_right=(
+                        "real"
+                        if inputs.config.vision.cameras.stereo_right.enabled
+                        else None
+                    ),
                 ),
                 session_dir=artifacts.session_dir,
             )

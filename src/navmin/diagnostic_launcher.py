@@ -99,6 +99,7 @@ class DiagnosticEndpoints:
             self._base_inputs.config,
             turret=replace(self._base_inputs.config.turret, emulate_stm32=False),
         )
+        config = _disable_stereo_right(config)
         try:
             if self.selection.overview is CameraEndpoint.LOCALHOST:
                 overview = self._base_inputs.overview_calibration
@@ -313,7 +314,11 @@ def _planned_preflight_inputs(
     inputs: LoadedApplicationInputs,
 ) -> LoadedApplicationInputs:
     """Apply only pure endpoint overrides needed to preflight the planned profile."""
-    config = replace(inputs.config, turret=replace(inputs.config.turret, emulate_stm32=False))
+    config = replace(
+        inputs.config,
+        turret=replace(inputs.config.turret, emulate_stm32=False),
+    )
+    config = _disable_stereo_right(config)
     if selection.overview is CameraEndpoint.LOCALHOST:
         config = _replace_camera_endpoint(
             config, camera_name="overview", fallback_port=8888
@@ -323,6 +328,22 @@ def _planned_preflight_inputs(
             config, camera_name="stereo_left", fallback_port=8889
         )
     return replace(inputs, config=config)
+
+
+def _disable_stereo_right(config: AppConfig) -> AppConfig:
+    cameras = config.vision.cameras
+    if not cameras.stereo_right.enabled:
+        return config
+    return replace(
+        config,
+        vision=replace(
+            config.vision,
+            cameras=replace(
+                cameras,
+                stereo_right=replace(cameras.stereo_right, enabled=False),
+            ),
+        ),
+    )
 
 
 def _parser() -> argparse.ArgumentParser:

@@ -303,9 +303,14 @@ def _smoke_turret_config() -> TurretConfig:
     )
 
 
-def _smoke_camera_config(port: int, *, processing_enabled: bool) -> CameraConfig:
+def _smoke_camera_config(
+    port: int,
+    *,
+    processing_enabled: bool,
+    enabled: bool = True,
+) -> CameraConfig:
     return CameraConfig(
-        enabled=True,
+        enabled=enabled,
         source=RtpJpegSourceConfig(
             bind_address="127.0.0.1",
             port=port,
@@ -335,7 +340,11 @@ def _smoke_app_config() -> AppConfig:
             cameras=CamerasConfig(
                 overview=_smoke_overview_config(8888),
                 stereo_left=_smoke_camera_config(8889, processing_enabled=True),
-                stereo_right=_smoke_camera_config(8890, processing_enabled=False),
+                stereo_right=_smoke_camera_config(
+                    8890,
+                    processing_enabled=False,
+                    enabled=False,
+                ),
             ),
             distance=VisionDistanceConfig(
                 source=DistanceSource.MANUAL,

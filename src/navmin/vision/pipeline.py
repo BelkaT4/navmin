@@ -147,6 +147,26 @@ def stereo_left_corrector(calibration: StereoCalibration) -> _FrameCorrector:
     )
 
 
+def stereo_right_corrector(calibration: StereoCalibration) -> _FrameCorrector:
+    size = (calibration.image_width, calibration.image_height)
+    map_x, map_y = cv2.initUndistortRectifyMap(
+        np.asarray(calibration.K_right, dtype=np.float64),
+        np.asarray(calibration.D_right, dtype=np.float64),
+        np.asarray(calibration.R2, dtype=np.float64),
+        np.asarray(calibration.P2, dtype=np.float64),
+        size,
+        cv2.CV_32FC1,
+    )
+    _left_model, right_model = stereo_camera_models(calibration)
+    return _OpenCvMapCorrector(
+        image_width=calibration.image_width,
+        image_height=calibration.image_height,
+        map_x=map_x,
+        map_y=map_y,
+        camera_model=right_model,
+    )
+
+
 def build_working_frame_corrector(
     camera: CameraRole,
     *,
@@ -161,6 +181,12 @@ def build_working_frame_corrector(
         if stereo_calibration is None:
             raise MissingCalibrationError("Stereo calibration is required for Stereo Left")
         return stereo_left_corrector(stereo_calibration)
+    if camera is CameraRole.STEREO_RIGHT:
+        if stereo_calibration is None:
+            raise MissingCalibrationError(
+                "Stereo calibration is required for Stereo Right"
+            )
+        return stereo_right_corrector(stereo_calibration)
     raise ValueError(f"prototype checkpoint does not build a pipeline for {camera.value}")
 
 
@@ -264,8 +290,12 @@ class VisionPipeline:
         timestamp_clock_ns: Callable[[], int] = monotonic_ns,
         processing_enabled: bool = True,
     ) -> None:
-        if camera not in (CameraRole.OVERVIEW, CameraRole.STEREO_LEFT):
-            raise ValueError("prototype pipeline supports Overview and Stereo Left only")
+        if camera not in (
+            CameraRole.OVERVIEW,
+            CameraRole.STEREO_LEFT,
+            CameraRole.STEREO_RIGHT,
+        ):
+            raise ValueError("unsupported camera role")
         self.camera = camera
         self._corrector = corrector
         self._processor = processor or create_vision_processor()
@@ -485,7 +515,8 @@ class VisionPipeline:
                 frame_id=frame_id,
                 capture_id=(
                     pending.capture_id
-                    if self.camera is CameraRole.STEREO_LEFT
+                    if self.camera
+                    in (CameraRole.STEREO_LEFT, CameraRole.STEREO_RIGHT)
                     else None
                 ),
                 receive_timestamp_ns=pending.receive_timestamp_ns,
@@ -550,4 +581,5 @@ __all__ = [
     "build_working_frame_corrector",
     "overview_corrector",
     "stereo_left_corrector",
+    "stereo_right_corrector",
 ]

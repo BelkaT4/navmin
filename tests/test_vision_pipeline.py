@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from threading import Event, Lock, Thread, current_thread
 from typing import Self
 
@@ -7,7 +8,11 @@ import cv2
 import numpy as np
 import pytest
 
-from navmin.calibration import OverviewCalibration, StereoCalibration
+from navmin.calibration import (
+    OverviewCalibration,
+    StereoCalibration,
+    stereo_camera_models,
+)
 from navmin.concurrency import InvalidatableLatest, LatestValue
 from navmin.contracts import (
     CameraRole,
@@ -24,6 +29,7 @@ from navmin.vision.pipeline import (
     build_working_frame_corrector,
     overview_corrector,
     stereo_left_corrector,
+    stereo_right_corrector,
 )
 from navmin.vision.processor import VisionProcessorOutput
 
@@ -158,6 +164,7 @@ class _BlockingErrorStatus(LatestValue[CameraStatus]):
     [
         (CameraRole.OVERVIEW, lambda: overview_corrector(overview_calibration())),
         (CameraRole.STEREO_LEFT, lambda: stereo_left_corrector(stereo_calibration())),
+        (CameraRole.STEREO_RIGHT, lambda: stereo_right_corrector(stereo_calibration())),
     ],
 )
 def test_working_frame_correction_preserves_size_and_publishes_read_only_image(
@@ -198,18 +205,75 @@ def test_overview_corrector_matches_opencv_fisheye_maps() -> None:
     assert np.array_equal(actual, expected)
 
 
+def test_stereo_right_corrector_uses_right_calibration_side(monkeypatch) -> None:
+    right_k = ((21.0, 0.0, 14.0), (0.0, 22.0, 10.0), (0.0, 0.0, 1.0))
+    right_d = (0.1, -0.02, 0.003, -0.0004, 0.00005)
+    right_r = ((0.0, -1.0, 0.0), (1.0, 0.0, 0.0), (0.0, 0.0, 1.0))
+    right_p = (
+        (23.0, 0.0, 12.0, -1.0),
+        (0.0, 24.0, 10.0, 0.0),
+        (0.0, 0.0, 1.0, 0.0),
+    )
+    calibration = replace(
+        stereo_calibration(),
+        K_right=right_k,
+        D_right=right_d,
+        R2=right_r,
+        P2=right_p,
+    )
+    captured: list[np.ndarray | tuple[int, int] | int] = []
+
+    def capture_maps(K, D, R, P, size, map_type):
+        captured.extend((K, D, R, P, size, map_type))
+        empty = np.zeros((HEIGHT, WIDTH), dtype=np.float32)
+        return empty, empty
+
+    monkeypatch.setattr(cv2, "initUndistortRectifyMap", capture_maps)
+
+    corrector = stereo_right_corrector(calibration)
+
+    assert np.array_equal(captured[0], np.asarray(calibration.K_right))
+    assert np.array_equal(captured[1], np.asarray(calibration.D_right))
+    assert np.array_equal(captured[2], np.asarray(calibration.R2))
+    assert np.array_equal(captured[3], np.asarray(calibration.P2))
+    assert captured[4:] == [(WIDTH, HEIGHT), cv2.CV_32FC1]
+    _left_model, right_model = stereo_camera_models(calibration)
+    assert corrector.camera_model == right_model
+
+
 def test_missing_calibration_is_explicit_and_has_no_raw_fallback() -> None:
     with pytest.raises(MissingCalibrationError):
         build_working_frame_corrector(CameraRole.OVERVIEW)
     with pytest.raises(MissingCalibrationError):
         build_working_frame_corrector(CameraRole.STEREO_LEFT)
+    with pytest.raises(MissingCalibrationError):
+        build_working_frame_corrector(CameraRole.STEREO_RIGHT)
 
 
-def test_resolution_mismatch_sets_error_and_never_publishes_raw_frame() -> None:
+def test_build_working_frame_corrector_supports_stereo_right() -> None:
+    corrector = build_working_frame_corrector(
+        CameraRole.STEREO_RIGHT,
+        stereo_calibration=stereo_calibration(),
+    )
+
+    assert corrector.correct(source_frame()).shape == (HEIGHT, WIDTH, 3)
+
+
+@pytest.mark.parametrize(
+    ("camera", "corrector"),
+    [
+        (CameraRole.OVERVIEW, lambda: overview_corrector(overview_calibration())),
+        (CameraRole.STEREO_RIGHT, lambda: stereo_right_corrector(stereo_calibration())),
+    ],
+)
+def test_resolution_mismatch_sets_error_and_never_publishes_raw_frame(
+    camera,
+    corrector,
+) -> None:
     processor = _RecordingProcessor()
     pipeline = VisionPipeline(
-        camera=CameraRole.OVERVIEW,
-        corrector=overview_corrector(overview_calibration()),
+        camera=camera,
+        corrector=corrector(),
         processor=processor,
         timestamp_clock_ns=_Clock(),
     )
@@ -235,6 +299,18 @@ def test_resolution_mismatch_sets_error_and_never_publishes_raw_frame() -> None:
             lambda: stereo_left_corrector(stereo_calibration()),
             55,
             55,
+        ),
+        (
+            CameraRole.STEREO_RIGHT,
+            lambda: stereo_right_corrector(stereo_calibration()),
+            55,
+            55,
+        ),
+        (
+            CameraRole.STEREO_RIGHT,
+            lambda: stereo_right_corrector(stereo_calibration()),
+            None,
+            None,
         ),
     ],
 )
@@ -304,6 +380,22 @@ def test_camera_session_barrier_precedes_generation_data_and_restart_clears_old_
     assert second_result.frame.frame_id == 0
     assert pipeline.latest_result.get() is second_result
     assert processor.reset_calls == 2
+
+
+def test_stereo_right_session_barrier_and_generation_are_role_correct() -> None:
+    pipeline = VisionPipeline(
+        camera=CameraRole.STEREO_RIGHT,
+        corrector=stereo_right_corrector(stereo_calibration()),
+        processor=_RecordingProcessor(),
+        timestamp_clock_ns=_Clock(),
+    )
+
+    first = pipeline.start()
+    second = pipeline.start()
+
+    assert first.camera is CameraRole.STEREO_RIGHT
+    assert second.camera is CameraRole.STEREO_RIGHT
+    assert (first.generation, second.generation) == (1, 2)
 
 
 def test_late_old_generation_failure_does_not_replace_new_generation_status() -> None:

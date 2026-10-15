@@ -88,6 +88,7 @@ class StartupBackendSelection:
     overview: str
     stereo_left: str
     turret: str
+    stereo_right: str | None = None
 
     def __post_init__(self) -> None:
         if self.overview not in _CAMERA_BACKENDS:
@@ -96,6 +97,11 @@ class StartupBackendSelection:
             raise ValueError(f"unsupported Stereo Left backend: {self.stereo_left}")
         if self.turret not in _TURRET_BACKENDS:
             raise ValueError(f"unsupported Turret backend: {self.turret}")
+        if (
+            self.stereo_right is not None
+            and self.stereo_right not in _CAMERA_BACKENDS
+        ):
+            raise ValueError(f"unsupported Stereo Right backend: {self.stereo_right}")
 
 
 StringCheck = Callable[[], str | None]
@@ -134,7 +140,7 @@ def run_startup_preflight(
     checks.append(_result_check("Session directory", session_directory_check(session_dir)))
     checks.append(_result_check("PyQt6 QtWidgets", qt_check()))
 
-    camera_specs = (
+    camera_specs = [
         (
             "Overview",
             selection.overview,
@@ -149,7 +155,18 @@ def run_startup_preflight(
             inputs.stereo_calibration.image_width,
             inputs.stereo_calibration.image_height,
         ),
-    )
+    ]
+    stereo_right = inputs.config.vision.cameras.stereo_right
+    if stereo_right.enabled and selection.stereo_right is not None:
+        camera_specs.append(
+            (
+                "Stereo Right",
+                selection.stereo_right,
+                stereo_right,
+                inputs.stereo_calibration.image_width,
+                inputs.stereo_calibration.image_height,
+            )
+        )
 
     endpoints: list[tuple[str, str, int]] = []
     receiver_elements: list[str] = []

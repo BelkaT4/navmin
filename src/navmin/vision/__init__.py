@@ -22,6 +22,7 @@ from .pipeline import (
     build_working_frame_corrector,
     overview_corrector,
     stereo_left_corrector,
+    stereo_right_corrector,
 )
 from .processor import (
     DEFAULT_VISION_PROCESSOR_CLASS,
@@ -57,4 +58,5 @@ __all__ = [
     "create_vision_processor",
     "overview_corrector",
     "stereo_left_corrector",
+    "stereo_right_corrector",
 ]

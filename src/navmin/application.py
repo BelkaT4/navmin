@@ -34,13 +34,18 @@ from navmin.vision.gstreamer_source import (
     GStreamerRtspSource,
     initialize_gstreamer_runtime,
 )
-from navmin.vision.pipeline import overview_corrector, stereo_left_corrector
+from navmin.vision.pipeline import (
+    overview_corrector,
+    stereo_left_corrector,
+    stereo_right_corrector,
+)
 
 LOGGER = logging.getLogger(__name__)
 
 _DEFAULT_SHUTDOWN_TIMEOUT_SECONDS = 2.0
 _OVERVIEW_COMPONENT = "Overview CameraWorker"
 _STEREO_LEFT_COMPONENT = "Stereo Left CameraWorker"
+_STEREO_RIGHT_COMPONENT = "Stereo Right CameraWorker"
 _TURRET_COMPONENT = "TurretWorker"
 _TURRET_SAFETY_COMPONENT = "Turret safety shutdown"
 
@@ -51,6 +56,7 @@ class ApplicationFactories:
 
     overview_source_factory: SourceFactory = create_camera_source
     stereo_left_source_factory: SourceFactory = create_camera_source
+    stereo_right_source_factory: SourceFactory = create_camera_source
     turret_transport_factory: TransportFactory | None = None
 
 
@@ -88,13 +94,14 @@ class ApplicationShutdownError(RuntimeError):
 
 
 class ApplicationRuntime:
-    """One-shot owner of the two normal cameras, Turret, and Mediator."""
+    """Own normal cameras, optional Stereo Right, Turret, and Mediator."""
 
     def __init__(
         self,
         *,
         overview_worker: CameraWorker,
         stereo_left_worker: CameraWorker,
+        stereo_right_worker: CameraWorker | None,
         turret_worker: TurretWorker,
         mediator: Mediator,
         camera_stale_timeout_ms: int,
@@ -107,6 +114,7 @@ class ApplicationRuntime:
             raise TypeError("tracking_control_config must be TrackingControlConfig")
         self.overview_worker = overview_worker
         self.stereo_left_worker = stereo_left_worker
+        self.stereo_right_worker = stereo_right_worker
         self.turret_worker = turret_worker
         self.mediator = mediator
         self.camera_stale_timeout_ms = camera_stale_timeout_ms
@@ -115,12 +123,13 @@ class ApplicationRuntime:
         self._runtime_tracking_control_config = tracking_control_config
         self._tracking_tuning_revision = 0
 
-        self._camera_workers = MappingProxyType(
-            {
-                CameraRole.OVERVIEW: overview_worker,
-                CameraRole.STEREO_LEFT: stereo_left_worker,
-            }
-        )
+        camera_workers = {
+            CameraRole.OVERVIEW: overview_worker,
+            CameraRole.STEREO_LEFT: stereo_left_worker,
+        }
+        if stereo_right_worker is not None:
+            camera_workers[CameraRole.STEREO_RIGHT] = stereo_right_worker
+        self._camera_workers = MappingProxyType(camera_workers)
         self._camera_bindings = MappingProxyType(
             {
                 CameraRole.OVERVIEW: self._binding(overview_worker),
@@ -275,7 +284,7 @@ class ApplicationRuntime:
                 raise ValueError(f"{name} must be >= 0")
 
     def start(self) -> None:
-        """Start Turret, Overview, and Stereo Left with automatic rollback."""
+        """Start owned workers in deterministic order with automatic rollback."""
         if self._start_attempted:
             raise RuntimeError("ApplicationRuntime is one-shot and start was attempted")
         if self._shutdown_complete:
@@ -291,6 +300,9 @@ class ApplicationRuntime:
             self._active_components.add(_OVERVIEW_COMPONENT)
             self.stereo_left_worker.start()
             self._active_components.add(_STEREO_LEFT_COMPONENT)
+            if self.stereo_right_worker is not None:
+                self.stereo_right_worker.start()
+                self._active_components.add(_STEREO_RIGHT_COMPONENT)
         except RuntimeError as startup_error:
             failures = self._stop_active(_DEFAULT_SHUTDOWN_TIMEOUT_SECONDS)
             if failures:
@@ -393,12 +405,13 @@ class ApplicationRuntime:
     ) -> tuple[ApplicationShutdownFailure, ...]:
         failures: list[ApplicationShutdownFailure] = []
         ordered = (
+            (_STEREO_RIGHT_COMPONENT, self.stereo_right_worker),
             (_STEREO_LEFT_COMPONENT, self.stereo_left_worker),
             (_OVERVIEW_COMPONENT, self.overview_worker),
             (_TURRET_COMPONENT, self.turret_worker),
         )
         for component, worker in ordered:
-            if component not in self._active_components:
+            if worker is None or component not in self._active_components:
                 continue
             try:
                 if isinstance(worker, CameraWorker):
@@ -417,7 +430,7 @@ class ApplicationRuntime:
     def _uses_production_gstreamer(self) -> bool:
         return any(
             isinstance(worker.source, (GStreamerRtpJpegSource, GStreamerRtspSource))
-            for worker in (self.overview_worker, self.stereo_left_worker)
+            for worker in self._camera_workers.values()
         )
 
     @staticmethod
@@ -465,6 +478,14 @@ def build_application_runtime(
         corrector=stereo_left_corrector(stereo_calibration),
         source_factory=selected_factories.stereo_left_source_factory,
     )
+    stereo_right_worker = None
+    if config.vision.cameras.stereo_right.enabled:
+        stereo_right_worker = build_camera_worker(
+            camera=CameraRole.STEREO_RIGHT,
+            config=config.vision.cameras.stereo_right,
+            corrector=stereo_right_corrector(stereo_calibration),
+            source_factory=selected_factories.stereo_right_source_factory,
+        )
     turret_worker = TurretWorker(
         config.turret,
         config.tracking_control,
@@ -490,6 +511,7 @@ def build_application_runtime(
     return ApplicationRuntime(
         overview_worker=overview_worker,
         stereo_left_worker=stereo_left_worker,
+        stereo_right_worker=stereo_right_worker,
         turret_worker=turret_worker,
         mediator=mediator,
         camera_stale_timeout_ms=config.vision.camera_stale_timeout_ms,
