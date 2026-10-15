@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from contextlib import contextmanager
 from dataclasses import dataclass
 from math import isfinite
+from time import monotonic_ns
 from typing import Literal
 
 from navmin.config.models import AxisMechanicsConfig, Stm32Config, TurretConfig
@@ -13,8 +15,10 @@ from navmin.contracts import (
     ConfigUpdate,
     MotorState,
     MoveRelativeCommand,
+    PlatformMotionSnapshot,
 )
 
+from .platform_motion import CommandMotionModel
 from .protocol import (
     CommandCode,
     MoveRelativePayload,
@@ -29,6 +33,7 @@ from .protocol import (
 from .session import SessionResult, TurretSession
 
 type AxisName = Literal["x", "y"]
+type NanosecondClock = Callable[[], int]
 
 
 class HalError(RuntimeError):
@@ -49,12 +54,19 @@ class _PendingConfig:
 class TurretHal:
     """Application-unit HAL over the accepted Stage 3B ``TurretSession``."""
 
-    def __init__(self, session: TurretSession, config: TurretConfig) -> None:
+    def __init__(
+        self,
+        session: TurretSession,
+        config: TurretConfig,
+        *,
+        command_clock_ns: NanosecondClock = monotonic_ns,
+    ) -> None:
         if not isinstance(session, TurretSession):
             raise TypeError("session must be TurretSession")
         if not isinstance(config, TurretConfig):
             raise TypeError("config must be TurretConfig")
         self._session = session
+        self._command_clock_ns = command_clock_ns
         # Mechanical conversion is restart-only in v1: keep this snapshot forever.
         self._mechanics_x = config.axes.x
         self._mechanics_y = config.axes.y
@@ -66,6 +78,10 @@ class TurretHal:
         self._motor_state = MotorState.UNKNOWN
         self._operation_active = False
         self._config_drain_defer_depth = 0
+        self._platform_motion = CommandMotionModel(
+            acceleration_x_deg_s2=config.stm32.acceleration_x_deg_s2,
+            acceleration_y_deg_s2=config.stm32.acceleration_y_deg_s2,
+        )
 
     @property
     def motor_state(self) -> MotorState:
@@ -82,6 +98,10 @@ class TurretHal:
     @property
     def pending_config_revision(self) -> int | None:
         return None if self._pending_config is None else self._pending_config.revision
+
+    @property
+    def platform_motion_snapshot(self) -> PlatformMotionSnapshot:
+        return self._platform_motion.snapshot()
 
     def rebind_session(self, session: TurretSession) -> None:
         """Bind a recovered session without changing restart-only mechanics."""
@@ -173,7 +193,12 @@ class TurretHal:
             delta_x_steps=self.degrees_to_steps("x", command.delta_x_deg),
             delta_y_steps=self.degrees_to_steps("y", command.delta_y_deg),
         )
-        return self._ordinary(CommandCode.MOVE_RELATIVE, payload)
+        result = self._ordinary(CommandCode.MOVE_RELATIVE, payload)
+        if self._response_ok(result):
+            # Relative target execution has no observable rate lifecycle.
+            self._platform_motion.invalidate()
+            self._record_confirmed_emergency(result)
+        return result
 
     def set_velocity(self, setpoint: AxisVelocitySetpoint) -> SessionResult:
         if not isinstance(setpoint, AxisVelocitySetpoint):
@@ -186,7 +211,25 @@ class TurretHal:
                 "y", setpoint.velocity_y_deg_s
             ),
         )
-        return self._ordinary(CommandCode.SET_VELOCITY, payload)
+        command_timestamp_ns = self._read_command_timestamp()
+        result = self._ordinary(
+            CommandCode.SET_VELOCITY,
+            payload,
+            drain_pending_config=False,
+        )
+        if self._response_ok(result):
+            self._platform_motion.record_velocity_command(
+                timestamp_ns=command_timestamp_ns,
+                commanded_rate_x_deg_s=self._logical_velocity_from_steps_s(
+                    "x", payload.velocity_x_steps_s
+                ),
+                commanded_rate_y_deg_s=self._logical_velocity_from_steps_s(
+                    "y", payload.velocity_y_steps_s
+                ),
+            )
+        self._record_confirmed_emergency(result)
+        self._drain_pending_config_if_idle()
+        return result
 
     def motor_on(self) -> SessionResult:
         result = self._ordinary(CommandCode.MOTOR_ON)
@@ -198,10 +241,17 @@ class TurretHal:
         result = self._ordinary(CommandCode.MOTOR_OFF)
         if self._response_ok(result):
             self._motor_state = MotorState.OFF
+            self._platform_motion.mark_known_zero(
+                timestamp_ns=self._read_command_timestamp()
+            )
         return result
 
     def emergency_stop(self) -> ProtocolResponse | None:
         response = self._session.request_emergency()
+        if response is not None and response.result is ResultCode.OK:
+            self._platform_motion.mark_known_zero(
+                timestamp_ns=self._read_command_timestamp()
+            )
         self._drain_pending_config_if_idle()
         return response
 
@@ -268,11 +318,21 @@ class TurretHal:
             finally:
                 self._operation_active = False
             last_result = result
+            self._record_confirmed_emergency(result)
             if not self._response_ok(result):
                 return result
 
             self._applied_stm32_config = pending.config
             self._applied_config_revision = pending.revision
+            self._platform_motion.record_acceleration_limits(
+                timestamp_ns=self._read_command_timestamp(),
+                acceleration_x_deg_s2=self._acceleration_from_steps_s2(
+                    "x", pending.payload.acceleration_x_steps_s2
+                ),
+                acceleration_y_deg_s2=self._acceleration_from_steps_s2(
+                    "y", pending.payload.acceleration_y_steps_s2
+                ),
+            )
             if (
                 self._pending_config is not None
                 and self._pending_config.revision == pending.revision
@@ -285,21 +345,53 @@ class TurretHal:
         self._motor_state = MotorState.UNKNOWN
         self._applied_stm32_config = None
         self._applied_config_revision = None
+        self._platform_motion.invalidate()
 
-    def _ordinary(self, command: CommandCode, payload=None) -> SessionResult:
+    def _ordinary(
+        self,
+        command: CommandCode,
+        payload=None,
+        *,
+        drain_pending_config: bool = True,
+    ) -> SessionResult:
         self._operation_active = True
         try:
             result = self._session.transact(command, payload)
         finally:
             self._operation_active = False
-        self._drain_pending_config_if_idle()
+        if command is not CommandCode.SET_VELOCITY:
+            self._record_confirmed_emergency(result)
+        if drain_pending_config:
+            self._drain_pending_config_if_idle()
         return result
+
+    def _record_confirmed_emergency(self, result: SessionResult) -> None:
+        emergency = result.emergency_response
+        if emergency is not None and emergency.result is ResultCode.OK:
+            self._platform_motion.mark_known_zero(
+                timestamp_ns=self._read_command_timestamp()
+            )
+
+    def _read_command_timestamp(self) -> int:
+        value = self._command_clock_ns()
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise TypeError("command_clock_ns must return an integer")
+        if value < 0:
+            raise ValueError("command_clock_ns must return a non-negative value")
+        return value
 
     def _drain_pending_config_if_idle(self) -> None:
         if self._config_drain_defer_depth > 0:
             return
         if self._pending_config is not None and not self._operation_active:
             self.flush_pending_config()
+
+    def _logical_velocity_from_steps_s(self, axis: AxisName, steps_s: int) -> float:
+        logical_steps_s = -steps_s if self._mechanics(axis).invert else steps_s
+        return logical_steps_s * 360.0 / self.effective_steps_per_revolution(axis)
+
+    def _acceleration_from_steps_s2(self, axis: AxisName, steps_s2: int) -> float:
+        return steps_s2 * 360.0 / self.effective_steps_per_revolution(axis)
 
     def _round_steps(self, axis: AxisName, value: float) -> int:
         try:
@@ -345,4 +437,4 @@ class TurretHal:
         return result
 
 
-__all__ = ["HalError", "RelativeMoveLimitError", "TurretHal"]
+__all__ = ["HalError", "NanosecondClock", "RelativeMoveLimitError", "TurretHal"]

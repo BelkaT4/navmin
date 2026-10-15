@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Any
 
-from navmin.contracts import CameraRole, DistanceSource
+from navmin.contracts import CameraRole, DistanceSource, PlatformMotionSource
 
 
 class ProcessingScope(Enum):
@@ -62,8 +62,13 @@ class CameraConfig:
 
 
 @dataclass(frozen=True)
+class OverviewCameraConfig(CameraConfig):
+    calibration_file: str
+
+
+@dataclass(frozen=True)
 class CamerasConfig:
-    overview: CameraConfig
+    overview: OverviewCameraConfig
     stereo_left: CameraConfig
     stereo_right: CameraConfig
 
@@ -73,6 +78,7 @@ class StereoDistanceConfig:
     stereo_enabled: bool
     right_frame_buffer_size: int
     pair_timeout_ms: int
+    calibration_file: str
 
 
 @dataclass(frozen=True)
@@ -106,9 +112,48 @@ class AimPointsConfig:
 
 @dataclass(frozen=True)
 class AimingConfig:
-    lead_time_ms: int
     target_lost_timeout_ms: int
     aim_points: AimPointsConfig
+
+
+@dataclass(frozen=True)
+class VelocityEstimatorConfig:
+    window_ms: int
+    min_span_ms: int
+    min_samples: int
+    max_samples: int
+    max_fit_rms_deg: float
+    max_target_rate_x_deg_s: float
+    max_target_rate_y_deg_s: float
+
+
+@dataclass(frozen=True)
+class FeedForwardConfig:
+    enabled: bool
+    gain_x: float
+    gain_y: float
+
+
+@dataclass(frozen=True)
+class PredictionConfig:
+    enabled: bool
+    horizon_ms: int
+    max_angle_x_deg: float
+    max_angle_y_deg: float
+
+
+@dataclass(frozen=True)
+class PlatformMotionConfig:
+    source: PlatformMotionSource
+
+
+@dataclass(frozen=True)
+class TrackingControlConfig:
+    velocity_estimator: VelocityEstimatorConfig
+    feed_forward: FeedForwardConfig
+    prediction: PredictionConfig
+    platform_motion: PlatformMotionConfig
+
 
 
 @dataclass(frozen=True)
@@ -174,6 +219,7 @@ class AppConfig:
     schema_version: int
     vision: VisionConfig
     aiming: AimingConfig
+    tracking_control: TrackingControlConfig
     turret: TurretConfig
     ui: UiConfig
 
@@ -181,8 +227,21 @@ class AppConfig:
 _DYNAMIC_EXACT_PATHS = frozenset(
     {
         "vision.processing-scope",
-        "aiming.lead-time-ms",
         "aiming.target-lost-timeout-ms",
+        "tracking-control.velocity-estimator.window-ms",
+        "tracking-control.velocity-estimator.min-span-ms",
+        "tracking-control.velocity-estimator.min-samples",
+        "tracking-control.velocity-estimator.max-samples",
+        "tracking-control.velocity-estimator.max-fit-rms-deg",
+        "tracking-control.velocity-estimator.max-target-rate-x-deg-s",
+        "tracking-control.velocity-estimator.max-target-rate-y-deg-s",
+        "tracking-control.feed-forward.enabled",
+        "tracking-control.feed-forward.gain-x",
+        "tracking-control.feed-forward.gain-y",
+        "tracking-control.prediction.enabled",
+        "tracking-control.prediction.horizon-ms",
+        "tracking-control.prediction.max-angle-x-deg",
+        "tracking-control.prediction.max-angle-y-deg",
         "ui.show-fps",
         "ui.show-stereo-right-diagnostics",
     }
@@ -199,6 +258,15 @@ def config_apply_policy(path: str) -> ConfigApplyPolicy | None:
         return ConfigApplyPolicy.DYNAMIC
 
     parts = path.split(".")
+    if path == "tracking-control.platform-motion.source":
+        return ConfigApplyPolicy.APPLICATION_RESTART
+
+    if path in {
+        "vision.cameras.overview.calibration-file",
+        "vision.distance.stereo.calibration-file",
+    }:
+        return ConfigApplyPolicy.APPLICATION_RESTART
+
     if (
         parts[:2] == ["turret", "controller"]
         and len(parts) == 3
@@ -232,7 +300,8 @@ def config_apply_policy(path: str) -> ConfigApplyPolicy | None:
     if (
         len(parts) == 4
         and parts[:2] == ["turret", "axes"]
-        and parts[3] in {
+        and parts[3]
+        in {
             "invert",
             "full-steps-per-revolution",
             "microstep-divider",
@@ -284,7 +353,10 @@ __all__ = [
     "CameraSourceConfig",
     "CamerasConfig",
     "ConfigApplyPolicy",
+    "FeedForwardConfig",
     "PidControllerConfig",
+    "PlatformMotionConfig",
+    "PredictionConfig",
     "ProcessingScope",
     "RtpJpegSourceConfig",
     "RtspDecoderMode",
@@ -293,8 +365,10 @@ __all__ = [
     "SerialConfig",
     "StereoDistanceConfig",
     "Stm32Config",
+    "TrackingControlConfig",
     "TurretConfig",
     "UiConfig",
+    "VelocityEstimatorConfig",
     "VisionConfig",
     "VisionDistanceConfig",
     "changed_config_paths",

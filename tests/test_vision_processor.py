@@ -1,12 +1,32 @@
 from __future__ import annotations
 
-import numpy as np
+from dataclasses import FrozenInstanceError
+from typing import get_args
 
-from navmin.contracts import BBox, CameraRole, FramePacket
-from navmin.vision import create_vision_processor
+import numpy as np
+import pytest
+
+from navmin.contracts import (
+    BBox,
+    CameraRole,
+    ClearTargetSelection,
+    FramePacket,
+    TargetAcquired,
+    TargetAcquisitionFailed,
+    TargetAcquisitionFailureReason,
+    TargetLifecycleEvent,
+    TargetRef,
+    TargetSelectionRequest,
+    TargetTrackingEnded,
+    TargetTrackingEndReason,
+    VisionTargetControlCommand,
+)
+from navmin.vision import VisionProcessorOutput, create_vision_processor
 from navmin.vision.processors.legacy_14.detector import Legacy14Detector
 from navmin.vision.processors.legacy_14.processor import Legacy14VisionProcessor
-from navmin.vision.tracking import SimpleTracker
+from navmin.vision.processors.vt11 import Vt11VisionProcessor
+from navmin.vision.processors.vt11 import settings as vt11_settings
+from navmin.vision.tracking import PublicTrackIdAllocator, SimpleTracker
 
 
 class _FixedDetector:
@@ -54,6 +74,97 @@ def test_default_processor_is_legacy14() -> None:
     assert isinstance(create_vision_processor(), Legacy14VisionProcessor)
 
 
+@pytest.mark.parametrize("profile", ["day", "thermal"])
+def test_factory_creates_vt11_with_internal_profile(
+    monkeypatch: pytest.MonkeyPatch,
+    profile: str,
+) -> None:
+    monkeypatch.setattr(vt11_settings, "VT11_PROFILE", profile)
+
+    processor = create_vision_processor("Vt11VisionProcessor")
+
+    assert isinstance(processor, Vt11VisionProcessor)
+    assert processor.settings_snapshot.profile == profile
+
+
+@pytest.mark.parametrize("profile", ["invalid", "DAY"])
+def test_factory_rejects_invalid_vt11_internal_profile(
+    monkeypatch: pytest.MonkeyPatch,
+    profile: str,
+) -> None:
+    monkeypatch.setattr(vt11_settings, "VT11_PROFILE", profile)
+
+    with pytest.raises(ValueError, match="VT11_PROFILE must be 'day' or 'thermal'"):
+        create_vision_processor("Vt11VisionProcessor")
+
+
+def test_factory_rejects_unknown_processor_class() -> None:
+    with pytest.raises(ValueError, match="unsupported VisionProcessor class"):
+        create_vision_processor("UnknownVisionProcessor")
+
+
+def test_target_control_and_lifecycle_contracts_are_immutable_unions() -> None:
+    request = TargetSelectionRequest(
+        selection_id=11,
+        camera=CameraRole.OVERVIEW,
+        generation=2,
+        frame_id=7,
+        x_px=12.5,
+        y_px=14.0,
+    )
+    clear = ClearTargetSelection(CameraRole.OVERVIEW, generation=2)
+    target = TargetRef(CameraRole.OVERVIEW, generation=2, track_id=4)
+    acquired = TargetAcquired(
+        selection_id=11,
+        target=target,
+        request_frame_id=7,
+        decision_frame_id=7,
+        decision_frame_timestamp_ns=1_000,
+    )
+    failed = TargetAcquisitionFailed(
+        selection_id=11,
+        camera=CameraRole.OVERVIEW,
+        generation=2,
+        request_frame_id=7,
+        reason=TargetAcquisitionFailureReason.STALE_SELECTION,
+        decision_frame_id=None,
+        decision_frame_timestamp_ns=None,
+    )
+    ended = TargetTrackingEnded(
+        target=target,
+        reason=TargetTrackingEndReason.LOST_UNRECOVERED,
+        decision_frame_id=9,
+        decision_frame_timestamp_ns=2_000,
+    )
+
+    assert set(get_args(VisionTargetControlCommand)) == {
+        TargetSelectionRequest,
+        ClearTargetSelection,
+    }
+    assert set(get_args(TargetLifecycleEvent)) == {
+        TargetAcquired,
+        TargetAcquisitionFailed,
+        TargetTrackingEnded,
+    }
+    for value in (request, clear, acquired, failed, ended):
+        with pytest.raises(FrozenInstanceError):
+            value.generation = 99
+
+
+def test_vision_processor_output_is_immutable_and_defaults_to_no_events() -> None:
+    frame = packet(generation=1, frame_id=0, timestamp_ns=10)
+    result = Legacy14VisionProcessor().process(
+        frame,
+        processing_enabled=False,
+    )
+
+    assert isinstance(result, VisionProcessorOutput)
+    assert result.result.frame is frame
+    assert result.target_events == ()
+    with pytest.raises(FrozenInstanceError):
+        result.target_events = ()
+
+
 def test_processor_returns_exact_frame_tuple_objects_and_does_not_mutate_image() -> None:
     bbox = BBox(3, 4, 5, 6)
     detector = _FixedDetector(bbox)
@@ -62,8 +173,8 @@ def test_processor_returns_exact_frame_tuple_objects_and_does_not_mutate_image()
     second = packet(generation=1, frame_id=1, timestamp_ns=1_000_000_000)
     before = second.image.copy()
 
-    assert processor.process(first).tracked_objects == ()
-    result = processor.process(second)
+    assert processor.process(first).result.tracked_objects == ()
+    result = processor.process(second).result
 
     assert result.frame is second
     assert isinstance(result.tracked_objects, tuple)
@@ -78,20 +189,47 @@ def test_processor_resets_detector_and_tracker_on_generation_change() -> None:
     detector = _FixedDetector(BBox(1, 2, 3, 4))
     processor = Legacy14VisionProcessor(detector=detector, tracker=SimpleTracker())
 
-    assert processor.process(packet(generation=1, frame_id=0, timestamp_ns=0)).tracked_objects == ()
+    assert (
+        processor.process(packet(generation=1, frame_id=0, timestamp_ns=0))
+        .result.tracked_objects
+        == ()
+    )
     assert processor.process(
         packet(generation=1, frame_id=1, timestamp_ns=1_000_000_000)
-    ).tracked_objects[0].track_id == 1
+    ).result.tracked_objects[0].track_id == 1
 
     assert processor.process(
         packet(generation=2, frame_id=0, timestamp_ns=2_000_000_000)
-    ).tracked_objects == ()
+    ).result.tracked_objects == ()
     new_generation = processor.process(
         packet(generation=2, frame_id=1, timestamp_ns=3_000_000_000)
-    )
+    ).result
 
     assert new_generation.tracked_objects[0].track_id == 1
     assert detector.reset_calls == 2
+
+
+def test_legacy_processor_reset_preserves_external_public_id_namespace() -> None:
+    allocator = PublicTrackIdAllocator()
+    detector = _FixedDetector(BBox(1, 2, 3, 4))
+    processor = Legacy14VisionProcessor(
+        detector=detector,
+        public_track_id_allocator=allocator,
+    )
+
+    processor.process(packet(generation=1, frame_id=0, timestamp_ns=0))
+    first = processor.process(
+        packet(generation=1, frame_id=1, timestamp_ns=1_000_000_000)
+    ).result.tracked_objects
+    assert [item.track_id for item in first] == [1]
+
+    processor.reset()
+    processor.process(packet(generation=1, frame_id=2, timestamp_ns=2_000_000_000))
+    second = processor.process(
+        packet(generation=1, frame_id=3, timestamp_ns=3_000_000_000)
+    ).result.tracked_objects
+
+    assert [item.track_id for item in second] == [2]
 
 
 def test_processing_disabled_returns_empty_without_running_detector_or_tracker() -> None:
@@ -99,7 +237,7 @@ def test_processing_disabled_returns_empty_without_running_detector_or_tracker()
     processor = Legacy14VisionProcessor(detector=detector, tracker=_ExplodingTracker())
     frame = packet(generation=1, frame_id=0, timestamp_ns=10)
 
-    result = processor.process(frame, processing_enabled=False)
+    result = processor.process(frame, processing_enabled=False).result
 
     assert result.frame is frame
     assert result.tracked_objects == ()

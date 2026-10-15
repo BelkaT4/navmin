@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import replace
+from pathlib import Path
 from time import monotonic, sleep
 
 import pytest
@@ -11,6 +13,7 @@ from navmin.application import (
     build_application_runtime,
 )
 from navmin.calibration import OverviewCalibration, StereoCalibration
+from navmin.config import load_config
 from navmin.config.models import (
     AimingConfig,
     AimPointConfig,
@@ -20,6 +23,7 @@ from navmin.config.models import (
     AxisMechanicsConfig,
     CameraConfig,
     CamerasConfig,
+    OverviewCameraConfig,
     PidControllerConfig,
     ProcessingScope,
     RtpJpegSourceConfig,
@@ -36,8 +40,12 @@ from navmin.config.models import (
 )
 from navmin.contracts import (
     CameraRole,
+    ConfigUpdate,
     DistanceSource,
     MotorState,
+    PlatformMotionRate,
+    TargetRef,
+    TrackingError,
     TurretConnectionState,
 )
 from navmin.turret.protocol import CommandCode
@@ -72,6 +80,17 @@ def _camera(port: int, *, enabled: bool = True) -> CameraConfig:
     )
 
 
+def _overview_camera(port: int) -> OverviewCameraConfig:
+    camera = _camera(port)
+    return OverviewCameraConfig(
+        enabled=camera.enabled,
+        source=camera.source,
+        processing_enabled=camera.processing_enabled,
+        vision_processor_class=camera.vision_processor_class,
+        calibration_file="calibration/overview.json",
+    )
+
+
 def _rtsp_camera(uri: str) -> CameraConfig:
     return CameraConfig(
         enabled=True,
@@ -88,6 +107,16 @@ def _rtsp_camera(uri: str) -> CameraConfig:
     )
 
 
+def _default_tracking_control_config():
+    defaults = (
+        Path(__file__).resolve().parents[1]
+        / "config"
+        / "defaults"
+        / "navmin.json"
+    )
+    return load_config(defaults).tracking_control
+
+
 def _config() -> AppConfig:
     center = AimPointConfig(x_px=None, y_px=None)
     axis = AxisMechanicsConfig(
@@ -97,11 +126,11 @@ def _config() -> AppConfig:
         max_relative_move_deg=45.0,
     )
     return AppConfig(
-        schema_version=1,
+        schema_version=3,
         vision=VisionConfig(
             processing_scope=ProcessingScope.MAIN_AND_PREVIEW,
             cameras=CamerasConfig(
-                overview=_camera(8888),
+                overview=_overview_camera(8888),
                 stereo_left=_camera(8889),
                 stereo_right=_camera(8890),
             ),
@@ -113,16 +142,17 @@ def _config() -> AppConfig:
                     stereo_enabled=False,
                     right_frame_buffer_size=4,
                     pair_timeout_ms=100,
+                    calibration_file="calibration/stereo.json",
                 ),
             ),
             camera_stale_timeout_ms=500,
             simulation_mode=False,
         ),
         aiming=AimingConfig(
-            lead_time_ms=100,
             target_lost_timeout_ms=500,
             aim_points=AimPointsConfig(overview=center, stereo_left=center),
         ),
+        tracking_control=_default_tracking_control_config(),
         turret=TurretConfig(
             serial=SerialConfig(
                 port="/dev/ttyUSB0",
@@ -288,6 +318,127 @@ def test_default_construction_uses_only_production_transport_boundaries() -> Non
     assert factories.turret_transport_factory is None
 
 
+def test_runtime_pid_tuning_dependencies_use_loaded_config_and_monotonic_updates(
+    monkeypatch,
+    caplog,
+) -> None:
+    config = _config()
+    runtime = build_application_runtime(
+        config=config,
+        overview_calibration=_overview_calibration(),
+        stereo_calibration=_stereo_calibration(),
+    )
+    queued: list[ConfigUpdate[TurretConfig]] = []
+    monkeypatch.setattr(runtime.turret_worker, "submit_config_update", queued.append)
+    caplog.set_level(logging.INFO, logger="navmin.application")
+
+    ui = runtime.ui_dependencies
+    assert ui.pid_controller_config is config.turret.controller
+
+    first = PidControllerConfig(0.25, 0.01, 0.04, 0.30, 0.02, 0.05)
+    second = PidControllerConfig(0.35, 0.03, 0.06, 0.40, 0.04, 0.07)
+    third = PidControllerConfig(0.45, 0.05, 0.08, 0.50, 0.06, 0.09)
+    for gains in (first, second, third):
+        ui.apply_pid_tuning(gains)
+
+    assert [update.revision for update in queued] == [1, 2, 3]
+    assert [update.config.controller for update in queued] == [first, second, third]
+    for update in queued:
+        assert update.config.serial == config.turret.serial
+        assert update.config.axes == config.turret.axes
+        assert update.config.stm32 == config.turret.stm32
+        assert update.config.emulate_stm32 == config.turret.emulate_stm32
+    assert queued[-1].config == replace(config.turret, controller=third)
+    assert "PID tuning update queued revision=3" in caplog.text
+
+
+@pytest.mark.parametrize("invalid", [-0.1, float("nan"), float("inf")])
+def test_runtime_pid_tuning_rejects_invalid_gains_without_publishing(
+    monkeypatch,
+    invalid: float,
+) -> None:
+    runtime = build_application_runtime(
+        config=_config(),
+        overview_calibration=_overview_calibration(),
+        stereo_calibration=_stereo_calibration(),
+    )
+    queued: list[ConfigUpdate[TurretConfig]] = []
+    monkeypatch.setattr(runtime.turret_worker, "submit_config_update", queued.append)
+    gains = PidControllerConfig(invalid, 0.0, 0.0, 1.0, 0.0, 0.0)
+
+    with pytest.raises(ValueError):
+        runtime.apply_pid_tuning(gains)
+
+    assert queued == []
+
+
+def test_runtime_tracking_tuning_uses_one_revision_for_core_and_turret(
+    monkeypatch,
+    caplog,
+) -> None:
+    config = _config()
+    runtime = build_application_runtime(
+        config=config,
+        overview_calibration=_overview_calibration(),
+        stereo_calibration=_stereo_calibration(),
+    )
+    queued: list[ConfigUpdate] = []
+    monkeypatch.setattr(
+        runtime.turret_worker,
+        "submit_tracking_control_config_update",
+        queued.append,
+    )
+    caplog.set_level(logging.INFO, logger="navmin.application")
+    estimator = runtime.mediator.tracking_estimator
+    target = TargetRef(CameraRole.OVERVIEW, 1, 7)
+    estimator.observe(
+        TrackingError(target, 1.0, 2.0, 1_000_000_000),
+        PlatformMotionRate(1_000_000_000, 0.0, 0.0),
+    )
+
+    control_only = replace(
+        config.tracking_control,
+        feed_forward=replace(
+            config.tracking_control.feed_forward,
+            enabled=True,
+            gain_x=0.4,
+            gain_y=0.5,
+        ),
+        prediction=replace(
+            config.tracking_control.prediction,
+            enabled=True,
+            horizon_ms=75,
+        ),
+    )
+    runtime.apply_tracking_control_tuning(control_only)
+
+    assert estimator.sample_count == 1
+    assert estimator.diagnostics.target == target
+    assert queued == [ConfigUpdate(1, control_only)]
+
+    estimator_change = replace(
+        control_only,
+        velocity_estimator=replace(
+            control_only.velocity_estimator,
+            window_ms=250,
+        ),
+    )
+    runtime.apply_tracking_control_tuning(estimator_change)
+
+    assert estimator.sample_count == 0
+    assert estimator.diagnostics.target == target
+    assert queued == [ConfigUpdate(1, control_only), ConfigUpdate(2, estimator_change)]
+    messages = [
+        record.getMessage()
+        for record in caplog.records
+        if "Tracking tuning update queued" in record.getMessage()
+    ]
+    assert len(messages) == 2
+    assert "revision=2" in messages[-1]
+    assert "gain=(0.4,0.5)" in messages[-1]
+    assert "horizon=75" in messages[-1]
+    assert "window=250" in messages[-1]
+
 
 def test_default_composition_supports_overview_rtsp_and_stereo_left_rtp() -> None:
     base = _config()
@@ -349,6 +500,10 @@ def test_shared_runtime_starts_and_exposes_complete_ui_dependency_surface() -> N
         assert (
             bindings[CameraRole.STEREO_LEFT].session_barriers
             is runtime.stereo_left_worker.pipeline.session_barriers
+        )
+        assert (
+            bindings[CameraRole.OVERVIEW].target_events
+            is runtime.overview_worker.pipeline.target_events
         )
 
         for binding in bindings.values():

@@ -63,13 +63,12 @@ class Aiming:
         )
         return MoveRelativeCommand(delta_x_deg=delta_x, delta_y_deg=delta_y)
 
-    def lead_point(self, tracked: TrackedObject) -> PixelPoint:
-        lead_time_s = self._config.lead_time_ms / 1000.0
-        center_x = tracked.bbox.x + tracked.bbox.width / 2.0
-        center_y = tracked.bbox.y + tracked.bbox.height / 2.0
+    @staticmethod
+    def tracked_center(tracked: TrackedObject) -> PixelPoint:
+        """Return the current observed bbox center without extrapolation."""
         return (
-            center_x + tracked.velocity_x_px_s * lead_time_s,
-            center_y + tracked.velocity_y_px_s * lead_time_s,
+            tracked.bbox.x + tracked.bbox.width / 2.0,
+            tracked.bbox.y + tracked.bbox.height / 2.0,
         )
 
     def tracking_error(
@@ -80,12 +79,12 @@ class Aiming:
         tracked: TrackedObject,
         target: TargetRef,
     ) -> TrackingError:
-        lead = self.lead_point(tracked)
+        center = self.tracked_center(tracked)
         error_x, error_y = self.angular_delta(
             camera=frame.camera,
             camera_model=camera_model,
             frame=frame,
-            target=lead,
+            target=center,
         )
         return TrackingError(
             target=target,

@@ -92,7 +92,7 @@ class ConfigManager:
         self._publish_all(initial, revision=0)
 
     @classmethod
-    def load(cls, path: str | Path = "config.json") -> ConfigManager:
+    def load(cls, path: str | Path = "config/navmin.json") -> ConfigManager:
         return cls(path, load_config(path))
 
     @property

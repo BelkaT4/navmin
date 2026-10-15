@@ -3,7 +3,7 @@ from __future__ import annotations
 import pytest
 
 from navmin.contracts import BBox
-from navmin.vision.tracking import SimpleTracker
+from navmin.vision.tracking import PublicTrackIdAllocator, SimpleTracker
 
 
 def box(x: int, y: int = 20, width: int = 20, height: int = 20) -> BBox:
@@ -138,6 +138,34 @@ def test_reset_starts_independent_generation_id_space() -> None:
     tracker.reset()
 
     assert confirm(tracker, box(100), box(110)).track_id == 1
+
+
+def test_external_allocator_is_shared_and_not_reset_by_tracker() -> None:
+    allocator = PublicTrackIdAllocator()
+    tracker = SimpleTracker(public_track_id_allocator=allocator)
+
+    assert tracker.update([box(0), box(100)], timestamp_ns=0) == ()
+    confirmed = tracker.update(
+        [box(5), box(105)],
+        timestamp_ns=1_000_000_000,
+    )
+    assert [item.track_id for item in confirmed] == [1, 2]
+
+    assert allocator.allocate() == 3
+    tracker.reset()
+
+    assert confirm(tracker, box(200), box(205)).track_id == 4
+
+
+def test_allocator_reset_starts_a_new_generation_namespace() -> None:
+    allocator = PublicTrackIdAllocator()
+    tracker = SimpleTracker(public_track_id_allocator=allocator)
+    assert confirm(tracker, box(0), box(5)).track_id == 1
+
+    tracker.reset()
+    allocator.reset()
+
+    assert confirm(tracker, box(100), box(105)).track_id == 1
 
 
 def test_one_detection_cannot_update_two_tracks() -> None:

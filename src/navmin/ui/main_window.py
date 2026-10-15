@@ -20,12 +20,12 @@ from PyQt6.QtWidgets import (
 )
 
 from navmin.concurrency import LatestValue
+from navmin.config.models import PidControllerConfig, TrackingControlConfig
 from navmin.contracts import (
     CameraRole,
     CameraSessionStarted,
     CameraStatus,
     MotorState,
-    TargetRef,
     TurretControlMode,
     TurretState,
     VisionResult,
@@ -74,6 +74,10 @@ class MainWindow(QMainWindow):
         camera_bindings: Mapping[CameraRole, CameraUiBinding],
         turret_states: LatestValue[TurretState],
         camera_stale_timeout_ms: int,
+        pid_controller_config: PidControllerConfig,
+        apply_pid_tuning: Callable[[PidControllerConfig], None],
+        tracking_control_config: TrackingControlConfig,
+        apply_tracking_control_tuning: Callable[[TrackingControlConfig], None],
         clock_ns: Callable[[], int] = monotonic_ns,
         wall_clock: Callable[[], datetime] = datetime.now,
         show_diagnostic_clock: bool = False,
@@ -160,6 +164,10 @@ class MainWindow(QMainWindow):
             owner=self,
             on_toggle_fullscreen=self.toggle_fullscreen,
             on_exit=self.request_exit,
+            pid_controller_config=pid_controller_config,
+            on_apply_pid_tuning=apply_pid_tuning,
+            tracking_control_config=tracking_control_config,
+            on_apply_tracking_control_tuning=apply_tracking_control_tuning,
         )
 
         self.state_pump = UiStatePump(
@@ -241,6 +249,9 @@ class MainWindow(QMainWindow):
         self.refresh_presentation()
 
     def refresh_presentation(self) -> None:
+        self.operator_window.set_tracking_diagnostics(
+            self._mediator.tracking_diagnostics
+        )
         if self._mediator.main_camera is not self._shown_main_camera:
             self._shown_main_camera = self._mediator.main_camera
             self._refresh_view_roles()
@@ -321,34 +332,12 @@ class MainWindow(QMainWindow):
         if mode is TurretControlMode.RELATIVE:
             self._mediator.handle_relative_click(displayed_result, x_px, y_px)
         elif mode is TurretControlMode.TRACKING:
-            tracked = self._hit_test(displayed_result, x_px, y_px)
-            if tracked is None:
-                self._mediator.deselect_target()
-            else:
-                self._mediator.select_target(
-                    TargetRef(
-                        camera=displayed_result.frame.camera,
-                        generation=displayed_result.frame.generation,
-                        track_id=tracked,
-                    )
-                )
+            self._mediator.request_target_selection(
+                displayed_result,
+                x_px,
+                y_px,
+            )
         self.refresh_presentation()
-
-    @staticmethod
-    def _hit_test(result: VisionResult, x_px: float, y_px: float) -> int | None:
-        candidates: list[tuple[float, int]] = []
-        for tracked in result.tracked_objects:
-            bbox = tracked.bbox
-            if not (
-                bbox.x <= x_px < bbox.x + bbox.width
-                and bbox.y <= y_px < bbox.y + bbox.height
-            ):
-                continue
-            center_x = bbox.x + bbox.width / 2.0
-            center_y = bbox.y + bbox.height / 2.0
-            distance_squared = (center_x - x_px) ** 2 + (center_y - y_px) ** 2
-            candidates.append((distance_squared, tracked.track_id))
-        return min(candidates)[1] if candidates else None
 
     def _request_other_mode(self) -> None:
         current = self._mediator.turret_state.control_mode

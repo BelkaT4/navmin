@@ -41,7 +41,7 @@ def _write_host_config(
     address: str = "192.168.42.2/24",
     profile: str = "NavMin Cameras",
 ) -> Path:
-    config = tmp_path / "host.local.env"
+    config = tmp_path / "host.env"
     config.write_text(
         "\n".join(
             (
@@ -207,16 +207,138 @@ def test_linux_host_shell_files_are_posix_syntax_valid() -> None:
         assert script.stat().st_mode & 0o111
 
 
-def test_example_host_config_is_tracked_but_local_config_is_ignored() -> None:
-    example = (REPO_ROOT / "config" / "host.example.env").read_text(encoding="utf-8")
+def test_default_host_config_is_safe_and_working_inputs_are_ignored() -> None:
+    default = (REPO_ROOT / "config" / "defaults" / "host.env").read_text(
+        encoding="utf-8"
+    )
     ignore = (REPO_ROOT / ".gitignore").read_text(encoding="utf-8")
 
-    assert "SERIAL_SETUP_DEVICE=/dev/ttyUSB0" in example
-    assert "SERIAL_ALIAS=navmin-turret" in example
-    assert "CAMERA_INTERFACE=enp3s0" in example
-    assert "CAMERA_HOST_ADDRESS=192.168.42.2/24" in example
-    assert "CAMERA_PROFILE_NAME=NavMin Cameras" in example
-    assert "/config/host.local.env" in ignore
+    assert "SERIAL_SETUP_DEVICE=/dev/navmin-configure-serial-setup" in default
+    assert "SERIAL_ALIAS=navmin-turret-configure" in default
+    assert "CAMERA_INTERFACE=navmin-configure-interface" in default
+    assert "CAMERA_HOST_ADDRESS=192.0.2.2/24" in default
+    assert "CAMERA_PROFILE_NAME=NavMin Cameras CONFIGURE BEFORE USE" in default
+    assert not (REPO_ROOT / "config" / "host.example.env").exists()
+    assert "/config/*.json" in ignore
+    assert "/config/*.env" in ignore
+    assert "/config/**/*.json" in ignore
+    assert "/config/**/*.env" in ignore
+    assert "!/config/defaults/" in ignore
+    assert "!/config/defaults/**" in ignore
+
+
+def _write_minimal_run_navmin_tree(tmp_path: Path) -> tuple[Path, Path]:
+    repo = tmp_path / "repo"
+    linux_tools = repo / "tools" / "platform" / "linux"
+    defaults = repo / "config" / "defaults"
+    linux_tools.mkdir(parents=True)
+    defaults.mkdir(parents=True)
+
+    run_navmin = repo / "run_navmin.sh"
+    run_navmin.write_bytes((REPO_ROOT / "run_navmin.sh").read_bytes())
+    run_navmin.chmod(0o755)
+    (linux_tools / "host_config.sh").write_bytes(
+        (LINUX_TOOLS / "host_config.sh").read_bytes()
+    )
+    (defaults / "host.env").write_bytes(
+        (REPO_ROOT / "config" / "defaults" / "host.env").read_bytes()
+    )
+
+    marker = tmp_path / "unexpected-call.log"
+    for name in ("camera_network_up.sh", "camera_network_down.sh"):
+        _write_executable(
+            linux_tools / name,
+            f"#!/bin/sh\necho {name} >> {marker!s}\nexit 0\n",
+        )
+    return repo, marker
+
+
+def test_run_navmin_missing_host_config_restores_safe_template_then_stops(
+    tmp_path: Path,
+) -> None:
+    repo, marker = _write_minimal_run_navmin_tree(tmp_path)
+    env = os.environ.copy()
+    env.pop("NAVMIN_HOST_CONFIG", None)
+    # No fake uv is provided on purpose: host recovery must happen before the
+    # launcher checks the Python toolchain or touches the camera network.
+    env["PATH"] = "/usr/bin:/bin"
+
+    result = subprocess.run(
+        [str(repo / "run_navmin.sh")],
+        cwd=repo,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    working = repo / "config" / "host.env"
+    assert result.returncode == 2
+    assert working.read_bytes() == (repo / "config" / "defaults" / "host.env").read_bytes()
+    assert "Created safe config/host.env" in result.stdout
+    assert "Review and fill host parameters" in result.stdout
+    assert not marker.exists()
+
+
+def test_run_navmin_existing_host_config_is_never_replaced_by_default(
+    tmp_path: Path,
+) -> None:
+    repo, marker = _write_minimal_run_navmin_tree(tmp_path)
+    working = repo / "config" / "host.env"
+    working.write_text("BROKEN_BUT_OPERATOR_OWNED=1\n", encoding="utf-8")
+    original = working.read_bytes()
+
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    _write_executable(bin_dir / "uv", "#!/bin/sh\nexit 0\n")
+    # Existing-but-invalid host data reaches the normal validator/network helper.
+    # Make that boundary fail deterministically without touching the file.
+    _write_executable(
+        repo / "tools" / "platform" / "linux" / "camera_network_up.sh",
+        "#!/bin/sh\necho invalid-host >&2\nexit 9\n",
+    )
+    env = os.environ.copy()
+    env.pop("NAVMIN_HOST_CONFIG", None)
+    env["PATH"] = f"{bin_dir}:{env['PATH']}"
+
+    result = subprocess.run(
+        [str(repo / "run_navmin.sh")],
+        cwd=repo,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 9
+    assert working.read_bytes() == original
+    assert "Created safe config/host.env" not in result.stdout
+    assert not marker.exists()
+
+
+def test_run_navmin_missing_explicit_host_override_is_not_recovered(
+    tmp_path: Path,
+) -> None:
+    repo, marker = _write_minimal_run_navmin_tree(tmp_path)
+    explicit = tmp_path / "custom" / "host.env"
+    env = os.environ.copy()
+    env["NAVMIN_HOST_CONFIG"] = str(explicit)
+    env["PATH"] = "/usr/bin:/bin"
+
+    result = subprocess.run(
+        [str(repo / "run_navmin.sh")],
+        cwd=repo,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 1
+    assert "explicit host config not found" in result.stderr
+    assert not explicit.exists()
+    assert not (repo / "config" / "host.env").exists()
+    assert not marker.exists()
 
 
 def test_camera_network_up_and_down_restore_previous_profile(tmp_path: Path) -> None:

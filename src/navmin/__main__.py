@@ -25,11 +25,7 @@ from navmin.preflight import (
     format_preflight_summary,
     run_startup_preflight,
 )
-from navmin.session_artifacts import (
-    SessionArtifacts,
-    SessionStatus,
-    SourceInputPaths,
-)
+from navmin.session_artifacts import SessionArtifacts, SessionStatus
 
 LOGGER = logging.getLogger(__name__)
 
@@ -61,16 +57,16 @@ def _parser() -> argparse.ArgumentParser:
         prog="navmin",
         description="Run NavMin against configured real camera sources and a real STM32 serial device.",
     )
-    parser.add_argument("--config", type=Path, default=Path("config.json"))
+    parser.add_argument("--config", type=Path, default=Path("config/navmin.json"))
     parser.add_argument(
         "--overview-calibration",
         type=Path,
-        default=Path("calibration/overview.json"),
+        default=None,
     )
     parser.add_argument(
         "--stereo-calibration",
         type=Path,
-        default=Path("calibration/stereo.json"),
+        default=None,
     )
     parser.add_argument(
         "--preflight-only",
@@ -102,16 +98,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         turret_backend="real",
         input_mode="files",
     )
-    source_paths = SourceInputPaths(
-        config=paths.config,
-        overview_calibration=paths.overview_calibration,
-        stereo_calibration=paths.stereo_calibration,
-    )
-
     with session_file_logging(artifacts.runtime_log_path, level=logging.INFO):
         LOGGER.info(
             "Normal launcher selected configured real cameras + real STM32; "
-            "config=%s overview_calibration=%s stereo_calibration=%s session=%s",
+            "config=%s overview_calibration_override=%s "
+            "stereo_calibration_override=%s session=%s",
             paths.config,
             paths.overview_calibration,
             paths.stereo_calibration,
@@ -123,12 +114,18 @@ def main(argv: Sequence[str] | None = None) -> int:
             LOGGER.exception("NavMin input loading failed")
             print(f"INPUT ERROR: {exc}", file=sys.stderr)
             should_recover = False
-            if not args.preflight_only:
+            recoverable = bool(getattr(exc, "recoverable", False))
+            if not args.preflight_only and recoverable:
                 try:
                     should_recover = _prompt_input_recovery(str(exc))
                 except (ImportError, OSError, RuntimeError) as dialog_exc:
                     LOGGER.exception("NavMin input recovery dialog unavailable")
                     print(f"RECOVERY UI ERROR: {dialog_exc}", file=sys.stderr)
+            elif not recoverable:
+                LOGGER.warning(
+                    "Input recovery is disabled for this failure; explicit CLI "
+                    "calibration overrides are never modified"
+                )
             if should_recover:
                 try:
                     result = recover_default_inputs(paths)
@@ -156,6 +153,15 @@ def main(argv: Sequence[str] | None = None) -> int:
                 failure=exc,
             )
             return _FAILURE_EXIT_CODE
+
+        if inputs.source_paths is not None:
+            LOGGER.info(
+                "Resolved input paths: config=%s overview_calibration=%s "
+                "stereo_calibration=%s",
+                inputs.source_paths.config,
+                inputs.source_paths.overview_calibration,
+                inputs.source_paths.stereo_calibration,
+            )
 
         try:
             validate_normal_hardware_config(inputs.config)
@@ -207,7 +213,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 config=inputs.config,
                 overview_calibration=inputs.overview_calibration,
                 stereo_calibration=inputs.stereo_calibration,
-                source_paths=source_paths,
+                source_paths=inputs.source_paths,
             )
             exit_code = run_loaded_application(inputs)
         except KeyboardInterrupt as exc:

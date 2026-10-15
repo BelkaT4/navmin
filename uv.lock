@@ -440,10 +440,12 @@ name = "navmin"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
+    { name = "numpy" },
     { name = "opencv-python" },
     { name = "pygobject" },
     { name = "pyqt6" },
     { name = "pyserial" },
+    { name = "pyyaml" },
 ]
 
 [package.optional-dependencies]
@@ -467,12 +469,14 @@ requires-dist = [
     { name = "mkdocs-git-revision-date-localized-plugin", marker = "extra == 'docs'", specifier = ">=1.0" },
     { name = "mkdocs-material", marker = "extra == 'docs'", specifier = ">=9.0" },
     { name = "mkdocs-minify-plugin", marker = "extra == 'docs'", specifier = ">=0.8" },
+    { name = "numpy", specifier = ">=2.0,<3" },
     { name = "opencv-python", specifier = ">=4.8" },
     { name = "pygobject", specifier = ">=3.58.0" },
     { name = "pymdown-extensions", marker = "extra == 'docs'", specifier = ">=10.0" },
     { name = "pyqt6", specifier = ">=6.5" },
     { name = "pyserial", specifier = ">=3.5" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=7.0" },
+    { name = "pyyaml", specifier = ">=6.0,<7" },
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.1.0" },
 ]
 provides-extras = ["dev", "docs"]

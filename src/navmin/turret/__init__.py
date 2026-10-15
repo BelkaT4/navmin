@@ -9,6 +9,7 @@ from .controller import (
 )
 from .hal import HalError, RelativeMoveLimitError, TurretHal
 from .pid import AxisPid, PidGains
+from .platform_motion import CommandMotionModel
 from .protocol import (
     CommandCode,
     MoveRelativePayload,
@@ -49,6 +50,7 @@ __all__ = [
     "AxisPid",
     "BaudRecoveryError",
     "CommandCode",
+    "CommandMotionModel",
     "ControllerError",
     "ControllerModeError",
     "ControllerStateError",

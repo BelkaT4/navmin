@@ -11,6 +11,7 @@ from statistics import median
 from navmin.contracts import BBox, TrackedObject
 
 from . import settings
+from .public_ids import PublicTrackIdAllocator
 
 type Center = tuple[float, float]
 
@@ -42,15 +43,23 @@ class _Track:
 class SimpleTracker:
     """2-hit tracker with short miss persistence and real-time velocity."""
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        public_track_id_allocator: PublicTrackIdAllocator | None = None,
+    ) -> None:
         self._tracks: list[_Track] = []
         self._next_internal_id = 1
-        self._next_public_track_id = 1
+        self._public_track_ids = (
+            public_track_id_allocator or PublicTrackIdAllocator()
+        )
+        self._owns_public_track_ids = public_track_id_allocator is None
 
     def reset(self) -> None:
         self._tracks.clear()
         self._next_internal_id = 1
-        self._next_public_track_id = 1
+        if self._owns_public_track_ids:
+            self._public_track_ids.reset()
 
     @staticmethod
     def _center(bbox: BBox) -> Center:
@@ -154,8 +163,7 @@ class SimpleTracker:
         self._update_velocity(track)
         if not track.confirmed and track.consecutive_matches >= settings.CONFIRMATION_MATCHES:
             track.confirmed = True
-            track.public_track_id = self._next_public_track_id
-            self._next_public_track_id += 1
+            track.public_track_id = self._public_track_ids.allocate()
 
     def _new_track(self, bbox: BBox, timestamp_ns: int) -> None:
         center = self._center(bbox)

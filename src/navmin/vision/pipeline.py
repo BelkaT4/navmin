@@ -22,6 +22,8 @@ from navmin.concurrency import (
     CameraSessionBarrierChannel,
     InvalidatableLatest,
     LatestValue,
+    TargetControlChannel,
+    TargetLifecycleEventChannel,
 )
 from navmin.contracts import (
     CameraModel,
@@ -30,6 +32,10 @@ from navmin.contracts import (
     CameraState,
     CameraStatus,
     FramePacket,
+    TargetAcquired,
+    TargetAcquisitionFailed,
+    TargetLifecycleEvent,
+    TargetTrackingEnded,
     VisionResult,
 )
 
@@ -251,6 +257,8 @@ class VisionPipeline:
         corrector: _FrameCorrector,
         processor: VisionProcessor | None = None,
         session_barriers: CameraSessionBarrierChannel | None = None,
+        target_control: TargetControlChannel | None = None,
+        target_events: TargetLifecycleEventChannel | None = None,
         latest_result: InvalidatableLatest[VisionResult] | None = None,
         status: LatestValue[CameraStatus] | None = None,
         timestamp_clock_ns: Callable[[], int] = monotonic_ns,
@@ -262,6 +270,10 @@ class VisionPipeline:
         self._corrector = corrector
         self._processor = processor or create_vision_processor()
         self.session_barriers = session_barriers or CameraSessionBarrierChannel()
+        self.target_control = target_control or TargetControlChannel(camera)
+        if self.target_control.camera is not camera:
+            raise ValueError("target-control channel belongs to another camera")
+        self.target_events = target_events or TargetLifecycleEventChannel()
         self.latest_result = latest_result or InvalidatableLatest()
         self.status = status or LatestValue()
         self._timestamp_clock_ns = timestamp_clock_ns
@@ -286,6 +298,7 @@ class VisionPipeline:
             generation = self._generation
             self._frame_id = 0
             self._last_processed_revision = self._pending.snapshot().revision
+            self.target_control.discard_pending()
             self._processor.reset()
             self.latest_result.invalidate()
             timestamp_ns = self._timestamp_clock_ns()
@@ -306,6 +319,47 @@ class VisionPipeline:
             self.session_barriers.publish(session)
         LOGGER.info("Vision pipeline started camera=%s generation=%d", self.camera.value, generation)
         return session
+
+    def apply_latest_target_control(self) -> tuple[TargetLifecycleEvent, ...]:
+        """Apply one latest-wins target intent on the pipeline owner thread."""
+        with self._state_lock:
+            generation = self._generation
+            if generation <= 0:
+                return ()
+            command = self.target_control.consume_latest(generation=generation)
+            if command is None:
+                return ()
+            if command.camera is not self.camera or command.generation != generation:
+                raise VisionPipelineError(
+                    "target-control command does not belong to the active camera session"
+                )
+            events = self._processor.apply_target_control(command)
+            self._publish_target_events(events, generation=generation)
+            return events
+
+    def _publish_target_events(
+        self,
+        events: tuple[TargetLifecycleEvent, ...],
+        *,
+        generation: int,
+    ) -> None:
+        for event in events:
+            if isinstance(event, TargetAcquired):
+                event_camera = event.target.camera
+                event_generation = event.target.generation
+            elif isinstance(event, TargetAcquisitionFailed):
+                event_camera = event.camera
+                event_generation = event.generation
+            elif isinstance(event, TargetTrackingEnded):
+                event_camera = event.target.camera
+                event_generation = event.target.generation
+            else:
+                raise TypeError("processor returned an unknown target lifecycle event")
+            if event_camera is not self.camera or event_generation != generation:
+                raise VisionPipelineError(
+                    "processor returned a target event for another camera session"
+                )
+            self.target_events.publish(event)
 
     def stop(self) -> None:
         with self._state_lock:
@@ -437,10 +491,11 @@ class VisionPipeline:
                 receive_timestamp_ns=pending.receive_timestamp_ns,
                 image=image,
             )
-            result = self._processor.process(
+            processor_output = self._processor.process(
                 packet,
                 processing_enabled=self._processing_enabled,
             )
+            result = processor_output.result
         except Exception as exc:
             with self._state_lock:
                 is_current_generation = pending.generation == self._generation
@@ -468,6 +523,10 @@ class VisionPipeline:
             if pending.generation != self._generation:
                 return None
             self._frame_id += 1
+            self._publish_target_events(
+                processor_output.target_events,
+                generation=pending.generation,
+            )
             self.latest_result.publish(result)
             self.status.publish(
                 CameraStatus(

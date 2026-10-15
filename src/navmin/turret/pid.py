@@ -86,16 +86,31 @@ class AxisPid:
         )
         self._i_term = _clamp(self._i_term, self._output_limit)
 
-    def step(self, error: float, *, now_s: float) -> float:
-        error_value = _require_nonnegative_or_signed_finite(error, name="error")
+    def step(
+        self,
+        real_error: float,
+        *,
+        now_s: float,
+        proportional_offset: float = 0.0,
+        feed_forward: float = 0.0,
+    ) -> float:
+        error_value = _require_nonnegative_or_signed_finite(
+            real_error, name="real_error"
+        )
         now = _require_nonnegative_or_signed_finite(now_s, name="now_s")
-        p_term = self._gains.kp * error_value
+        offset = _require_nonnegative_or_signed_finite(
+            proportional_offset, name="proportional_offset"
+        )
+        ff_term = _require_nonnegative_or_signed_finite(
+            feed_forward, name="feed_forward"
+        )
+        p_term = self._gains.kp * (error_value + offset)
 
         if not self._has_sample:
             self._previous_error = error_value
             self._previous_time_s = now
             self._has_sample = True
-            return _clamp(p_term, self._output_limit)
+            return _clamp(p_term + ff_term, self._output_limit)
 
         dt = now - self._previous_time_s
         if dt <= 0:
@@ -108,7 +123,7 @@ class AxisPid:
                 self._output_limit,
             )
 
-        candidate_output = p_term + candidate_i + d_term
+        candidate_output = p_term + candidate_i + d_term + ff_term
         drives_positive_saturation = (
             candidate_output > self._output_limit and error_value > 0
         )
@@ -118,7 +133,10 @@ class AxisPid:
         if not drives_positive_saturation and not drives_negative_saturation:
             self._i_term = candidate_i
 
-        output = _clamp(p_term + self._i_term + d_term, self._output_limit)
+        output = _clamp(
+            p_term + self._i_term + d_term + ff_term,
+            self._output_limit,
+        )
         self._previous_error = error_value
         self._previous_time_s = now
         return output

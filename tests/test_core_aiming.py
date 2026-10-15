@@ -37,12 +37,10 @@ class _NonLinearRayModel(_RayModel):
 
 def _config(
     *,
-    lead_time_ms: int = 150,
     overview: AimPointConfig | None = None,
     stereo_left: AimPointConfig | None = None,
 ) -> AimingConfig:
     return AimingConfig(
-        lead_time_ms=lead_time_ms,
         target_lost_timeout_ms=500,
         aim_points=AimPointsConfig(
             overview=overview or AimPointConfig(50, 40),
@@ -120,16 +118,33 @@ def test_angular_delta_comes_from_camera_model_rays_not_linear_pixels() -> None:
     assert not math.isclose(far.delta_x_deg, near.delta_x_deg * 2.0)
 
 
-def test_lead_time_zero_uses_bbox_center() -> None:
+def test_tracked_center_uses_current_bbox_center() -> None:
     tracked = TrackedObject(3, BBox(10, 20, 8, 6), 200.0, -100.0, 5)
 
-    assert Aiming(_config(lead_time_ms=0)).lead_point(tracked) == (14.0, 23.0)
+    assert Aiming(_config()).tracked_center(tracked) == (14.0, 23.0)
 
 
-def test_positive_velocity_and_lead_time_shift_lead_point() -> None:
-    tracked = TrackedObject(3, BBox(10, 20, 8, 6), 20.0, 10.0, 5)
+def test_tracking_error_is_independent_of_tracked_pixel_velocity() -> None:
+    target = TargetRef(CameraRole.OVERVIEW, 1, 3)
+    stationary = TrackedObject(3, BBox(10, 20, 8, 6), 0.0, 0.0, 5)
+    moving = TrackedObject(3, BBox(10, 20, 8, 6), 200.0, -100.0, 5)
+    model = _RayModel()
+    frame = _frame()
 
-    assert Aiming(_config(lead_time_ms=250)).lead_point(tracked) == (19.0, 25.5)
+    stationary_error = Aiming(_config()).tracking_error(
+        camera_model=model,
+        frame=frame,
+        tracked=stationary,
+        target=target,
+    )
+    moving_error = Aiming(_config()).tracking_error(
+        camera_model=model,
+        frame=frame,
+        tracked=moving,
+        target=target,
+    )
+
+    assert moving_error == stationary_error
 
 
 def test_tracking_error_contains_target_frame_timestamp_and_finite_angles() -> None:
@@ -138,7 +153,7 @@ def test_tracking_error_contains_target_frame_timestamp_and_finite_angles() -> N
     model = _RayModel()
     frame = _frame(timestamp_ns=987654321)
 
-    error = Aiming(_config(lead_time_ms=100)).tracking_error(
+    error = Aiming(_config()).tracking_error(
         camera_model=model,
         frame=frame,
         tracked=tracked,

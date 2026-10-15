@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import os
+from collections.abc import Callable
+from dataclasses import replace
 from datetime import UTC, datetime
+from pathlib import Path
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -12,8 +15,21 @@ from PyQt6.QtGui import QPixmap
 from PyQt6.QtTest import QTest
 from PyQt6.QtWidgets import QApplication, QMessageBox
 
-from navmin.concurrency import CameraSessionBarrierChannel, LatestValue
-from navmin.config.models import AimingConfig, AimPointConfig, AimPointsConfig, UiConfig
+from navmin.concurrency import (
+    CameraSessionBarrierChannel,
+    LatestValue,
+    TargetControlChannel,
+    TargetLifecycleEventChannel,
+)
+from navmin.config import load_config
+from navmin.config.models import (
+    AimingConfig,
+    AimPointConfig,
+    AimPointsConfig,
+    PidControllerConfig,
+    TrackingControlConfig,
+    UiConfig,
+)
 from navmin.contracts import (
     BBox,
     CameraRay,
@@ -24,15 +40,23 @@ from navmin.contracts import (
     FramePacket,
     MotorState,
     MoveRelativeCommand,
+    PlatformMotionSnapshot,
+    PlatformMotionSource,
+    TargetAcquired,
     TargetRef,
     TrackedObject,
-    TrackingError,
+    TrackingControlSample,
     TurretConnectionState,
     TurretControlMode,
     TurretState,
     VisionResult,
 )
-from navmin.core import Mediator
+from navmin.core import (
+    AxisTrackingEstimate,
+    Mediator,
+    TrackingEstimateInvalidReason,
+    TrackingEstimatorDiagnostics,
+)
 from navmin.ui import (
     CameraUiBinding,
     MainWindow,
@@ -72,7 +96,7 @@ class _FakeTurret:
     def __init__(self, state: TurretState) -> None:
         self._state = state
         self.relative_commands: list[MoveRelativeCommand] = []
-        self.tracking_errors: list[TrackingError] = []
+        self.tracking_controls: list[TrackingControlSample] = []
         self.invalidations = 0
         self.mode_requests: list[TurretControlMode] = []
         self.stop_requests = 0
@@ -87,11 +111,14 @@ class _FakeTurret:
     def submit_move_relative(self, command: MoveRelativeCommand) -> None:
         self.relative_commands.append(command)
 
-    def submit_tracking_error(self, error: TrackingError) -> None:
-        self.tracking_errors.append(error)
+    def submit_tracking_control(self, sample: TrackingControlSample) -> None:
+        self.tracking_controls.append(sample)
 
-    def invalidate_tracking_error(self) -> None:
+    def invalidate_tracking_control(self) -> None:
         self.invalidations += 1
+
+    def platform_motion_snapshot(self) -> PlatformMotionSnapshot:
+        return PlatformMotionSnapshot(PlatformMotionSource.COMMAND_MODEL, False, ())
 
     def set_control_mode(self, mode: TurretControlMode) -> bool:
         self.mode_requests.append(mode)
@@ -118,8 +145,18 @@ class _CountingMediator(Mediator):
         super().__init__(*args, **kwargs)
         self.vision_accept_calls = 0
         self.turret_accept_calls = 0
+        self.accept_order: list[str] = []
+
+    def accept_camera_session(self, session: CameraSessionStarted) -> bool:
+        self.accept_order.append("session")
+        return super().accept_camera_session(session)
+
+    def accept_target_lifecycle_event(self, event) -> bool:
+        self.accept_order.append("target_event")
+        return super().accept_target_lifecycle_event(event)
 
     def accept_vision_result(self, result: VisionResult) -> bool:
+        self.accept_order.append("vision_result")
         self.vision_accept_calls += 1
         return super().accept_vision_result(result)
 
@@ -154,7 +191,6 @@ def _mediator(
     mediator_type = _CountingMediator if counting else Mediator
     mediator = mediator_type(
         aiming_config=AimingConfig(
-            lead_time_ms=100,
             target_lost_timeout_ms=500,
             aim_points=aim_points
             or AimPointsConfig(
@@ -162,8 +198,19 @@ def _mediator(
                 stereo_left=AimPointConfig(50, 25),
             ),
         ),
+        tracking_control_config=load_config(
+            Path(__file__).resolve().parents[1]
+            / "config"
+            / "defaults"
+            / "navmin.json"
+        ).tracking_control,
+        tracking_gap_timeout_ms=200,
         ui_config=UiConfig(CameraRole.OVERVIEW, False, False),
         turret=turret,
+        target_controls={
+            camera: TargetControlChannel(camera)
+            for camera in (CameraRole.OVERVIEW, CameraRole.STEREO_LEFT)
+        },
     )
     return mediator, turret
 
@@ -208,11 +255,23 @@ def _bindings() -> dict[CameraRole, CameraUiBinding]:
         camera: CameraUiBinding(
             camera,
             CameraSessionBarrierChannel(),
+            TargetLifecycleEventChannel(),
             LatestValue(),
             LatestValue(),
         )
         for camera in (CameraRole.OVERVIEW, CameraRole.STEREO_LEFT)
     }
+
+
+def _pid_config() -> PidControllerConfig:
+    return PidControllerConfig(
+        pid_kp_x=0.25,
+        pid_ki_x=0.01,
+        pid_kd_x=0.04,
+        pid_kp_y=0.30,
+        pid_ki_y=0.02,
+        pid_kd_y=0.05,
+    )
 
 
 def _window(
@@ -226,6 +285,11 @@ def _window(
     frame_preparer=prepare_vision_frame,
     camera_stale_timeout_ms: int = 500,
     aim_points: AimPointsConfig | None = None,
+    pid_controller_config: PidControllerConfig | None = None,
+    apply_pid_tuning: Callable[[PidControllerConfig], None] | None = None,
+    apply_tracking_control_tuning: (
+        Callable[[TrackingControlConfig], None] | None
+    ) = None,
 ) -> tuple[
     MainWindow,
     Mediator,
@@ -243,6 +307,12 @@ def _window(
         camera_bindings=bindings,
         turret_states=turret_states,
         camera_stale_timeout_ms=camera_stale_timeout_ms,
+        pid_controller_config=pid_controller_config or _pid_config(),
+        apply_pid_tuning=apply_pid_tuning or (lambda _config: None),
+        tracking_control_config=mediator.tracking_estimator.config,
+        apply_tracking_control_tuning=(
+            apply_tracking_control_tuning or (lambda _config: None)
+        ),
         clock_ns=clock or _Clock(),
         wall_clock=wall_clock
         or _WallClock(datetime(2026, 9, 22, 12, 0, 0, tzinfo=UTC)),
@@ -269,6 +339,29 @@ def _publish_camera(
     binding.latest_result.publish(result)
     binding.status.publish(status or _status(result.frame.camera, result.frame.generation))
     window.state_pump.pump_once()
+
+
+def _publish_acquired(
+    window: MainWindow,
+    mediator: Mediator,
+    bindings: dict[CameraRole, CameraUiBinding],
+    *,
+    track_id: int = 7,
+) -> TargetRef:
+    request = mediator.pending_selection
+    assert request is not None
+    target = TargetRef(request.camera, request.generation, track_id)
+    bindings[request.camera].target_events.publish(
+        TargetAcquired(
+            selection_id=request.selection_id,
+            target=target,
+            request_frame_id=request.frame_id,
+            decision_frame_id=request.frame_id,
+            decision_frame_timestamp_ns=1_000_000_000,
+        )
+    )
+    window.state_pump.pump_once()
+    return target
 
 
 def test_rendered_rect_and_widget_mapping_cover_letterbox_boundaries() -> None:
@@ -399,7 +492,6 @@ def test_main_reticle_follows_camera_swap_and_dynamic_aiming_config(
 
     mediator.aiming.replace_config(
         AimingConfig(
-            lead_time_ms=100,
             target_lost_timeout_ms=500,
             aim_points=AimPointsConfig(
                 overview=AimPointConfig(25, 15),
@@ -443,7 +535,7 @@ def test_relative_click_uses_displayed_result_not_newer_unpumped_latest(
     window.close()
 
 
-def test_tracking_hit_test_uses_displayed_bbox_and_deterministic_tie(
+def test_tracking_click_sends_exact_displayed_frame_to_mediator(
     qt_application: QApplication,
 ) -> None:
     window, mediator, _turret, bindings, _states = _window(
@@ -460,21 +552,35 @@ def test_tracking_hit_test_uses_displayed_bbox_and_deterministic_tie(
     )
 
     window._handle_main_click(displayed, 50.0, 25.0)
-    assert mediator.selected_target == TargetRef(CameraRole.OVERVIEW, 1, 3)
-
-    window._handle_main_click(displayed, 5.0, 5.0)
+    request = mediator.pending_selection
+    assert request is not None
+    assert request.camera is CameraRole.OVERVIEW
+    assert request.generation == 1
+    assert request.frame_id == displayed.frame.frame_id
+    assert (request.x_px, request.y_px) == (50.0, 25.0)
     assert mediator.selected_target is None
+
+    selected = _publish_acquired(window, mediator, bindings, track_id=3)
+    assert mediator.selected_target == selected
     window.close()
 
 
-def test_tracking_overlap_chooses_closest_center() -> None:
-    objects = (
-        TrackedObject(8, BBox(10, 10, 40, 30), 0.0, 0.0, 1),
-        TrackedObject(4, BBox(25, 10, 40, 30), 0.0, 0.0, 1),
+def test_tracking_empty_point_is_forwarded_without_ui_hit_test(
+    qt_application: QApplication,
+) -> None:
+    window, mediator, _turret, bindings, _states = _window(
+        qt_application, mode=TurretControlMode.TRACKING
     )
-    result = _result(CameraRole.OVERVIEW, 1, objects=objects)
-    assert MainWindow._hit_test(result, 45.0, 25.0) == 4
-    assert MainWindow._hit_test(result, 90.0, 25.0) is None
+    displayed = _result(CameraRole.OVERVIEW, 1, objects=())
+    _publish_camera(window, bindings, displayed)
+
+    window._handle_main_click(displayed, 5.0, 5.0)
+
+    request = mediator.pending_selection
+    assert request is not None
+    assert request.frame_id == displayed.frame.frame_id
+    assert (request.x_px, request.y_px) == (5.0, 5.0)
+    window.close()
 
 
 def test_right_click_and_letterbox_do_nothing(qt_application: QApplication) -> None:
@@ -675,6 +781,54 @@ def test_pump_drains_all_barriers_before_freshest_payloads_and_coalesces() -> No
     assert mediator.vision_accept_calls == 2
 
 
+def test_pump_orders_generation_barrier_then_lifecycle_then_latest_result() -> None:
+    mediator, _turret = _mediator(
+        mode=TurretControlMode.TRACKING,
+        counting=True,
+    )
+    assert isinstance(mediator, _CountingMediator)
+    bindings = _bindings()
+    first = _result(CameraRole.OVERVIEW, 1)
+    assert mediator.accept_camera_session(_session(CameraRole.OVERVIEW, 1))
+    assert mediator.accept_vision_result(first)
+    assert mediator.request_target_selection(first, 50.0, 25.0)
+    pending = mediator.pending_selection
+    assert pending is not None
+    mediator.accept_order.clear()
+
+    overview = bindings[CameraRole.OVERVIEW]
+    overview.session_barriers.publish(_session(CameraRole.OVERVIEW, 2))
+    overview.target_events.publish(
+        TargetAcquired(
+            selection_id=pending.selection_id,
+            target=TargetRef(CameraRole.OVERVIEW, 1, 7),
+            request_frame_id=pending.frame_id,
+            decision_frame_id=pending.frame_id,
+            decision_frame_timestamp_ns=1_000_000_000,
+        )
+    )
+    overview.latest_result.publish(
+        _result(CameraRole.OVERVIEW, 2, frame_id=1)
+    )
+    pump = UiStatePump(
+        mediator=mediator,
+        camera_bindings=bindings,
+        turret_states=LatestValue(),
+        on_camera_session=lambda _item: None,
+        on_vision_result=lambda _item: None,
+        on_camera_status=lambda _item: None,
+        on_turret_state=lambda _item: None,
+        on_presentation_tick=lambda: None,
+    )
+
+    pump.pump_once()
+
+    assert mediator.accept_order == ["session", "target_event", "vision_result"]
+    assert mediator.pending_selection is None
+    assert mediator.selected_target is None
+    assert mediator.latest_vision_result(CameraRole.OVERVIEW).frame.generation == 2
+
+
 def test_rejected_new_generation_revision_is_retried_after_barrier() -> None:
     mediator, _turret = _mediator(counting=True)
     assert isinstance(mediator, _CountingMediator)
@@ -751,8 +905,7 @@ def test_temporary_target_miss_keeps_authoritative_selection_without_old_bbox(
     initial = _result(CameraRole.OVERVIEW, 1)
     _publish_camera(window, bindings, initial)
     window._handle_main_click(initial, 50.0, 25.0)
-    selected = mediator.selected_target
-    assert selected is not None
+    selected = _publish_acquired(window, mediator, bindings)
 
     missing = _result(CameraRole.OVERVIEW, 1, frame_id=2, objects=())
     bindings[CameraRole.OVERVIEW].latest_result.publish(missing)
@@ -836,8 +989,7 @@ def test_stale_tracking_does_not_select_or_deselect(qt_application: QApplication
         status=_status(CameraRole.OVERVIEW, 1, timestamp_ns=1_000_000_000),
     )
     window._handle_main_click(result, 50.0, 25.0)
-    selected = mediator.selected_target
-    assert selected is not None
+    selected = _publish_acquired(window, mediator, bindings)
     clock.now_ns = 1_500_000_000
     window.refresh_presentation()
     window._handle_main_click(result, 5.0, 5.0)
@@ -984,6 +1136,184 @@ def test_operator_window_statuses_follow_existing_ui_update_path(
     window.close()
 
 
+def test_operator_pid_panel_uses_initial_values_and_queues_full_typed_update(
+    qt_application: QApplication,
+) -> None:
+    initial = _pid_config()
+    queued: list[PidControllerConfig] = []
+    window, _mediator_value, _turret, _bindings_value, _states = _window(
+        qt_application,
+        pid_controller_config=initial,
+        apply_pid_tuning=queued.append,
+    )
+    operator = window.operator_window
+
+    assert operator.pid_inputs["pid_kp_x"].text() == "0.25"
+    assert operator.pid_inputs["pid_ki_x"].text() == "0.01"
+    assert operator.pid_inputs["pid_kd_x"].text() == "0.04"
+    assert operator.pid_inputs["pid_kp_y"].text() == "0.3"
+    assert operator.pid_inputs["pid_ki_y"].text() == "0.02"
+    assert operator.pid_inputs["pid_kd_y"].text() == "0.05"
+
+    values = {
+        "pid_kp_x": "1.25",
+        "pid_ki_x": "0.11",
+        "pid_kd_x": "0.14",
+        "pid_kp_y": "1.30",
+        "pid_ki_y": "0.12",
+        "pid_kd_y": "0.15",
+    }
+    for field, text in values.items():
+        operator.pid_inputs[field].setText(text)
+    QTest.mouseClick(operator.pid_apply_button, Qt.MouseButton.LeftButton)
+
+    assert queued == [
+        PidControllerConfig(
+            pid_kp_x=1.25,
+            pid_ki_x=0.11,
+            pid_kd_x=0.14,
+            pid_kp_y=1.30,
+            pid_ki_y=0.12,
+            pid_kd_y=0.15,
+        )
+    ]
+    assert operator.pid_status_label.text().startswith("Отправлено:")
+    assert "Применено" not in operator.pid_status_label.text()
+    assert operator.pid_error_label.text() == ""
+
+    operator.hide()
+    operator.show()
+    qt_application.processEvents()
+    assert operator.pid_inputs["pid_kp_x"].text() == "1.25"
+    window.close()
+
+
+@pytest.mark.parametrize("invalid", ["-0.1", "nan", "inf", "-inf", "", "abc"])
+def test_operator_pid_panel_rejects_invalid_input_without_changing_last_status(
+    qt_application: QApplication,
+    invalid: str,
+) -> None:
+    queued: list[PidControllerConfig] = []
+    window, _mediator_value, _turret, _bindings_value, _states = _window(
+        qt_application,
+        apply_pid_tuning=queued.append,
+    )
+    operator = window.operator_window
+
+    QTest.mouseClick(operator.pid_apply_button, Qt.MouseButton.LeftButton)
+    assert len(queued) == 1
+    successful_status = operator.pid_status_label.text()
+
+    operator.pid_inputs["pid_kp_x"].setText(invalid)
+    QTest.mouseClick(operator.pid_apply_button, Qt.MouseButton.LeftButton)
+
+    assert len(queued) == 1
+    assert operator.pid_status_label.text() == successful_status
+    assert operator.pid_error_label.text().startswith("Ошибка PID:")
+    window.close()
+
+
+def test_operator_tracking_panel_queues_only_exposed_typed_runtime_fields(
+    qt_application: QApplication,
+) -> None:
+    queued: list[TrackingControlConfig] = []
+    window, mediator, _turret, _bindings_value, _states = _window(
+        qt_application,
+        apply_tracking_control_tuning=queued.append,
+    )
+    operator = window.operator_window
+    initial = mediator.tracking_estimator.config
+
+    assert not operator.ff_enabled_checkbox.isChecked()
+    assert operator.tracking_inputs["gain_x"].text() == "0"
+    assert operator.tracking_inputs["gain_y"].text() == "0"
+    assert not operator.prediction_enabled_checkbox.isChecked()
+    assert operator.tracking_inputs["horizon_ms"].text() == "0"
+    assert operator.tracking_inputs["window_ms"].text() == "200"
+
+    operator.ff_enabled_checkbox.setChecked(True)
+    operator.tracking_inputs["gain_x"].setText("0.4")
+    operator.tracking_inputs["gain_y"].setText("0.5")
+    operator.prediction_enabled_checkbox.setChecked(True)
+    operator.tracking_inputs["horizon_ms"].setText("75")
+    operator.tracking_inputs["window_ms"].setText("250")
+    QTest.mouseClick(operator.tracking_apply_button, Qt.MouseButton.LeftButton)
+
+    assert len(queued) == 1
+    update = queued[0]
+    assert update.feed_forward == replace(
+        initial.feed_forward,
+        enabled=True,
+        gain_x=0.4,
+        gain_y=0.5,
+    )
+    assert update.prediction == replace(
+        initial.prediction,
+        enabled=True,
+        horizon_ms=75,
+    )
+    assert update.velocity_estimator == replace(
+        initial.velocity_estimator,
+        window_ms=250,
+    )
+    assert update.platform_motion == initial.platform_motion
+    assert operator.tracking_status_label.text().startswith("Отправлено:")
+    assert "сохран" not in operator.tracking_status_label.text().lower()
+    assert operator.tracking_error_label.text() == ""
+    window.close()
+
+
+def test_operator_tracking_diagnostics_render_typed_axis_state(
+    qt_application: QApplication,
+) -> None:
+    window, _mediator_value, _turret, _bindings_value, _states = _window(
+        qt_application
+    )
+    operator = window.operator_window
+    diagnostics = TrackingEstimatorDiagnostics(
+        target=None,
+        observation_timestamp_ns=123,
+        platform_source=PlatformMotionSource.COMMAND_MODEL,
+        x=AxisTrackingEstimate(
+            relative_rate_deg_s=1.5,
+            platform_rate_deg_s=2.0,
+            target_rate_deg_s=3.5,
+            fit_rms_deg=0.125,
+            sample_count=5,
+            actual_span_ms=160.0,
+            valid=True,
+            invalid_reason=None,
+            prediction_offset_deg=0.25,
+        ),
+        y=AxisTrackingEstimate(
+            relative_rate_deg_s=-1.0,
+            platform_rate_deg_s=None,
+            target_rate_deg_s=None,
+            fit_rms_deg=0.5,
+            sample_count=5,
+            actual_span_ms=160.0,
+            valid=False,
+            invalid_reason=TrackingEstimateInvalidReason.PLATFORM_UNAVAILABLE,
+            prediction_offset_deg=0.0,
+        ),
+    )
+
+    operator.set_tracking_diagnostics(diagnostics)
+
+    assert operator.platform_source_label.text() == "Platform source: COMMAND_MODEL"
+    assert operator.tracking_diagnostic_labels["relative_rate_x"].text() == "1.5 deg/s"
+    assert operator.tracking_diagnostic_labels["platform_rate_y"].text() == "—"
+    assert operator.tracking_diagnostic_labels["sample_count_x"].text() == "5"
+    assert operator.tracking_diagnostic_labels["actual_span_y"].text() == "160 ms"
+    assert operator.tracking_diagnostic_labels["validity_x"].text() == "VALID"
+    assert (
+        operator.tracking_diagnostic_labels["validity_y"].text()
+        == "INVALID (platform_unavailable)"
+    )
+    assert operator.tracking_diagnostic_labels["prediction_offset_x"].text() == "0.25 deg"
+    window.close()
+
+
 def test_operator_fullscreen_button_and_f11_keep_text_synchronized(
     qt_application: QApplication,
 ) -> None:
@@ -1039,6 +1369,10 @@ def test_main_window_can_request_fullscreen_at_startup(qt_application: QApplicat
         camera_bindings=_bindings(),
         turret_states=LatestValue(),
         camera_stale_timeout_ms=500,
+        pid_controller_config=_pid_config(),
+        apply_pid_tuning=lambda _config: None,
+        tracking_control_config=mediator.tracking_estimator.config,
+        apply_tracking_control_tuning=lambda _config: None,
         start_timer=False,
         start_fullscreen=True,
     )

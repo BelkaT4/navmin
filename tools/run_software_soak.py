@@ -278,11 +278,16 @@ class SoftwareSoak:
         result = "FAIL"
         try:
             self.runtime.start()
+            ui = self.runtime.application.ui_dependencies
             self.window = MainWindow(
                 mediator=self.runtime.mediator,
                 camera_bindings=self.runtime.camera_bindings(),
                 turret_states=self.runtime.turret_worker.state_updates,
                 camera_stale_timeout_ms=_STALE_TIMEOUT_MS,
+                pid_controller_config=ui.pid_controller_config,
+                apply_pid_tuning=ui.apply_pid_tuning,
+                tracking_control_config=ui.tracking_control_config,
+                apply_tracking_control_tuning=ui.apply_tracking_control_tuning,
                 start_timer=False,
                 start_fullscreen=False,
             )
@@ -553,9 +558,11 @@ class SoftwareSoak:
         )
         baseline = self._command_count(CommandCode.SET_VELOCITY)
         QTest.mouseClick(self.window.main_view, Qt.MouseButton.LeftButton, pos=click)
-        self.application.processEvents()
-        if self.runtime.mediator.selected_target is None:
-            raise SoakFailure("TRACKING selection was not established")
+        self._wait_until(
+            lambda: self.runtime.mediator.selected_target is not None,
+            2.0,
+            "TRACKING selection was not acquired",
+        )
         self._wait_until(lambda: self._has_nonzero_velocity_since(baseline), 2.0, "nonzero SET_VELOCITY did not reach endpoint")
 
     def _deselect_tracking(self) -> None:

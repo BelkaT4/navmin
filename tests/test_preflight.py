@@ -9,6 +9,7 @@ import pytest
 
 import navmin.preflight as preflight_module
 from navmin.calibration import OverviewCalibration, StereoCalibration
+from navmin.config import load_config
 from navmin.config.models import (
     AimingConfig,
     AimPointConfig,
@@ -18,6 +19,7 @@ from navmin.config.models import (
     AxisMechanicsConfig,
     CameraConfig,
     CamerasConfig,
+    OverviewCameraConfig,
     PidControllerConfig,
     ProcessingScope,
     RtpJpegSourceConfig,
@@ -49,6 +51,16 @@ K = ((50.0, 0.0, 31.5), (0.0, 50.0, 23.5), (0.0, 0.0, 1.0))
 IDENTITY = ((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0))
 
 
+def _default_tracking_control_config():
+    defaults = (
+        Path(__file__).resolve().parents[1]
+        / "config"
+        / "defaults"
+        / "navmin.json"
+    )
+    return load_config(defaults).tracking_control
+
+
 def _camera(port: int, *, address: str = "127.0.0.1") -> CameraConfig:
     return CameraConfig(
         enabled=True,
@@ -59,6 +71,17 @@ def _camera(port: int, *, address: str = "127.0.0.1") -> CameraConfig:
         ),
         processing_enabled=False,
         vision_processor_class="Legacy14VisionProcessor",
+    )
+
+
+def _overview_camera(port: int) -> OverviewCameraConfig:
+    camera = _camera(port)
+    return OverviewCameraConfig(
+        enabled=camera.enabled,
+        source=camera.source,
+        processing_enabled=camera.processing_enabled,
+        vision_processor_class=camera.vision_processor_class,
+        calibration_file="calibration/overview.json",
     )
 
 
@@ -96,11 +119,11 @@ def _inputs(
         max_relative_move_deg=45.0,
     )
     config = AppConfig(
-        schema_version=1,
+        schema_version=3,
         vision=VisionConfig(
             processing_scope=ProcessingScope.MAIN_AND_PREVIEW,
             cameras=CamerasConfig(
-                overview=_camera(overview_port),
+                overview=_overview_camera(overview_port),
                 stereo_left=_camera(stereo_port),
                 stereo_right=_camera(stereo_port + 1),
             ),
@@ -112,16 +135,17 @@ def _inputs(
                     stereo_enabled=False,
                     right_frame_buffer_size=4,
                     pair_timeout_ms=100,
+                    calibration_file="calibration/stereo.json",
                 ),
             ),
             camera_stale_timeout_ms=500,
             simulation_mode=False,
         ),
         aiming=AimingConfig(
-            lead_time_ms=100,
             target_lost_timeout_ms=500,
             aim_points=AimPointsConfig(overview=center, stereo_left=center),
         ),
+        tracking_control=_default_tracking_control_config(),
         turret=TurretConfig(
             serial=SerialConfig(
                 port=serial_port,

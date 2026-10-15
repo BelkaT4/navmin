@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+from pathlib import Path
 from threading import Event, Lock, Thread
 from time import monotonic
 
@@ -17,6 +18,7 @@ from navmin.application import (
     build_application_runtime,
 )
 from navmin.calibration import OverviewCalibration, StereoCalibration
+from navmin.config import load_config
 from navmin.config.models import (
     AimingConfig,
     AimPointConfig,
@@ -26,6 +28,7 @@ from navmin.config.models import (
     AxisMechanicsConfig,
     CameraConfig,
     CamerasConfig,
+    OverviewCameraConfig,
     PidControllerConfig,
     ProcessingScope,
     RtpJpegSourceConfig,
@@ -252,7 +255,6 @@ class SyntheticFrameProducer:
 def _smoke_aiming_config() -> AimingConfig:
     center = AimPointConfig(x_px=None, y_px=None)
     return AimingConfig(
-        lead_time_ms=100,
         target_lost_timeout_ms=500,
         aim_points=AimPointsConfig(overview=center, stereo_left=center),
     )
@@ -314,13 +316,24 @@ def _smoke_camera_config(port: int, *, processing_enabled: bool) -> CameraConfig
     )
 
 
+def _smoke_overview_config(port: int) -> OverviewCameraConfig:
+    camera = _smoke_camera_config(port, processing_enabled=True)
+    return OverviewCameraConfig(
+        enabled=camera.enabled,
+        source=camera.source,
+        processing_enabled=camera.processing_enabled,
+        vision_processor_class=camera.vision_processor_class,
+        calibration_file="calibration/overview.json",
+    )
+
+
 def _smoke_app_config() -> AppConfig:
     return AppConfig(
-        schema_version=1,
+        schema_version=3,
         vision=VisionConfig(
             processing_scope=ProcessingScope.MAIN_AND_PREVIEW,
             cameras=CamerasConfig(
-                overview=_smoke_camera_config(8888, processing_enabled=True),
+                overview=_smoke_overview_config(8888),
                 stereo_left=_smoke_camera_config(8889, processing_enabled=True),
                 stereo_right=_smoke_camera_config(8890, processing_enabled=False),
             ),
@@ -332,12 +345,19 @@ def _smoke_app_config() -> AppConfig:
                     stereo_enabled=False,
                     right_frame_buffer_size=4,
                     pair_timeout_ms=100,
+                    calibration_file="calibration/stereo.json",
                 ),
             ),
             camera_stale_timeout_ms=500,
             simulation_mode=True,
         ),
         aiming=_smoke_aiming_config(),
+        tracking_control=load_config(
+            Path(__file__).resolve().parents[1]
+            / "config"
+            / "defaults"
+            / "navmin.json"
+        ).tracking_control,
         turret=_smoke_turret_config(),
         ui=_smoke_ui_config(),
     )
@@ -510,6 +530,10 @@ def _run_qt_smoke(runtime: SoftwareSmokeRuntime, auto_close_seconds: float | Non
         camera_bindings=ui.camera_bindings,
         turret_states=ui.turret_states,
         camera_stale_timeout_ms=ui.camera_stale_timeout_ms,
+        pid_controller_config=ui.pid_controller_config,
+        apply_pid_tuning=ui.apply_pid_tuning,
+        tracking_control_config=ui.tracking_control_config,
+        apply_tracking_control_tuning=ui.apply_tracking_control_tuning,
     )
 
 

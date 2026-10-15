@@ -112,6 +112,7 @@ class CameraWorker:
         self._pipeline.start()
         self._source.start()
         while not self._stop_token.is_stop_requested():
+            self._pipeline.apply_latest_target_control()
             failure = self._source.failure
             if failure is not None:
                 self._pipeline.report_source_failure(failure)
@@ -138,6 +139,7 @@ class CameraWorker:
                 return
 
             while not self._stop_token.is_stop_requested():
+                self._pipeline.apply_latest_target_control()
                 failure = self._source.failure
                 if failure is not None:
                     self._pipeline.report_source_reconnecting(failure)

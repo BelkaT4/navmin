@@ -6,14 +6,18 @@ from math import isfinite
 from time import monotonic
 from typing import Protocol
 
-from navmin.config.models import PidControllerConfig, TurretConfig
+from navmin.config.models import (
+    PidControllerConfig,
+    TrackingControlConfig,
+    TurretConfig,
+)
 from navmin.contracts import (
     AxisVelocitySetpoint,
     ConfigUpdate,
     MotorState,
     MoveRelativeCommand,
     TargetRef,
-    TrackingError,
+    TrackingControlSample,
     TurretControlMode,
 )
 
@@ -49,6 +53,7 @@ class TurretController:
         self,
         hal: TurretHal,
         config: TurretConfig,
+        tracking_control_config: TrackingControlConfig,
         *,
         clock: Clock = monotonic,
     ) -> None:
@@ -56,8 +61,11 @@ class TurretController:
             raise TypeError("hal must be TurretHal")
         if not isinstance(config, TurretConfig):
             raise TypeError("config must be TurretConfig")
+        if not isinstance(tracking_control_config, TrackingControlConfig):
+            raise TypeError("tracking_control_config must be TrackingControlConfig")
         self._hal = hal
         self._config = config
+        self._tracking_control_config = tracking_control_config
         self._config_revision = 0
         self._clock = clock
         self._control_mode = TurretControlMode.RELATIVE
@@ -101,12 +109,16 @@ class TurretController:
             raise TypeError("command must be MoveRelativeCommand")
         self._pending_motion = command
 
-    def submit_tracking_error(self, revision: int, error: TrackingError) -> bool:
+    def submit_tracking_control(
+        self, revision: int, sample: TrackingControlSample
+    ) -> bool:
         if self._control_mode is not TurretControlMode.TRACKING:
-            raise ControllerModeError("TrackingError is only valid in TRACKING mode")
+            raise ControllerModeError(
+                "TrackingControlSample is only valid in TRACKING mode"
+            )
         self._require_revision(revision)
-        if not isinstance(error, TrackingError):
-            raise TypeError("error must be TrackingError")
+        if not isinstance(sample, TrackingControlSample):
+            raise TypeError("sample must be TrackingControlSample")
         if (
             self._last_processed_revision is not None
             and revision <= self._last_processed_revision
@@ -114,7 +126,7 @@ class TurretController:
             return False
 
         now = self._require_finite_time(self._clock())
-        target_changed = self._target is not None and error.target != self._target
+        target_changed = self._target is not None and sample.target != self._target
         gap_exceeded = (
             self._last_tracking_time_s is not None
             and now - self._last_tracking_time_s
@@ -123,19 +135,55 @@ class TurretController:
         if target_changed or gap_exceeded:
             self._reset_pid()
 
-        velocity_x = self._pid_x.step(error.error_x_deg, now_s=now)
-        velocity_y = self._pid_y.step(error.error_y_deg, now_s=now)
+        prediction = self._tracking_control_config.prediction
+        feed_forward = self._tracking_control_config.feed_forward
+        x_usable = sample.rate_valid_x and sample.target_rate_x_deg_s is not None
+        y_usable = sample.rate_valid_y and sample.target_rate_y_deg_s is not None
+        velocity_x = self._pid_x.step(
+            sample.real_error_x_deg,
+            now_s=now,
+            proportional_offset=(
+                sample.prediction_offset_x_deg
+                if x_usable and prediction.enabled
+                else 0.0
+            ),
+            feed_forward=(
+                feed_forward.gain_x * sample.target_rate_x_deg_s
+                if x_usable and feed_forward.enabled
+                else 0.0
+            ),
+        )
+        velocity_y = self._pid_y.step(
+            sample.real_error_y_deg,
+            now_s=now,
+            proportional_offset=(
+                sample.prediction_offset_y_deg
+                if y_usable and prediction.enabled
+                else 0.0
+            ),
+            feed_forward=(
+                feed_forward.gain_y * sample.target_rate_y_deg_s
+                if y_usable and feed_forward.enabled
+                else 0.0
+            ),
+        )
         self._pending_motion = AxisVelocitySetpoint(
             velocity_x_deg_s=velocity_x,
             velocity_y_deg_s=velocity_y,
-            timestamp_ns=error.timestamp_ns,
+            timestamp_ns=sample.observation_timestamp_ns,
         )
-        self._target = error.target
+        self._target = sample.target
         self._last_tracking_time_s = now
         self._last_processed_revision = revision
         return True
 
-    def invalidate_tracking_error(self, revision: int) -> bool:
+    def apply_tracking_control_config(self, config: TrackingControlConfig) -> None:
+        """Replace FF/prediction policy without disturbing PID state."""
+        if not isinstance(config, TrackingControlConfig):
+            raise TypeError("config must be TrackingControlConfig")
+        self._tracking_control_config = config
+
+    def invalidate_tracking_control(self, revision: int) -> bool:
         self._require_revision(revision)
         if (
             self._last_processed_revision is not None
