@@ -11,7 +11,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 import numpy as np
 import pytest
 from PyQt6.QtCore import QPoint, QPointF, QSize, Qt
-from PyQt6.QtGui import QPixmap
+from PyQt6.QtGui import QPixmap, QWheelEvent
 from PyQt6.QtTest import QTest
 from PyQt6.QtWidgets import QApplication, QMessageBox
 
@@ -37,6 +37,8 @@ from navmin.contracts import (
     CameraSessionStarted,
     CameraState,
     CameraStatus,
+    DistanceResult,
+    DistanceSource,
     FramePacket,
     MotorState,
     MoveRelativeCommand,
@@ -53,6 +55,7 @@ from navmin.contracts import (
 )
 from navmin.core import (
     AxisTrackingEstimate,
+    DistanceMeasurementMode,
     Mediator,
     TrackingEstimateInvalidReason,
     TrackingEstimatorDiagnostics,
@@ -643,6 +646,9 @@ def test_operational_bar_is_compact_and_emergency_remains_largest(
         window.motor_button,
         window.connection_label,
         window.now_label,
+        window.distance_mode_combo,
+        window.distance_slider,
+        window.distance_value_label,
     )
     assert all(control.height() <= 42 for control in ordinary_controls)
     assert window.emergency_button.height() > max(
@@ -651,6 +657,146 @@ def test_operational_bar_is_compact_and_emergency_remains_largest(
     assert window.emergency_button.width() > max(
         control.width() for control in ordinary_controls
     )
+    window.close()
+
+
+def test_distance_controls_follow_main_camera_and_preserve_runtime_mode(
+    qt_application: QApplication,
+) -> None:
+    window, mediator, _turret, _bindings, _states = _window(qt_application)
+
+    assert [
+        window.distance_mode_combo.itemText(index)
+        for index in range(window.distance_mode_combo.count())
+    ] == [
+        "Константа",
+        "Стерео — точная пара",
+        "Стерео — по времени",
+    ]
+    assert mediator.distance_mode is DistanceMeasurementMode.CONSTANT
+    assert not window.distance_mode_combo.isEnabled()
+    assert window.distance_slider.isHidden()
+    assert not window.distance_slider.isEnabled()
+    assert window.distance_value_label.text() == "—"
+
+    window.swap_main_preview()
+    assert mediator.main_camera is CameraRole.STEREO_LEFT
+    assert window.distance_mode_combo.isEnabled()
+    assert window.distance_slider.isVisible()
+    assert window.distance_slider.isEnabled()
+    assert window.distance_slider.minimum() == 10
+    assert window.distance_slider.maximum() == 500
+    assert window.distance_slider.singleStep() == 10
+    assert window.distance_slider.pageStep() == 10
+    assert window.distance_slider.value() == 100
+    assert window.distance_value_label.text() == "100 м"
+
+    window.distance_slider.setValue(247)
+    assert mediator.manual_distance_m == 250
+    assert window.distance_slider.value() == 250
+    assert window.distance_value_label.text() == "250 м"
+
+    window.distance_mode_combo.setCurrentIndex(1)
+    assert mediator.distance_mode is DistanceMeasurementMode.STEREO_EXACT
+    assert window.distance_slider.isHidden()
+    assert not window.distance_slider.isEnabled()
+    assert window.distance_value_label.text() == "—"
+
+    window.distance_mode_combo.setCurrentIndex(2)
+    assert mediator.distance_mode is DistanceMeasurementMode.STEREO_TIMESTAMP
+    assert window.distance_value_label.text() == "—"
+
+    window.swap_main_preview()
+    assert mediator.main_camera is CameraRole.OVERVIEW
+    assert not window.distance_mode_combo.isEnabled()
+    assert window.distance_value_label.text() == "—"
+
+    window.swap_main_preview()
+    assert mediator.main_camera is CameraRole.STEREO_LEFT
+    assert mediator.distance_mode is DistanceMeasurementMode.STEREO_TIMESTAMP
+    assert window.distance_mode_combo.currentIndex() == 2
+    assert window.distance_slider.isHidden()
+    assert window.distance_value_label.text() == "—"
+    window.close()
+
+
+def test_distance_slider_standard_wheel_step_is_ten_metres(
+    qt_application: QApplication,
+) -> None:
+    window, mediator, _turret, _bindings, _states = _window(qt_application)
+    window.swap_main_preview()
+    assert window.distance_slider.value() == 100
+
+    up = QWheelEvent(
+        QPointF(20.0, 16.0),
+        QPointF(20.0, 16.0),
+        QPoint(),
+        QPoint(0, 120),
+        Qt.MouseButton.NoButton,
+        Qt.KeyboardModifier.NoModifier,
+        Qt.ScrollPhase.ScrollUpdate,
+        False,
+    )
+    QApplication.sendEvent(window.distance_slider, up)
+    assert mediator.manual_distance_m == 110
+    assert window.distance_slider.value() == 110
+
+    down = QWheelEvent(
+        QPointF(20.0, 16.0),
+        QPointF(20.0, 16.0),
+        QPoint(),
+        QPoint(0, -120),
+        Qt.MouseButton.NoButton,
+        Qt.KeyboardModifier.NoModifier,
+        Qt.ScrollPhase.ScrollUpdate,
+        False,
+    )
+    QApplication.sendEvent(window.distance_slider, down)
+    assert mediator.manual_distance_m == 100
+    assert window.distance_slider.value() == 100
+    window.close()
+
+
+def test_target_distance_annotation_is_main_stereo_target_bound(
+    qt_application: QApplication,
+) -> None:
+    window, mediator, _turret, bindings, _states = _window(
+        qt_application, mode=TurretControlMode.TRACKING
+    )
+    _publish_camera(window, bindings, _result(CameraRole.OVERVIEW, 1))
+    stereo_result = _result(CameraRole.STEREO_LEFT, 1)
+    _publish_camera(window, bindings, stereo_result)
+
+    window.swap_main_preview()
+    window._handle_main_click(stereo_result, 50.0, 25.0)
+    selected = _publish_acquired(window, mediator, bindings)
+
+    distance = mediator.current_distance
+    assert distance is not None
+    assert distance.target == selected
+    assert distance.source is DistanceSource.MANUAL
+    assert window.main_view.target_distance == distance
+    assert window.main_view.distance_annotation_text == "100 м"
+    assert window.preview_view.target_distance is None
+    assert window.preview_view.distance_annotation_text is None
+
+    window.main_view.set_target_distance(
+        DistanceResult(
+            target=selected,
+            distance_m=12.44,
+            source=DistanceSource.STEREO,
+            source_frame_id=stereo_result.frame.frame_id,
+            capture_id=7,
+            measured_timestamp_ns=stereo_result.frame.receive_timestamp_ns,
+        )
+    )
+    assert window.main_view.distance_annotation_text == "12.4 м"
+
+    window.swap_main_preview()
+    assert mediator.main_camera is CameraRole.OVERVIEW
+    assert window.main_view.target_distance is None
+    assert window.main_view.distance_annotation_text is None
+    assert window.preview_view.target_distance is None
     window.close()
 
 

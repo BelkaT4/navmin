@@ -24,6 +24,8 @@ from navmin.contracts import (
     CameraRole,
     CameraState,
     CameraStatus,
+    DistanceResult,
+    DistanceSource,
     TargetRef,
     VisionResult,
 )
@@ -172,6 +174,7 @@ class VideoView(QWidget):
         self._prepared: PreparedVisionFrame | None = None
         self._status: CameraStatus | None = None
         self._selected_target: TargetRef | None = None
+        self._target_distance: DistanceResult | None = None
         self._aim_point: tuple[float, float] | None = None
         self._stale = False
         self.setMinimumSize(1, 1)
@@ -209,6 +212,32 @@ class VideoView(QWidget):
         return self._aim_point
 
     @property
+    def target_distance(self) -> DistanceResult | None:
+        return self._target_distance
+
+    @property
+    def distance_annotation_text(self) -> str | None:
+        result = self.displayed_result
+        target = self._selected_target
+        distance = self._target_distance
+        if (
+            self._preview
+            or self._camera is not CameraRole.STEREO_LEFT
+            or result is None
+            or target is None
+            or distance is None
+            or result.frame.camera is not self._camera
+            or distance.target != target
+            or target.camera is not result.frame.camera
+            or target.generation != result.frame.generation
+            or not any(
+                tracked.track_id == target.track_id for tracked in result.tracked_objects
+            )
+        ):
+            return None
+        return self._format_distance(distance)
+
+    @property
     def stale_overlay_text(self) -> str | None:
         return STALE_MESSAGE if self._prepared is not None and self._stale else None
 
@@ -216,6 +245,7 @@ class VideoView(QWidget):
         if camera is self._camera:
             return
         self._camera = camera
+        self._target_distance = None
         self._aim_point = None
         self.update()
 
@@ -237,6 +267,16 @@ class VideoView(QWidget):
         if target == self._selected_target:
             return
         self._selected_target = target
+        if self._target_distance is not None and self._target_distance.target != target:
+            self._target_distance = None
+        self.update()
+
+    def set_target_distance(self, distance: DistanceResult | None) -> None:
+        if distance is not None and not isinstance(distance, DistanceResult):
+            raise TypeError("distance must be DistanceResult or None")
+        if distance == self._target_distance:
+            return
+        self._target_distance = distance
         self.update()
 
     def set_aim_point(self, point: tuple[float, float] | None) -> None:
@@ -381,14 +421,49 @@ class VideoView(QWidget):
                 QPen(QColor(255, 210, 30) if selected else QColor(50, 230, 90), 4 if selected else 2)
             )
             bbox = tracked.bbox
-            painter.drawRect(
-                QRectF(
-                    display_rect.left() + bbox.x * scale_x,
-                    display_rect.top() + bbox.y * scale_y,
-                    bbox.width * scale_x,
-                    bbox.height * scale_y,
-                )
+            bbox_rect = QRectF(
+                display_rect.left() + bbox.x * scale_x,
+                display_rect.top() + bbox.y * scale_y,
+                bbox.width * scale_x,
+                bbox.height * scale_y,
             )
+            painter.drawRect(bbox_rect)
+            if selected:
+                self._draw_distance_annotation(painter, display_rect, bbox_rect)
+
+    def _draw_distance_annotation(
+        self,
+        painter: QPainter,
+        display_rect: QRectF,
+        bbox_rect: QRectF,
+    ) -> None:
+        text = self.distance_annotation_text
+        if text is None:
+            return
+        painter.setFont(QFont("Sans Serif", 11, QFont.Weight.Bold))
+        metrics = painter.fontMetrics()
+        label_rect = QRectF(metrics.boundingRect(text).adjusted(-6, -3, 6, 3))
+        x = min(
+            max(display_rect.left(), bbox_rect.left()),
+            max(display_rect.left(), display_rect.right() - label_rect.width()),
+        )
+        above_y = bbox_rect.top() - label_rect.height() - 4
+        below_y = bbox_rect.bottom() + 4
+        y = above_y if above_y >= display_rect.top() else below_y
+        y = min(
+            max(display_rect.top(), y),
+            max(display_rect.top(), display_rect.bottom() - label_rect.height()),
+        )
+        label_rect.moveTopLeft(QPointF(x, y))
+        painter.fillRect(label_rect, QColor(0, 0, 0, 175))
+        painter.setPen(QColor(255, 235, 90))
+        painter.drawText(label_rect, Qt.AlignmentFlag.AlignCenter, text)
+
+    @staticmethod
+    def _format_distance(distance: DistanceResult) -> str:
+        if distance.source is DistanceSource.MANUAL:
+            return f"{distance.distance_m:.0f} м"
+        return f"{distance.distance_m:.1f} м"
 
     def _draw_reticle(
         self,

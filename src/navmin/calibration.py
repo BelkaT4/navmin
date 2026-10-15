@@ -6,7 +6,7 @@ import json
 import math
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, NoReturn
+from typing import Any, Literal, NoReturn
 
 import numpy as np
 
@@ -254,9 +254,19 @@ class OverviewCalibration:
     new_camera_matrix: Matrix3x3
 
 
+type StereoTranslationUnit = Literal["mm", "m"]
+
+
+def _translation_unit(value: Any) -> StereoTranslationUnit:
+    if type(value) is not str or value not in ("mm", "m"):
+        _validation("translation-unit", "expected 'mm' or 'm'")
+    return value
+
+
 @dataclass(frozen=True)
 class StereoCalibration:
     schema_version: int
+    translation_unit: StereoTranslationUnit
     image_width: int
     image_height: int
     K_left: Matrix3x3
@@ -270,6 +280,10 @@ class StereoCalibration:
     P1: Matrix3x4
     P2: Matrix3x4
     Q: Matrix4x4
+
+    @property
+    def length_scale_to_m(self) -> float:
+        return 0.001 if self.translation_unit == "mm" else 1.0
 
 
 @dataclass(frozen=True)
@@ -337,6 +351,7 @@ def load_stereo_calibration(
         _read_json(path),
         {
             "schema_version",
+            "translation-unit",
             "image_width",
             "image_height",
             "K_left",
@@ -354,6 +369,7 @@ def load_stereo_calibration(
     )
     calibration = StereoCalibration(
         schema_version=_schema_version(obj["schema_version"]),
+        translation_unit=_translation_unit(obj["translation-unit"]),
         image_width=_positive_int(obj["image_width"], "image_width"),
         image_height=_positive_int(obj["image_height"], "image_height"),
         K_left=_matrix(obj["K_left"], "K_left", 3, 3),  # type: ignore[arg-type]

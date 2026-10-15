@@ -218,6 +218,7 @@ def _stereo() -> StereoCalibration:
     )
     return StereoCalibration(
         schema_version=1,
+        translation_unit="m",
         image_width=WIDTH,
         image_height=HEIGHT,
         K_left=K,
@@ -849,9 +850,15 @@ def test_input_recovery_creates_valid_safe_defaults_without_existing_files(
     assert config.turret.axes.y.max_relative_move_deg == 1.0
     assert overview.image_width == 320
     assert overview.image_height == 240
-    assert stereo.image_width == 320
-    assert stereo.image_height == 240
-    assert stereo.T == (0.0, 0.0, 0.0)
+    assert stereo.image_width == 1296
+    assert stereo.image_height == 976
+    assert stereo.translation_unit == "mm"
+    assert stereo.length_scale_to_m == 0.001
+    assert stereo.T == (
+        -464.858897078744,
+        -0.8951708439316364,
+        45.641669363174564,
+    )
 
 
 def test_input_recovery_replaces_malformed_root_and_invalid_canonical_calibrations(

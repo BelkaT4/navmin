@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
+from math import isfinite
+from time import monotonic_ns
 from typing import Protocol
 
-from navmin.concurrency import TargetControlChannel
+from navmin.concurrency import LatestValue, TargetControlChannel
 from navmin.config.models import AimingConfig, TrackingControlConfig, UiConfig
 from navmin.contracts import (
     CameraRole,
@@ -14,6 +16,8 @@ from navmin.contracts import (
     CameraStatus,
     ClearTargetSelection,
     ConfigUpdate,
+    DistanceResult,
+    DistanceSource,
     FramePacket,
     MotorState,
     MoveRelativeCommand,
@@ -33,6 +37,7 @@ from navmin.contracts import (
 )
 
 from .aiming import Aiming
+from .distance import DistanceMeasurementMode, quantize_constant_distance
 from .session_gate import CameraSessionGate
 from .tracking_estimator import TrackingEstimator, TrackingEstimatorDiagnostics
 
@@ -69,6 +74,32 @@ class TurretPort(Protocol):
     def request_emergency(self) -> None: ...
 
 
+class StereoDistanceCandidatePort(Protocol):
+    """Narrow internal result shape produced by the stereo distance worker."""
+
+    target: TargetRef
+    intent_revision: int
+    distance_m: float
+    source_frame_id: int
+    capture_id: int
+    measured_timestamp_ns: int
+
+
+class StereoTargetJoinPort(Protocol):
+    """Narrow boundary for exact stereo pair/target frame joining."""
+
+    def start_generation(self, generation: int) -> None: ...
+
+    def set_target(
+        self,
+        target: TargetRef | None,
+        *,
+        intent_revision: int = 0,
+    ) -> None: ...
+
+    def offer_vision_result(self, result: VisionResult) -> object | None: ...
+
+
 class Mediator:
     """Coordinate accepted Vision state, target lifecycle, Aiming, and Turret."""
 
@@ -83,6 +114,11 @@ class Mediator:
         target_controls: Mapping[CameraRole, TargetControlChannel],
         vision_processing_enabled: Mapping[CameraRole, bool] | None = None,
         session_gate: CameraSessionGate | None = None,
+        stereo_target_joiner: StereoTargetJoinPort | None = None,
+        stereo_distance_results: LatestValue[StereoDistanceCandidatePort] | None = None,
+        initial_manual_distance_m: float = 100.0,
+        distance_stale_timeout_ms: int = 300,
+        clock_ns: Callable[[], int] = monotonic_ns,
     ) -> None:
         if ui_config.default_camera not in _NORMAL_CAMERAS:
             raise ValueError("ui.default_camera must be Overview or Stereo Left")
@@ -109,10 +145,22 @@ class Mediator:
         ):
             raise ValueError("tracking_gap_timeout_ms must be a positive integer")
 
+        if (
+            isinstance(distance_stale_timeout_ms, bool)
+            or not isinstance(distance_stale_timeout_ms, int)
+            or distance_stale_timeout_ms <= 0
+        ):
+            raise ValueError("distance_stale_timeout_ms must be a positive integer")
+        if not callable(clock_ns):
+            raise TypeError("clock_ns must be callable")
+
         self._turret = turret
         self._target_controls = dict(target_controls)
         self._vision_processing_enabled = enabled
         self._session_gate = session_gate or CameraSessionGate()
+        self._stereo_target_joiner = stereo_target_joiner
+        self._stereo_distance_results = stereo_distance_results
+        self._stereo_distance_result_revision = 0
         self._aiming = Aiming(aiming_config)
         self._tracking_estimator = TrackingEstimator(tracking_control_config)
         self._tracking_control_config_revision = 0
@@ -120,6 +168,12 @@ class Mediator:
         self._main_camera = ui_config.default_camera
         self._pending_selection: TargetSelectionRequest | None = None
         self._selected_target: TargetRef | None = None
+        self._distance_mode = DistanceMeasurementMode.CONSTANT
+        self._manual_distance_m = quantize_constant_distance(initial_manual_distance_m)
+        self._distance_stale_timeout_ns = distance_stale_timeout_ms * 1_000_000
+        self._clock_ns = clock_ns
+        self._distance_intent_revision = 0
+        self._current_distance: DistanceResult | None = None
         self._next_selection_id = 1
         self._latest_results: dict[CameraRole, VisionResult | None] = {
             camera: None for camera in _NORMAL_CAMERAS
@@ -156,6 +210,68 @@ class Mediator:
         return self._selected_target
 
     @property
+    def distance_mode(self) -> DistanceMeasurementMode:
+        return self._distance_mode
+
+    @property
+    def manual_distance_m(self) -> int:
+        return self._manual_distance_m
+
+    @property
+    def current_distance(self) -> DistanceResult | None:
+        self._consume_stereo_distance_candidate()
+        distance = self._current_distance
+        if (
+            self._main_camera is not CameraRole.STEREO_LEFT
+            or self._selected_target is None
+            or distance is None
+            or distance.target != self._selected_target
+        ):
+            return None
+        if (
+            distance.source is DistanceSource.STEREO
+            and self._clock_ns() - distance.measured_timestamp_ns
+            > self._distance_stale_timeout_ns
+        ):
+            self._current_distance = None
+            return None
+        return distance
+
+    def set_distance_mode(self, mode: DistanceMeasurementMode) -> None:
+        if not isinstance(mode, DistanceMeasurementMode):
+            raise TypeError("mode must be DistanceMeasurementMode")
+        if self._distance_mode is mode:
+            return
+        self._distance_mode = mode
+        self._invalidate_distance_intent()
+        self._refresh_stereo_join_target()
+        self._refresh_manual_distance()
+
+    def set_manual_distance_m(self, distance_m: float) -> None:
+        self._manual_distance_m = quantize_constant_distance(distance_m)
+        if self._distance_mode is DistanceMeasurementMode.CONSTANT:
+            self._refresh_manual_distance()
+
+    def _refresh_manual_distance(self) -> None:
+        self._current_distance = None
+        target = self._selected_target
+        if (
+            self._distance_mode is DistanceMeasurementMode.CONSTANT
+            and self._main_camera is CameraRole.STEREO_LEFT
+            and target is not None
+            and self._session_gate.accepts(target.camera, target.generation)
+        ):
+            # This is a runtime operator setting, not a frame measurement.
+            self._current_distance = DistanceResult(
+                target=target,
+                distance_m=float(self._manual_distance_m),
+                source=DistanceSource.MANUAL,
+                source_frame_id=None,
+                capture_id=None,
+                measured_timestamp_ns=self._clock_ns(),
+            )
+
+    @property
     def turret_state(self) -> TurretState:
         return self._turret_state
 
@@ -185,6 +301,10 @@ class Mediator:
         """Accept a generation barrier before any data from that generation."""
         if not self._session_gate.accept(session):
             return False
+        if session.camera is CameraRole.STEREO_LEFT:
+            self._invalidate_distance_intent()
+            if self._stereo_target_joiner is not None:
+                self._stereo_target_joiner.start_generation(session.generation)
         if session.camera in self._latest_results:
             self._latest_results[session.camera] = None
         if self._target_intent_uses_camera(session.camera):
@@ -210,6 +330,8 @@ class Mediator:
         if not self._session_gate.accepts(camera, result.frame.generation):
             return False
         self._latest_results[camera] = result
+        if camera is CameraRole.STEREO_LEFT and self._stereo_target_joiner is not None:
+            self._stereo_target_joiner.offer_vision_result(result)
         if camera is self._main_camera and self._selected_target is not None:
             self._update_tracking_from_result(result)
         return True
@@ -332,6 +454,8 @@ class Mediator:
         had_selected_target = self._selected_target is not None
         self._pending_selection = request
         self._selected_target = None
+        self._invalidate_distance_intent()
+        self._refresh_stereo_join_target()
         self._tracking_estimator.reset()
         self._turret.invalidate_tracking_control()
         if had_selected_target:
@@ -349,17 +473,20 @@ class Mediator:
 
     def swap_main_preview(self) -> CameraRole:
         old_main = self._main_camera
+        self._invalidate_distance_intent()
         self._main_camera = (
             CameraRole.STEREO_LEFT
             if self._main_camera is CameraRole.OVERVIEW
             else CameraRole.OVERVIEW
         )
+        self._refresh_stereo_join_target()
         if (
             self._turret_state.control_mode is TurretControlMode.TRACKING
             and self._has_target_intent()
         ):
             self._invalidate_target_intent(stop_motion=True)
             self._publish_clear((old_main, self._main_camera))
+        self._refresh_manual_distance()
         return self._main_camera
 
     def request_control_mode(self, mode: TurretControlMode) -> bool:
@@ -423,6 +550,9 @@ class Mediator:
 
         self._pending_selection = None
         self._selected_target = target
+        self._invalidate_distance_intent()
+        self._refresh_stereo_join_target()
+        self._refresh_manual_distance()
         self._tracking_estimator.reset()
         result = self._latest_results.get(target.camera)
         if result is not None:
@@ -445,6 +575,8 @@ class Mediator:
             return False
         self._pending_selection = None
         self._selected_target = None
+        self._invalidate_distance_intent()
+        self._refresh_stereo_join_target()
         self._tracking_estimator.reset()
         self._turret.invalidate_tracking_control()
         return True
@@ -459,6 +591,8 @@ class Mediator:
         ):
             return False
         self._selected_target = None
+        self._invalidate_distance_intent()
+        self._refresh_stereo_join_target()
         self._tracking_estimator.reset()
         self._turret.invalidate_tracking_control()
         self._turret.stop_motion()
@@ -530,10 +664,83 @@ class Mediator:
     def _invalidate_target_intent(self, *, stop_motion: bool) -> None:
         self._pending_selection = None
         self._selected_target = None
+        self._invalidate_distance_intent()
+        self._refresh_stereo_join_target()
         self._tracking_estimator.reset()
         self._turret.invalidate_tracking_control()
         if stop_motion:
             self._turret.stop_motion()
+
+    def _refresh_stereo_join_target(self) -> None:
+        joiner = self._stereo_target_joiner
+        if joiner is None:
+            return
+        target = self._selected_target
+        if (
+            self._distance_mode is DistanceMeasurementMode.STEREO_EXACT
+            and self._main_camera is CameraRole.STEREO_LEFT
+            and target is not None
+            and target.camera is CameraRole.STEREO_LEFT
+            and self._session_gate.accepts(target.camera, target.generation)
+        ):
+            joiner.set_target(target, intent_revision=self._distance_intent_revision)
+            return
+        joiner.set_target(None, intent_revision=self._distance_intent_revision)
+
+    def invalidate_distance_computation(self) -> None:
+        """Invalidate stereo work and close exact joining for shutdown."""
+        self._invalidate_distance_intent()
+        joiner = self._stereo_target_joiner
+        if joiner is not None:
+            joiner.set_target(None, intent_revision=self._distance_intent_revision)
+
+    def _consume_stereo_distance_candidate(self) -> None:
+        results = self._stereo_distance_results
+        if results is None:
+            return
+        snapshot = results.snapshot()
+        if snapshot.revision <= self._stereo_distance_result_revision:
+            return
+        self._stereo_distance_result_revision = snapshot.revision
+        candidate = snapshot.value
+        if candidate is None:
+            return
+        if not self._accept_stereo_distance_candidate(candidate):
+            return
+        self._current_distance = DistanceResult(
+            target=candidate.target,
+            distance_m=candidate.distance_m,
+            source=DistanceSource.STEREO,
+            source_frame_id=candidate.source_frame_id,
+            capture_id=candidate.capture_id,
+            measured_timestamp_ns=candidate.measured_timestamp_ns,
+        )
+
+    def _accept_stereo_distance_candidate(
+        self,
+        candidate: StereoDistanceCandidatePort,
+    ) -> bool:
+        now_ns = self._clock_ns()
+        return bool(
+            candidate.intent_revision == self._distance_intent_revision
+            and self._distance_mode is DistanceMeasurementMode.STEREO_EXACT
+            and self._main_camera is CameraRole.STEREO_LEFT
+            and self._selected_target == candidate.target
+            and candidate.target.camera is CameraRole.STEREO_LEFT
+            and self._session_gate.accepts(
+                candidate.target.camera, candidate.target.generation
+            )
+            and candidate.source_frame_id >= 0
+            and isfinite(candidate.distance_m)
+            and candidate.distance_m > 0.0
+            and candidate.measured_timestamp_ns <= now_ns
+            and now_ns - candidate.measured_timestamp_ns
+            <= self._distance_stale_timeout_ns
+        )
+
+    def _invalidate_distance_intent(self) -> None:
+        self._distance_intent_revision += 1
+        self._current_distance = None
 
     def _publish_clear(self, cameras: tuple[CameraRole, ...]) -> None:
         for camera in dict.fromkeys(cameras):

@@ -39,7 +39,12 @@ from navmin.vision.pipeline import (
     stereo_left_corrector,
     stereo_right_corrector,
 )
+from navmin.vision.stereo_distance_worker import StereoDistanceWorker
 from navmin.vision.stereo_pairing import StereoPairer
+from navmin.vision.stereo_target_join import (
+    StereoPairingTargetJoinSink,
+    StereoTargetJoiner,
+)
 
 LOGGER = logging.getLogger(__name__)
 
@@ -47,6 +52,7 @@ _DEFAULT_SHUTDOWN_TIMEOUT_SECONDS = 2.0
 _OVERVIEW_COMPONENT = "Overview CameraWorker"
 _STEREO_LEFT_COMPONENT = "Stereo Left CameraWorker"
 _STEREO_RIGHT_COMPONENT = "Stereo Right CameraWorker"
+_STEREO_DISTANCE_COMPONENT = "Stereo Distance Worker"
 _TURRET_COMPONENT = "TurretWorker"
 _TURRET_SAFETY_COMPONENT = "Turret safety shutdown"
 
@@ -104,6 +110,8 @@ class ApplicationRuntime:
         stereo_left_worker: CameraWorker,
         stereo_right_worker: CameraWorker | None,
         stereo_pairer: StereoPairer | None,
+        stereo_target_joiner: StereoTargetJoiner | None,
+        stereo_distance_worker: StereoDistanceWorker | None,
         turret_worker: TurretWorker,
         mediator: Mediator,
         camera_stale_timeout_ms: int,
@@ -118,6 +126,8 @@ class ApplicationRuntime:
         self.stereo_left_worker = stereo_left_worker
         self.stereo_right_worker = stereo_right_worker
         self.stereo_pairer = stereo_pairer
+        self.stereo_target_joiner = stereo_target_joiner
+        self.stereo_distance_worker = stereo_distance_worker
         self.turret_worker = turret_worker
         self.mediator = mediator
         self.camera_stale_timeout_ms = camera_stale_timeout_ms
@@ -306,6 +316,9 @@ class ApplicationRuntime:
             if self.stereo_right_worker is not None:
                 self.stereo_right_worker.start()
                 self._active_components.add(_STEREO_RIGHT_COMPONENT)
+            if self.stereo_distance_worker is not None:
+                self.stereo_distance_worker.start()
+                self._active_components.add(_STEREO_DISTANCE_COMPONENT)
         except RuntimeError as startup_error:
             failures = self._stop_active(_DEFAULT_SHUTDOWN_TIMEOUT_SECONDS)
             if failures:
@@ -319,6 +332,8 @@ class ApplicationRuntime:
             self._shutdown_complete = not self._active_components
             if self.stereo_pairer is not None:
                 self.stereo_pairer.reset()
+            if self.stereo_target_joiner is not None:
+                self.stereo_target_joiner.reset()
             raise
 
         LOGGER.info("Application runtime workers started")
@@ -332,6 +347,7 @@ class ApplicationRuntime:
             self._start_attempted = True
 
         failures: list[ApplicationShutdownFailure] = []
+        self.mediator.invalidate_distance_computation()
         if _TURRET_COMPONENT in self._active_components:
             safety_failure = self._prepare_turret_for_shutdown(timeout)
             if safety_failure is not None:
@@ -339,6 +355,8 @@ class ApplicationRuntime:
         failures.extend(self._stop_active(timeout))
         if self.stereo_pairer is not None:
             self.stereo_pairer.reset()
+        if self.stereo_target_joiner is not None:
+            self.stereo_target_joiner.reset()
         self._shutdown_complete = not self._active_components
         if failures:
             raise ApplicationShutdownError(tuple(failures))
@@ -415,6 +433,7 @@ class ApplicationRuntime:
             (_STEREO_RIGHT_COMPONENT, self.stereo_right_worker),
             (_STEREO_LEFT_COMPONENT, self.stereo_left_worker),
             (_OVERVIEW_COMPONENT, self.overview_worker),
+            (_STEREO_DISTANCE_COMPONENT, self.stereo_distance_worker),
             (_TURRET_COMPONENT, self.turret_worker),
         )
         for component, worker in ordered:
@@ -475,6 +494,9 @@ def build_application_runtime(
 
     stereo_config = config.vision.distance.stereo
     stereo_pairer = None
+    stereo_target_joiner = None
+    stereo_distance_worker = None
+    stereo_frame_sink = None
     if (
         config.vision.cameras.stereo_left.enabled
         and config.vision.cameras.stereo_right.enabled
@@ -483,6 +505,16 @@ def build_application_runtime(
         stereo_pairer = StereoPairer(
             right_frame_buffer_size=stereo_config.right_frame_buffer_size,
             pair_timeout_ms=stereo_config.pair_timeout_ms,
+        )
+        stereo_distance_worker = StereoDistanceWorker(
+            calibration=stereo_calibration,
+        )
+        stereo_target_joiner = StereoTargetJoiner(
+            stereo_distance_worker.submit_observation
+        )
+        stereo_frame_sink = StereoPairingTargetJoinSink(
+            stereo_pairer,
+            stereo_target_joiner,
         )
 
     overview_worker = build_camera_worker(
@@ -496,7 +528,7 @@ def build_application_runtime(
         config=config.vision.cameras.stereo_left,
         corrector=stereo_left_corrector(stereo_calibration),
         source_factory=selected_factories.stereo_left_source_factory,
-        corrected_frame_sink=stereo_pairer,
+        corrected_frame_sink=stereo_frame_sink,
     )
     stereo_right_worker = None
     if config.vision.cameras.stereo_right.enabled:
@@ -505,7 +537,7 @@ def build_application_runtime(
             config=config.vision.cameras.stereo_right,
             corrector=stereo_right_corrector(stereo_calibration),
             source_factory=selected_factories.stereo_right_source_factory,
-            corrected_frame_sink=stereo_pairer,
+            corrected_frame_sink=stereo_frame_sink,
         )
     turret_worker = TurretWorker(
         config.turret,
@@ -516,12 +548,18 @@ def build_application_runtime(
         aiming_config=config.aiming,
         tracking_control_config=config.tracking_control,
         tracking_gap_timeout_ms=config.turret.stm32.velocity_watchdog_timeout_ms,
+        initial_manual_distance_m=config.vision.distance.manual_distance_m,
         ui_config=config.ui,
         turret=turret_worker,
         target_controls={
             CameraRole.OVERVIEW: overview_worker.pipeline.target_control,
             CameraRole.STEREO_LEFT: stereo_left_worker.pipeline.target_control,
         },
+        stereo_target_joiner=stereo_target_joiner,
+        stereo_distance_results=(
+            None if stereo_distance_worker is None else stereo_distance_worker.results
+        ),
+        distance_stale_timeout_ms=config.vision.distance.distance_stale_timeout_ms,
         vision_processing_enabled={
             CameraRole.OVERVIEW: config.vision.cameras.overview.processing_enabled,
             CameraRole.STEREO_LEFT: (
@@ -534,6 +572,8 @@ def build_application_runtime(
         stereo_left_worker=stereo_left_worker,
         stereo_right_worker=stereo_right_worker,
         stereo_pairer=stereo_pairer,
+        stereo_target_joiner=stereo_target_joiner,
+        stereo_distance_worker=stereo_distance_worker,
         turret_worker=turret_worker,
         mediator=mediator,
         camera_stale_timeout_ms=config.vision.camera_stale_timeout_ms,

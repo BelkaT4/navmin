@@ -198,6 +198,7 @@ def _inputs(
     )
     stereo = StereoCalibration(
         schema_version=1,
+        translation_unit="m",
         image_width=64,
         image_height=48,
         K_left=K,

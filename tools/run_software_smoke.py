@@ -99,6 +99,7 @@ def synthetic_stereo_calibration() -> StereoCalibration:
     )
     return StereoCalibration(
         schema_version=1,
+        translation_unit="m",
         image_width=FRAME_WIDTH,
         image_height=FRAME_HEIGHT,
         K_left=camera_matrix,

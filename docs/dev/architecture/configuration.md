@@ -108,6 +108,7 @@ Stereo `calibration/stereo.json`:
 
 ```text
 schema_version = 1
+translation-unit: required "mm" or "m"; physical unit of stereo geometry (T, P2, Q)
 image_width / image_height: integer > 0
 K_left / K_right: 3x3 finite matrices
 D_left / D_right: finite coefficient vectors, non-empty

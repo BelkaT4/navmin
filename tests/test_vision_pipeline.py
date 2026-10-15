@@ -61,6 +61,7 @@ def overview_calibration() -> OverviewCalibration:
 def stereo_calibration() -> StereoCalibration:
     return StereoCalibration(
         schema_version=1,
+        translation_unit="m",
         image_width=WIDTH,
         image_height=HEIGHT,
         K_left=K,

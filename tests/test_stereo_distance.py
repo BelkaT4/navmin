@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from threading import Event
 
 import cv2
 import numpy as np
 import pytest
 
 from navmin.calibration import StereoCalibration
-from navmin.contracts import BBox, CameraRole, FramePacket
+from navmin.contracts import BBox, CameraRole, FramePacket, TargetRef
 from navmin.vision import stereo_distance
 from navmin.vision.stereo_distance import (
     StereoDistanceEstimate,
@@ -22,7 +23,9 @@ from navmin.vision.stereo_distance import (
     reproject_disparity_point,
     validate_stereo_pair_geometry,
 )
+from navmin.vision.stereo_distance_worker import StereoDistanceWorker
 from navmin.vision.stereo_pairing import StereoFramePair, StereoPairIdentity
+from navmin.vision.stereo_target_join import StereoTargetObservation
 
 
 def calibration(
@@ -34,6 +37,7 @@ def calibration(
 ) -> StereoCalibration:
     return StereoCalibration(
         schema_version=1,
+        translation_unit="m",
         image_width=width,
         image_height=height,
         K_left=((focal, 0.0, width / 2), (0.0, focal, height / 2), (0.0, 0.0, 1.0)),
@@ -858,3 +862,95 @@ def test_pair_to_distance_processing_scale_preserves_distance() -> None:
     assert full.distance_m == pytest.approx(expected_distance_m, abs=0.01)
     assert half.distance_m == pytest.approx(expected_distance_m, abs=0.02)
     assert half.distance_m == pytest.approx(full.distance_m, abs=0.02)
+
+
+def _worker_observation(
+    frame_id: int,
+    *,
+    intent_revision: int = 1,
+    timestamp_ns: int = 1_000,
+) -> StereoTargetObservation:
+    base = pair(width=8, height=6)
+    left = replace(
+        base.left,
+        frame_id=frame_id,
+        receive_timestamp_ns=timestamp_ns,
+    )
+    right = replace(base.right, frame_id=frame_id + 100)
+    exact_pair = replace(base, left=left, right=right)
+    return StereoTargetObservation(
+        target=TargetRef(CameraRole.STEREO_LEFT, 1, 7),
+        intent_revision=intent_revision,
+        pair=exact_pair,
+        roi=BBox(1, 1, 4, 3),
+    )
+
+
+def _worker_estimate(distance_m: float) -> StereoDistanceEstimate:
+    return StereoDistanceEstimate(
+        distance_m=distance_m,
+        median_disparity_px=10.0,
+        valid_pixel_count=12,
+        valid_pixel_fraction=1.0,
+        method=StereoDistanceMethod.DISPARITY_MAP_ROI_MEDIAN,
+    )
+
+
+def test_distance_worker_keeps_only_latest_not_started_job() -> None:
+    first_started = Event()
+    release_first = Event()
+    calls: list[int] = []
+
+    def compute(observation: StereoTargetObservation):
+        frame_id = observation.pair.left.frame_id
+        calls.append(frame_id)
+        if frame_id == 1:
+            first_started.set()
+            assert release_first.wait(1.0)
+        return _worker_estimate(float(frame_id))
+
+    worker = StereoDistanceWorker(
+        calibration=calibration(width=8, height=6),
+        compute=compute,
+    )
+    worker.start()
+    try:
+        assert worker.submit_observation(_worker_observation(1))
+        assert first_started.wait(1.0)
+        assert worker.submit_observation(_worker_observation(2))
+        assert worker.submit_observation(_worker_observation(3))
+        release_first.set()
+
+        snapshot = worker.results.wait_for_revision(0, 1.0)
+        assert snapshot is not None
+        if snapshot.value is None or snapshot.value.source_frame_id != 3:
+            snapshot = worker.results.wait_for_revision(snapshot.revision, 1.0)
+            assert snapshot is not None
+        assert snapshot.value is not None
+        assert snapshot.value.source_frame_id == 3
+        assert calls == [1, 3]
+    finally:
+        worker.shutdown()
+
+
+def test_distance_worker_candidate_uses_exact_left_observation_identity() -> None:
+    observation = _worker_observation(9, intent_revision=17, timestamp_ns=123_456)
+    worker = StereoDistanceWorker(
+        calibration=calibration(width=8, height=6),
+        compute=lambda _observation: _worker_estimate(42.5),
+    )
+    worker.start()
+    try:
+        assert worker.submit_observation(observation)
+        snapshot = worker.results.wait_for_revision(0, 1.0)
+        assert snapshot is not None
+        candidate = snapshot.value
+        assert candidate is not None
+        assert candidate.target == observation.target
+        assert candidate.intent_revision == 17
+        assert candidate.distance_m == 42.5
+        assert candidate.source_frame_id == 9
+        assert candidate.capture_id == observation.pair.identity.capture_id
+        assert candidate.measured_timestamp_ns == 123_456
+    finally:
+        worker.shutdown()

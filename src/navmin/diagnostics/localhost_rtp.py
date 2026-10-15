@@ -670,6 +670,7 @@ def diagnostic_stereo_calibration(
     )
     return StereoCalibration(
         schema_version=1,
+        translation_unit="m",
         image_width=width,
         image_height=height,
         K_left=matrix,

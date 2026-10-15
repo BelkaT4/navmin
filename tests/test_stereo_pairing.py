@@ -5,12 +5,23 @@ from dataclasses import replace
 import numpy as np
 import pytest
 
-from navmin.contracts import CameraRole, FramePacket
+from navmin.contracts import (
+    BBox,
+    CameraRole,
+    FramePacket,
+    TargetRef,
+    TrackedObject,
+    VisionResult,
+)
 from navmin.vision.stereo_pairing import (
     StereoFramePair,
     StereoPairContractError,
     StereoPairIdentity,
     make_exact_stereo_pair,
+)
+from navmin.vision.stereo_target_join import (
+    StereoPairingTargetJoinSink,
+    StereoTargetJoiner,
 )
 
 
@@ -607,3 +618,194 @@ def test_pairer_is_thread_safe_for_simultaneous_left_and_right_arrival() -> None
     assert len(pairs) == 1
     assert pairs[0].identity == StereoPairIdentity(8, 9, 123)
     assert stereo_pairer.latest_pair is pairs[0]
+
+
+def _vision_result_for(
+    packet: FramePacket,
+    *,
+    track_ids: tuple[int, ...] = (7,),
+) -> VisionResult:
+    tracked = tuple(
+        TrackedObject(
+            track_id=track_id,
+            bbox=BBox(10 + index * 5, 11, 12, 13),
+            velocity_x_px_s=0.0,
+            velocity_y_px_s=0.0,
+            age_frames=3,
+        )
+        for index, track_id in enumerate(track_ids)
+    )
+    return VisionResult(frame=packet, tracked_objects=tracked, processing_time_ns=5)
+
+
+def _exact_pair_for_left(left: FramePacket, *, right_generation: int = 2) -> StereoFramePair:
+    pair = make_exact_stereo_pair(
+        left,
+        frame(
+            CameraRole.STEREO_RIGHT,
+            generation=right_generation,
+            frame_id=99,
+            capture_id=left.capture_id,
+        ),
+    )
+    assert pair is not None
+    return pair
+
+
+def _active_joiner(*, generation: int = 1, track_id: int = 7) -> StereoTargetJoiner:
+    joiner = StereoTargetJoiner()
+    joiner.start_generation(generation)
+    joiner.set_target(TargetRef(CameraRole.STEREO_LEFT, generation, track_id))
+    return joiner
+
+
+def test_target_join_accepts_pair_then_exact_result_for_selected_track() -> None:
+    joiner = _active_joiner(generation=3, track_id=8)
+    left = frame(
+        CameraRole.STEREO_LEFT,
+        generation=3,
+        frame_id=12,
+        capture_id=44,
+    )
+    pair = _exact_pair_for_left(left, right_generation=9)
+
+    assert joiner.offer_pair(pair) is None
+    observation = joiner.offer_vision_result(
+        _vision_result_for(left, track_ids=(4, 8, 12))
+    )
+
+    assert observation is not None
+    assert observation.target == TargetRef(CameraRole.STEREO_LEFT, 3, 8)
+    assert observation.pair is pair
+    assert observation.roi == BBox(15, 11, 12, 13)
+    assert joiner.observations.get() is observation
+    assert joiner.state.pending_pair_frame_id is None
+    assert joiner.state.pending_result_frame_id is None
+
+
+def test_target_join_accepts_result_then_pair_without_timestamp_fallback() -> None:
+    joiner = _active_joiner(generation=2)
+    left = frame(
+        CameraRole.STEREO_LEFT,
+        generation=2,
+        frame_id=5,
+        capture_id=70,
+        receive_timestamp_ns=10,
+    )
+    pair = _exact_pair_for_left(left)
+
+    assert joiner.offer_vision_result(_vision_result_for(left)) is None
+    observation = joiner.offer_pair(pair)
+
+    assert observation is not None
+    assert observation.pair.left.frame_id == 5
+    assert observation.pair.identity.capture_id == 70
+
+    mismatched = frame(
+        CameraRole.STEREO_LEFT,
+        generation=2,
+        frame_id=6,
+        capture_id=70,
+        receive_timestamp_ns=11,
+    )
+    published_revision = joiner.observations.snapshot().revision
+    assert joiner.offer_vision_result(_vision_result_for(mismatched)) is None
+    assert joiner.offer_pair(pair) is None
+    assert joiner.observations.snapshot().revision == published_revision
+    assert joiner.observations.get() is observation
+
+
+def test_target_join_requires_exact_capture_identity_and_selected_track() -> None:
+    joiner = _active_joiner()
+    left = frame(CameraRole.STEREO_LEFT, frame_id=10, capture_id=20)
+    pair = _exact_pair_for_left(left)
+    wrong_capture_result = _vision_result_for(replace(left, capture_id=21))
+
+    joiner.offer_pair(pair)
+    assert joiner.offer_vision_result(wrong_capture_result) is None
+    assert joiner.observations.get() is None
+
+    joiner.offer_pair(pair)
+    assert joiner.offer_vision_result(_vision_result_for(left, track_ids=(99,))) is None
+    assert joiner.observations.get() is None
+
+
+def test_target_join_state_is_single_slot_latest_useful_and_generation_aware() -> None:
+    joiner = _active_joiner(generation=4)
+    first = frame(CameraRole.STEREO_LEFT, generation=4, frame_id=1, capture_id=1)
+    second = frame(CameraRole.STEREO_LEFT, generation=4, frame_id=2, capture_id=2)
+
+    joiner.offer_vision_result(_vision_result_for(first))
+    joiner.offer_vision_result(_vision_result_for(second))
+    assert joiner.state.pending_result_frame_id == 2
+
+    joiner.offer_pair(_exact_pair_for_left(first))
+    assert joiner.state.pending_pair_frame_id is None
+    assert joiner.state.pending_result_frame_id == 2
+
+    observation = joiner.offer_pair(_exact_pair_for_left(second))
+    assert observation is not None
+    assert observation.pair.left.frame_id == 2
+
+    third = frame(CameraRole.STEREO_LEFT, generation=4, frame_id=3, capture_id=3)
+    fourth = frame(CameraRole.STEREO_LEFT, generation=4, frame_id=4, capture_id=4)
+    joiner.offer_pair(_exact_pair_for_left(third))
+    joiner.offer_pair(_exact_pair_for_left(fourth))
+    assert joiner.state.pending_pair_frame_id == 4
+    joiner.offer_vision_result(_vision_result_for(third))
+    assert joiner.state.pending_pair_frame_id == 4
+    assert joiner.state.pending_result_frame_id is None
+
+    joiner.start_generation(5)
+    assert joiner.state.left_generation == 5
+    assert joiner.state.target is None
+    assert joiner.state.pending_pair_frame_id is None
+    assert joiner.state.pending_result_frame_id is None
+    assert joiner.observations.get() is None
+
+
+def test_target_change_or_disable_clears_pending_and_published_join_state() -> None:
+    joiner = _active_joiner()
+    left = frame(CameraRole.STEREO_LEFT, frame_id=4, capture_id=4)
+    observation = joiner.offer_pair(_exact_pair_for_left(left))
+    assert observation is None
+    observation = joiner.offer_vision_result(_vision_result_for(left))
+    assert observation is not None
+
+    joiner.set_target(None)
+    assert joiner.state.target is None
+    assert joiner.observations.get() is None
+
+    joiner.set_target(TargetRef(CameraRole.STEREO_LEFT, 1, 8))
+    joiner.offer_pair(_exact_pair_for_left(left))
+    joiner.set_target(TargetRef(CameraRole.STEREO_LEFT, 1, 9))
+    assert joiner.state.pending_pair_frame_id is None
+    assert joiner.observations.get() is None
+
+
+def test_pairing_target_join_sink_forwards_only_new_exact_pairs() -> None:
+    stereo_pairer = pairer()
+    joiner = _active_joiner(generation=6)
+    sink = StereoPairingTargetJoinSink(stereo_pairer, joiner)
+    stereo_pairer.start_generation(CameraRole.STEREO_LEFT, 6)
+    stereo_pairer.start_generation(CameraRole.STEREO_RIGHT, 7)
+    left = frame(
+        CameraRole.STEREO_LEFT,
+        generation=6,
+        frame_id=20,
+        capture_id=55,
+    )
+    right = frame(
+        CameraRole.STEREO_RIGHT,
+        generation=7,
+        frame_id=30,
+        capture_id=55,
+    )
+
+    sink.on_corrected_frame(left)
+    assert joiner.offer_vision_result(_vision_result_for(left)) is None
+    sink.on_corrected_frame(right)
+
+    observation = joiner.observations.get()
+    assert observation is not None
+    assert observation.pair.identity == StereoPairIdentity(6, 7, 55)

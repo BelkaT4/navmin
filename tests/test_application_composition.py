@@ -49,6 +49,7 @@ from navmin.contracts import (
     TrackingError,
     TurretConnectionState,
 )
+from navmin.core import DistanceMeasurementMode
 from navmin.turret.protocol import CommandCode
 from navmin.turret.simulator import FakeStm32Endpoint, FakeTransport
 from navmin.turret.worker import TurretWorker
@@ -212,6 +213,7 @@ def _stereo_calibration() -> StereoCalibration:
     )
     return StereoCalibration(
         schema_version=1,
+        translation_unit="m",
         image_width=WIDTH,
         image_height=HEIGHT,
         K_left=K,
@@ -405,6 +407,28 @@ def test_stereo_pairer_is_inactive_when_any_prerequisite_is_disabled(
     )
 
     assert runtime.stereo_pairer is None
+    assert runtime.stereo_target_joiner is None
+    assert runtime.stereo_distance_worker is None
+
+
+def test_stereo_disabled_keeps_modes_selectable_without_compute_path() -> None:
+    runtime, _sources, _endpoint = _injected_runtime(
+        stereo_right_enabled=True,
+        stereo_enabled=False,
+    )
+
+    assert runtime.stereo_pairer is None
+    assert runtime.stereo_target_joiner is None
+    assert runtime.stereo_distance_worker is None
+    assert runtime.mediator.swap_main_preview() is CameraRole.STEREO_LEFT
+
+    runtime.mediator.set_distance_mode(DistanceMeasurementMode.STEREO_EXACT)
+    assert runtime.mediator.distance_mode is DistanceMeasurementMode.STEREO_EXACT
+    assert runtime.mediator.current_distance is None
+
+    runtime.mediator.set_distance_mode(DistanceMeasurementMode.STEREO_TIMESTAMP)
+    assert runtime.mediator.distance_mode is DistanceMeasurementMode.STEREO_TIMESTAMP
+    assert runtime.mediator.current_distance is None
 
 
 def test_enabled_stereo_pairer_receives_both_corrected_frame_paths_and_resets() -> None:
@@ -413,7 +437,11 @@ def test_enabled_stereo_pairer_receives_both_corrected_frame_paths_and_resets() 
         stereo_enabled=True,
     )
     pairer = runtime.stereo_pairer
+    joiner = runtime.stereo_target_joiner
+    distance_worker = runtime.stereo_distance_worker
     assert pairer is not None
+    assert joiner is not None
+    assert distance_worker is not None
     assert runtime.stereo_right_worker is not None
     assert set(runtime.camera_bindings) == {
         CameraRole.OVERVIEW,
@@ -450,6 +478,10 @@ def test_enabled_stereo_pairer_receives_both_corrected_frame_paths_and_resets() 
     assert pairer.latest_pair is None
     assert pairer.state.left_generation is None
     assert pairer.state.right_generation is None
+    assert joiner.state.left_generation is None
+    assert joiner.state.target is None
+    assert joiner.observations.get() is None
+    assert not distance_worker.is_alive()
 
 
 def test_stereo_right_enabled_follows_startup_and_reverse_shutdown_order(
