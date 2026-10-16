@@ -65,6 +65,21 @@ class StereoTargetJoinerState:
     latest_observation_frame_id: int | None
 
 
+@dataclass(frozen=True, slots=True)
+class StereoTargetJoinerDiagnostics:
+    pairs_received: int
+    vision_results_received: int
+    target_observations_emitted: int
+    pair_superseded_unmatched: int
+    vision_result_superseded_unmatched: int
+    rejected_inactive_target: int
+    rejected_wrong_generation: int
+    rejected_wrong_frame_id: int
+    rejected_left_identity: int
+    rejected_target_not_tracked: int
+    generation_resets: int
+
+
 class StereoTargetJoiner:
     """Join pair/result identity for only the active Stereo Left target.
 
@@ -87,6 +102,17 @@ class StereoTargetJoiner:
         self.observations: InvalidatableLatest[StereoTargetObservation] = (
             InvalidatableLatest()
         )
+        self._pairs_received = 0
+        self._vision_results_received = 0
+        self._target_observations_emitted = 0
+        self._pair_superseded_unmatched = 0
+        self._vision_result_superseded_unmatched = 0
+        self._rejected_inactive_target = 0
+        self._rejected_wrong_generation = 0
+        self._rejected_wrong_frame_id = 0
+        self._rejected_left_identity = 0
+        self._rejected_target_not_tracked = 0
+        self._generation_resets = 0
 
     @property
     def state(self) -> StereoTargetJoinerState:
@@ -109,6 +135,25 @@ class StereoTargetJoiner:
                 ),
             )
 
+    @property
+    def diagnostics(self) -> StereoTargetJoinerDiagnostics:
+        with self._lock:
+            return StereoTargetJoinerDiagnostics(
+                pairs_received=self._pairs_received,
+                vision_results_received=self._vision_results_received,
+                target_observations_emitted=self._target_observations_emitted,
+                pair_superseded_unmatched=self._pair_superseded_unmatched,
+                vision_result_superseded_unmatched=(
+                    self._vision_result_superseded_unmatched
+                ),
+                rejected_inactive_target=self._rejected_inactive_target,
+                rejected_wrong_generation=self._rejected_wrong_generation,
+                rejected_wrong_frame_id=self._rejected_wrong_frame_id,
+                rejected_left_identity=self._rejected_left_identity,
+                rejected_target_not_tracked=self._rejected_target_not_tracked,
+                generation_resets=self._generation_resets,
+            )
+
     def start_generation(self, generation: int) -> None:
         """Accept the authoritative Stereo Left generation barrier."""
         if isinstance(generation, bool) or not isinstance(generation, int):
@@ -118,9 +163,11 @@ class StereoTargetJoiner:
         with self._lock:
             if self._left_generation == generation:
                 return
+            self._generation_resets += 1
             self._left_generation = generation
             self._target = None
             self._intent_revision = 0
+            self._count_pending_discards_locked()
             self._clear_inputs_locked()
             self.observations.invalidate()
 
@@ -144,6 +191,7 @@ class StereoTargetJoiner:
                 return
             self._target = target
             self._intent_revision = intent_revision
+            self._count_pending_discards_locked()
             self._clear_inputs_locked()
             self.observations.invalidate()
 
@@ -152,6 +200,7 @@ class StereoTargetJoiner:
         if not isinstance(pair, (StereoFramePair, TimestampStereoFramePair)):
             raise TypeError("pair must be an exact or timestamp stereo pair")
         with self._lock:
+            self._pairs_received += 1
             target = self._target
             if (
                 target is None
@@ -159,7 +208,13 @@ class StereoTargetJoiner:
                 or target.generation != self._left_generation
                 or pair.left.generation != self._left_generation
             ):
+                if target is None:
+                    self._rejected_inactive_target += 1
+                else:
+                    self._rejected_wrong_generation += 1
                 return None
+            if self._pending_pair is not None:
+                self._pair_superseded_unmatched += 1
             self._pending_pair = pair
             observation = self._try_join_locked()
         self._notify_observation(observation)
@@ -174,8 +229,11 @@ class StereoTargetJoiner:
             raise TypeError("result must be VisionResult")
         frame = result.frame
         if frame.camera is not CameraRole.STEREO_LEFT:
+            with self._lock:
+                self._vision_results_received += 1
             return None
         with self._lock:
+            self._vision_results_received += 1
             target = self._target
             if (
                 target is None
@@ -183,7 +241,13 @@ class StereoTargetJoiner:
                 or target.generation != self._left_generation
                 or frame.generation != self._left_generation
             ):
+                if target is None:
+                    self._rejected_inactive_target += 1
+                else:
+                    self._rejected_wrong_generation += 1
                 return None
+            if self._pending_result is not None:
+                self._vision_result_superseded_unmatched += 1
             self._pending_result = result
             observation = self._try_join_locked()
         self._notify_observation(observation)
@@ -195,6 +259,7 @@ class StereoTargetJoiner:
             self._left_generation = None
             self._target = None
             self._intent_revision = 0
+            self._count_pending_discards_locked()
             self._clear_inputs_locked()
             self.observations.invalidate()
 
@@ -208,15 +273,20 @@ class StereoTargetJoiner:
         left = pair.left
         frame = result.frame
         if frame.generation != left.generation:
+            self._rejected_wrong_generation += 1
             self._discard_older_frame_locked(left.frame_id, frame.frame_id)
             return None
         if frame.frame_id != left.frame_id:
+            self._rejected_wrong_frame_id += 1
             self._discard_older_frame_locked(left.frame_id, frame.frame_id)
             return None
         if (
             frame.capture_id != left.capture_id
             or frame.receive_timestamp_ns != left.receive_timestamp_ns
         ):
+            self._rejected_left_identity += 1
+            self._pair_superseded_unmatched += 1
+            self._vision_result_superseded_unmatched += 1
             self._clear_inputs_locked()
             self.observations.invalidate()
             return None
@@ -227,6 +297,7 @@ class StereoTargetJoiner:
         )
         self._clear_inputs_locked()
         if tracked is None:
+            self._rejected_target_not_tracked += 1
             self.observations.invalidate()
             return None
 
@@ -242,14 +313,19 @@ class StereoTargetJoiner:
             ),
         )
         self.observations.publish(observation)
+        self._target_observations_emitted += 1
         return observation
 
     def _discard_older_frame_locked(self, pair_frame_id: int, result_frame_id: int) -> None:
         if pair_frame_id < result_frame_id:
             self._pending_pair = None
+            self._pair_superseded_unmatched += 1
         elif result_frame_id < pair_frame_id:
             self._pending_result = None
+            self._vision_result_superseded_unmatched += 1
         else:
+            self._pair_superseded_unmatched += 1
+            self._vision_result_superseded_unmatched += 1
             self._clear_inputs_locked()
 
     def _notify_observation(
@@ -262,6 +338,12 @@ class StereoTargetJoiner:
     def _clear_inputs_locked(self) -> None:
         self._pending_pair = None
         self._pending_result = None
+
+    def _count_pending_discards_locked(self) -> None:
+        if self._pending_pair is not None:
+            self._pair_superseded_unmatched += 1
+        if self._pending_result is not None:
+            self._vision_result_superseded_unmatched += 1
 
 
 class StereoPairingTargetJoinSink:
@@ -332,6 +414,7 @@ __all__ = [
     "StereoPairingKind",
     "StereoPairingTargetJoinSink",
     "StereoTargetJoiner",
+    "StereoTargetJoinerDiagnostics",
     "StereoTargetJoinerState",
     "StereoTargetObservation",
     "StereoTargetPair",

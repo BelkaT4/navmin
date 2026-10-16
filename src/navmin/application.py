@@ -25,6 +25,10 @@ from navmin.contracts import (
     TurretState,
 )
 from navmin.core import DistanceMeasurementMode, Mediator
+from navmin.diagnostics.stereo_runtime import (
+    StereoDiagnosticsReporter,
+    StereoRuntimeDiagnostics,
+)
 from navmin.turret.worker import TransportFactory, TurretWorker
 from navmin.ui.bridge import CameraUiBinding
 from navmin.vision.camera_source import create_camera_source
@@ -55,6 +59,7 @@ _OVERVIEW_COMPONENT = "Overview CameraWorker"
 _STEREO_LEFT_COMPONENT = "Stereo Left CameraWorker"
 _STEREO_RIGHT_COMPONENT = "Stereo Right CameraWorker"
 _STEREO_DISTANCE_COMPONENT = "Stereo Distance Worker"
+_STEREO_DIAGNOSTICS_COMPONENT = "Stereo Diagnostics Reporter"
 _TURRET_COMPONENT = "TurretWorker"
 _TURRET_SAFETY_COMPONENT = "Turret safety shutdown"
 
@@ -115,6 +120,7 @@ class ApplicationRuntime:
         stereo_timestamp_pairer: TimestampStereoPairer | None,
         stereo_target_joiner: StereoTargetJoiner | None,
         stereo_distance_worker: StereoDistanceWorker | None,
+        stereo_diagnostics_reporter: StereoDiagnosticsReporter | None,
         turret_worker: TurretWorker,
         mediator: Mediator,
         camera_stale_timeout_ms: int,
@@ -132,6 +138,7 @@ class ApplicationRuntime:
         self.stereo_timestamp_pairer = stereo_timestamp_pairer
         self.stereo_target_joiner = stereo_target_joiner
         self.stereo_distance_worker = stereo_distance_worker
+        self.stereo_diagnostics_reporter = stereo_diagnostics_reporter
         self.turret_worker = turret_worker
         self.mediator = mediator
         self.camera_stale_timeout_ms = camera_stale_timeout_ms
@@ -323,6 +330,9 @@ class ApplicationRuntime:
             if self.stereo_distance_worker is not None:
                 self.stereo_distance_worker.start()
                 self._active_components.add(_STEREO_DISTANCE_COMPONENT)
+            if self.stereo_diagnostics_reporter is not None:
+                self.stereo_diagnostics_reporter.start()
+                self._active_components.add(_STEREO_DIAGNOSTICS_COMPONENT)
         except RuntimeError as startup_error:
             failures = self._stop_active(_DEFAULT_SHUTDOWN_TIMEOUT_SECONDS)
             if failures:
@@ -438,6 +448,7 @@ class ApplicationRuntime:
     ) -> tuple[ApplicationShutdownFailure, ...]:
         failures: list[ApplicationShutdownFailure] = []
         ordered = (
+            (_STEREO_DIAGNOSTICS_COMPONENT, self.stereo_diagnostics_reporter),
             (_STEREO_RIGHT_COMPONENT, self.stereo_right_worker),
             (_STEREO_LEFT_COMPONENT, self.stereo_left_worker),
             (_OVERVIEW_COMPONENT, self.overview_worker),
@@ -591,6 +602,23 @@ def build_application_runtime(
             return None
 
         stereo_frame_sink.set_active_pairing_kind_provider(active_pairing_kind)
+    stereo_diagnostics_reporter = None
+    if (
+        stereo_right_worker is not None
+        and stereo_pairer is not None
+        and stereo_timestamp_pairer is not None
+    ):
+        stereo_diagnostics_reporter = StereoDiagnosticsReporter(
+            StereoRuntimeDiagnostics(
+                left_pipeline=stereo_left_worker.pipeline,
+                right_pipeline=stereo_right_worker.pipeline,
+                exact_pairer=stereo_pairer,
+                timestamp_pairer=stereo_timestamp_pairer,
+                target_joiner=stereo_target_joiner,
+                distance_worker=stereo_distance_worker,
+                mediator=mediator,
+            )
+        )
     return ApplicationRuntime(
         overview_worker=overview_worker,
         stereo_left_worker=stereo_left_worker,
@@ -599,6 +627,7 @@ def build_application_runtime(
         stereo_timestamp_pairer=stereo_timestamp_pairer,
         stereo_target_joiner=stereo_target_joiner,
         stereo_distance_worker=stereo_distance_worker,
+        stereo_diagnostics_reporter=stereo_diagnostics_reporter,
         turret_worker=turret_worker,
         mediator=mediator,
         camera_stale_timeout_ms=config.vision.camera_stale_timeout_ms,

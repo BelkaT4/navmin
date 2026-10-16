@@ -148,3 +148,50 @@ def test_exact_equal_timestamps_without_capture_ids_still_rejected():
                                   f(RIGHT, 1, 100, capture_id=9)) is None
     assert make_exact_stereo_pair(f(LEFT, 1, 100, capture_id=8),
                                   f(RIGHT, 1, 800, capture_id=8)) is not None
+
+
+def test_timestamp_diagnostics_count_bounds_timeouts_and_skew_rejections():
+    clock = FakeClock()
+    p = pairer(clock=clock, capacity=1, timeout=10, skew=30)
+    p.offer_frame(f(LEFT, 1, 100))
+    p.offer_frame(f(LEFT, 2, 200))
+    p.offer_frame(f(RIGHT, 1, 100))
+    p.offer_frame(f(RIGHT, 2, 400))
+    p.offer_frame(f(LEFT, 3, 350))
+    clock.advance_ms(10)
+    p.expire()
+
+    diagnostics = p.diagnostics
+    assert diagnostics.left_frames_seen == 3
+    assert diagnostics.right_frames_seen == 2
+    assert diagnostics.timestamp_pairs_emitted == 0
+    assert diagnostics.pending_left_superseded == 2
+    assert diagnostics.pair_attempts_expired == 1
+    assert diagnostics.right_frames_evicted_by_capacity == 1
+    assert diagnostics.right_frames_timed_out == 1
+    assert diagnostics.skew_rejected_candidates == 3
+
+
+def test_timestamp_skew_statistics_use_fixed_recent_window_and_nearest_rank():
+    p = TimestampStereoPairer(
+        right_frame_buffer_size=2,
+        pair_timeout_ms=100,
+        max_timestamp_skew_ms=30,
+        clock_ns=FakeClock(),
+        diagnostic_window_size=4,
+    )
+    p.start_generation(LEFT, 1)
+    p.start_generation(RIGHT, 1)
+    for index, skew_ms in enumerate((1, 2, 3, 4, 20), 1):
+        p.offer_frame(f(RIGHT, index, index * 100 + skew_ms))
+        assert p.offer_frame(f(LEFT, index, index * 100)) is not None
+
+    diagnostics = p.diagnostics
+    assert diagnostics.timestamp_pairs_emitted == 5
+    assert diagnostics.skew.sample_count == 5
+    assert diagnostics.skew.retained_sample_count == 4
+    assert diagnostics.skew.latest_ns == 20 * MS
+    assert diagnostics.skew.minimum_ns == 1 * MS
+    assert diagnostics.skew.maximum_ns == 20 * MS
+    assert diagnostics.skew.p50_ns == 3 * MS
+    assert diagnostics.skew.p95_ns == 20 * MS

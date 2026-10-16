@@ -1311,6 +1311,60 @@ def test_s5_stereo_distance_expires_without_falling_back_to_constant(
     assert mediator._current_distance is None
     assert mediator.distance_mode is mode
     assert mediator.manual_distance_m == 100
+    assert mediator.stereo_distance_diagnostics.accepted == 1
+    assert mediator.stereo_distance_diagnostics.stale_invalidations == 1
+
+
+def test_stereo_publication_diagnostics_separate_stale_lifecycle_and_shutdown() -> None:
+    clock = _FakeClock(2_000_000_000)
+    results: LatestValue[StereoDistanceCandidate] = LatestValue()
+    joiner = StereoTargetJoiner()
+    mediator, _, _ = _mediator(
+        main=CameraRole.STEREO_LEFT,
+        mode=TurretControlMode.TRACKING,
+        stereo_target_joiner=joiner,
+        stereo_distance_results=results,
+        distance_stale_timeout_ms=10,
+        clock_ns=clock,
+    )
+    frame = _accept_main(mediator)
+    request = _request(mediator, frame)
+    assert mediator.accept_target_lifecycle_event(_acquired(request))
+    mediator.set_distance_mode(DistanceMeasurementMode.STEREO_EXACT)
+    target = mediator.selected_target
+    assert target is not None
+    revision = joiner.state.intent_revision
+
+    clock.advance_ms(20)
+    results.publish(
+        _stereo_candidate(target, intent_revision=revision, timestamp_ns=1_000_000_000)
+    )
+    assert mediator.current_distance is None
+
+    mediator.set_distance_mode(DistanceMeasurementMode.STEREO_TIMESTAMP)
+    mediator.set_distance_mode(DistanceMeasurementMode.STEREO_EXACT)
+    results.publish(
+        _stereo_candidate(target, intent_revision=revision, timestamp_ns=clock())
+    )
+    assert mediator.current_distance is None
+
+    mediator.invalidate_distance_computation()
+    results.publish(
+        _stereo_candidate(
+            target,
+            intent_revision=joiner.state.intent_revision,
+            timestamp_ns=clock(),
+        )
+    )
+    assert mediator.current_distance is None
+
+    diagnostics = mediator.stereo_distance_diagnostics
+    assert diagnostics.candidates_received == 3
+    assert diagnostics.accepted == 0
+    assert diagnostics.rejected == 3
+    assert diagnostics.rejected_stale == 1
+    assert diagnostics.rejected_intent_revision_changed == 1
+    assert diagnostics.rejected_shutdown == 1
 
 
 def test_s4_constant_distance_never_time_stales() -> None:

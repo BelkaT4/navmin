@@ -23,7 +23,10 @@ from navmin.vision.stereo_distance import (
     reproject_disparity_point,
     validate_stereo_pair_geometry,
 )
-from navmin.vision.stereo_distance_worker import StereoDistanceWorker
+from navmin.vision.stereo_distance_worker import (
+    StereoDistanceFailureClass,
+    StereoDistanceWorker,
+)
 from navmin.vision.stereo_pairing import StereoFramePair, StereoPairIdentity
 from navmin.vision.stereo_target_join import StereoPairingKind, StereoTargetObservation
 from navmin.vision.stereo_timestamp_pairing import (
@@ -933,6 +936,12 @@ def test_distance_worker_keeps_only_latest_not_started_job() -> None:
         assert snapshot.value is not None
         assert snapshot.value.source_frame_id == 3
         assert calls == [1, 3]
+        diagnostics = worker.diagnostics
+        assert diagnostics.jobs_submitted == 3
+        assert diagnostics.pending_replacements == 1
+        assert diagnostics.computations_started == 2
+        assert diagnostics.computations_succeeded == 2
+        assert diagnostics.computations_failed == 0
     finally:
         worker.shutdown()
 
@@ -993,6 +1002,69 @@ def test_timestamp_distance_uses_single_s3_core_and_preserves_candidate_kind() -
         assert candidate.measured_timestamp_ns == 555_000
         assert candidate.source_frame_id == 19
         assert candidate.intent_revision == 5
+        success = worker.diagnostics.latest_success
+        assert success is not None
+        assert success.distance_m == pytest.approx(12.4)
+        assert success.median_disparity_px == pytest.approx(10.0)
+        assert success.valid_pixel_count == 12
+        assert success.valid_pixel_fraction == pytest.approx(1.0)
+        assert success.left_frame_id == 19
+        assert success.capture_id is None
+        assert success.pairing_kind is StereoPairingKind.TIMESTAMP
+        assert success.timestamp_skew_ns == 1_000
+    finally:
+        worker.shutdown()
+
+
+def test_distance_worker_classifies_failure_and_measures_compute_boundary() -> None:
+    first_started = Event()
+
+    class AdvancingClock:
+        def __init__(self) -> None:
+            self.value = 0
+
+        def __call__(self) -> int:
+            current = self.value
+            self.value += 7_000_000
+            return current
+
+    def compute(observation: StereoTargetObservation):
+        if observation.pair.left.frame_id == 1:
+            first_started.set()
+            return StereoDistanceFailure(
+                StereoDistanceFailureReason.INSUFFICIENT_VALID_PIXELS
+            )
+        return _worker_estimate(22.0)
+
+    worker = StereoDistanceWorker(
+        calibration=calibration(width=8, height=6),
+        compute=compute,
+        clock_ns=AdvancingClock(),
+    )
+    worker.start()
+    try:
+        assert worker.submit_observation(_worker_observation(1))
+        assert first_started.wait(1.0)
+        assert worker.submit_observation(_worker_observation(2))
+        snapshot = worker.results.wait_for_revision(0, 1.0)
+        assert snapshot is not None and snapshot.value is not None
+
+        diagnostics = worker.diagnostics
+        assert diagnostics.jobs_submitted == 2
+        assert diagnostics.computations_started == 2
+        assert diagnostics.computations_succeeded == 1
+        assert diagnostics.computations_failed == 1
+        assert diagnostics.failure_insufficient_valid_roi_pixels == 1
+        assert diagnostics.latest_failure_reason is (
+            StereoDistanceFailureReason.INSUFFICIENT_VALID_PIXELS
+        )
+        assert diagnostics.latest_failure_class is (
+            StereoDistanceFailureClass.INSUFFICIENT_VALID_ROI_PIXELS
+        )
+        assert diagnostics.compute_duration.sample_count == 2
+        assert diagnostics.compute_duration.latest_ns == 7_000_000
+        assert diagnostics.compute_duration.p50_ns == 7_000_000
+        assert diagnostics.compute_duration.p95_ns == 7_000_000
     finally:
         worker.shutdown()
 

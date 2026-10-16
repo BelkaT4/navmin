@@ -439,10 +439,12 @@ def test_enabled_stereo_pairer_receives_both_corrected_frame_paths_and_resets() 
     pairer = runtime.stereo_pairer
     joiner = runtime.stereo_target_joiner
     distance_worker = runtime.stereo_distance_worker
+    diagnostics_reporter = runtime.stereo_diagnostics_reporter
     assert pairer is not None
     assert runtime.stereo_timestamp_pairer is not None
     assert joiner is not None
     assert distance_worker is not None
+    assert diagnostics_reporter is not None
     assert runtime.stereo_right_worker is not None
     assert set(runtime.camera_bindings) == {
         CameraRole.OVERVIEW,
@@ -504,6 +506,7 @@ def test_enabled_stereo_pairer_receives_both_corrected_frame_paths_and_resets() 
     assert joiner.state.target is None
     assert joiner.observations.get() is None
     assert not distance_worker.is_alive()
+    assert not diagnostics_reporter.is_alive()
 
 
 def test_stereo_right_enabled_follows_startup_and_reverse_shutdown_order(

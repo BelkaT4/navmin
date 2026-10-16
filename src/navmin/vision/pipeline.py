@@ -281,6 +281,22 @@ class _PendingFrame:
     receive_timestamp_ns: int
 
 
+@dataclass(frozen=True, slots=True)
+class CameraRuntimeDiagnostics:
+    """Bounded read-only metrics for the current camera generation."""
+
+    camera: CameraRole
+    generation: int
+    frames_received: int
+    first_frame_timestamp_ns: int | None
+    latest_frame_timestamp_ns: int | None
+    decoded_width: int | None
+    decoded_height: int | None
+    capture_id_present_count: int
+    capture_id_missing_count: int
+    received_fps: float | None
+
+
 class VisionPipeline:
     """Owner-local prototype pipeline with barrier and latest-only result semantics."""
 
@@ -323,11 +339,47 @@ class VisionPipeline:
         self._generation = 0
         self._frame_id = 0
         self._state_lock = Lock()
+        self._diagnostic_frames_received = 0
+        self._diagnostic_first_frame_timestamp_ns: int | None = None
+        self._diagnostic_latest_frame_timestamp_ns: int | None = None
+        self._diagnostic_decoded_width: int | None = None
+        self._diagnostic_decoded_height: int | None = None
+        self._diagnostic_capture_id_present_count = 0
+        self._diagnostic_capture_id_missing_count = 0
 
     @property
     def generation(self) -> int:
         with self._state_lock:
             return self._generation
+
+    @property
+    def diagnostics(self) -> CameraRuntimeDiagnostics:
+        with self._state_lock:
+            first_ns = self._diagnostic_first_frame_timestamp_ns
+            latest_ns = self._diagnostic_latest_frame_timestamp_ns
+            frames = self._diagnostic_frames_received
+            elapsed_ns = (
+                None
+                if first_ns is None or latest_ns is None or latest_ns <= first_ns
+                else latest_ns - first_ns
+            )
+            received_fps = (
+                None
+                if elapsed_ns is None or frames < 2
+                else (frames - 1) * 1_000_000_000.0 / elapsed_ns
+            )
+            return CameraRuntimeDiagnostics(
+                camera=self.camera,
+                generation=self._generation,
+                frames_received=frames,
+                first_frame_timestamp_ns=first_ns,
+                latest_frame_timestamp_ns=latest_ns,
+                decoded_width=self._diagnostic_decoded_width,
+                decoded_height=self._diagnostic_decoded_height,
+                capture_id_present_count=self._diagnostic_capture_id_present_count,
+                capture_id_missing_count=self._diagnostic_capture_id_missing_count,
+                received_fps=received_fps,
+            )
 
     def set_processing_enabled(self, enabled: bool) -> None:
         self._processing_enabled = bool(enabled)
@@ -341,6 +393,7 @@ class VisionPipeline:
             self.target_control.discard_pending()
             self._processor.reset()
             self.latest_result.invalidate()
+            self._reset_diagnostics_locked()
             timestamp_ns = self._timestamp_clock_ns()
             self.status.publish(
                 CameraStatus(
@@ -488,6 +541,36 @@ class VisionPipeline:
             if receive_timestamp_ns is None
             else receive_timestamp_ns
         )
+        first_frame_evidence: tuple[int, int, int] | None = None
+        with self._state_lock:
+            if generation != self._generation:
+                return
+            self._diagnostic_frames_received += 1
+            self._diagnostic_latest_frame_timestamp_ns = received_ns
+            if capture_id is None:
+                self._diagnostic_capture_id_missing_count += 1
+            else:
+                self._diagnostic_capture_id_present_count += 1
+            if self._diagnostic_first_frame_timestamp_ns is None:
+                self._diagnostic_first_frame_timestamp_ns = received_ns
+                if image.ndim >= 2:
+                    self._diagnostic_decoded_width = int(image.shape[1])
+                    self._diagnostic_decoded_height = int(image.shape[0])
+                    first_frame_evidence = (
+                        generation,
+                        self._diagnostic_decoded_width,
+                        self._diagnostic_decoded_height,
+                    )
+        if first_frame_evidence is not None:
+            evidence_generation, width, height = first_frame_evidence
+            LOGGER.info(
+                "Vision decoded first frame camera=%s generation=%d "
+                "decoded_resolution=%dx%d",
+                self.camera.value,
+                evidence_generation,
+                width,
+                height,
+            )
         self._pending.publish(
             _PendingFrame(
                 generation=generation,
@@ -586,8 +669,18 @@ class VisionPipeline:
             )
         return result
 
+    def _reset_diagnostics_locked(self) -> None:
+        self._diagnostic_frames_received = 0
+        self._diagnostic_first_frame_timestamp_ns = None
+        self._diagnostic_latest_frame_timestamp_ns = None
+        self._diagnostic_decoded_width = None
+        self._diagnostic_decoded_height = None
+        self._diagnostic_capture_id_present_count = 0
+        self._diagnostic_capture_id_missing_count = 0
+
 
 __all__ = [
+    "CameraRuntimeDiagnostics",
     "CorrectedFrameSink",
     "DecodedFrame",
     "DecodedFrameSource",

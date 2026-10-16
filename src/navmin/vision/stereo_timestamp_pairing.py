@@ -9,6 +9,11 @@ from threading import Lock
 from time import monotonic_ns
 
 from navmin.contracts import CameraRole, CameraSessionStarted, FramePacket
+from navmin.vision.stereo_diagnostics import (
+    STEREO_DIAGNOSTIC_WINDOW_SIZE,
+    BoundedTimingSnapshot,
+    BoundedTimingStats,
+)
 from navmin.vision.stereo_pairing import StereoPairContractError
 
 DEFAULT_TIMESTAMP_PAIR_MAX_SKEW_MS = 30
@@ -62,6 +67,24 @@ class TimestampStereoPairerState:
 
 
 @dataclass(frozen=True, slots=True)
+class TimestampStereoPairerDiagnostics:
+    left_frames_seen: int
+    right_frames_seen: int
+    timestamp_pairs_emitted: int
+    pending_left_superseded: int
+    pair_attempts_expired: int
+    right_frames_evicted_by_capacity: int
+    right_frames_pruned_too_old: int
+    right_frames_timed_out: int
+    skew_rejected_candidates: int
+    generation_resets: int
+    max_timestamp_skew_ns: int
+    skew: BoundedTimingSnapshot
+    pending_left_frame_id: int | None = None
+    right_buffer_size: int = 0
+
+
+@dataclass(frozen=True, slots=True)
 class _TimedFrame:
     frame: FramePacket
     arrival_ns: int
@@ -77,6 +100,7 @@ class TimestampStereoPairer:
         pair_timeout_ms: int,
         max_timestamp_skew_ms: int = DEFAULT_TIMESTAMP_PAIR_MAX_SKEW_MS,
         clock_ns: Callable[[], int] = monotonic_ns,
+        diagnostic_window_size: int = STEREO_DIAGNOSTIC_WINDOW_SIZE,
     ) -> None:
         if right_frame_buffer_size < 1:
             raise ValueError("right_frame_buffer_size must be >= 1")
@@ -96,6 +120,17 @@ class TimestampStereoPairer:
         self._latest_pair: TimestampStereoFramePair | None = None
         self._last_left_frame_id: int | None = None
         self._last_right_frame_id: int | None = None
+        self._left_frames_seen = 0
+        self._right_frames_seen = 0
+        self._timestamp_pairs_emitted = 0
+        self._pending_left_superseded = 0
+        self._pair_attempts_expired = 0
+        self._right_frames_evicted_by_capacity = 0
+        self._right_frames_pruned_too_old = 0
+        self._right_frames_timed_out = 0
+        self._skew_rejected_candidates = 0
+        self._generation_resets = 0
+        self._skew_stats = BoundedTimingStats(window_size=diagnostic_window_size)
 
     def on_camera_session_started(self, session: CameraSessionStarted) -> None:
         self.start_generation(session.camera, session.generation)
@@ -124,6 +159,33 @@ class TimestampStereoPairer:
                 latest_skew_ns=identity.timestamp_skew_ns if identity else None,
             )
 
+    @property
+    def diagnostics(self) -> TimestampStereoPairerDiagnostics:
+        with self._lock:
+            self._expire_locked(self._clock_ns())
+            return TimestampStereoPairerDiagnostics(
+                left_frames_seen=self._left_frames_seen,
+                right_frames_seen=self._right_frames_seen,
+                timestamp_pairs_emitted=self._timestamp_pairs_emitted,
+                pending_left_superseded=self._pending_left_superseded,
+                pair_attempts_expired=self._pair_attempts_expired,
+                right_frames_evicted_by_capacity=(
+                    self._right_frames_evicted_by_capacity
+                ),
+                right_frames_pruned_too_old=self._right_frames_pruned_too_old,
+                right_frames_timed_out=self._right_frames_timed_out,
+                skew_rejected_candidates=self._skew_rejected_candidates,
+                generation_resets=self._generation_resets,
+                max_timestamp_skew_ns=self._max_skew_ns,
+                skew=self._skew_stats.snapshot(),
+                pending_left_frame_id=(
+                    None
+                    if self._pending_left is None
+                    else self._pending_left.frame.frame_id
+                ),
+                right_buffer_size=len(self._right_buffer),
+            )
+
     def start_generation(self, camera: CameraRole, generation: int) -> None:
         if camera not in (CameraRole.STEREO_LEFT, CameraRole.STEREO_RIGHT):
             raise StereoPairContractError("stereo pairer accepts only stereo cameras")
@@ -136,6 +198,7 @@ class TimestampStereoPairer:
                 if generation == self._right_generation:
                     return
                 self._right_generation = generation
+            self._generation_resets += 1
             self._clear_locked()
 
     def offer_frame(self, frame: FramePacket) -> TimestampStereoFramePair | None:
@@ -143,6 +206,10 @@ class TimestampStereoPairer:
             raise StereoPairContractError("stereo pairer accepts only stereo cameras")
         now = self._clock_ns()
         with self._lock:
+            if frame.camera is CameraRole.STEREO_LEFT:
+                self._left_frames_seen += 1
+            else:
+                self._right_frames_seen += 1
             self._expire_locked(now)
             if frame.camera is CameraRole.STEREO_LEFT:
                 if (
@@ -156,6 +223,8 @@ class TimestampStereoPairer:
                 ):
                     return None
                 self._last_left_frame_id = frame.frame_id
+                if self._pending_left is not None:
+                    self._pending_left_superseded += 1
                 self._pending_left = None  # The new Left supersedes the old attempt.
                 self._prune_right_older_than_left_locked(frame)
                 index = self._nearest_right_index(frame)
@@ -179,11 +248,16 @@ class TimestampStereoPairer:
             self._last_right_frame_id = frame.frame_id
             if self._pending_left is not None:
                 left = self._pending_left.frame
-                if abs(left.receive_timestamp_ns - frame.receive_timestamp_ns) <= self._max_skew_ns:
+                skew_ns = abs(
+                    left.receive_timestamp_ns - frame.receive_timestamp_ns
+                )
+                if skew_ns <= self._max_skew_ns:
                     self._pending_left = None
                     return self._publish_locked(left, frame)
+                self._skew_rejected_candidates += 1
             if len(self._right_buffer) == self._capacity:
                 self._right_buffer.popleft()
+                self._right_frames_evicted_by_capacity += 1
             self._right_buffer.append(_TimedFrame(frame, now))
             return None
 
@@ -199,14 +273,16 @@ class TimestampStereoPairer:
 
     def _prune_right_older_than_left_locked(self, left: FramePacket) -> None:
         oldest_useful_timestamp_ns = left.receive_timestamp_ns - self._max_skew_ns
+        previous_size = len(self._right_buffer)
         self._right_buffer = deque(
             item
             for item in self._right_buffer
             if item.frame.receive_timestamp_ns >= oldest_useful_timestamp_ns
         )
+        self._right_frames_pruned_too_old += previous_size - len(self._right_buffer)
 
     def _nearest_right_index(self, left: FramePacket) -> int | None:
-        candidates = (
+        candidates = [
             (
                 abs(item.frame.receive_timestamp_ns - left.receive_timestamp_ns),
                 item.frame.receive_timestamp_ns,
@@ -214,10 +290,11 @@ class TimestampStereoPairer:
                 index,
             )
             for index, item in enumerate(self._right_buffer)
-        )
+        ]
         eligible = [
             candidate for candidate in candidates if candidate[0] <= self._max_skew_ns
         ]
+        self._skew_rejected_candidates += len(candidates) - len(eligible)
         return min(eligible)[3] if eligible else None
 
     def _publish_locked(
@@ -238,6 +315,8 @@ class TimestampStereoPairer:
             left,
             right,
         )
+        self._timestamp_pairs_emitted += 1
+        self._skew_stats.add(self._latest_pair.identity.timestamp_skew_ns)
         return self._latest_pair
 
     def _expire_locked(self, now: int) -> None:
@@ -246,11 +325,14 @@ class TimestampStereoPairer:
             and now - self._pending_left.arrival_ns >= self._timeout_ns
         ):
             self._pending_left = None
+            self._pair_attempts_expired += 1
+        previous_size = len(self._right_buffer)
         self._right_buffer = deque(
             item
             for item in self._right_buffer
             if now - item.arrival_ns < self._timeout_ns
         )
+        self._right_frames_timed_out += previous_size - len(self._right_buffer)
 
     def _clear_locked(self) -> None:
         self._pending_left = None
@@ -258,3 +340,13 @@ class TimestampStereoPairer:
         self._latest_pair = None
         self._last_left_frame_id = None
         self._last_right_frame_id = None
+
+
+__all__ = [
+    "DEFAULT_TIMESTAMP_PAIR_MAX_SKEW_MS",
+    "TimestampStereoFramePair",
+    "TimestampStereoPairIdentity",
+    "TimestampStereoPairer",
+    "TimestampStereoPairerDiagnostics",
+    "TimestampStereoPairerState",
+]

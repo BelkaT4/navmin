@@ -943,3 +943,58 @@ def test_production_stereo_sink_routes_only_selected_pairing_kind() -> None:
     sink.on_corrected_frame(frame(CameraRole.STEREO_RIGHT, frame_id=4, capture_id=100))
     sink.on_corrected_frame(frame(CameraRole.STEREO_LEFT, frame_id=4, capture_id=100))
     assert len(joiner.pairs) == 2
+
+
+def test_exact_pairer_diagnostics_count_only_provable_events() -> None:
+    clock = FakeClock()
+    stereo_pairer = pairer(clock=clock, capacity=1, timeout_ms=10)
+    start_pairer_sessions(stereo_pairer)
+
+    stereo_pairer.offer_frame(frame(CameraRole.STEREO_LEFT, capture_id=None))
+    stereo_pairer.offer_frame(frame(CameraRole.STEREO_LEFT, capture_id=1))
+    stereo_pairer.offer_frame(frame(CameraRole.STEREO_LEFT, capture_id=2))
+    stereo_pairer.offer_frame(frame(CameraRole.STEREO_RIGHT, capture_id=3))
+    stereo_pairer.offer_frame(frame(CameraRole.STEREO_RIGHT, capture_id=4))
+    clock.advance_ms(10)
+    stereo_pairer.expire()
+    stereo_pairer.offer_frame(frame(CameraRole.STEREO_RIGHT, capture_id=5))
+    paired = stereo_pairer.offer_frame(
+        frame(CameraRole.STEREO_LEFT, capture_id=5)
+    )
+
+    assert paired is not None
+    diagnostics = stereo_pairer.diagnostics
+    assert diagnostics.left_frames_seen == 4
+    assert diagnostics.right_frames_seen == 3
+    assert diagnostics.capture_id_missing == 1
+    assert diagnostics.exact_pairs_emitted == 1
+    assert diagnostics.pending_left_superseded == 1
+    assert diagnostics.right_capacity_evictions == 1
+    assert diagnostics.pair_attempts_expired == 2
+    assert diagnostics.unmatched_discarded == 4
+    assert diagnostics.generation_resets == 2
+
+
+def test_target_join_diagnostics_cover_success_and_exact_left_mismatch() -> None:
+    joiner = _active_joiner(generation=3, track_id=7)
+    first = frame(
+        CameraRole.STEREO_LEFT,
+        generation=3,
+        frame_id=1,
+        capture_id=1,
+    )
+    second = replace(first, frame_id=2, capture_id=2)
+    joiner.offer_pair(_exact_pair_for_left(first))
+    joiner.offer_pair(_exact_pair_for_left(second))
+    joiner.offer_vision_result(_vision_result_for(first))
+    observation = joiner.offer_vision_result(_vision_result_for(second))
+
+    assert observation is not None
+    diagnostics = joiner.diagnostics
+    assert diagnostics.pairs_received == 2
+    assert diagnostics.vision_results_received == 2
+    assert diagnostics.target_observations_emitted == 1
+    assert diagnostics.pair_superseded_unmatched == 1
+    assert diagnostics.vision_result_superseded_unmatched == 1
+    assert diagnostics.rejected_wrong_frame_id == 1
+    assert diagnostics.generation_resets == 1

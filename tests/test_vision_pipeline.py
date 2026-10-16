@@ -705,3 +705,82 @@ def test_stale_corrected_frame_is_not_sent_to_sink_after_concurrent_restart() ->
     assert stereo_pairer.state.left_generation == 2
     assert stereo_pairer.state.pending_left_capture_id is None
     assert stereo_pairer.latest_pair is None
+
+
+def test_camera_diagnostics_report_actual_decoded_shape_before_correction_failure(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    pipeline = VisionPipeline(
+        camera=CameraRole.STEREO_LEFT,
+        corrector=stereo_left_corrector(stereo_calibration()),
+        processor=_RecordingProcessor(),
+    )
+    pipeline.start()
+    wrong_shape = np.zeros((HEIGHT - 4, WIDTH, 3), dtype=np.uint8)
+
+    with caplog.at_level("INFO", logger="navmin.vision.pipeline"):
+        pipeline.submit_decoded_frame(
+            wrong_shape,
+            capture_id=None,
+            receive_timestamp_ns=1_000_000_000,
+        )
+        with pytest.raises(WorkingFrameError, match="source resolution"):
+            pipeline.process_latest()
+
+    diagnostics = pipeline.diagnostics
+    assert diagnostics.frames_received == 1
+    assert (diagnostics.decoded_width, diagnostics.decoded_height) == (
+        WIDTH,
+        HEIGHT - 4,
+    )
+    assert diagnostics.capture_id_missing_count == 1
+    assert diagnostics.capture_id_present_count == 0
+    assert diagnostics.received_fps is None
+    assert caplog.messages.count(
+        "Vision decoded first frame camera=stereo_left generation=1 "
+        f"decoded_resolution={WIDTH}x{HEIGHT - 4}"
+    ) == 1
+
+
+def test_camera_diagnostics_log_once_per_generation_and_measure_fps(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    pipeline = VisionPipeline(
+        camera=CameraRole.STEREO_RIGHT,
+        corrector=stereo_right_corrector(stereo_calibration()),
+        processor=_RecordingProcessor(),
+    )
+
+    with caplog.at_level("INFO", logger="navmin.vision.pipeline"):
+        pipeline.start()
+        pipeline.submit_decoded_frame(
+            source_frame(1), capture_id=1, receive_timestamp_ns=1_000_000_000
+        )
+        pipeline.submit_decoded_frame(
+            source_frame(2), capture_id=None, receive_timestamp_ns=1_050_000_000
+        )
+        first_generation = pipeline.diagnostics
+        pipeline.start()
+        pipeline.submit_decoded_frame(
+            source_frame(3), capture_id=None, receive_timestamp_ns=2_000_000_000
+        )
+
+    assert first_generation.frames_received == 2
+    assert first_generation.capture_id_present_count == 1
+    assert first_generation.capture_id_missing_count == 1
+    assert first_generation.received_fps == pytest.approx(20.0)
+    assert pipeline.diagnostics.generation == 2
+    assert pipeline.diagnostics.frames_received == 1
+    resolution_messages = [
+        message for message in caplog.messages if "decoded_resolution=" in message
+    ]
+    assert resolution_messages == [
+        (
+            f"Vision decoded first frame camera=stereo_right generation=1 "
+            f"decoded_resolution={WIDTH}x{HEIGHT}"
+        ),
+        (
+            f"Vision decoded first frame camera=stereo_right generation=2 "
+            f"decoded_resolution={WIDTH}x{HEIGHT}"
+        ),
+    ]

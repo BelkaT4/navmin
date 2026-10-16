@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
+from dataclasses import dataclass
+from enum import Enum
 from math import isfinite
+from threading import Lock
 from time import monotonic_ns
 from typing import Protocol
 
@@ -48,6 +51,35 @@ _DISCONNECTED_CAMERA_STATES = (
     CameraState.ERROR,
     CameraState.STOPPED,
 )
+
+
+class StereoDistanceRejectionReason(Enum):
+    """Existing Core revalidation decisions exposed for diagnostics."""
+
+    MODE_MISMATCH = "mode_mismatch"
+    INTENT_REVISION_CHANGED = "intent_revision_changed"
+    TARGET_CHANGED = "target_changed"
+    GENERATION_INVALID = "generation_invalid"
+    MAIN_CAMERA_MISMATCH = "main_camera_mismatch"
+    STALE = "stale"
+    SHUTDOWN = "shutdown"
+    INVALID_CANDIDATE = "invalid_candidate"
+
+
+@dataclass(frozen=True, slots=True)
+class StereoDistancePublicationDiagnostics:
+    candidates_received: int
+    accepted: int
+    rejected: int
+    rejected_mode_mismatch: int
+    rejected_intent_revision_changed: int
+    rejected_target_changed: int
+    rejected_generation_invalid: int
+    rejected_main_camera_mismatch: int
+    rejected_stale: int
+    rejected_shutdown: int
+    rejected_invalid_candidate: int
+    stale_invalidations: int
 
 
 class TurretPort(Protocol):
@@ -176,6 +208,14 @@ class Mediator:
         self._clock_ns = clock_ns
         self._distance_intent_revision = 0
         self._current_distance: DistanceResult | None = None
+        self._distance_shutdown = False
+        self._distance_diagnostics_lock = Lock()
+        self._distance_candidates_received = 0
+        self._distance_candidates_accepted = 0
+        self._distance_rejections = {
+            reason: 0 for reason in StereoDistanceRejectionReason
+        }
+        self._distance_stale_invalidations = 0
         self._next_selection_id = 1
         self._latest_results: dict[CameraRole, VisionResult | None] = {
             camera: None for camera in _NORMAL_CAMERAS
@@ -236,8 +276,45 @@ class Mediator:
             > self._distance_stale_timeout_ns
         ):
             self._current_distance = None
+            with self._distance_diagnostics_lock:
+                self._distance_stale_invalidations += 1
             return None
         return distance
+
+    @property
+    def stereo_distance_diagnostics(self) -> StereoDistancePublicationDiagnostics:
+        with self._distance_diagnostics_lock:
+            rejected = sum(self._distance_rejections.values())
+            return StereoDistancePublicationDiagnostics(
+                candidates_received=self._distance_candidates_received,
+                accepted=self._distance_candidates_accepted,
+                rejected=rejected,
+                rejected_mode_mismatch=self._distance_rejections[
+                    StereoDistanceRejectionReason.MODE_MISMATCH
+                ],
+                rejected_intent_revision_changed=self._distance_rejections[
+                    StereoDistanceRejectionReason.INTENT_REVISION_CHANGED
+                ],
+                rejected_target_changed=self._distance_rejections[
+                    StereoDistanceRejectionReason.TARGET_CHANGED
+                ],
+                rejected_generation_invalid=self._distance_rejections[
+                    StereoDistanceRejectionReason.GENERATION_INVALID
+                ],
+                rejected_main_camera_mismatch=self._distance_rejections[
+                    StereoDistanceRejectionReason.MAIN_CAMERA_MISMATCH
+                ],
+                rejected_stale=self._distance_rejections[
+                    StereoDistanceRejectionReason.STALE
+                ],
+                rejected_shutdown=self._distance_rejections[
+                    StereoDistanceRejectionReason.SHUTDOWN
+                ],
+                rejected_invalid_candidate=self._distance_rejections[
+                    StereoDistanceRejectionReason.INVALID_CANDIDATE
+                ],
+                stale_invalidations=self._distance_stale_invalidations,
+            )
 
     def set_distance_mode(self, mode: DistanceMeasurementMode) -> None:
         if not isinstance(mode, DistanceMeasurementMode):
@@ -694,6 +771,7 @@ class Mediator:
 
     def invalidate_distance_computation(self) -> None:
         """Invalidate stereo work and close target joining for shutdown."""
+        self._distance_shutdown = True
         self._invalidate_distance_intent()
         joiner = self._stereo_target_joiner
         if joiner is not None:
@@ -710,8 +788,15 @@ class Mediator:
         candidate = snapshot.value
         if candidate is None:
             return
-        if not self._accept_stereo_distance_candidate(candidate):
+        with self._distance_diagnostics_lock:
+            self._distance_candidates_received += 1
+        rejection_reason = self._stereo_distance_rejection_reason(candidate)
+        if rejection_reason is not None:
+            with self._distance_diagnostics_lock:
+                self._distance_rejections[rejection_reason] += 1
             return
+        with self._distance_diagnostics_lock:
+            self._distance_candidates_accepted += 1
         self._current_distance = DistanceResult(
             target=candidate.target,
             distance_m=candidate.distance_m,
@@ -725,35 +810,53 @@ class Mediator:
         self,
         candidate: StereoDistanceCandidatePort,
     ) -> bool:
+        return self._stereo_distance_rejection_reason(candidate) is None
+
+    def _stereo_distance_rejection_reason(
+        self,
+        candidate: StereoDistanceCandidatePort,
+    ) -> StereoDistanceRejectionReason | None:
         now_ns = self._clock_ns()
-        return bool(
-            candidate.intent_revision == self._distance_intent_revision
-            and (
-                (
-                    self._distance_mode is DistanceMeasurementMode.STEREO_EXACT
-                    and candidate.pairing_kind is StereoPairingKind.EXACT
-                    and isinstance(candidate.capture_id, int)
-                    and not isinstance(candidate.capture_id, bool)
-                )
-                or (
-                    self._distance_mode is DistanceMeasurementMode.STEREO_TIMESTAMP
-                    and candidate.pairing_kind is StereoPairingKind.TIMESTAMP
-                    and candidate.capture_id is None
-                )
-            )
-            and self._main_camera is CameraRole.STEREO_LEFT
-            and self._selected_target == candidate.target
-            and candidate.target.camera is CameraRole.STEREO_LEFT
-            and self._session_gate.accepts(
-                candidate.target.camera, candidate.target.generation
-            )
-            and candidate.source_frame_id >= 0
-            and isfinite(candidate.distance_m)
-            and candidate.distance_m > 0.0
-            and candidate.measured_timestamp_ns <= now_ns
-            and now_ns - candidate.measured_timestamp_ns
-            <= self._distance_stale_timeout_ns
+        if self._distance_shutdown:
+            return StereoDistanceRejectionReason.SHUTDOWN
+        if candidate.intent_revision != self._distance_intent_revision:
+            return StereoDistanceRejectionReason.INTENT_REVISION_CHANGED
+        mode_matches = (
+            self._distance_mode is DistanceMeasurementMode.STEREO_EXACT
+            and candidate.pairing_kind is StereoPairingKind.EXACT
+            and isinstance(candidate.capture_id, int)
+            and not isinstance(candidate.capture_id, bool)
+        ) or (
+            self._distance_mode is DistanceMeasurementMode.STEREO_TIMESTAMP
+            and candidate.pairing_kind is StereoPairingKind.TIMESTAMP
+            and candidate.capture_id is None
         )
+        if not mode_matches:
+            return StereoDistanceRejectionReason.MODE_MISMATCH
+        if self._main_camera is not CameraRole.STEREO_LEFT:
+            return StereoDistanceRejectionReason.MAIN_CAMERA_MISMATCH
+        if (
+            self._selected_target != candidate.target
+            or candidate.target.camera is not CameraRole.STEREO_LEFT
+        ):
+            return StereoDistanceRejectionReason.TARGET_CHANGED
+        if not self._session_gate.accepts(
+            candidate.target.camera, candidate.target.generation
+        ):
+            return StereoDistanceRejectionReason.GENERATION_INVALID
+        if (
+            candidate.source_frame_id < 0
+            or not isfinite(candidate.distance_m)
+            or candidate.distance_m <= 0.0
+            or candidate.measured_timestamp_ns > now_ns
+        ):
+            return StereoDistanceRejectionReason.INVALID_CANDIDATE
+        if (
+            now_ns - candidate.measured_timestamp_ns
+            > self._distance_stale_timeout_ns
+        ):
+            return StereoDistanceRejectionReason.STALE
+        return None
 
     def _invalidate_distance_intent(self) -> None:
         self._distance_intent_revision += 1

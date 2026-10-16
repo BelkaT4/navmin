@@ -64,6 +64,21 @@ class StereoPairerState:
 
 
 @dataclass(frozen=True, slots=True)
+class StereoPairerDiagnostics:
+    """Cumulative exact-pairing evidence without changing pairing decisions."""
+
+    left_frames_seen: int
+    right_frames_seen: int
+    exact_pairs_emitted: int
+    capture_id_missing: int
+    unmatched_discarded: int
+    pending_left_superseded: int
+    right_capacity_evictions: int
+    pair_attempts_expired: int
+    generation_resets: int
+
+
+@dataclass(frozen=True, slots=True)
 class _TimedFrame:
     frame: FramePacket
     arrival_ns: int
@@ -98,6 +113,15 @@ class StereoPairer:
         self._right_buffer: deque[_TimedFrame] = deque()
         self._pending_left: _TimedFrame | None = None
         self._latest_pair: StereoFramePair | None = None
+        self._left_frames_seen = 0
+        self._right_frames_seen = 0
+        self._exact_pairs_emitted = 0
+        self._capture_id_missing = 0
+        self._unmatched_discarded = 0
+        self._pending_left_superseded = 0
+        self._right_capacity_evictions = 0
+        self._pair_attempts_expired = 0
+        self._generation_resets = 0
 
     def on_camera_session_started(self, session: CameraSessionStarted) -> None:
         """Accept a Vision camera-session boundary through the corrected-frame seam."""
@@ -132,6 +156,22 @@ class StereoPairer:
                 ),
             )
 
+    @property
+    def diagnostics(self) -> StereoPairerDiagnostics:
+        with self._lock:
+            self._expire_locked(self._clock_ns())
+            return StereoPairerDiagnostics(
+                left_frames_seen=self._left_frames_seen,
+                right_frames_seen=self._right_frames_seen,
+                exact_pairs_emitted=self._exact_pairs_emitted,
+                capture_id_missing=self._capture_id_missing,
+                unmatched_discarded=self._unmatched_discarded,
+                pending_left_superseded=self._pending_left_superseded,
+                right_capacity_evictions=self._right_capacity_evictions,
+                pair_attempts_expired=self._pair_attempts_expired,
+                generation_resets=self._generation_resets,
+            )
+
     def start_generation(self, camera: CameraRole, generation: int) -> None:
         """Apply a camera-session generation barrier.
 
@@ -149,7 +189,9 @@ class StereoPairer:
                 if self._right_generation == generation:
                     return
                 self._right_generation = generation
-            self._clear_pairing_state_locked()
+            self._generation_resets += 1
+            self._discard_unmatched_state_locked()
+            self._latest_pair = None
 
     def offer_frame(self, frame: FramePacket) -> StereoFramePair | None:
         """Offer one corrected frame without waiting for the opposite camera."""
@@ -157,6 +199,12 @@ class StereoPairer:
             raise StereoPairContractError("stereo pairer accepts only stereo cameras")
         now_ns = self._clock_ns()
         with self._lock:
+            if frame.camera is CameraRole.STEREO_LEFT:
+                self._left_frames_seen += 1
+            else:
+                self._right_frames_seen += 1
+            if frame.capture_id is None:
+                self._capture_id_missing += 1
             self._expire_locked(now_ns)
             if frame.camera is CameraRole.STEREO_LEFT:
                 return self._offer_left_locked(frame, now_ns)
@@ -172,7 +220,8 @@ class StereoPairer:
         with self._lock:
             self._left_generation = None
             self._right_generation = None
-            self._clear_pairing_state_locked()
+            self._discard_unmatched_state_locked()
+            self._latest_pair = None
 
     def _offer_left_locked(
         self,
@@ -204,6 +253,9 @@ class StereoPairer:
         ):
             return None
 
+        if self._pending_left is not None:
+            self._pending_left_superseded += 1
+            self._unmatched_discarded += 1
         self._pending_left = _TimedFrame(frame=frame, arrival_ns=now_ns)
         return None
 
@@ -234,6 +286,8 @@ class StereoPairer:
 
         if len(self._right_buffer) == self._right_frame_buffer_size:
             self._right_buffer.popleft()
+            self._right_capacity_evictions += 1
+            self._unmatched_discarded += 1
         self._right_buffer.append(_TimedFrame(frame=frame, arrival_ns=now_ns))
         return None
 
@@ -246,6 +300,7 @@ class StereoPairer:
         if pair is None:  # Defensive: callers reach here only after exact-ID match.
             raise AssertionError("exact stereo pair unexpectedly unavailable")
         self._latest_pair = pair
+        self._exact_pairs_emitted += 1
         return pair
 
     def _find_right_index_locked(self, capture_id: int) -> int | None:
@@ -269,17 +324,30 @@ class StereoPairer:
             and now_ns - self._pending_left.arrival_ns >= self._pair_timeout_ns
         ):
             self._pending_left = None
+            self._pair_attempts_expired += 1
+            self._unmatched_discarded += 1
         if self._right_buffer:
+            previous_size = len(self._right_buffer)
             self._right_buffer = deque(
                 timed
                 for timed in self._right_buffer
                 if now_ns - timed.arrival_ns < self._pair_timeout_ns
             )
+            expired = previous_size - len(self._right_buffer)
+            self._pair_attempts_expired += expired
+            self._unmatched_discarded += expired
 
     def _clear_pairing_state_locked(self) -> None:
         self._right_buffer.clear()
         self._pending_left = None
         self._latest_pair = None
+
+    def _discard_unmatched_state_locked(self) -> None:
+        self._unmatched_discarded += len(self._right_buffer)
+        if self._pending_left is not None:
+            self._unmatched_discarded += 1
+        self._right_buffer.clear()
+        self._pending_left = None
 
 
 def make_exact_stereo_pair(
@@ -317,6 +385,7 @@ __all__ = [
     "StereoPairContractError",
     "StereoPairIdentity",
     "StereoPairer",
+    "StereoPairerDiagnostics",
     "StereoPairerState",
     "make_exact_stereo_pair",
 ]
