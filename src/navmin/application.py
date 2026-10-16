@@ -24,7 +24,7 @@ from navmin.contracts import (
     TurretConnectionState,
     TurretState,
 )
-from navmin.core import Mediator
+from navmin.core import DistanceMeasurementMode, Mediator
 from navmin.turret.worker import TransportFactory, TurretWorker
 from navmin.ui.bridge import CameraUiBinding
 from navmin.vision.camera_source import create_camera_source
@@ -42,9 +42,11 @@ from navmin.vision.pipeline import (
 from navmin.vision.stereo_distance_worker import StereoDistanceWorker
 from navmin.vision.stereo_pairing import StereoPairer
 from navmin.vision.stereo_target_join import (
+    StereoPairingKind,
     StereoPairingTargetJoinSink,
     StereoTargetJoiner,
 )
+from navmin.vision.stereo_timestamp_pairing import TimestampStereoPairer
 
 LOGGER = logging.getLogger(__name__)
 
@@ -110,6 +112,7 @@ class ApplicationRuntime:
         stereo_left_worker: CameraWorker,
         stereo_right_worker: CameraWorker | None,
         stereo_pairer: StereoPairer | None,
+        stereo_timestamp_pairer: TimestampStereoPairer | None,
         stereo_target_joiner: StereoTargetJoiner | None,
         stereo_distance_worker: StereoDistanceWorker | None,
         turret_worker: TurretWorker,
@@ -126,6 +129,7 @@ class ApplicationRuntime:
         self.stereo_left_worker = stereo_left_worker
         self.stereo_right_worker = stereo_right_worker
         self.stereo_pairer = stereo_pairer
+        self.stereo_timestamp_pairer = stereo_timestamp_pairer
         self.stereo_target_joiner = stereo_target_joiner
         self.stereo_distance_worker = stereo_distance_worker
         self.turret_worker = turret_worker
@@ -332,6 +336,8 @@ class ApplicationRuntime:
             self._shutdown_complete = not self._active_components
             if self.stereo_pairer is not None:
                 self.stereo_pairer.reset()
+            if self.stereo_timestamp_pairer is not None:
+                self.stereo_timestamp_pairer.reset()
             if self.stereo_target_joiner is not None:
                 self.stereo_target_joiner.reset()
             raise
@@ -355,6 +361,8 @@ class ApplicationRuntime:
         failures.extend(self._stop_active(timeout))
         if self.stereo_pairer is not None:
             self.stereo_pairer.reset()
+        if self.stereo_timestamp_pairer is not None:
+            self.stereo_timestamp_pairer.reset()
         if self.stereo_target_joiner is not None:
             self.stereo_target_joiner.reset()
         self._shutdown_complete = not self._active_components
@@ -494,6 +502,7 @@ def build_application_runtime(
 
     stereo_config = config.vision.distance.stereo
     stereo_pairer = None
+    stereo_timestamp_pairer = None
     stereo_target_joiner = None
     stereo_distance_worker = None
     stereo_frame_sink = None
@@ -506,6 +515,10 @@ def build_application_runtime(
             right_frame_buffer_size=stereo_config.right_frame_buffer_size,
             pair_timeout_ms=stereo_config.pair_timeout_ms,
         )
+        stereo_timestamp_pairer = TimestampStereoPairer(
+            right_frame_buffer_size=stereo_config.right_frame_buffer_size,
+            pair_timeout_ms=stereo_config.pair_timeout_ms,
+        )
         stereo_distance_worker = StereoDistanceWorker(
             calibration=stereo_calibration,
         )
@@ -515,6 +528,7 @@ def build_application_runtime(
         stereo_frame_sink = StereoPairingTargetJoinSink(
             stereo_pairer,
             stereo_target_joiner,
+            timestamp_pairer=stereo_timestamp_pairer,
         )
 
     overview_worker = build_camera_worker(
@@ -567,11 +581,22 @@ def build_application_runtime(
             ),
         },
     )
+    if stereo_frame_sink is not None:
+        def active_pairing_kind() -> StereoPairingKind | None:
+            mode = mediator.distance_mode
+            if mode is DistanceMeasurementMode.STEREO_EXACT:
+                return StereoPairingKind.EXACT
+            if mode is DistanceMeasurementMode.STEREO_TIMESTAMP:
+                return StereoPairingKind.TIMESTAMP
+            return None
+
+        stereo_frame_sink.set_active_pairing_kind_provider(active_pairing_kind)
     return ApplicationRuntime(
         overview_worker=overview_worker,
         stereo_left_worker=stereo_left_worker,
         stereo_right_worker=stereo_right_worker,
         stereo_pairer=stereo_pairer,
+        stereo_timestamp_pairer=stereo_timestamp_pairer,
         stereo_target_joiner=stereo_target_joiner,
         stereo_distance_worker=stereo_distance_worker,
         turret_worker=turret_worker,

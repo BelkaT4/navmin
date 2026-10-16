@@ -35,6 +35,7 @@ from navmin.contracts import (
     TurretState,
     VisionResult,
 )
+from navmin.vision.stereo_target_join import StereoPairingKind
 
 from .aiming import Aiming
 from .distance import DistanceMeasurementMode, quantize_constant_distance
@@ -81,12 +82,13 @@ class StereoDistanceCandidatePort(Protocol):
     intent_revision: int
     distance_m: float
     source_frame_id: int
-    capture_id: int
+    capture_id: int | None
     measured_timestamp_ns: int
+    pairing_kind: StereoPairingKind
 
 
 class StereoTargetJoinPort(Protocol):
-    """Narrow boundary for exact stereo pair/target frame joining."""
+    """Narrow boundary for selected stereo pair/target frame joining."""
 
     def start_generation(self, generation: int) -> None: ...
 
@@ -677,7 +679,10 @@ class Mediator:
             return
         target = self._selected_target
         if (
-            self._distance_mode is DistanceMeasurementMode.STEREO_EXACT
+            self._distance_mode in (
+                DistanceMeasurementMode.STEREO_EXACT,
+                DistanceMeasurementMode.STEREO_TIMESTAMP,
+            )
             and self._main_camera is CameraRole.STEREO_LEFT
             and target is not None
             and target.camera is CameraRole.STEREO_LEFT
@@ -688,7 +693,7 @@ class Mediator:
         joiner.set_target(None, intent_revision=self._distance_intent_revision)
 
     def invalidate_distance_computation(self) -> None:
-        """Invalidate stereo work and close exact joining for shutdown."""
+        """Invalidate stereo work and close target joining for shutdown."""
         self._invalidate_distance_intent()
         joiner = self._stereo_target_joiner
         if joiner is not None:
@@ -723,7 +728,19 @@ class Mediator:
         now_ns = self._clock_ns()
         return bool(
             candidate.intent_revision == self._distance_intent_revision
-            and self._distance_mode is DistanceMeasurementMode.STEREO_EXACT
+            and (
+                (
+                    self._distance_mode is DistanceMeasurementMode.STEREO_EXACT
+                    and candidate.pairing_kind is StereoPairingKind.EXACT
+                    and isinstance(candidate.capture_id, int)
+                    and not isinstance(candidate.capture_id, bool)
+                )
+                or (
+                    self._distance_mode is DistanceMeasurementMode.STEREO_TIMESTAMP
+                    and candidate.pairing_kind is StereoPairingKind.TIMESTAMP
+                    and candidate.capture_id is None
+                )
+            )
             and self._main_camera is CameraRole.STEREO_LEFT
             and self._selected_target == candidate.target
             and candidate.target.camera is CameraRole.STEREO_LEFT

@@ -25,7 +25,11 @@ from navmin.vision.stereo_distance import (
 )
 from navmin.vision.stereo_distance_worker import StereoDistanceWorker
 from navmin.vision.stereo_pairing import StereoFramePair, StereoPairIdentity
-from navmin.vision.stereo_target_join import StereoTargetObservation
+from navmin.vision.stereo_target_join import StereoPairingKind, StereoTargetObservation
+from navmin.vision.stereo_timestamp_pairing import (
+    TimestampStereoFramePair,
+    TimestampStereoPairIdentity,
+)
 
 
 def calibration(
@@ -954,3 +958,51 @@ def test_distance_worker_candidate_uses_exact_left_observation_identity() -> Non
         assert candidate.measured_timestamp_ns == 123_456
     finally:
         worker.shutdown()
+
+
+def test_timestamp_distance_uses_single_s3_core_and_preserves_candidate_kind() -> None:
+    base = pair(width=8, height=6)
+    left = replace(base.left, capture_id=None, frame_id=19, receive_timestamp_ns=555_000)
+    right = replace(base.right, capture_id=None, receive_timestamp_ns=556_000)
+    timestamp_pair = TimestampStereoFramePair(
+        identity=TimestampStereoPairIdentity(1, 1, 19, right.frame_id, 555_000, 556_000, 1_000),
+        left=left,
+        right=right,
+    )
+    assert validate_stereo_pair_geometry(timestamp_pair, calibration(width=8, height=6)) is None
+    observation = StereoTargetObservation(
+        target=TargetRef(CameraRole.STEREO_LEFT, 1, 7),
+        intent_revision=5,
+        pair=timestamp_pair,
+        roi=BBox(1, 1, 4, 3),
+        pairing_kind=StereoPairingKind.TIMESTAMP,
+    )
+    worker = StereoDistanceWorker(
+        calibration=calibration(width=8, height=6),
+        compute=lambda _observation: _worker_estimate(12.4),
+    )
+    worker.start()
+    try:
+        assert worker.submit_observation(observation)
+        snapshot = worker.results.wait_for_revision(0, 1.0)
+        assert snapshot is not None
+        candidate = snapshot.value
+        assert candidate is not None
+        assert candidate.pairing_kind is StereoPairingKind.TIMESTAMP
+        assert candidate.capture_id is None
+        assert candidate.measured_timestamp_ns == 555_000
+        assert candidate.source_frame_id == 19
+        assert candidate.intent_revision == 5
+    finally:
+        worker.shutdown()
+
+
+def test_observation_rejects_pair_kind_mismatch() -> None:
+    with pytest.raises(ValueError, match="pairing_kind"):
+        StereoTargetObservation(
+            target=TargetRef(CameraRole.STEREO_LEFT, 1, 7),
+            intent_revision=2,
+            pair=pair(width=8, height=6),
+            roi=BBox(1, 1, 4, 3),
+            pairing_kind=StereoPairingKind.TIMESTAMP,
+        )

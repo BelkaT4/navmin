@@ -48,7 +48,15 @@ from navmin.vision.stereo_distance_worker import (
     StereoDistanceWorker,
 )
 from navmin.vision.stereo_pairing import StereoFramePair, StereoPairIdentity
-from navmin.vision.stereo_target_join import StereoTargetJoiner, StereoTargetObservation
+from navmin.vision.stereo_target_join import (
+    StereoPairingKind,
+    StereoTargetJoiner,
+    StereoTargetObservation,
+)
+from navmin.vision.stereo_timestamp_pairing import (
+    TimestampStereoFramePair,
+    TimestampStereoPairIdentity,
+)
 
 
 class _CameraModel:
@@ -930,7 +938,7 @@ def test_s4_exact_join_target_follows_mediator_mode_and_lifecycle() -> None:
     assert joiner.state.pending_result_frame_id == 5
 
     mediator.set_distance_mode(DistanceMeasurementMode.STEREO_TIMESTAMP)
-    assert joiner.state.target is None
+    assert joiner.state.target == mediator.selected_target
     assert joiner.state.pending_result_frame_id is None
 
     assert mediator.accept_camera_session(_session(CameraRole.STEREO_LEFT, 2))
@@ -1090,7 +1098,184 @@ def test_s4_exact_join_worker_chain_publishes_target_bound_distance() -> None:
         worker.shutdown()
 
 
-def test_s4_stereo_distance_expires_without_falling_back_to_constant() -> None:
+def test_s5_timestamp_join_worker_chain_publishes_target_bound_distance() -> None:
+    clock = _FakeClock(20_000_000_000)
+    worker = StereoDistanceWorker(
+        calibration=load_stereo_calibration(
+            Path(__file__).resolve().parents[1]
+            / "config"
+            / "defaults"
+            / "calibration"
+            / "stereo.json"
+        ),
+        compute=lambda _observation: StereoDistanceEstimate(
+            distance_m=12.4,
+            median_disparity_px=10.0,
+            valid_pixel_count=5,
+            valid_pixel_fraction=1.0,
+            method=StereoDistanceMethod.DISPARITY_MAP_ROI_MEDIAN,
+        ),
+    )
+    joiner = StereoTargetJoiner(worker.submit_observation)
+    mediator, _, _ = _mediator(
+        main=CameraRole.STEREO_LEFT,
+        mode=TurretControlMode.TRACKING,
+        stereo_target_joiner=joiner,
+        stereo_distance_results=worker.results,
+        clock_ns=clock,
+    )
+    initial = _accept_main(mediator)
+    request = _request(mediator, initial)
+    assert mediator.accept_target_lifecycle_event(_acquired(request))
+    mediator.set_distance_mode(DistanceMeasurementMode.STEREO_TIMESTAMP)
+    target = mediator.selected_target
+    assert target is not None
+
+    left_result = _result(
+        CameraRole.STEREO_LEFT,
+        target.generation,
+        frame_id=6,
+        timestamp_ns=clock(),
+    )
+    left = replace(left_result.frame, capture_id=None)
+    left_result = replace(left_result, frame=left)
+    right = replace(
+        left,
+        camera=CameraRole.STEREO_RIGHT,
+        frame_id=56,
+        receive_timestamp_ns=clock() + 5_000_000,
+    )
+    pair = TimestampStereoFramePair(
+        identity=TimestampStereoPairIdentity(
+            target.generation,
+            target.generation,
+            left.frame_id,
+            right.frame_id,
+            left.receive_timestamp_ns,
+            right.receive_timestamp_ns,
+            5_000_000,
+        ),
+        left=left,
+        right=right,
+    )
+
+    worker.start()
+    try:
+        assert mediator.accept_vision_result(left_result)
+        observation = joiner.offer_pair(pair)
+        assert observation is not None
+        assert observation.pairing_kind is StereoPairingKind.TIMESTAMP
+        snapshot = worker.results.wait_for_revision(0, 1.0)
+        assert snapshot is not None and snapshot.value is not None
+
+        distance = mediator.current_distance
+        assert distance is not None
+        assert distance.target == target
+        assert distance.source is DistanceSource.STEREO
+        assert distance.distance_m == pytest.approx(12.4)
+        assert distance.source_frame_id == left.frame_id
+        assert distance.capture_id is None
+        assert distance.measured_timestamp_ns == left.receive_timestamp_ns
+    finally:
+        worker.shutdown()
+
+
+def test_s5_timestamp_compute_finishing_after_mode_switch_is_rejected() -> None:
+    started = Event()
+    release = Event()
+
+    def compute(_observation: StereoTargetObservation):
+        started.set()
+        assert release.wait(1.0)
+        return StereoDistanceEstimate(
+            distance_m=12.4,
+            median_disparity_px=10.0,
+            valid_pixel_count=5,
+            valid_pixel_fraction=1.0,
+            method=StereoDistanceMethod.DISPARITY_MAP_ROI_MEDIAN,
+        )
+
+    worker = StereoDistanceWorker(
+        calibration=load_stereo_calibration(
+            Path(__file__).resolve().parents[1]
+            / "config"
+            / "defaults"
+            / "calibration"
+            / "stereo.json"
+        ),
+        compute=compute,
+    )
+    joiner = StereoTargetJoiner(worker.submit_observation)
+    mediator, _, _ = _mediator(
+        main=CameraRole.STEREO_LEFT,
+        mode=TurretControlMode.TRACKING,
+        stereo_target_joiner=joiner,
+        stereo_distance_results=worker.results,
+    )
+    frame = _accept_main(mediator)
+    request = _request(mediator, frame)
+    assert mediator.accept_target_lifecycle_event(_acquired(request))
+    mediator.set_distance_mode(DistanceMeasurementMode.STEREO_TIMESTAMP)
+    target = mediator.selected_target
+    assert target is not None
+
+    left = replace(
+        frame.frame,
+        capture_id=None,
+        receive_timestamp_ns=monotonic_ns(),
+    )
+    right = replace(
+        left,
+        camera=CameraRole.STEREO_RIGHT,
+        frame_id=99,
+        receive_timestamp_ns=left.receive_timestamp_ns + 1_000_000,
+    )
+    observation = StereoTargetObservation(
+        target=target,
+        intent_revision=joiner.state.intent_revision,
+        pair=TimestampStereoFramePair(
+            identity=TimestampStereoPairIdentity(
+                target.generation,
+                target.generation,
+                left.frame_id,
+                right.frame_id,
+                left.receive_timestamp_ns,
+                right.receive_timestamp_ns,
+                1_000_000,
+            ),
+            left=left,
+            right=right,
+        ),
+        roi=BBox(55, 36, 10, 8),
+        pairing_kind=StereoPairingKind.TIMESTAMP,
+    )
+
+    worker.start()
+    try:
+        assert worker.submit_observation(observation)
+        assert started.wait(1.0)
+        mediator.set_distance_mode(DistanceMeasurementMode.STEREO_EXACT)
+        release.set()
+        snapshot = worker.results.wait_for_revision(0, 1.0)
+        assert snapshot is not None and snapshot.value is not None
+        assert snapshot.value.pairing_kind is StereoPairingKind.TIMESTAMP
+        assert mediator.current_distance is None
+    finally:
+        worker.shutdown()
+
+
+@pytest.mark.parametrize(
+    ("mode", "kind", "capture_id"),
+    [
+        (DistanceMeasurementMode.STEREO_EXACT, StereoPairingKind.EXACT, 77),
+        (DistanceMeasurementMode.STEREO_TIMESTAMP, StereoPairingKind.TIMESTAMP, None),
+    ],
+)
+def test_s5_stereo_distance_expires_without_falling_back_to_constant(
+    mode: DistanceMeasurementMode,
+    kind: StereoPairingKind,
+    capture_id: int | None,
+) -> None:
     clock = _FakeClock(1_000_000_000)
     results: LatestValue[StereoDistanceCandidate] = LatestValue()
     joiner = StereoTargetJoiner()
@@ -1105,14 +1290,18 @@ def test_s4_stereo_distance_expires_without_falling_back_to_constant() -> None:
     frame = _accept_main(mediator)
     request = _request(mediator, frame)
     assert mediator.accept_target_lifecycle_event(_acquired(request))
-    mediator.set_distance_mode(DistanceMeasurementMode.STEREO_EXACT)
+    mediator.set_distance_mode(mode)
     target = mediator.selected_target
     assert target is not None
     results.publish(
-        _stereo_candidate(
-            target,
-            intent_revision=joiner.state.intent_revision,
-            timestamp_ns=clock(),
+        replace(
+            _stereo_candidate(
+                target,
+                intent_revision=joiner.state.intent_revision,
+                timestamp_ns=clock(),
+            ),
+            pairing_kind=kind,
+            capture_id=capture_id,
         )
     )
 
@@ -1120,7 +1309,7 @@ def test_s4_stereo_distance_expires_without_falling_back_to_constant() -> None:
     clock.advance_ms(11)
     assert mediator.current_distance is None
     assert mediator._current_distance is None
-    assert mediator.distance_mode is DistanceMeasurementMode.STEREO_EXACT
+    assert mediator.distance_mode is mode
     assert mediator.manual_distance_m == 100
 
 
@@ -1301,3 +1490,111 @@ def test_s4_running_compute_is_rejected_after_lifecycle_boundary(
         assert mediator.current_distance is None
     finally:
         worker.shutdown()
+
+
+@pytest.mark.parametrize(
+    ("mode", "kind", "capture_id", "accepted"),
+    [
+        (DistanceMeasurementMode.STEREO_EXACT, StereoPairingKind.EXACT, 77, True),
+        (DistanceMeasurementMode.STEREO_EXACT, StereoPairingKind.TIMESTAMP, None, False),
+        (DistanceMeasurementMode.STEREO_TIMESTAMP, StereoPairingKind.TIMESTAMP, None, True),
+        (DistanceMeasurementMode.STEREO_TIMESTAMP, StereoPairingKind.EXACT, 77, False),
+        (DistanceMeasurementMode.CONSTANT, StereoPairingKind.TIMESTAMP, None, False),
+        (DistanceMeasurementMode.STEREO_EXACT, StereoPairingKind.EXACT, None, False),
+        (DistanceMeasurementMode.STEREO_TIMESTAMP, StereoPairingKind.TIMESTAMP, 77, False),
+    ],
+)
+def test_s5_3_candidate_mode_and_capture_identity_guard(
+    mode: DistanceMeasurementMode,
+    kind: StereoPairingKind,
+    capture_id: int | None,
+    accepted: bool,
+) -> None:
+    clock = _FakeClock(5_000_000_000)
+    results: LatestValue[StereoDistanceCandidate] = LatestValue()
+    joiner = StereoTargetJoiner()
+    mediator, _, _ = _mediator(
+        main=CameraRole.STEREO_LEFT,
+        mode=TurretControlMode.TRACKING,
+        stereo_target_joiner=joiner,
+        stereo_distance_results=results,
+        clock_ns=clock,
+    )
+    frame = _accept_main(mediator)
+    request = _request(mediator, frame)
+    assert mediator.accept_target_lifecycle_event(_acquired(request))
+    mediator.set_distance_mode(mode)
+    target = mediator.selected_target
+    assert target is not None
+    results.publish(
+        replace(
+            _stereo_candidate(target, intent_revision=joiner.state.intent_revision),
+            measured_timestamp_ns=clock(),
+            pairing_kind=kind,
+            capture_id=capture_id,
+        )
+    )
+    distance = mediator.current_distance
+    assert (distance is not None and distance.source is DistanceSource.STEREO) == accepted
+    if accepted:
+        assert distance is not None and distance.capture_id == capture_id
+
+
+@pytest.mark.parametrize(
+    ("initial", "next_mode"),
+    [
+        (DistanceMeasurementMode.STEREO_EXACT, DistanceMeasurementMode.STEREO_TIMESTAMP),
+        (DistanceMeasurementMode.STEREO_TIMESTAMP, DistanceMeasurementMode.STEREO_EXACT),
+    ],
+)
+def test_s5_3_mode_switch_rejects_late_old_kind_and_clears_distance(
+    initial: DistanceMeasurementMode,
+    next_mode: DistanceMeasurementMode,
+) -> None:
+    clock = _FakeClock(5_000_000_000)
+    results: LatestValue[StereoDistanceCandidate] = LatestValue()
+    joiner = StereoTargetJoiner()
+    mediator, _, _ = _mediator(
+        main=CameraRole.STEREO_LEFT,
+        mode=TurretControlMode.TRACKING,
+        stereo_target_joiner=joiner,
+        stereo_distance_results=results,
+        clock_ns=clock,
+    )
+    frame = _accept_main(mediator)
+    request = _request(mediator, frame)
+    assert mediator.accept_target_lifecycle_event(_acquired(request))
+    mediator.set_distance_mode(initial)
+    target = mediator.selected_target
+    assert target is not None
+    old_kind = (
+        StereoPairingKind.EXACT
+        if initial is DistanceMeasurementMode.STEREO_EXACT
+        else StereoPairingKind.TIMESTAMP
+    )
+    old_capture_id = 77 if old_kind is StereoPairingKind.EXACT else None
+    stale = replace(
+        _stereo_candidate(target, intent_revision=joiner.state.intent_revision),
+        pairing_kind=old_kind,
+        capture_id=old_capture_id,
+        measured_timestamp_ns=clock(),
+    )
+    results.publish(stale)
+    assert mediator.current_distance is not None
+    mediator.set_distance_mode(next_mode)
+    assert mediator.current_distance is None
+    assert joiner.state.target == target
+    results.publish(replace(stale, intent_revision=joiner.state.intent_revision))
+    assert mediator.current_distance is None
+    new_kind = (
+        StereoPairingKind.EXACT
+        if next_mode is DistanceMeasurementMode.STEREO_EXACT
+        else StereoPairingKind.TIMESTAMP
+    )
+    results.publish(replace(
+        stale,
+        intent_revision=joiner.state.intent_revision,
+        pairing_kind=new_kind,
+        capture_id=77 if new_kind is StereoPairingKind.EXACT else None,
+    ))
+    assert mediator.current_distance is not None

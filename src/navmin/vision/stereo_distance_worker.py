@@ -1,4 +1,4 @@
-"""Bounded asynchronous execution boundary for exact stereo distance jobs."""
+"""Bounded asynchronous execution boundary for stereo distance jobs."""
 
 from __future__ import annotations
 
@@ -18,7 +18,8 @@ from .stereo_distance import (
     StereoSgbmSettings,
     estimate_distance_from_stereo_pair,
 )
-from .stereo_target_join import StereoTargetObservation
+from .stereo_pairing import StereoFramePair
+from .stereo_target_join import StereoPairingKind, StereoTargetObservation
 
 LOGGER = logging.getLogger(__name__)
 _DEFAULT_MIN_VALID_PIXEL_COUNT = 5
@@ -32,15 +33,16 @@ class StereoDistanceCandidate:
     intent_revision: int
     distance_m: float
     source_frame_id: int
-    capture_id: int
+    capture_id: int | None
     measured_timestamp_ns: int
+    pairing_kind: StereoPairingKind = StereoPairingKind.EXACT
 
 
 type StereoDistanceCompute = Callable[[StereoTargetObservation], StereoDistanceEstimateOutcome]
 
 
 class StereoDistanceWorker:
-    """Single worker with one latest-wins pending exact-target observation.
+    """Single worker with one latest-wins pending target observation.
 
     One observation may be executing while at most one newer observation waits.
     Replacing the pending observation never grows a queue. Public ``DistanceResult``
@@ -90,7 +92,7 @@ class StereoDistanceWorker:
         thread.start()
 
     def submit_observation(self, observation: StereoTargetObservation) -> bool:
-        """Replace any not-yet-started job with the newest exact observation."""
+        """Replace any not-yet-started job with the newest observation."""
         if not isinstance(observation, StereoTargetObservation):
             raise TypeError("observation must be StereoTargetObservation")
         with self._condition:
@@ -158,8 +160,13 @@ class StereoDistanceWorker:
                     intent_revision=observation.intent_revision,
                     distance_m=outcome.distance_m,
                     source_frame_id=observation.pair.left.frame_id,
-                    capture_id=observation.pair.identity.capture_id,
+                    capture_id=(
+                        observation.pair.identity.capture_id
+                        if isinstance(observation.pair, StereoFramePair)
+                        else None
+                    ),
                     measured_timestamp_ns=observation.pair.left.receive_timestamp_ns,
+                    pairing_kind=observation.pairing_kind,
                 )
                 with self._condition:
                     if self._stop_requested:

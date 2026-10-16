@@ -1,9 +1,10 @@
-"""Bounded exact join between one stereo pair and one selected-target observation."""
+"""Bounded exact-left-frame join for exact and timestamp stereo pairs."""
 
 from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
+from enum import Enum
 from threading import Lock
 
 from navmin.concurrency import InvalidatableLatest
@@ -17,6 +18,17 @@ from navmin.contracts import (
 )
 
 from .stereo_pairing import StereoFramePair, StereoPairer
+from .stereo_timestamp_pairing import TimestampStereoFramePair, TimestampStereoPairer
+
+
+class StereoPairingKind(Enum):
+    """Internal pairing origin, independent of public distance source."""
+
+    EXACT = "exact"
+    TIMESTAMP = "timestamp"
+
+
+type StereoTargetPair = StereoFramePair | TimestampStereoFramePair
 
 
 @dataclass(frozen=True, slots=True)
@@ -25,8 +37,20 @@ class StereoTargetObservation:
 
     target: TargetRef
     intent_revision: int
-    pair: StereoFramePair
+    pair: StereoTargetPair
     roi: BBox
+    pairing_kind: StereoPairingKind = StereoPairingKind.EXACT
+
+    def __post_init__(self) -> None:
+        expected = (
+            StereoPairingKind.EXACT
+            if isinstance(self.pair, StereoFramePair)
+            else StereoPairingKind.TIMESTAMP
+            if isinstance(self.pair, TimestampStereoFramePair)
+            else None
+        )
+        if expected is None or self.pairing_kind is not expected:
+            raise ValueError("pairing_kind must agree with stereo pair type")
 
 
 @dataclass(frozen=True, slots=True)
@@ -42,7 +66,7 @@ class StereoTargetJoinerState:
 
 
 class StereoTargetJoiner:
-    """Join exact pair/result identity for only the active Stereo Left target.
+    """Join pair/result identity for only the active Stereo Left target.
 
     The joiner intentionally keeps one latest-useful pair and one latest-useful
     ``VisionResult``. It never searches nearest frames, timestamps, or target
@@ -58,7 +82,7 @@ class StereoTargetJoiner:
         self._target: TargetRef | None = None
         self._intent_revision = 0
         self._observation_sink = observation_sink
-        self._pending_pair: StereoFramePair | None = None
+        self._pending_pair: StereoTargetPair | None = None
         self._pending_result: VisionResult | None = None
         self.observations: InvalidatableLatest[StereoTargetObservation] = (
             InvalidatableLatest()
@@ -106,7 +130,7 @@ class StereoTargetJoiner:
         *,
         intent_revision: int = 0,
     ) -> None:
-        """Activate one exact Stereo Left target for one distance-intent revision."""
+        """Activate one Stereo Left target for one distance-intent revision."""
         if target is not None and target.camera is not CameraRole.STEREO_LEFT:
             raise ValueError("stereo target join requires Stereo Left target")
         if (
@@ -123,10 +147,10 @@ class StereoTargetJoiner:
             self._clear_inputs_locked()
             self.observations.invalidate()
 
-    def offer_pair(self, pair: StereoFramePair) -> StereoTargetObservation | None:
-        """Offer one exact pair; old pending pair is replaced latest-wins."""
-        if not isinstance(pair, StereoFramePair):
-            raise TypeError("pair must be StereoFramePair")
+    def offer_pair(self, pair: StereoTargetPair) -> StereoTargetObservation | None:
+        """Offer one stereo pair; old pending pair is replaced latest-wins."""
+        if not isinstance(pair, (StereoFramePair, TimestampStereoFramePair)):
+            raise TypeError("pair must be an exact or timestamp stereo pair")
         with self._lock:
             target = self._target
             if (
@@ -189,7 +213,10 @@ class StereoTargetJoiner:
         if frame.frame_id != left.frame_id:
             self._discard_older_frame_locked(left.frame_id, frame.frame_id)
             return None
-        if frame.capture_id != left.capture_id:
+        if (
+            frame.capture_id != left.capture_id
+            or frame.receive_timestamp_ns != left.receive_timestamp_ns
+        ):
             self._clear_inputs_locked()
             self.observations.invalidate()
             return None
@@ -208,6 +235,11 @@ class StereoTargetJoiner:
             intent_revision=self._intent_revision,
             pair=pair,
             roi=tracked.bbox,
+            pairing_kind=(
+                StereoPairingKind.EXACT
+                if isinstance(pair, StereoFramePair)
+                else StereoPairingKind.TIMESTAMP
+            ),
         )
         self.observations.publish(observation)
         return observation
@@ -233,24 +265,74 @@ class StereoTargetJoiner:
 
 
 class StereoPairingTargetJoinSink:
-    """Corrected-frame sink that preserves S2 pairing and forwards new pairs."""
+    """Route corrected frames into independent exact and compatibility pairers.
 
-    def __init__(self, pairer: StereoPairer, joiner: StereoTargetJoiner) -> None:
+    Only the operator-selected pairing kind reaches the target joiner. Both
+    pairers retain their independent generation barriers and state bounds.
+    """
+
+    def __init__(
+        self,
+        pairer: StereoPairer,
+        joiner: StereoTargetJoiner,
+        *,
+        timestamp_pairer: TimestampStereoPairer | None = None,
+        active_pairing_kind: Callable[[], StereoPairingKind | None] | None = None,
+    ) -> None:
         self._pairer = pairer
         self._joiner = joiner
+        self._timestamp_pairer = timestamp_pairer
+        self._active_pairing_kind = active_pairing_kind
+        self._routing_lock = Lock()
+        self._last_kind: StereoPairingKind | None = None
+        self._generations: dict[CameraRole, int] = {}
+
+    def set_active_pairing_kind_provider(
+        self, provider: Callable[[], StereoPairingKind | None]
+    ) -> None:
+        self._active_pairing_kind = provider
 
     def on_camera_session_started(self, session: CameraSessionStarted) -> None:
-        self._pairer.on_camera_session_started(session)
+        with self._routing_lock:
+            self._generations[session.camera] = session.generation
+            self._pairer.on_camera_session_started(session)
+            if self._timestamp_pairer is not None:
+                self._timestamp_pairer.on_camera_session_started(session)
 
     def on_corrected_frame(self, frame: FramePacket) -> None:
-        pair = self._pairer.offer_frame(frame)
+        # An absent provider preserves the previous exact-only sink contract.
+        kind = (
+            StereoPairingKind.EXACT
+            if self._active_pairing_kind is None
+            else self._active_pairing_kind()
+        )
+        with self._routing_lock:
+            if kind is not self._last_kind:
+                if self._last_kind is not None:
+                    # Mode changes discard unmatched input, not camera sessions.
+                    self._pairer.reset()
+                    if self._timestamp_pairer is not None:
+                        self._timestamp_pairer.reset()
+                    for camera, generation in self._generations.items():
+                        self._pairer.start_generation(camera, generation)
+                        if self._timestamp_pairer is not None:
+                            self._timestamp_pairer.start_generation(camera, generation)
+                self._last_kind = kind
+            if kind is StereoPairingKind.EXACT:
+                pair = self._pairer.offer_frame(frame)
+            elif kind is StereoPairingKind.TIMESTAMP and self._timestamp_pairer is not None:
+                pair = self._timestamp_pairer.offer_frame(frame)
+            else:
+                return
         if pair is not None:
             self._joiner.offer_pair(pair)
 
 
 __all__ = [
+    "StereoPairingKind",
     "StereoPairingTargetJoinSink",
     "StereoTargetJoiner",
     "StereoTargetJoinerState",
     "StereoTargetObservation",
+    "StereoTargetPair",
 ]

@@ -12,6 +12,9 @@ import numpy as np
 from navmin.calibration import StereoCalibration
 from navmin.contracts import BBox
 from navmin.vision.stereo_pairing import StereoFramePair
+from navmin.vision.stereo_timestamp_pairing import TimestampStereoFramePair
+
+type StereoDistancePair = StereoFramePair | TimestampStereoFramePair
 
 
 class StereoDistanceFailureReason(Enum):
@@ -90,7 +93,7 @@ StereoDistanceEstimateOutcome = StereoDistanceEstimate | StereoDistanceFailure
 
 
 def estimate_distance_from_stereo_pair(
-    pair: StereoFramePair,
+    pair: StereoDistancePair,
     calibration: StereoCalibration,
     settings: StereoSgbmSettings,
     *,
@@ -100,7 +103,7 @@ def estimate_distance_from_stereo_pair(
 ) -> StereoDistanceEstimateOutcome:
     """Compute full-frame SGBM once and aggregate distance in a Left ROI.
 
-    ``StereoFramePair`` already contains corrected/rectified working frames from
+    Both supported stereo pair types contain corrected/rectified working frames from
     the accepted S1/S2 pipeline. No pairing, rectification, resize-to-calibration,
     or stale-distance fallback is performed here. ``roi=None`` means the full
     rectified Left working frame.
@@ -263,7 +266,7 @@ def _validate_sgbm_image_pair(left_bgr: np.ndarray, right_bgr: np.ndarray) -> No
 
 
 def validate_stereo_pair_geometry(
-    pair: StereoFramePair,
+    pair: StereoDistancePair,
     calibration: StereoCalibration,
 ) -> StereoDistanceFailure | None:
     """Validate corrected stereo frame shapes against each other and calibration."""
@@ -286,7 +289,7 @@ def validate_stereo_pair_geometry(
 
 
 def estimate_distance_from_disparity_roi(
-    pair: StereoFramePair,
+    pair: StereoDistancePair,
     calibration: StereoCalibration,
     disparity_map_px: np.ndarray,
     roi: BBox,

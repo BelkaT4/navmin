@@ -440,6 +440,7 @@ def test_enabled_stereo_pairer_receives_both_corrected_frame_paths_and_resets() 
     joiner = runtime.stereo_target_joiner
     distance_worker = runtime.stereo_distance_worker
     assert pairer is not None
+    assert runtime.stereo_timestamp_pairer is not None
     assert joiner is not None
     assert distance_worker is not None
     assert runtime.stereo_right_worker is not None
@@ -451,6 +452,7 @@ def test_enabled_stereo_pairer_receives_both_corrected_frame_paths_and_resets() 
     assert CameraRole.STEREO_RIGHT not in runtime.mediator._vision_processing_enabled
 
     frame = np.zeros((HEIGHT, WIDTH, 3), dtype=np.uint8)
+    runtime.mediator.set_distance_mode(DistanceMeasurementMode.STEREO_EXACT)
     runtime.start()
     try:
         sources[CameraRole.STEREO_LEFT].push(
@@ -472,10 +474,30 @@ def test_enabled_stereo_pairer_receives_both_corrected_frame_paths_and_resets() 
         assert pair.right.camera is CameraRole.STEREO_RIGHT
         assert pair.left.generation == runtime.stereo_left_worker.pipeline.generation
         assert pair.right.generation == runtime.stereo_right_worker.pipeline.generation
+
+        runtime.mediator.set_distance_mode(DistanceMeasurementMode.STEREO_TIMESTAMP)
+        sources[CameraRole.STEREO_RIGHT].push(
+            frame, capture_id=None, receive_timestamp_ns=10_000_000
+        )
+        sources[CameraRole.STEREO_LEFT].push(
+            frame, capture_id=None, receive_timestamp_ns=10_010_000
+        )
+        timestamp_pairer = runtime.stereo_timestamp_pairer
+        assert timestamp_pairer is not None
+        _wait_until(lambda: timestamp_pairer.latest_pair is not None)
+        timestamp_pair = timestamp_pairer.latest_pair
+        assert timestamp_pair is not None
+        assert timestamp_pair.left.capture_id is None
+        assert timestamp_pair.right.capture_id is None
+        assert pairer.latest_pair is None  # mode transition cleared old exact pair
     finally:
         runtime.shutdown()
 
     assert pairer.latest_pair is None
+    assert runtime.stereo_timestamp_pairer is not None
+    assert runtime.stereo_timestamp_pairer.latest_pair is None
+    assert runtime.stereo_timestamp_pairer.state.left_generation is None
+    assert runtime.stereo_timestamp_pairer.state.right_generation is None
     assert pairer.state.left_generation is None
     assert pairer.state.right_generation is None
     assert joiner.state.left_generation is None

@@ -5,6 +5,7 @@ from collections.abc import Callable
 from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
+from time import monotonic_ns
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -72,6 +73,8 @@ from navmin.ui import (
     rendered_image_rect,
 )
 from navmin.ui.video_view import map_source_to_widget, reticle_segments
+from navmin.vision.stereo_distance_worker import StereoDistanceCandidate
+from navmin.vision.stereo_target_join import StereoPairingKind, StereoTargetJoiner
 
 
 class _Clock:
@@ -189,6 +192,8 @@ def _mediator(
     motor: MotorState = MotorState.ON,
     counting: bool = False,
     aim_points: AimPointsConfig | None = None,
+    stereo_target_joiner: StereoTargetJoiner | None = None,
+    stereo_distance_results: LatestValue[StereoDistanceCandidate] | None = None,
 ) -> tuple[Mediator, _FakeTurret]:
     turret = _FakeTurret(_turret_state(mode=mode, motor=motor))
     mediator_type = _CountingMediator if counting else Mediator
@@ -214,6 +219,8 @@ def _mediator(
             camera: TargetControlChannel(camera)
             for camera in (CameraRole.OVERVIEW, CameraRole.STEREO_LEFT)
         },
+        stereo_target_joiner=stereo_target_joiner,
+        stereo_distance_results=stereo_distance_results,
     )
     return mediator, turret
 
@@ -293,6 +300,8 @@ def _window(
     apply_tracking_control_tuning: (
         Callable[[TrackingControlConfig], None] | None
     ) = None,
+    stereo_target_joiner: StereoTargetJoiner | None = None,
+    stereo_distance_results: LatestValue[StereoDistanceCandidate] | None = None,
 ) -> tuple[
     MainWindow,
     Mediator,
@@ -301,7 +310,11 @@ def _window(
     LatestValue[TurretState],
 ]:
     mediator, turret = _mediator(
-        mode=mode, motor=motor, aim_points=aim_points
+        mode=mode,
+        motor=motor,
+        aim_points=aim_points,
+        stereo_target_joiner=stereo_target_joiner,
+        stereo_distance_results=stereo_distance_results,
     )
     bindings = _bindings()
     turret_states: LatestValue[TurretState] = LatestValue()
@@ -718,6 +731,53 @@ def test_distance_controls_follow_main_camera_and_preserve_runtime_mode(
     assert window.distance_slider.isHidden()
     assert window.distance_value_label.text() == "—"
     window.close()
+
+
+def test_timestamp_distance_is_shown_without_approximation_marker(
+    qt_application: QApplication,
+) -> None:
+    joiner = StereoTargetJoiner()
+    results: LatestValue[StereoDistanceCandidate] = LatestValue()
+    window, mediator, _turret, bindings, _states = _window(
+        qt_application,
+        mode=TurretControlMode.TRACKING,
+        stereo_target_joiner=joiner,
+        stereo_distance_results=results,
+    )
+    _publish_camera(window, bindings, _result(CameraRole.OVERVIEW, 1))
+    stereo_result = _result(
+        CameraRole.STEREO_LEFT,
+        1,
+        timestamp_ns=monotonic_ns(),
+    )
+    _publish_camera(window, bindings, stereo_result)
+
+    window.swap_main_preview()
+    window._handle_main_click(stereo_result, 50.0, 25.0)
+    selected = _publish_acquired(window, mediator, bindings)
+    window.distance_mode_combo.setCurrentIndex(2)
+    assert mediator.distance_mode is DistanceMeasurementMode.STEREO_TIMESTAMP
+    assert window.distance_value_label.text() == "—"
+
+    results.publish(
+        StereoDistanceCandidate(
+            target=selected,
+            intent_revision=joiner.state.intent_revision,
+            distance_m=12.44,
+            source_frame_id=stereo_result.frame.frame_id,
+            capture_id=None,
+            measured_timestamp_ns=stereo_result.frame.receive_timestamp_ns,
+            pairing_kind=StereoPairingKind.TIMESTAMP,
+        )
+    )
+    window.refresh_presentation()
+
+    assert window.distance_value_label.text() == "12.4 м"
+    assert "~" not in window.distance_value_label.text()
+    assert window.main_view.distance_annotation_text == "12.4 м"
+    assert window.preview_view.distance_annotation_text is None
+    window.close()
+
 
 
 def test_distance_slider_standard_wheel_step_is_ten_metres(

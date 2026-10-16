@@ -20,8 +20,13 @@ from navmin.vision.stereo_pairing import (
     make_exact_stereo_pair,
 )
 from navmin.vision.stereo_target_join import (
+    StereoPairingKind,
     StereoPairingTargetJoinSink,
     StereoTargetJoiner,
+)
+from navmin.vision.stereo_timestamp_pairing import (
+    TimestampStereoFramePair,
+    TimestampStereoPairIdentity,
 )
 
 
@@ -809,3 +814,132 @@ def test_pairing_target_join_sink_forwards_only_new_exact_pairs() -> None:
     observation = joiner.observations.get()
     assert observation is not None
     assert observation.pair.identity == StereoPairIdentity(6, 7, 55)
+
+
+def _timestamp_pair_for_left(left: FramePacket) -> TimestampStereoFramePair:
+    right = frame(
+        CameraRole.STEREO_RIGHT,
+        generation=8,
+        frame_id=29,
+        capture_id=None,
+        receive_timestamp_ns=left.receive_timestamp_ns + 12_000_000,
+    )
+    return TimestampStereoFramePair(
+        identity=TimestampStereoPairIdentity(
+            left.generation,
+            right.generation,
+            left.frame_id,
+            right.frame_id,
+            left.receive_timestamp_ns,
+            right.receive_timestamp_ns,
+            12_000_000,
+        ),
+        left=left,
+        right=right,
+    )
+
+
+@pytest.mark.parametrize("result_first", [False, True])
+def test_timestamp_target_join_only_matches_same_left_observation(result_first: bool) -> None:
+    joiner = _active_joiner(generation=3, track_id=7)
+    left = frame(
+        CameraRole.STEREO_LEFT,
+        generation=3,
+        frame_id=5,
+        capture_id=None,
+        receive_timestamp_ns=90_000_000,
+    )
+    pair = _timestamp_pair_for_left(left)
+    result = _vision_result_for(left, track_ids=(7, 8))
+    if result_first:
+        assert joiner.offer_vision_result(result) is None
+        observation = joiner.offer_pair(pair)
+    else:
+        assert joiner.offer_pair(pair) is None
+        observation = joiner.offer_vision_result(result)
+    assert observation is not None
+    assert observation.pairing_kind is StereoPairingKind.TIMESTAMP
+    assert observation.pair is pair
+    assert observation.target.track_id == 7
+
+
+@pytest.mark.parametrize("change", ["frame_id", "generation", "receive_timestamp_ns", "track"])
+def test_timestamp_join_does_not_guess_left_target(change: str) -> None:
+    joiner = _active_joiner(generation=3)
+    left = frame(
+        CameraRole.STEREO_LEFT,
+        generation=3,
+        frame_id=5,
+        capture_id=None,
+        receive_timestamp_ns=90_000_000,
+    )
+    result_left = left
+    tracks = (7,)
+    if change == "frame_id":
+        result_left = replace(left, frame_id=6)
+    elif change == "generation":
+        result_left = replace(left, generation=4)
+    elif change == "receive_timestamp_ns":
+        result_left = replace(left, receive_timestamp_ns=90_000_001)
+    else:
+        tracks = (22,)
+    assert joiner.offer_pair(_timestamp_pair_for_left(left)) is None
+    assert joiner.offer_vision_result(_vision_result_for(result_left, track_ids=tracks)) is None
+    assert joiner.observations.get() is None
+
+
+def test_production_stereo_sink_routes_only_selected_pairing_kind() -> None:
+    """Timestamp frames with no capture ID cannot become exact distance input."""
+    from navmin.vision.stereo_pairing import StereoPairer
+    from navmin.vision.stereo_timestamp_pairing import TimestampStereoPairer
+
+    class RecordingJoiner:
+        def __init__(self) -> None:
+            self.pairs: list[StereoFramePair | TimestampStereoFramePair] = []
+
+        def offer_pair(self, pair: StereoFramePair | TimestampStereoFramePair) -> None:
+            self.pairs.append(pair)
+
+    exact = StereoPairer(right_frame_buffer_size=3, pair_timeout_ms=200)
+    timed = TimestampStereoPairer(right_frame_buffer_size=3, pair_timeout_ms=200)
+    joiner = RecordingJoiner()
+    selected: list[StereoPairingKind | None] = [StereoPairingKind.EXACT]
+    sink = StereoPairingTargetJoinSink(
+        exact, joiner, timestamp_pairer=timed, active_pairing_kind=lambda: selected[0]
+    )
+    # Camera sessions are injected here without creating hardware/Qt workers.
+    for camera in (CameraRole.STEREO_LEFT, CameraRole.STEREO_RIGHT):
+        exact.start_generation(camera, 1)
+        timed.start_generation(camera, 1)
+        sink._generations[camera] = 1
+
+    sink.on_corrected_frame(frame(CameraRole.STEREO_RIGHT, frame_id=1, capture_id=None))
+    sink.on_corrected_frame(frame(CameraRole.STEREO_LEFT, frame_id=1, capture_id=None))
+    assert not joiner.pairs
+
+    selected[0] = StereoPairingKind.TIMESTAMP
+    sink.on_corrected_frame(
+        frame(CameraRole.STEREO_RIGHT, frame_id=2, capture_id=None, receive_timestamp_ns=10_000)
+    )
+    sink.on_corrected_frame(
+        frame(CameraRole.STEREO_LEFT, frame_id=2, capture_id=None, receive_timestamp_ns=10_010)
+    )
+    assert len(joiner.pairs) == 1
+    assert isinstance(joiner.pairs[0], TimestampStereoFramePair)
+    assert joiner.pairs[0].left.capture_id is None
+
+    selected[0] = StereoPairingKind.EXACT
+    sink.on_corrected_frame(
+        frame(CameraRole.STEREO_RIGHT, frame_id=3, capture_id=99, receive_timestamp_ns=15_000)
+    )
+    sink.on_corrected_frame(
+        frame(CameraRole.STEREO_LEFT, frame_id=3, capture_id=99, receive_timestamp_ns=999_000)
+    )
+    assert len(joiner.pairs) == 2
+    assert isinstance(joiner.pairs[1], StereoFramePair)
+    assert joiner.pairs[1].identity.capture_id == 99
+
+    selected[0] = None
+    sink.on_corrected_frame(frame(CameraRole.STEREO_RIGHT, frame_id=4, capture_id=100))
+    sink.on_corrected_frame(frame(CameraRole.STEREO_LEFT, frame_id=4, capture_id=100))
+    assert len(joiner.pairs) == 2
