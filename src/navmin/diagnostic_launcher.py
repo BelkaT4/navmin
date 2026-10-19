@@ -74,6 +74,7 @@ class DiagnosticSelection:
     overview: CameraEndpoint
     stereo_left: CameraEndpoint
     turret: TurretEndpoint
+    stereo_right: CameraEndpoint | None = None
 
 
 class DiagnosticEndpoints:
@@ -100,7 +101,7 @@ class DiagnosticEndpoints:
             self._base_inputs.config,
             turret=replace(self._base_inputs.config.turret, emulate_stm32=False),
         )
-        config = _disable_stereo_right(config)
+        config = _select_stereo_right(config, self.selection.stereo_right)
         try:
             if self.selection.overview is CameraEndpoint.LOCALHOST:
                 overview = self._base_inputs.overview_calibration
@@ -129,6 +130,17 @@ class DiagnosticEndpoints:
                 assert isinstance(source, RtpJpegSourceConfig)
                 self._start_sender(
                     camera_role=CameraRole.STEREO_LEFT,
+                    port=source.port,
+                    width=stereo.image_width,
+                    height=stereo.image_height,
+                )
+
+            if self.selection.stereo_right is CameraEndpoint.LOCALHOST:
+                stereo = self._base_inputs.stereo_calibration
+                source = config.vision.cameras.stereo_right.source
+                assert isinstance(source, RtpJpegSourceConfig)
+                self._start_sender(
+                    camera_role=CameraRole.STEREO_RIGHT,
                     port=source.port,
                     width=stereo.image_width,
                     height=stereo.image_height,
@@ -326,7 +338,7 @@ def _planned_preflight_inputs(
         inputs.config,
         turret=replace(inputs.config.turret, emulate_stm32=False),
     )
-    config = _disable_stereo_right(config)
+    config = _select_stereo_right(config, selection.stereo_right)
     if selection.overview is CameraEndpoint.LOCALHOST:
         config = _replace_camera_endpoint(
             config, camera_name="overview", fallback_port=8888
@@ -338,20 +350,28 @@ def _planned_preflight_inputs(
     return replace(inputs, config=config)
 
 
-def _disable_stereo_right(config: AppConfig) -> AppConfig:
+def _select_stereo_right(
+    config: AppConfig,
+    endpoint: CameraEndpoint | None,
+) -> AppConfig:
     cameras = config.vision.cameras
-    if not cameras.stereo_right.enabled:
-        return config
-    return replace(
-        config,
-        vision=replace(
-            config.vision,
-            cameras=replace(
-                cameras,
-                stereo_right=replace(cameras.stereo_right, enabled=False),
+    enabled = endpoint is not None
+    if cameras.stereo_right.enabled != enabled:
+        config = replace(
+            config,
+            vision=replace(
+                config.vision,
+                cameras=replace(
+                    cameras,
+                    stereo_right=replace(cameras.stereo_right, enabled=enabled),
+                ),
             ),
-        ),
-    )
+        )
+    if endpoint is CameraEndpoint.LOCALHOST:
+        config = _replace_camera_endpoint(
+            config, camera_name="stereo_right", fallback_port=8890
+        )
+    return config
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -403,6 +423,15 @@ def _parser() -> argparse.ArgumentParser:
         required=True,
     )
     parser.add_argument(
+        "--stereo-right",
+        choices=tuple(item.value for item in CameraEndpoint),
+        default=None,
+        help=(
+            "Enable Stereo Right explicitly with the configured real source or a "
+            "localhost RTP/JPEG sender. Omit to keep it disabled."
+        ),
+    )
+    parser.add_argument(
         "--turret",
         choices=tuple(item.value for item in TurretEndpoint),
         required=True,
@@ -423,16 +452,23 @@ def main(argv: Sequence[str] | None = None) -> int:
         overview=CameraEndpoint(args.overview),
         stereo_left=CameraEndpoint(args.stereo_left),
         turret=TurretEndpoint(args.turret),
+        stereo_right=(
+            CameraEndpoint(args.stereo_right)
+            if args.stereo_right is not None
+            else None
+        ),
     )
-    fully_synthetic = selection == DiagnosticSelection(
-        overview=CameraEndpoint.LOCALHOST,
-        stereo_left=CameraEndpoint.LOCALHOST,
-        turret=TurretEndpoint.PTY,
+    fully_synthetic = (
+        selection.overview is CameraEndpoint.LOCALHOST
+        and selection.stereo_left is CameraEndpoint.LOCALHOST
+        and selection.turret is TurretEndpoint.PTY
+        and selection.stereo_right in (None, CameraEndpoint.LOCALHOST)
     )
     if args.synthetic_inputs and not fully_synthetic:
         parser.error(
             "--synthetic-inputs requires --overview localhost "
-            "--stereo-left localhost --turret pty"
+            "--stereo-left localhost --turret pty and, when provided, "
+            "--stereo-right localhost"
         )
 
     artifacts = SessionArtifacts.create(
@@ -445,11 +481,17 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     with session_file_logging(artifacts.runtime_log_path, level=logging.DEBUG):
         LOGGER.info(
-            "Diagnostic launcher selected overview=%s stereo_left=%s turret=%s; "
-            "inputs=%s config=%s overview_calibration_override=%s "
-            "stereo_calibration_override=%s session=%s",
+            "Diagnostic launcher selected overview=%s stereo_left=%s "
+            "stereo_right=%s turret=%s; inputs=%s config=%s "
+            "overview_calibration_override=%s stereo_calibration_override=%s "
+            "session=%s",
             selection.overview.value,
             selection.stereo_left.value,
+            (
+                selection.stereo_right.value
+                if selection.stereo_right is not None
+                else "disabled"
+            ),
             selection.turret.value,
             "synthetic" if args.synthetic_inputs else "files",
             paths.config,
@@ -482,6 +524,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                     overview=selection.overview.value,
                     stereo_left=selection.stereo_left.value,
                     turret=selection.turret.value,
+                    stereo_right=(
+                        selection.stereo_right.value
+                        if selection.stereo_right is not None
+                        else None
+                    ),
                 ),
                 session_dir=artifacts.session_dir,
             )
@@ -526,7 +573,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                 effective_inputs,
                 show_diagnostic_clock=(
                     CameraEndpoint.LOCALHOST
-                    in (selection.overview, selection.stereo_left)
+                    in (
+                        selection.overview,
+                        selection.stereo_left,
+                        selection.stereo_right,
+                    )
                 ),
             )
             if exit_code == 0:

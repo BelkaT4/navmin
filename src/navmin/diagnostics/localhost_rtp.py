@@ -46,6 +46,7 @@ _TARGET_RADIUS_PX = 6
 _TARGET_SPEED_PX_PER_FRAME = 2
 _OVERVIEW_BACKGROUND_BGR = (32, 48, 64)
 _STEREO_LEFT_BACKGROUND_BGR = (70, 44, 30)
+_STEREO_RIGHT_BACKGROUND_BGR = (30, 54, 70)
 _TARGET_BGR = (245, 245, 245)
 _TEXT_BGR = (245, 245, 245)
 _FOOTER_TOP_RATIO = 0.85
@@ -96,8 +97,12 @@ class RtpJpegSenderConfig:
                 raise ValueError(f"{name} must be a positive integer")
         if self.host != "127.0.0.1":
             raise ValueError("localhost diagnostic sender host must be 127.0.0.1")
-        if self.camera not in (CameraRole.OVERVIEW, CameraRole.STEREO_LEFT):
-            raise ValueError("camera must be Overview or Stereo Left")
+        if self.camera not in (
+            CameraRole.OVERVIEW,
+            CameraRole.STEREO_LEFT,
+            CameraRole.STEREO_RIGHT,
+        ):
+            raise ValueError("camera must be Overview, Stereo Left, or Stereo Right")
 
 
 def _ping_pong_coordinate(frame_index: int, start: int, end: int) -> int:
@@ -122,8 +127,12 @@ class SyntheticDiagnosticFrameGenerator:
         height: int,
         wall_clock: Callable[[], datetime] = datetime.now,
     ) -> None:
-        if camera not in (CameraRole.OVERVIEW, CameraRole.STEREO_LEFT):
-            raise ValueError("camera must be Overview or Stereo Left")
+        if camera not in (
+            CameraRole.OVERVIEW,
+            CameraRole.STEREO_LEFT,
+            CameraRole.STEREO_RIGHT,
+        ):
+            raise ValueError("camera must be Overview, Stereo Left, or Stereo Right")
         for name, value in (("width", width), ("height", height)):
             if type(value) is not int or value <= 0:
                 raise ValueError(f"{name} must be a positive integer")
@@ -152,11 +161,12 @@ class SyntheticDiagnosticFrameGenerator:
     def next_frame(self) -> np.ndarray:
         frame_counter = self._frame_counter
         timestamp = self._wall_clock()
-        background = (
-            _OVERVIEW_BACKGROUND_BGR
-            if self.camera is CameraRole.OVERVIEW
-            else _STEREO_LEFT_BACKGROUND_BGR
-        )
+        if self.camera is CameraRole.OVERVIEW:
+            background = _OVERVIEW_BACKGROUND_BGR
+        elif self.camera is CameraRole.STEREO_LEFT:
+            background = _STEREO_LEFT_BACKGROUND_BGR
+        else:
+            background = _STEREO_RIGHT_BACKGROUND_BGR
         frame = np.full((self.height, self.width, 3), background, dtype=np.uint8)
         scale = min(self.width / DEFAULT_WIDTH, self.height / DEFAULT_HEIGHT)
         radius = max(4, min(15, round(_TARGET_RADIUS_PX * scale)))
@@ -181,11 +191,12 @@ class SyntheticDiagnosticFrameGenerator:
         thickness = max(1, round(scale))
         first_baseline = round(self.height * 0.91)
         second_baseline = round(self.height * 0.975)
-        camera_name = (
-            "OVERVIEW"
-            if self.camera is CameraRole.OVERVIEW
-            else "STEREO LEFT"
-        )
+        if self.camera is CameraRole.OVERVIEW:
+            camera_name = "OVERVIEW"
+        elif self.camera is CameraRole.STEREO_LEFT:
+            camera_name = "STEREO LEFT"
+        else:
+            camera_name = "STEREO RIGHT"
         cv2.putText(
             frame,
             _source_timestamp(timestamp),

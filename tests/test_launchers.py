@@ -304,6 +304,20 @@ def test_normal_and_diagnostic_parsers_share_new_file_defaults() -> None:
         assert args.config == Path("config/navmin.json")
         assert args.overview_calibration is None
         assert args.stereo_calibration is None
+    assert diagnostic_args.stereo_right is None
+    explicit_right = diagnostic_parser().parse_args(
+        [
+            "--overview",
+            "real",
+            "--stereo-left",
+            "real",
+            "--stereo-right",
+            "real",
+            "--turret",
+            "pty",
+        ]
+    )
+    assert explicit_right.stereo_right == "real"
 
 
 def test_config_owned_relative_calibration_paths_follow_selected_config_directory(
@@ -578,6 +592,90 @@ def test_diagnostic_real_selection_still_disables_fake_transport() -> None:
         )
     finally:
         endpoints.stop()
+
+
+def test_diagnostic_explicit_real_stereo_right_enables_configured_source() -> None:
+    inputs = _inputs()
+    right = replace(inputs.config.vision.cameras.stereo_right, enabled=False)
+    config = replace(
+        inputs.config,
+        vision=replace(
+            inputs.config.vision,
+            cameras=replace(inputs.config.vision.cameras, stereo_right=right),
+        ),
+    )
+    endpoints = DiagnosticEndpoints(
+        selection=DiagnosticSelection(
+            overview=CameraEndpoint.REAL,
+            stereo_left=CameraEndpoint.REAL,
+            turret=TurretEndpoint.REAL,
+            stereo_right=CameraEndpoint.REAL,
+        ),
+        inputs=replace(inputs, config=config),
+    )
+
+    effective = endpoints.start()
+    try:
+        assert effective.config.vision.cameras.stereo_right.enabled is True
+        assert (
+            effective.config.vision.cameras.stereo_right.source
+            == inputs.config.vision.cameras.stereo_right.source
+        )
+    finally:
+        endpoints.stop()
+
+
+def test_diagnostic_localhost_stereo_right_uses_stereo_calibration(
+    monkeypatch,
+) -> None:
+    sender_configs = []
+    sender_events: list[str] = []
+
+    class FakeSender:
+        def __init__(self, config) -> None:
+            sender_configs.append(config)
+
+        def start(self) -> None:
+            sender_events.append("start")
+
+        def stop(self) -> None:
+            sender_events.append("stop")
+
+    monkeypatch.setattr("navmin.diagnostic_launcher.LocalhostRtpJpegSender", FakeSender)
+    inputs = _inputs()
+    right = replace(inputs.config.vision.cameras.stereo_right, enabled=False)
+    config = replace(
+        inputs.config,
+        vision=replace(
+            inputs.config.vision,
+            cameras=replace(inputs.config.vision.cameras, stereo_right=right),
+        ),
+    )
+    endpoints = DiagnosticEndpoints(
+        selection=DiagnosticSelection(
+            overview=CameraEndpoint.REAL,
+            stereo_left=CameraEndpoint.REAL,
+            turret=TurretEndpoint.REAL,
+            stereo_right=CameraEndpoint.LOCALHOST,
+        ),
+        inputs=replace(inputs, config=config),
+    )
+
+    effective = endpoints.start()
+    try:
+        source = effective.config.vision.cameras.stereo_right.source
+        assert effective.config.vision.cameras.stereo_right.enabled is True
+        assert isinstance(source, RtpJpegSourceConfig)
+        assert source.bind_address == "127.0.0.1"
+        assert source.port == 8890
+        assert len(sender_configs) == 1
+        assert sender_configs[0].camera is CameraRole.STEREO_RIGHT
+        assert sender_configs[0].width == WIDTH
+        assert sender_configs[0].height == HEIGHT
+    finally:
+        endpoints.stop()
+
+    assert sender_events == ["start", "stop"]
 
 
 def test_session_file_logging_writes_diagnostic_detail(tmp_path) -> None:
@@ -1375,6 +1473,58 @@ def test_planned_localhost_backend_replaces_rtsp_source_with_rtp_jpeg() -> None:
     assert source.port == 8888
     assert source.buffer_size == 3
     assert planned.config.vision.cameras.stereo_right.enabled is False
+
+
+def test_diagnostic_preflight_passes_explicit_stereo_right_backend(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    inputs = _inputs()
+    right = replace(inputs.config.vision.cameras.stereo_right, enabled=False)
+    inputs = replace(
+        inputs,
+        config=replace(
+            inputs.config,
+            vision=replace(
+                inputs.config.vision,
+                cameras=replace(inputs.config.vision.cameras, stereo_right=right),
+            ),
+        ),
+    )
+    captured: list[tuple[LoadedApplicationInputs, object]] = []
+
+    monkeypatch.setattr(
+        "navmin.diagnostic_launcher.load_application_inputs",
+        lambda _paths: inputs,
+    )
+
+    def preflight(planned, *, selection, session_dir):
+        del session_dir
+        captured.append((planned, selection))
+        return _preflight_report()
+
+    monkeypatch.setattr("navmin.diagnostic_launcher.run_startup_preflight", preflight)
+
+    assert diagnostic_main(
+        [
+            "--overview",
+            "real",
+            "--stereo-left",
+            "real",
+            "--stereo-right",
+            "real",
+            "--turret",
+            "pty",
+            "--preflight-only",
+            "--log-dir",
+            str(tmp_path / "logs"),
+        ]
+    ) == 0
+
+    assert len(captured) == 1
+    planned, selection = captured[0]
+    assert planned.config.vision.cameras.stereo_right.enabled is True
+    assert selection.stereo_right == "real"
 
 
 def test_diagnostic_preflight_only_uses_planned_localhost_endpoints_without_starting(

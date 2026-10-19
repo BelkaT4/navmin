@@ -37,12 +37,33 @@ from navmin.vision.processors.legacy_14.processor import Legacy14VisionProcessor
         ({"port": 9999, "height": -1}, "height"),
         ({"port": 9999, "fps": 0}, "fps"),
         ({"port": 9999, "host": "0.0.0.0"}, "127.0.0.1"),
-        ({"port": 9999, "camera": CameraRole.STEREO_RIGHT}, "camera"),
+        ({"port": 9999, "camera": "unsupported"}, "camera"),
     ],
 )
 def test_sender_config_rejects_invalid_transport_values(kwargs, message) -> None:
     with pytest.raises(ValueError, match=message):
         RtpJpegSenderConfig(**kwargs)
+
+
+def test_sender_config_accepts_stereo_right() -> None:
+    config = RtpJpegSenderConfig(port=18_890, camera=CameraRole.STEREO_RIGHT)
+
+    assert config.camera is CameraRole.STEREO_RIGHT
+
+
+def test_stereo_right_synthetic_scene_is_distinguishable() -> None:
+    fixed = datetime(2026, 9, 22, 14, 58, 21, 372_000, tzinfo=UTC)
+    generator = SyntheticDiagnosticFrameGenerator(
+        camera=CameraRole.STEREO_RIGHT,
+        width=320,
+        height=240,
+        wall_clock=lambda: fixed,
+    )
+
+    frame = generator.next_frame()
+
+    assert frame.shape == (240, 320, 3)
+    assert tuple(frame[0, 0]) == (30, 54, 70)
 
 
 def test_sender_command_is_shell_free_rtp_jpeg_pipeline() -> None:
