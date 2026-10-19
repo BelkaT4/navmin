@@ -5,10 +5,12 @@ from __future__ import annotations
 import argparse
 import logging
 import sys
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
 from enum import Enum
 from pathlib import Path
+
+import numpy as np
 
 from navmin.config import (
     AimingConfig,
@@ -37,6 +39,7 @@ from navmin.diagnostics.localhost_rtp import (
     LocalhostRtpJpegSender,
     RtpJpegSenderConfig,
     SenderProcessError,
+    SynchronizedSyntheticStereoSource,
     diagnostic_camera_config,
     diagnostic_overview_calibration,
     diagnostic_stereo_calibration,
@@ -106,6 +109,20 @@ class DiagnosticEndpoints:
             turret=replace(effective_inputs.config.turret, emulate_stm32=False),
         )
         config = _select_stereo_right(config, self.selection.stereo_right)
+        stereo_source = None
+        if (
+            self.selection.stereo_left is CameraEndpoint.LOCALHOST
+            and self.selection.stereo_right is CameraEndpoint.LOCALHOST
+            and effective_inputs.stereo_calibration.image_width == 1296
+            and effective_inputs.stereo_calibration.image_height == 976
+        ):
+            stereo_source = SynchronizedSyntheticStereoSource(
+                effective_inputs.stereo_calibration
+            )
+            LOGGER.info(
+                "Diagnostic localhost stereo source=working-range "
+                "targets=100m/150m/200m speeds=30/70/120px-s"
+            )
         try:
             if self.selection.overview is CameraEndpoint.LOCALHOST:
                 overview = effective_inputs.overview_calibration
@@ -137,6 +154,11 @@ class DiagnosticEndpoints:
                     port=source.port,
                     width=stereo.image_width,
                     height=stereo.image_height,
+                    frame_supplier=(
+                        None
+                        if stereo_source is None
+                        else lambda: stereo_source.next_frame(CameraRole.STEREO_LEFT)
+                    ),
                 )
 
             if self.selection.stereo_right is CameraEndpoint.LOCALHOST:
@@ -148,6 +170,11 @@ class DiagnosticEndpoints:
                     port=source.port,
                     width=stereo.image_width,
                     height=stereo.image_height,
+                    frame_supplier=(
+                        None
+                        if stereo_source is None
+                        else lambda: stereo_source.next_frame(CameraRole.STEREO_RIGHT)
+                    ),
                 )
 
             if self.selection.turret is TurretEndpoint.PTY:
@@ -195,6 +222,7 @@ class DiagnosticEndpoints:
         port: int,
         width: int,
         height: int,
+        frame_supplier: Callable[[], np.ndarray] | None = None,
     ) -> None:
         sender = LocalhostRtpJpegSender(
             RtpJpegSenderConfig(
@@ -202,7 +230,8 @@ class DiagnosticEndpoints:
                 width=width,
                 height=height,
                 camera=camera_role,
-            )
+            ),
+            frame_supplier=frame_supplier,
         )
         sender.start()
         self._senders.append(sender)

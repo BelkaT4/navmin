@@ -9,7 +9,7 @@ from contextlib import AbstractContextManager, contextmanager
 from dataclasses import dataclass
 from datetime import datetime
 from tempfile import TemporaryFile
-from threading import Event, Thread
+from threading import Event, Lock, Thread
 from time import monotonic, sleep
 from typing import IO, Any, Self
 
@@ -19,6 +19,12 @@ import numpy as np
 from navmin.calibration import OverviewCalibration, StereoCalibration
 from navmin.config.models import CameraConfig, RtpJpegSourceConfig
 from navmin.contracts import CameraRole
+from navmin.diagnostics.synthetic_stereo import (
+    DEFAULT_SYNTHETIC_FPS,
+    DEFAULT_SYNTHETIC_HEIGHT,
+    DEFAULT_SYNTHETIC_WIDTH,
+    SyntheticWorkingRangeStereoScene,
+)
 from navmin.vision.gstreamer_source import (
     GStreamerUnavailableError,
     initialize_gstreamer_runtime,
@@ -228,6 +234,51 @@ class SyntheticDiagnosticFrameGenerator:
         return frame
 
 
+class SynchronizedSyntheticStereoSource:
+    """Provide one time-based working-range scene to both localhost stereo senders."""
+
+    def __init__(
+        self,
+        calibration: StereoCalibration,
+        *,
+        fps: int = DEFAULT_SYNTHETIC_FPS,
+        monotonic_clock: Callable[[], float] = monotonic,
+    ) -> None:
+        if (
+            calibration.image_width != DEFAULT_SYNTHETIC_WIDTH
+            or calibration.image_height != DEFAULT_SYNTHETIC_HEIGHT
+        ):
+            raise ValueError(
+                "working-range RTP stereo source requires 1296x976 calibration"
+            )
+        if fps <= 0:
+            raise ValueError("fps must be > 0")
+        self._scene = SyntheticWorkingRangeStereoScene(
+            calibration,
+            fps=fps,
+            moving=True,
+        )
+        self._fps = fps
+        self._clock = monotonic_clock
+        self._started_at = monotonic_clock()
+        self._lock = Lock()
+        self._cached_index = -1
+        self._cached_frame = None
+
+    def next_frame(self, camera: CameraRole) -> np.ndarray:
+        if camera not in (CameraRole.STEREO_LEFT, CameraRole.STEREO_RIGHT):
+            raise ValueError("camera must be Stereo Left or Stereo Right")
+        elapsed_s = max(0.0, self._clock() - self._started_at)
+        frame_index = int(elapsed_s * self._fps)
+        with self._lock:
+            if frame_index != self._cached_index:
+                self._cached_frame = self._scene.render(frame_index)
+                self._cached_index = frame_index
+            frame = self._cached_frame
+            assert frame is not None
+            return frame.left if camera is CameraRole.STEREO_LEFT else frame.right
+
+
 def build_sender_command(
     config: RtpJpegSenderConfig,
     *,
@@ -421,6 +472,7 @@ class LocalhostRtpJpegSender:
         monotonic_clock: Callable[[], float] = monotonic,
         sleep_fn: Callable[[float], None] = sleep,
         wall_clock: Callable[[], datetime] = datetime.now,
+        frame_supplier: Callable[[], np.ndarray] | None = None,
     ) -> None:
         if startup_probe_seconds < 0.0:
             raise ValueError("startup_probe_seconds must be >= 0")
@@ -439,6 +491,8 @@ class LocalhostRtpJpegSender:
             height=config.height,
             wall_clock=wall_clock,
         )
+        self._frame_supplier = frame_supplier or self._frame_generator.next_frame
+        self._frames_generated = 0
         self._process: Any | None = None
         self._stderr_context: AbstractContextManager[IO[str]] | None = None
         self._stderr: IO[str] | None = None
@@ -462,7 +516,7 @@ class LocalhostRtpJpegSender:
 
     @property
     def frames_generated(self) -> int:
-        return self._frame_generator.frames_generated
+        return self._frames_generated
 
     def start(self) -> None:
         if self._process is not None:
@@ -570,7 +624,8 @@ class LocalhostRtpJpegSender:
         period_s = 1.0 / self.config.fps
         next_deadline = self._monotonic_clock()
         while not self._writer_stop.is_set():
-            frame = self._frame_generator.next_frame()
+            frame = self._frame_supplier()
+            self._frames_generated += 1
             try:
                 encoded, jpeg = cv2.imencode(
                     ".jpg",
@@ -722,6 +777,7 @@ __all__ = [
     "PreflightResult",
     "RtpJpegSenderConfig",
     "SenderProcessError",
+    "SynchronizedSyntheticStereoSource",
     "SyntheticDiagnosticFrameGenerator",
     "build_sender_command",
     "check_gstreamer_runtime",

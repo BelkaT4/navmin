@@ -51,9 +51,9 @@ class SyntheticStereoFrame:
 
 
 DEFAULT_WORKING_RANGE_TARGETS = (
-    SyntheticStereoTargetSpec(1, 100.0, 30.0, 190, 430),
-    SyntheticStereoTargetSpec(2, 150.0, 70.0, 488, 470),
-    SyntheticStereoTargetSpec(3, 200.0, 120.0, 786, 510),
+    SyntheticStereoTargetSpec(1, 100.0, 30.0, 190, 650),
+    SyntheticStereoTargetSpec(2, 150.0, 70.0, 488, 720),
+    SyntheticStereoTargetSpec(3, 200.0, 120.0, 786, 790),
 )
 
 
@@ -79,16 +79,17 @@ def rectified_synthetic_calibration(reference: StereoCalibration) -> StereoCalib
 
 
 class SyntheticWorkingRangeStereoScene:
-    """Three textured rectified targets at 100/150/200 m.
+    """Three plain circular rectified targets at 100/150/200 m.
 
-    The Left and Right targets share the same deterministic texture. Right is a
+    The Left and Right targets share the same compact circle shape. Right is a
     horizontal shift of Left by the target disparity. In moving mode both views
     use the same pixel velocity, so disparity remains constant for each target.
     """
 
-    _PATCH_WIDTH = 260
-    _PATCH_HEIGHT = 160
-    _ROI_MARGIN = 25
+    _PATCH_WIDTH = 64
+    _PATCH_HEIGHT = 64
+    _ROI_MARGIN = 6
+    _TARGET_RADIUS = 24
 
     def __init__(
         self,
@@ -162,8 +163,6 @@ class SyntheticWorkingRangeStereoScene:
                     expected_distance_m=point.distance_m,
                 )
             )
-            self._annotate(left, spec, left_x, top, disparity)
-            self._annotate(right, spec, right_x, top, disparity)
 
         left.flags.writeable = False
         right.flags.writeable = False
@@ -202,32 +201,27 @@ class SyntheticWorkingRangeStereoScene:
         return minimum + (center_x - minimum) % span
 
     def _background(self) -> np.ndarray:
-        frame = np.full(
+        return np.full(
             (self.calibration.image_height, self.calibration.image_width, 3),
             24,
             dtype=np.uint8,
         )
-        for x in range(0, self.calibration.image_width, 64):
-            cv2.line(frame, (x, 0), (x, self.calibration.image_height - 1), (31, 31, 31), 1)
-        for y in range(0, self.calibration.image_height, 64):
-            cv2.line(frame, (0, y), (self.calibration.image_width - 1, y), (31, 31, 31), 1)
-        return frame
 
     def _make_texture(self, spec: SyntheticStereoTargetSpec) -> np.ndarray:
-        rng = np.random.default_rng(10_000 + spec.track_id)
-        mono = rng.integers(
-            0,
-            256,
-            (self._PATCH_HEIGHT, self._PATCH_WIDTH),
+        del spec
+        patch = np.full(
+            (self._PATCH_HEIGHT, self._PATCH_WIDTH, 3),
+            24,
             dtype=np.uint8,
         )
-        patch = cv2.cvtColor(mono, cv2.COLOR_GRAY2BGR)
-        cv2.rectangle(
+        center = (self._PATCH_WIDTH // 2, self._PATCH_HEIGHT // 2)
+        cv2.circle(
             patch,
-            (0, 0),
-            (self._PATCH_WIDTH - 1, self._PATCH_HEIGHT - 1),
-            (255, 255, 255),
-            3,
+            center,
+            self._TARGET_RADIUS,
+            (245, 245, 245),
+            -1,
+            cv2.LINE_AA,
         )
         return patch
 
@@ -238,24 +232,7 @@ class SyntheticWorkingRangeStereoScene:
             raise ValueError("synthetic target moved outside frame")
         frame[y : y + height, x : x + width] = patch
 
-    @staticmethod
-    def _annotate(
-        frame: np.ndarray,
-        spec: SyntheticStereoTargetSpec,
-        x: int,
-        y: int,
-        disparity: int,
-    ) -> None:
-        cv2.putText(
-            frame,
-            f"T{spec.track_id} {spec.distance_m:.0f}m {spec.speed_px_s:.0f}px/s d={disparity}px",
-            (x + 8, y + 24),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.52,
-            (0, 255, 255),
-            1,
-            cv2.LINE_AA,
-        )
+
 
 
 __all__ = [

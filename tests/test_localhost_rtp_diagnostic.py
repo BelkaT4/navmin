@@ -3,12 +3,14 @@ from __future__ import annotations
 import subprocess
 from datetime import UTC, datetime
 from itertools import pairwise
+from pathlib import Path
 from types import SimpleNamespace
 
 import cv2
 import numpy as np
 import pytest
 
+from navmin.calibration import load_stereo_calibration
 from navmin.contracts import CameraRole, FramePacket
 from navmin.diagnostics.localhost_rtp import (
     GST_RECEIVER_ELEMENTS,
@@ -16,6 +18,7 @@ from navmin.diagnostics.localhost_rtp import (
     LocalhostRtpJpegSender,
     RtpJpegSenderConfig,
     SenderProcessError,
+    SynchronizedSyntheticStereoSource,
     SyntheticDiagnosticFrameGenerator,
     build_sender_command,
     check_gstreamer_runtime,
@@ -23,6 +26,10 @@ from navmin.diagnostics.localhost_rtp import (
     diagnostic_camera_config,
     diagnostic_overview_calibration,
     diagnostic_stereo_calibration,
+)
+from navmin.diagnostics.synthetic_stereo import (
+    SyntheticWorkingRangeStereoScene,
+    rectified_synthetic_calibration,
 )
 from navmin.vision.pipeline import (
     overview_corrector,
@@ -404,6 +411,41 @@ def test_detector_friendly_scene_survives_jpeg_and_keeps_stable_track() -> None:
         )
         assert stable[0].bbox != stable[-1].bbox
 
+
+
+def test_synchronized_working_range_source_shares_one_stereo_scene() -> None:
+    calibration = rectified_synthetic_calibration(
+        load_stereo_calibration(Path("config/calibration/stereo.json"))
+    )
+    now = [100.0]
+    source = SynchronizedSyntheticStereoSource(
+        calibration,
+        monotonic_clock=lambda: now[0],
+    )
+    reference = SyntheticWorkingRangeStereoScene(calibration, moving=True)
+
+    first = reference.render(0)
+    assert np.array_equal(source.next_frame(CameraRole.STEREO_LEFT), first.left)
+    assert np.array_equal(source.next_frame(CameraRole.STEREO_RIGHT), first.right)
+
+    now[0] += 0.5
+    later = reference.render(10)
+    assert np.array_equal(source.next_frame(CameraRole.STEREO_LEFT), later.left)
+    assert np.array_equal(source.next_frame(CameraRole.STEREO_RIGHT), later.right)
+    assert not np.array_equal(later.left, later.right)
+
+
+def test_synchronized_working_range_source_rejects_non_stereo_role() -> None:
+    calibration = rectified_synthetic_calibration(
+        load_stereo_calibration(Path("config/calibration/stereo.json"))
+    )
+    source = SynchronizedSyntheticStereoSource(
+        calibration,
+        monotonic_clock=lambda: 1.0,
+    )
+
+    with pytest.raises(ValueError, match="Stereo Left or Stereo Right"):
+        source.next_frame(CameraRole.OVERVIEW)
 
 def test_sender_only_preflight_does_not_inspect_receiver_elements() -> None:
     inspected: list[str] = []

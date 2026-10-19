@@ -8,6 +8,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 
 from navmin.__main__ import _parser as normal_parser
@@ -514,7 +515,7 @@ def test_diagnostic_selection_overrides_only_requested_external_endpoints(monkey
     pty_events: list[str] = []
 
     class FakeSender:
-        def __init__(self, config) -> None:
+        def __init__(self, config, **_kwargs) -> None:
             sender_configs.append(config)
 
         def start(self) -> None:
@@ -635,7 +636,7 @@ def test_diagnostic_localhost_stereo_right_uses_stereo_calibration(
     sender_events: list[str] = []
 
     class FakeSender:
-        def __init__(self, config) -> None:
+        def __init__(self, config, **_kwargs) -> None:
             sender_configs.append(config)
 
         def start(self) -> None:
@@ -684,7 +685,7 @@ def test_diagnostic_localhost_stereo_right_uses_stereo_calibration(
 
 def test_all_localhost_profile_uses_image_identity_calibrations(monkeypatch) -> None:
     class FakeSender:
-        def __init__(self, _config) -> None:
+        def __init__(self, _config, **_kwargs) -> None:
             pass
 
         def start(self) -> None:
@@ -733,6 +734,50 @@ def test_all_localhost_profile_uses_image_identity_calibrations(monkeypatch) -> 
     assert planned.overview_calibration == effective.overview_calibration
     assert planned.stereo_calibration == effective.stereo_calibration
 
+
+
+def test_all_localhost_working_range_profile_shares_stereo_frame_source(
+    monkeypatch,
+) -> None:
+    senders = []
+
+    class FakeSender:
+        def __init__(self, config, **kwargs) -> None:
+            senders.append((config, kwargs))
+
+        def start(self) -> None:
+            pass
+
+        def stop(self) -> None:
+            pass
+
+    monkeypatch.setattr("navmin.diagnostic_launcher.LocalhostRtpJpegSender", FakeSender)
+    inputs = _inputs()
+    stereo = load_stereo_calibration(REPO_ROOT / "config/calibration/stereo.json")
+    inputs = replace(inputs, stereo_calibration=stereo)
+    selection = DiagnosticSelection(
+        overview=CameraEndpoint.LOCALHOST,
+        stereo_left=CameraEndpoint.LOCALHOST,
+        stereo_right=CameraEndpoint.LOCALHOST,
+        turret=TurretEndpoint.REAL,
+    )
+
+    endpoints = DiagnosticEndpoints(selection=selection, inputs=inputs)
+    effective = endpoints.start()
+    try:
+        by_camera = {config.camera: kwargs for config, kwargs in senders}
+        left_supplier = by_camera[CameraRole.STEREO_LEFT]["frame_supplier"]
+        right_supplier = by_camera[CameraRole.STEREO_RIGHT]["frame_supplier"]
+        assert left_supplier is not None
+        assert right_supplier is not None
+        left = left_supplier()
+        right = right_supplier()
+        assert left.shape == right.shape == (976, 1296, 3)
+        assert not np.array_equal(left, right)
+        assert effective.stereo_calibration.image_width == 1296
+        assert effective.stereo_calibration.image_height == 976
+    finally:
+        endpoints.stop()
 
 def test_session_file_logging_writes_diagnostic_detail(tmp_path) -> None:
     path = tmp_path / "logs" / "diagnostic.log"
