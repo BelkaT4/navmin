@@ -549,6 +549,7 @@ def test_diagnostic_selection_overrides_only_requested_external_endpoints(monkey
         assert effective.config.vision.cameras.overview.source.port == 8888
         assert effective.config.vision.cameras.stereo_left.source.bind_address == "0.0.0.0"
         assert effective.config.vision.cameras.stereo_right.enabled is False
+        assert effective.stereo_calibration == endpoints._base_inputs.stereo_calibration
         assert effective.config.turret.serial.port == "/tmp/navmin-test-pty/stm32"
         assert effective.config.turret.emulate_stm32 is False
         assert len(sender_configs) == 1
@@ -621,6 +622,8 @@ def test_diagnostic_explicit_real_stereo_right_enables_configured_source() -> No
             effective.config.vision.cameras.stereo_right.source
             == inputs.config.vision.cameras.stereo_right.source
         )
+        assert effective.overview_calibration == inputs.overview_calibration
+        assert effective.stereo_calibration == inputs.stereo_calibration
     finally:
         endpoints.stop()
 
@@ -672,10 +675,63 @@ def test_diagnostic_localhost_stereo_right_uses_stereo_calibration(
         assert sender_configs[0].camera is CameraRole.STEREO_RIGHT
         assert sender_configs[0].width == WIDTH
         assert sender_configs[0].height == HEIGHT
+        assert effective.stereo_calibration == inputs.stereo_calibration
     finally:
         endpoints.stop()
 
     assert sender_events == ["start", "stop"]
+
+
+def test_all_localhost_profile_uses_image_identity_calibrations(monkeypatch) -> None:
+    class FakeSender:
+        def __init__(self, _config) -> None:
+            pass
+
+        def start(self) -> None:
+            pass
+
+        def stop(self) -> None:
+            pass
+
+    monkeypatch.setattr("navmin.diagnostic_launcher.LocalhostRtpJpegSender", FakeSender)
+
+    inputs = _inputs()
+    distorted_stereo = replace(
+        inputs.stereo_calibration,
+        K_left=((70.0, 0.0, 31.5), (0.0, 70.0, 23.5), (0.0, 0.0, 1.0)),
+        D_left=(0.2, -0.1, 0.01, 0.0, 0.0),
+        K_right=((72.0, 0.0, 31.5), (0.0, 72.0, 23.5), (0.0, 0.0, 1.0)),
+        D_right=(-0.1, 0.05, 0.0, 0.0, 0.0),
+    )
+    inputs = replace(inputs, stereo_calibration=distorted_stereo)
+    selection = DiagnosticSelection(
+        overview=CameraEndpoint.LOCALHOST,
+        stereo_left=CameraEndpoint.LOCALHOST,
+        stereo_right=CameraEndpoint.LOCALHOST,
+        turret=TurretEndpoint.REAL,
+    )
+
+    endpoints = DiagnosticEndpoints(selection=selection, inputs=inputs)
+    effective = endpoints.start()
+    try:
+        assert effective.overview_calibration.D != inputs.overview_calibration.D
+        assert effective.stereo_calibration.P1 == inputs.stereo_calibration.P1
+        assert effective.stereo_calibration.P2 == inputs.stereo_calibration.P2
+        assert effective.stereo_calibration.Q == inputs.stereo_calibration.Q
+        assert effective.stereo_calibration.K_left == tuple(
+            tuple(row[:3]) for row in inputs.stereo_calibration.P1
+        )
+        assert effective.stereo_calibration.K_right == tuple(
+            tuple(row[:3]) for row in inputs.stereo_calibration.P2
+        )
+        assert effective.stereo_calibration.D_left == (0.0, 0.0, 0.0, 0.0, 0.0)
+        assert effective.stereo_calibration.D_right == (0.0, 0.0, 0.0, 0.0, 0.0)
+    finally:
+        endpoints.stop()
+
+    planned = _planned_preflight_inputs(selection, inputs)
+    assert planned.overview_calibration == effective.overview_calibration
+    assert planned.stereo_calibration == effective.stereo_calibration
 
 
 def test_session_file_logging_writes_diagnostic_detail(tmp_path) -> None:

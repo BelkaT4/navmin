@@ -56,6 +56,13 @@ _IDENTITY_3X3 = (
     (0.0, 1.0, 0.0),
     (0.0, 0.0, 1.0),
 )
+_FISHEYE_IDENTITY_DISTORTION = (
+    1.0 / 3.0,
+    2.0 / 15.0,
+    17.0 / 315.0,
+    62.0 / 2835.0,
+)
+
 _IDENTITY_4X4 = (
     (1.0, 0.0, 0.0, 0.0),
     (0.0, 1.0, 0.0, 0.0),
@@ -646,7 +653,13 @@ def diagnostic_overview_calibration(
     width: int = DEFAULT_WIDTH,
     height: int = DEFAULT_HEIGHT,
 ) -> OverviewCalibration:
-    """Build exact-size zero-distortion fisheye calibration for diagnostics."""
+    """Build a fisheye calibration whose production remap is image-identity.
+
+    OpenCV fisheye undistortion with zero coefficients is not an identity map.
+    The coefficients below are the truncated ``tan(theta) / theta`` series,
+    which cancels the fisheye projection over the narrow synthetic field used
+    by diagnostics while keeping the normal Overview correction stage active.
+    """
     RtpJpegSenderConfig(port=1, width=width, height=height)
     matrix = _camera_matrix(
         width,
@@ -658,7 +671,7 @@ def diagnostic_overview_calibration(
         image_width=width,
         image_height=height,
         K=matrix,
-        D=(0.0, 0.0, 0.0, 0.0),
+        D=_FISHEYE_IDENTITY_DISTORTION,
         new_camera_matrix=matrix,
     )
 

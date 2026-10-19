@@ -42,6 +42,7 @@ from navmin.diagnostics.localhost_rtp import (
     diagnostic_stereo_calibration,
 )
 from navmin.diagnostics.pty_stm32 import PtyDiagnosticError, PtyStm32Emulator
+from navmin.diagnostics.synthetic_stereo import rectified_synthetic_calibration
 from navmin.launcher import (
     LauncherPaths,
     LoadedApplicationInputs,
@@ -97,14 +98,17 @@ class DiagnosticEndpoints:
             raise RuntimeError("DiagnosticEndpoints is one-shot and already started")
         self._started = True
 
+        effective_inputs = _apply_localhost_calibration_overrides(
+            self.selection, self._base_inputs
+        )
         config = replace(
-            self._base_inputs.config,
-            turret=replace(self._base_inputs.config.turret, emulate_stm32=False),
+            effective_inputs.config,
+            turret=replace(effective_inputs.config.turret, emulate_stm32=False),
         )
         config = _select_stereo_right(config, self.selection.stereo_right)
         try:
             if self.selection.overview is CameraEndpoint.LOCALHOST:
-                overview = self._base_inputs.overview_calibration
+                overview = effective_inputs.overview_calibration
                 config = _replace_camera_endpoint(
                     config,
                     camera_name="overview",
@@ -120,7 +124,7 @@ class DiagnosticEndpoints:
                 )
 
             if self.selection.stereo_left is CameraEndpoint.LOCALHOST:
-                stereo = self._base_inputs.stereo_calibration
+                stereo = effective_inputs.stereo_calibration
                 config = _replace_camera_endpoint(
                     config,
                     camera_name="stereo_left",
@@ -136,7 +140,7 @@ class DiagnosticEndpoints:
                 )
 
             if self.selection.stereo_right is CameraEndpoint.LOCALHOST:
-                stereo = self._base_inputs.stereo_calibration
+                stereo = effective_inputs.stereo_calibration
                 source = config.vision.cameras.stereo_right.source
                 assert isinstance(source, RtpJpegSourceConfig)
                 self._start_sender(
@@ -163,7 +167,7 @@ class DiagnosticEndpoints:
             self.stop()
             raise
 
-        return replace(self._base_inputs, config=config)
+        return replace(effective_inputs, config=config)
 
     def stop(self) -> None:
         errors: list[RuntimeError] = []
@@ -329,11 +333,52 @@ def _replace_camera_endpoint(
     return replace(config, vision=replace(config.vision, cameras=updated_cameras))
 
 
+def _apply_localhost_calibration_overrides(
+    selection: DiagnosticSelection,
+    inputs: LoadedApplicationInputs,
+) -> LoadedApplicationInputs:
+    """Keep localhost frames unchanged by production correction where safe.
+
+    Overview owns an independent calibration, so localhost can always use an
+    image-identity fisheye calibration. Stereo Left/Right share one calibration;
+    therefore the rectified synthetic calibration is used only when no active
+    Stereo camera in the diagnostic selection is real. Mixed real/localhost
+    Stereo profiles retain the file-backed physical calibration.
+    """
+    overview = inputs.overview_calibration
+    stereo = inputs.stereo_calibration
+    override_overview = selection.overview is CameraEndpoint.LOCALHOST
+    stereo_left_local = selection.stereo_left is CameraEndpoint.LOCALHOST
+    stereo_right_real = selection.stereo_right is CameraEndpoint.REAL
+    override_stereo = stereo_left_local and not stereo_right_real
+
+    if override_overview:
+        overview = diagnostic_overview_calibration(
+            inputs.overview_calibration.image_width,
+            inputs.overview_calibration.image_height,
+        )
+    if override_stereo:
+        stereo = rectified_synthetic_calibration(inputs.stereo_calibration)
+
+    if override_overview or override_stereo:
+        LOGGER.info(
+            "Diagnostic localhost calibration override overview=%s stereo=%s",
+            "identity" if override_overview else "physical",
+            "rectified-synthetic" if override_stereo else "physical",
+        )
+    return replace(
+        inputs,
+        overview_calibration=overview,
+        stereo_calibration=stereo,
+    )
+
+
 def _planned_preflight_inputs(
     selection: DiagnosticSelection,
     inputs: LoadedApplicationInputs,
 ) -> LoadedApplicationInputs:
-    """Apply only pure endpoint overrides needed to preflight the planned profile."""
+    """Apply only pure endpoint/calibration overrides for the planned profile."""
+    inputs = _apply_localhost_calibration_overrides(selection, inputs)
     config = replace(
         inputs.config,
         turret=replace(inputs.config.turret, emulate_stm32=False),

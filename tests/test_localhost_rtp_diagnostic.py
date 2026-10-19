@@ -24,7 +24,11 @@ from navmin.diagnostics.localhost_rtp import (
     diagnostic_overview_calibration,
     diagnostic_stereo_calibration,
 )
-from navmin.vision.pipeline import overview_corrector, stereo_left_corrector
+from navmin.vision.pipeline import (
+    overview_corrector,
+    stereo_left_corrector,
+    stereo_right_corrector,
+)
 from navmin.vision.processors.legacy_14.processor import Legacy14VisionProcessor
 
 
@@ -290,7 +294,9 @@ def test_diagnostic_calibrations_and_camera_config_match_synthetic_size() -> Non
     config = diagnostic_camera_config(18_889)
 
     assert (overview.image_width, overview.image_height) == (320, 240)
-    assert overview.D == (0.0, 0.0, 0.0, 0.0)
+    assert overview.D == pytest.approx(
+        (1.0 / 3.0, 2.0 / 15.0, 17.0 / 315.0, 62.0 / 2835.0)
+    )
     assert overview.K[0][0] == overview.K[1][1] == 1000.0
     assert (stereo.image_width, stereo.image_height) == (320, 240)
     assert stereo.D_left == stereo.D_right == (0.0, 0.0, 0.0, 0.0, 0.0)
@@ -299,6 +305,30 @@ def test_diagnostic_calibrations_and_camera_config_match_synthetic_size() -> Non
     assert config.source.port == 18_889
     assert config.source.buffer_size == 1
     assert not config.processing_enabled
+
+
+
+
+def test_diagnostic_corrections_preserve_synthetic_pixels() -> None:
+    generator = SyntheticDiagnosticFrameGenerator(
+        camera=CameraRole.OVERVIEW,
+        width=320,
+        height=240,
+    )
+    overview_frame = generator.next_frame()
+    overview_corrected = overview_corrector(
+        diagnostic_overview_calibration()
+    ).correct(overview_frame)
+    assert np.array_equal(overview_corrected, overview_frame)
+
+    stereo_frame = SyntheticDiagnosticFrameGenerator(
+        camera=CameraRole.STEREO_LEFT,
+        width=320,
+        height=240,
+    ).next_frame()
+    stereo = diagnostic_stereo_calibration()
+    assert np.array_equal(stereo_left_corrector(stereo).correct(stereo_frame), stereo_frame)
+    assert np.array_equal(stereo_right_corrector(stereo).correct(stereo_frame), stereo_frame)
 
 
 def test_synthetic_scene_renders_target_source_time_and_advancing_frame_counter() -> None:
