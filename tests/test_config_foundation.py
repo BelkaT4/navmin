@@ -25,7 +25,7 @@ from navmin.contracts import CameraRole, DistanceSource
 
 def _valid_config() -> dict:
     return {
-        "schema-version": 3,
+        "schema-version": 4,
         "vision": {
             "processing-scope": "main-only",
             "cameras": {
@@ -108,6 +108,13 @@ def _valid_config() -> dict:
             },
             "platform-motion": {"source": "command-model"},
         },
+        "imu": {
+            "enabled": False,
+            "bind-address": "0.0.0.0",
+            "port": 8891,
+            "expected-source": None,
+            "calibration-file": "calibration/imu.json",
+        },
         "turret": {
             "serial": {
                 "port": "/dev/ttyUSB0",
@@ -159,10 +166,10 @@ def _write_json(path, data) -> None:
     path.write_text(json.dumps(data), encoding="utf-8")
 
 
-def test_valid_schema_v3_builds_typed_immutable_snapshot() -> None:
+def test_valid_schema_v4_builds_typed_immutable_snapshot() -> None:
     config = parse_config(_valid_config())
 
-    assert config.schema_version == 3
+    assert config.schema_version == 4
     assert (
         config.vision.cameras.overview.calibration_file == "calibration/overview.json"
     )
@@ -171,6 +178,11 @@ def test_valid_schema_v3_builds_typed_immutable_snapshot() -> None:
     assert config.vision.distance.source is DistanceSource.MANUAL
     assert config.ui.default_camera is CameraRole.OVERVIEW
     assert config.turret.serial.baudrate == 115200
+    assert not config.imu.enabled
+    assert config.imu.bind_address == "0.0.0.0"
+    assert config.imu.port == 8891
+    assert config.imu.expected_source is None
+    assert config.imu.calibration_file == "calibration/imu.json"
 
     with pytest.raises(FrozenInstanceError):
         config.tracking_control.velocity_estimator.window_ms = 10  # type: ignore[misc]
@@ -182,7 +194,7 @@ def test_tracking_control_round_trips_through_mapping() -> None:
     assert parse_config(config_to_mapping(config)) == config
 
 
-def test_schema_v3_requires_tracking_control_and_rejects_old_pixel_lead() -> None:
+def test_schema_v4_requires_tracking_control_and_rejects_old_pixel_lead() -> None:
     missing = _valid_config()
     missing.pop("tracking-control")
     with pytest.raises(ConfigValidationError) as exc_info:
@@ -404,7 +416,7 @@ def test_missing_config_is_explicit_error(tmp_path) -> None:
 
 def test_malformed_json_is_preserved(tmp_path) -> None:
     path = tmp_path / "config.json"
-    original = b'{"schema-version": 3, broken}'
+    original = b'{"schema-version": 4, broken}'
     path.write_bytes(original)
 
     with pytest.raises(ConfigJsonError):
@@ -418,7 +430,7 @@ def test_malformed_json_is_preserved(tmp_path) -> None:
     [
         (lambda data: data.pop("schema-version"), "schema-version"),
         (lambda data: data.__setitem__("schema-version", True), "schema-version"),
-        (lambda data: data.__setitem__("schema-version", "3"), "schema-version"),
+        (lambda data: data.__setitem__("schema-version", "4"), "schema-version"),
     ],
 )
 def test_missing_or_invalid_schema_version_is_validation_error(mutation, path) -> None:
@@ -432,7 +444,7 @@ def test_missing_or_invalid_schema_version_is_validation_error(mutation, path) -
     assert not isinstance(exc_info.value, UnsupportedConfigSchemaError)
 
 
-@pytest.mark.parametrize("unsupported", [1, 2, 4])
+@pytest.mark.parametrize("unsupported", [1, 2, 3, 5])
 def test_unsupported_schema_is_distinct_error(unsupported: int) -> None:
     data = _valid_config()
     data["schema-version"] = unsupported
@@ -442,7 +454,7 @@ def test_unsupported_schema_is_distinct_error(unsupported: int) -> None:
 
     assert exc_info.value.path == "schema-version"
     assert exc_info.value.actual == unsupported
-    assert "expected 3" in str(exc_info.value)
+    assert "expected 4" in str(exc_info.value)
 
 
 @pytest.mark.parametrize(
@@ -508,6 +520,14 @@ def test_missing_required_field_reports_exact_path() -> None:
             "vision.distance.stereo.calibration-file",
         ),
         (
+            lambda d: d["imu"].pop("calibration-file"),
+            "imu.calibration-file",
+        ),
+        (
+            lambda d: d["imu"].__setitem__("calibration-file", ""),
+            "imu.calibration-file",
+        ),
+        (
             lambda d: d["vision"]["cameras"]["stereo-left"].__setitem__(
                 "calibration-file", "calibration/left.json"
             ),
@@ -521,7 +541,7 @@ def test_missing_required_field_reports_exact_path() -> None:
         ),
     ],
 )
-def test_schema_v3_calibration_references_are_required_and_role_owned(
+def test_schema_v4_calibration_references_are_required_and_role_owned(
     mutate, expected_path
 ) -> None:
     data = _valid_config()
@@ -547,12 +567,42 @@ def test_config_to_mapping_round_trips_calibration_references() -> None:
     )
     assert "calibration-file" not in mapped["vision"]["cameras"]["stereo-left"]
     assert "calibration-file" not in mapped["vision"]["cameras"]["stereo-right"]
+    assert mapped["imu"] == {
+        "enabled": False,
+        "bind-address": "0.0.0.0",
+        "port": 8891,
+        "expected-source": None,
+        "calibration-file": "calibration/imu.json",
+    }
+
+
+@pytest.mark.parametrize(
+    ("mutate", "expected_path"),
+    [
+        (lambda d: d.pop("imu"), "imu"),
+        (lambda d: d["imu"].__setitem__("enabled", 1), "imu.enabled"),
+        (lambda d: d["imu"].__setitem__("bind-address", ""), "imu.bind-address"),
+        (lambda d: d["imu"].__setitem__("port", 0), "imu.port"),
+        (lambda d: d["imu"].__setitem__("port", 65536), "imu.port"),
+        (lambda d: d["imu"].__setitem__("expected-source", ""), "imu.expected-source"),
+        (lambda d: d["imu"].__setitem__("expected-source", 123), "imu.expected-source"),
+    ],
+)
+def test_imu_config_is_strict_and_hardware_safe(mutate, expected_path) -> None:
+    data = _valid_config()
+    mutate(data)
+
+    with pytest.raises(ConfigValidationError) as exc_info:
+        parse_config(data)
+
+    assert exc_info.value.path == expected_path
 
 
 def test_repository_defaults_parse_with_production_loaders() -> None:
     from pathlib import Path
 
     from navmin.calibration import load_overview_calibration, load_stereo_calibration
+    from navmin.imu import ImuCalibration
 
     root = Path(__file__).resolve().parents[1]
     defaults = root / "config" / "defaults"
@@ -560,12 +610,17 @@ def test_repository_defaults_parse_with_production_loaders() -> None:
     config = load_config(defaults / "navmin.json")
     overview = load_overview_calibration(defaults / "calibration" / "overview.json")
     stereo = load_stereo_calibration(defaults / "calibration" / "stereo.json")
+    imu = ImuCalibration.load(defaults / "calibration" / "imu.json")
 
-    assert config.schema_version == 3
+    assert config.schema_version == 4
     assert (
         config.vision.cameras.overview.calibration_file == "calibration/overview.json"
     )
     assert config.vision.distance.stereo.calibration_file == "calibration/stereo.json"
+    assert config.imu.calibration_file == "calibration/imu.json"
+    assert not config.imu.enabled
+    assert config.imu.port == 8891
+    assert config.imu.expected_source is None
     assert not config.tracking_control.feed_forward.enabled
     assert config.tracking_control.feed_forward.gain_x == 0.0
     assert config.tracking_control.feed_forward.gain_y == 0.0
@@ -573,6 +628,10 @@ def test_repository_defaults_parse_with_production_loaders() -> None:
     assert config.tracking_control.prediction.horizon_ms == 0
     assert overview.schema_version == 1
     assert stereo.schema_version == 1
+    assert not imu.gyro_ready
+    assert not imu.accel_ready
+    assert not imu.mag_ready
+    assert imu.axes == [1, 2, 3]
 
 
 def test_optional_aim_point_missing_and_null_both_mean_center() -> None:
@@ -761,7 +820,7 @@ def test_rtsp_config_round_trip_preserves_source_specific_fields(tmp_path) -> No
     save_config(path, config)
 
     saved = json.loads(path.read_text(encoding="utf-8"))
-    assert saved["schema-version"] == 3
+    assert saved["schema-version"] == 4
     assert (
         saved["vision"]["cameras"]["overview"]["source"]
         == data["vision"]["cameras"]["overview"]["source"]
@@ -803,6 +862,7 @@ def test_change_metadata_reports_only_fixed_architecture_classification() -> Non
     data["turret"]["axes"]["x"]["max-relative-move-deg"] = 60.0
     data["turret"]["axes"]["y"]["max-relative-move-deg"] = 75.0
     data["vision"]["camera-stale-timeout-ms"] = 700
+    data["imu"]["port"] = 9001
     new = parse_config(data)
 
     paths = changed_config_paths(old, new)
@@ -812,6 +872,7 @@ def test_change_metadata_reports_only_fixed_architecture_classification() -> Non
     assert "turret.axes.y.max-relative-move-deg" in paths
     assert "vision.cameras.overview.calibration-file" in paths
     assert "vision.distance.stereo.calibration-file" in paths
+    assert "imu.port" in paths
     assert (
         config_apply_policy("aiming.target-lost-timeout-ms")
         is ConfigApplyPolicy.DYNAMIC
@@ -826,6 +887,11 @@ def test_change_metadata_reports_only_fixed_architecture_classification() -> Non
     )
     assert (
         config_apply_policy("vision.distance.stereo.calibration-file")
+        is ConfigApplyPolicy.APPLICATION_RESTART
+    )
+    assert config_apply_policy("imu.port") is ConfigApplyPolicy.APPLICATION_RESTART
+    assert (
+        config_apply_policy("imu.calibration-file")
         is ConfigApplyPolicy.APPLICATION_RESTART
     )
     assert (

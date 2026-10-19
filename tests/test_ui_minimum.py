@@ -61,6 +61,7 @@ from navmin.core import (
     TrackingEstimateInvalidReason,
     TrackingEstimatorDiagnostics,
 )
+from navmin.imu import GyroBiasState, ImuRuntimeState, ImuSourceIdentity
 from navmin.ui import (
     CameraUiBinding,
     MainWindow,
@@ -194,6 +195,7 @@ def _mediator(
     aim_points: AimPointsConfig | None = None,
     stereo_target_joiner: StereoTargetJoiner | None = None,
     stereo_distance_results: LatestValue[StereoDistanceCandidate] | None = None,
+    imu_states: LatestValue[ImuRuntimeState] | None = None,
 ) -> tuple[Mediator, _FakeTurret]:
     turret = _FakeTurret(_turret_state(mode=mode, motor=motor))
     mediator_type = _CountingMediator if counting else Mediator
@@ -302,6 +304,7 @@ def _window(
     ) = None,
     stereo_target_joiner: StereoTargetJoiner | None = None,
     stereo_distance_results: LatestValue[StereoDistanceCandidate] | None = None,
+    imu_states: LatestValue[ImuRuntimeState] | None = None,
 ) -> tuple[
     MainWindow,
     Mediator,
@@ -329,6 +332,7 @@ def _window(
         apply_tracking_control_tuning=(
             apply_tracking_control_tuning or (lambda _config: None)
         ),
+        imu_states=imu_states,
         clock_ns=clock or _Clock(),
         wall_clock=wall_clock
         or _WallClock(datetime(2026, 9, 22, 12, 0, 0, tzinfo=UTC)),
@@ -342,6 +346,46 @@ def _window(
     qt_application.processEvents()
     return window, mediator, turret, bindings, turret_states
 
+
+
+def _imu_state(
+    *,
+    running: bool = True,
+    fresh: bool = True,
+    gyro_bias_state: GyroBiasState = GyroBiasState.READY,
+    orientation_valid: bool = True,
+    euler: tuple[float, float, float] = (1.0, 2.0, 3.0),
+) -> ImuRuntimeState:
+    return ImuRuntimeState(
+        running=running,
+        fresh=fresh,
+        stale=not fresh,
+        source=ImuSourceIdentity("192.0.2.10", 54321),
+        sender_timestamp_s=12.5,
+        receive_timestamp_s=33.25,
+        accel_g=(0.0, 0.0, 1.0),
+        gyro_raw_dps=(1.0, 2.0, 3.0),
+        gyro_corrected_dps=(0.1, 0.2, 0.3),
+        mag_raw=(100.0, 200.0, 300.0),
+        mag_corrected=(10.0, 20.0, 30.0),
+        gyro_bias_state=gyro_bias_state,
+        gyro_bias_dps=(0.9, 1.8, 2.7),
+        gyro_bias_sample_count=17,
+        accel_calibrated=True,
+        mag_calibrated=True,
+        orientation_quaternion=(1.0, 0.0, 0.0, 0.0),
+        relative_quaternion=(1.0, 0.0, 0.0, 0.0),
+        euler_degrees=euler,
+        orientation_valid=orientation_valid,
+        heading_valid=True,
+        mounting_axes=(1, 2, 3),
+        relative_zero=(1.0, 0.0, 0.0, 0.0),
+        invalid_packets=1,
+        duplicate_packets=2,
+        out_of_order_packets=3,
+        foreign_packets=4,
+        last_error=None,
+    )
 
 def _publish_camera(
     window: MainWindow,
@@ -1311,6 +1355,113 @@ def test_escape_toggles_single_modeless_operator_window(
     assert window.isVisible()
     window.close()
 
+
+
+def test_position_button_reuses_one_modeless_imu_window_and_esc_does_not_hide_it(
+    qt_application: QApplication,
+) -> None:
+    imu_states: LatestValue[ImuRuntimeState] = LatestValue()
+    imu_states.publish(_imu_state())
+    window, _mediator_value, turret, _bindings_value, _states = _window(
+        qt_application,
+        imu_states=imu_states,
+    )
+    operator = window.operator_window
+    imu = window.imu_window
+    before = (
+        len(turret.relative_commands),
+        len(turret.tracking_controls),
+        turret.invalidations,
+        len(turret.mode_requests),
+        turret.stop_requests,
+        turret.motor_on_requests,
+        turret.motor_off_requests,
+        turret.emergency_requests,
+    )
+
+    operator.show()
+    QTest.mouseClick(operator.position_button, Qt.MouseButton.LeftButton)
+    qt_application.processEvents()
+
+    assert imu.isVisible()
+    assert imu.parentWidget() is window
+    assert imu.windowModality() is Qt.WindowModality.NonModal
+    assert imu.windowFlags() & Qt.WindowType.Tool
+    assert window.imu_window is imu
+    assert imu.states is imu_states
+    assert imu.status_label.text().startswith("LIVE")
+
+    imu.close()
+    qt_application.processEvents()
+    assert not imu.isVisible()
+    imu_states.publish(_imu_state(euler=(4.0, 5.0, 6.0)))
+
+    QTest.mouseClick(operator.position_button, Qt.MouseButton.LeftButton)
+    qt_application.processEvents()
+    assert window.imu_window is imu
+    assert imu.isVisible()
+    assert "Крен: +4.0°" in imu.angles_label.text()
+
+    QTest.keyClick(imu, Qt.Key.Key_Escape)
+    qt_application.processEvents()
+    assert not operator.isVisible()
+    assert imu.isVisible()
+    QTest.keyClick(imu, Qt.Key.Key_Escape)
+    qt_application.processEvents()
+    assert operator.isVisible()
+    assert imu.isVisible()
+
+    after = (
+        len(turret.relative_commands),
+        len(turret.tracking_controls),
+        turret.invalidations,
+        len(turret.mode_requests),
+        turret.stop_requests,
+        turret.motor_on_requests,
+        turret.motor_off_requests,
+        turret.emergency_requests,
+    )
+    assert after == before
+    window.close()
+
+
+def test_imu_window_distinguishes_calibrating_stale_error_and_disabled(
+    qt_application: QApplication,
+) -> None:
+    imu_states: LatestValue[ImuRuntimeState] = LatestValue()
+    window, _mediator_value, _turret, _bindings_value, _states = _window(
+        qt_application,
+        imu_states=imu_states,
+    )
+    imu = window.imu_window
+
+    imu_states.publish(
+        _imu_state(
+            gyro_bias_state=GyroBiasState.ACQUIRING,
+            orientation_valid=False,
+        )
+    )
+    imu.refresh_once()
+    assert imu.status_label.text().startswith("CALIBRATING")
+    assert not imu.attitude_view.fresh
+
+    imu_states.publish(_imu_state(fresh=False, orientation_valid=False))
+    imu.refresh_once()
+    assert imu.status_label.text().startswith("STALE")
+    assert not imu.attitude_view.fresh
+
+    imu_states.publish(_imu_state(running=False, fresh=False, orientation_valid=False))
+    imu.refresh_once()
+    assert imu.status_label.text().startswith("ERROR")
+    assert not imu.attitude_view.fresh
+    window.close()
+
+    disabled_window, *_ = _window(qt_application, imu_states=None)
+    disabled_window.imu_window.refresh_once()
+    assert disabled_window.imu_window.status_label.text() == (
+        "ERROR — IMU отключён в конфигурации"
+    )
+    disabled_window.close()
 
 def test_operator_window_statuses_follow_existing_ui_update_path(
     qt_application: QApplication,

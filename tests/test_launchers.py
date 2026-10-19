@@ -28,6 +28,7 @@ from navmin.config.models import (
     AxisMechanicsConfig,
     CameraConfig,
     CamerasConfig,
+    ImuConfig,
     OverviewCameraConfig,
     PidControllerConfig,
     ProcessingScope,
@@ -55,12 +56,14 @@ from navmin.diagnostic_launcher import (
     _parser as diagnostic_parser,
 )
 from navmin.diagnostic_launcher import main as diagnostic_main
+from navmin.imu import ImuCalibration
 from navmin.input_recovery import InputRecoveryError, recover_default_inputs
 from navmin.launcher import (
     ApplicationInputError,
     LauncherPaths,
     LoadedApplicationInputs,
     load_application_inputs,
+    resolve_imu_calibration_path,
     run_loaded_application,
     session_file_logging,
     validate_normal_hardware_config,
@@ -138,7 +141,7 @@ def _config(*, emulate_stm32: bool = False) -> AppConfig:
         max_relative_move_deg=45.0,
     )
     return AppConfig(
-        schema_version=3,
+        schema_version=4,
         vision=VisionConfig(
             processing_scope=ProcessingScope.MAIN_AND_PREVIEW,
             cameras=CamerasConfig(
@@ -165,6 +168,13 @@ def _config(*, emulate_stm32: bool = False) -> AppConfig:
             aim_points=AimPointsConfig(overview=center, stereo_left=center),
         ),
         tracking_control=_default_tracking_control_config(),
+        imu=ImuConfig(
+            enabled=False,
+            bind_address="0.0.0.0",
+            port=8891,
+            expected_source=None,
+            calibration_file="calibration/imu.json",
+        ),
         turret=TurretConfig(
             serial=SerialConfig(
                 port="/dev/ttyUSB0",
@@ -247,6 +257,7 @@ def _inputs(*, emulate_stm32: bool = False) -> LoadedApplicationInputs:
 def _config_with_calibration_refs(
     overview_ref: str,
     stereo_ref: str,
+    imu_ref: str | None = None,
 ) -> AppConfig:
     config = _config()
     cameras = replace(
@@ -263,7 +274,13 @@ def _config_with_calibration_refs(
             calibration_file=stereo_ref,
         ),
     )
-    return replace(config, vision=replace(config.vision, cameras=cameras, distance=distance))
+    result = replace(
+        config,
+        vision=replace(config.vision, cameras=cameras, distance=distance),
+    )
+    if imu_ref is not None:
+        result = replace(result, imu=replace(result.imu, calibration_file=imu_ref))
+    return result
 
 
 def _copy_default_calibrations(target_root: Path) -> tuple[Path, Path]:
@@ -414,6 +431,7 @@ def test_run_loaded_application_uses_shared_runtime_ui_surface_and_shutdown() ->
         mediator=object(),
         camera_bindings={CameraRole.OVERVIEW: object()},
         turret_states=object(),
+        imu_states=object(),
         camera_stale_timeout_ms=321,
         pid_controller_config=pid_config,
         apply_pid_tuning=apply_pid_tuning,
@@ -436,6 +454,7 @@ def test_run_loaded_application_uses_shared_runtime_ui_surface_and_shutdown() ->
             "config": inputs.config,
             "overview_calibration": inputs.overview_calibration,
             "stereo_calibration": inputs.stereo_calibration,
+            "imu_calibration": inputs.imu_calibration,
         }
         return FakeRuntime()
 
@@ -444,6 +463,7 @@ def test_run_loaded_application_uses_shared_runtime_ui_surface_and_shutdown() ->
         assert kwargs["mediator"] is ui_dependencies.mediator
         assert kwargs["camera_bindings"] is ui_dependencies.camera_bindings
         assert kwargs["turret_states"] is ui_dependencies.turret_states
+        assert kwargs["imu_states"] is ui_dependencies.imu_states
         assert kwargs["camera_stale_timeout_ms"] == 321
         assert kwargs["pid_controller_config"] is pid_config
         assert kwargs["apply_pid_tuning"] is apply_pid_tuning
@@ -704,6 +724,79 @@ def _write_source_placeholders(tmp_path: Path) -> tuple[Path, Path, Path]:
     return config_path, overview_path, stereo_path
 
 
+def test_disabled_imu_does_not_require_calibration_file(tmp_path) -> None:
+    selected_root = tmp_path / "disabled-imu"
+    selected_root.mkdir()
+    config_path = selected_root / "navmin.json"
+    save_config(config_path, _config())
+    _copy_default_calibrations(selected_root)
+    imu_path = selected_root / "calibration" / "imu.json"
+    imu_path.write_text("{broken-but-disabled", encoding="utf-8")
+
+    inputs = load_application_inputs(LauncherPaths(config=config_path))
+
+    assert inputs.imu_calibration is None
+    assert imu_path.read_text(encoding="utf-8") == "{broken-but-disabled"
+
+
+def test_enabled_imu_loads_strict_config_owned_calibration(tmp_path) -> None:
+    selected_root = tmp_path / "enabled-imu"
+    selected_root.mkdir()
+    config_path = selected_root / "navmin.json"
+    base = _config()
+    config = replace(base, imu=replace(base.imu, enabled=True))
+    save_config(config_path, config)
+    _copy_default_calibrations(selected_root)
+    expected = ImuCalibration(
+        accel_bias=[0.1, 0.2, 0.3],
+        accel_ready=True,
+    )
+    imu_path = selected_root / "calibration" / "imu.json"
+    expected.save(imu_path)
+
+    inputs = load_application_inputs(LauncherPaths(config=config_path))
+
+    assert inputs.imu_calibration == expected
+
+
+def test_enabled_imu_invalid_calibration_is_recoverable_input_error(tmp_path) -> None:
+    selected_root = tmp_path / "invalid-imu"
+    selected_root.mkdir()
+    config_path = selected_root / "navmin.json"
+    base = _config()
+    config = replace(base, imu=replace(base.imu, enabled=True))
+    save_config(config_path, config)
+    _copy_default_calibrations(selected_root)
+    imu_path = selected_root / "calibration" / "imu.json"
+    imu_path.write_text("{broken", encoding="utf-8")
+
+    with pytest.raises(ApplicationInputError) as exc_info:
+        load_application_inputs(LauncherPaths(config=config_path))
+
+    assert exc_info.value.label == "IMU calibration"
+    assert exc_info.value.path == imu_path.resolve()
+    assert exc_info.value.recoverable
+
+
+def test_imu_calibration_path_is_owned_by_selected_root_config(tmp_path, monkeypatch) -> None:
+    config = _config()
+    relative = replace(
+        config,
+        imu=replace(config.imu, calibration_file="calibration/imu-a.json"),
+    )
+    selected = tmp_path / "site-a" / "navmin.json"
+    assert resolve_imu_calibration_path(selected, relative) == (
+        selected.parent / "calibration" / "imu-a.json"
+    ).resolve()
+
+    absolute_path = tmp_path / "external" / "imu.json"
+    absolute = replace(
+        config,
+        imu=replace(config.imu, calibration_file=str(absolute_path)),
+    )
+    assert resolve_imu_calibration_path(selected, absolute) == absolute_path.resolve()
+
+
 def _recovery_paths(tmp_path: Path) -> LauncherPaths:
     return LauncherPaths(
         config=tmp_path / "config.json",
@@ -790,15 +883,25 @@ def test_recovery_uses_canonical_targets_and_leaves_custom_calibration_files_unt
     custom_dir.mkdir()
     custom_overview = custom_dir / "overview-a.json"
     custom_stereo = custom_dir / "stereo-a.json"
+    custom_imu = custom_dir / "imu-a.json"
     custom_overview.write_bytes(b"operator-overview-custom")
     custom_stereo.write_bytes(b"operator-stereo-custom")
+    custom_imu.write_bytes(b"operator-imu-custom")
 
     config_path = selected_root / "navmin.json"
     save_config(
         config_path,
-        _config_with_calibration_refs(str(custom_overview), str(custom_stereo)),
+        _config_with_calibration_refs(
+            str(custom_overview),
+            str(custom_stereo),
+            str(custom_imu),
+        ),
     )
-    custom_before = (custom_overview.read_bytes(), custom_stereo.read_bytes())
+    custom_before = (
+        custom_overview.read_bytes(),
+        custom_stereo.read_bytes(),
+        custom_imu.read_bytes(),
+    )
 
     result = recover_default_inputs(LauncherPaths(config=config_path), now=RECOVERY_TEST_NOW)
 
@@ -808,9 +911,15 @@ def test_recovery_uses_canonical_targets_and_leaves_custom_calibration_files_unt
         config_path.resolve(),
         canonical_overview,
         canonical_stereo,
+        selected_root / "calibration" / "imu.json",
+    )
+    assert (
+        ImuCalibration.load(selected_root / "calibration" / "imu.json")
+        == ImuCalibration()
     )
     assert custom_overview.read_bytes() == custom_before[0]
     assert custom_stereo.read_bytes() == custom_before[1]
+    assert custom_imu.read_bytes() == custom_before[2]
     recovered = load_config(config_path)
     assert recovered.vision.cameras.overview.calibration_file == "calibration/overview.json"
     assert recovered.vision.distance.stereo.calibration_file == "calibration/stereo.json"
@@ -826,19 +935,25 @@ def test_input_recovery_creates_valid_safe_defaults_without_existing_files(
 
     assert result.timestamp == "20260923-101530"
     assert result.backups == ()
+    imu_path = paths.config.parent / "calibration" / "imu.json"
     assert result.restored_paths == (
         paths.config,
         paths.overview_calibration,
         paths.stereo_calibration,
+        imu_path,
     )
 
     config = load_config(paths.config)
     overview = load_overview_calibration(paths.overview_calibration)
     stereo = load_stereo_calibration(paths.stereo_calibration)
+    imu = ImuCalibration.load(imu_path)
     assert config.turret.serial.port == "/dev/navmin-configure-serial-port"
-    assert config.schema_version == 3
+    assert config.schema_version == 4
     assert config.vision.cameras.overview.calibration_file == "calibration/overview.json"
     assert config.vision.distance.stereo.calibration_file == "calibration/stereo.json"
+    assert config.imu.calibration_file == "calibration/imu.json"
+    assert not config.imu.enabled
+    assert imu == ImuCalibration()
     assert isinstance(config.vision.cameras.overview.source, RtpJpegSourceConfig)
     assert config.vision.cameras.overview.source.bind_address == "0.0.0.0"
     assert config.vision.cameras.overview.source.port == 8888
@@ -874,7 +989,7 @@ def test_input_recovery_replaces_malformed_root_and_invalid_canonical_calibratio
 
     assert len(result.backups) == 3
     recovered = load_config(paths.config)
-    assert recovered.schema_version == 3
+    assert recovered.schema_version == 4
     assert recovered.vision.cameras.overview.calibration_file == "calibration/overview.json"
     assert recovered.vision.distance.stereo.calibration_file == "calibration/stereo.json"
     assert load_overview_calibration(paths.overview_calibration).schema_version == 1

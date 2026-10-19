@@ -19,6 +19,7 @@ from navmin.config.models import (
     AxisMechanicsConfig,
     CameraConfig,
     CamerasConfig,
+    ImuConfig,
     OverviewCameraConfig,
     PidControllerConfig,
     ProcessingScope,
@@ -124,7 +125,7 @@ def _inputs(
         max_relative_move_deg=45.0,
     )
     config = AppConfig(
-        schema_version=3,
+        schema_version=4,
         vision=VisionConfig(
             processing_scope=ProcessingScope.MAIN_AND_PREVIEW,
             cameras=CamerasConfig(
@@ -151,6 +152,13 @@ def _inputs(
             aim_points=AimPointsConfig(overview=center, stereo_left=center),
         ),
         tracking_control=_default_tracking_control_config(),
+        imu=ImuConfig(
+            enabled=False,
+            bind_address="0.0.0.0",
+            port=8891,
+            expected_source=None,
+            calibration_file="calibration/imu.json",
+        ),
         turret=TurretConfig(
             serial=SerialConfig(
                 port=serial_port,

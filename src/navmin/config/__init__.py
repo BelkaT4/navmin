@@ -1,4 +1,4 @@
-"""Typed configuration foundation for NavMin schema v3."""
+"""Typed configuration foundation for NavMin schema v4."""
 
 from .manager import ConfigManager, save_config
 from .models import (
@@ -13,6 +13,7 @@ from .models import (
     CameraSourceConfig,
     ConfigApplyPolicy,
     FeedForwardConfig,
+    ImuConfig,
     OverviewCameraConfig,
     PidControllerConfig,
     PlatformMotionConfig,
@@ -64,6 +65,7 @@ __all__ = [
     "ConfigPersistenceError",
     "ConfigValidationError",
     "FeedForwardConfig",
+    "ImuConfig",
     "OverviewCameraConfig",
     "PidControllerConfig",
     "PlatformMotionConfig",

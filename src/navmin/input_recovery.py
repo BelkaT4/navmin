@@ -11,6 +11,7 @@ from pathlib import Path
 
 from navmin.calibration import load_overview_calibration, load_stereo_calibration
 from navmin.config import load_config
+from navmin.imu import ImuCalibration
 from navmin.launcher import LauncherPaths, resolve_selected_config_path
 
 
@@ -29,20 +30,22 @@ def _repository_defaults_dir() -> Path:
     return Path(__file__).resolve().parents[2] / "config" / "defaults"
 
 
-def _canonical_recovery_targets(paths: LauncherPaths) -> tuple[Path, Path, Path]:
+def _canonical_recovery_targets(paths: LauncherPaths) -> tuple[Path, Path, Path, Path]:
     config_path = resolve_selected_config_path(paths.config)
     return (
         config_path,
         config_path.parent / "calibration" / "overview.json",
         config_path.parent / "calibration" / "stereo.json",
+        config_path.parent / "calibration" / "imu.json",
     )
 
 
-def _default_sources(defaults_dir: Path) -> tuple[Path, Path, Path]:
+def _default_sources(defaults_dir: Path) -> tuple[Path, Path, Path, Path]:
     return (
         defaults_dir / "navmin.json",
         defaults_dir / "calibration" / "overview.json",
         defaults_dir / "calibration" / "stereo.json",
+        defaults_dir / "calibration" / "imu.json",
     )
 
 
@@ -120,14 +123,20 @@ def recover_default_inputs(
     """Install vetted repository defaults at canonical targets and then stop.
 
     Explicit CLI calibration overrides are never recovery targets. Recovery
-    always installs ``navmin.json`` plus ``calibration/{overview,stereo}.json``
-    next to the selected root config and never searches arbitrary custom paths.
+    always installs ``navmin.json`` plus canonical Overview/Stereo/IMU
+    calibration files next to the selected root config and never searches
+    arbitrary custom paths.
     """
     local_now = now or datetime.now(UTC).astimezone()
     timestamp = local_now.strftime("%Y%m%d-%H%M%S")
     targets = _canonical_recovery_targets(paths)
     defaults = _default_sources(defaults_dir or _repository_defaults_dir())
-    validators = (load_config, load_overview_calibration, load_stereo_calibration)
+    validators = (
+        load_config,
+        load_overview_calibration,
+        load_stereo_calibration,
+        ImuCalibration.load,
+    )
 
     for source in defaults:
         if not source.is_file():
@@ -175,6 +184,7 @@ def recover_default_inputs(
         load_config(targets[0])
         load_overview_calibration(targets[1])
         load_stereo_calibration(targets[2])
+        ImuCalibration.load(targets[3])
     except (OSError, ValueError) as exc:
         rollback_failures: list[str] = []
         for target in reversed(replaced):

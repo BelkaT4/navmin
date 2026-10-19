@@ -1,4 +1,4 @@
-"""Strict parser and serializer for NavMin config schema v3."""
+"""Strict parser and serializer for NavMin config schema v4."""
 
 from __future__ import annotations
 
@@ -21,6 +21,7 @@ from .models import (
     CameraConfig,
     CamerasConfig,
     FeedForwardConfig,
+    ImuConfig,
     OverviewCameraConfig,
     PidControllerConfig,
     PlatformMotionConfig,
@@ -41,7 +42,7 @@ from .models import (
     VisionDistanceConfig,
 )
 
-SUPPORTED_SCHEMA_VERSION = 3
+SUPPORTED_SCHEMA_VERSION = 4
 SUPPORTED_BAUDRATES = frozenset({9600, 19200, 38400, 57600, 115200})
 
 
@@ -569,6 +570,41 @@ def _parse_tracking_control(value: Any) -> TrackingControlConfig:
     )
 
 
+def _nullable_nonempty_string(value: Any, path: str) -> str | None:
+    if value is None:
+        return None
+    return _nonempty_string(value, path)
+
+
+def _parse_imu(value: Any) -> ImuConfig:
+    path = "imu"
+    obj = _fields(
+        value,
+        path,
+        required={
+            "enabled",
+            "bind-address",
+            "port",
+            "expected-source",
+            "calibration-file",
+        },
+    )
+    port = _int(obj["port"], f"{path}.port", minimum=1)
+    if port > 65535:
+        _validation(f"{path}.port", "must be <= 65535")
+    return ImuConfig(
+        enabled=_bool(obj["enabled"], f"{path}.enabled"),
+        bind_address=_nonempty_string(obj["bind-address"], f"{path}.bind-address"),
+        port=port,
+        expected_source=_nullable_nonempty_string(
+            obj["expected-source"], f"{path}.expected-source"
+        ),
+        calibration_file=_nonempty_string(
+            obj["calibration-file"], f"{path}.calibration-file"
+        ),
+    )
+
+
 def _parse_axis(value: Any, path: str) -> AxisMechanicsConfig:
     obj = _fields(
         value,
@@ -753,7 +789,7 @@ def _parse_ui(value: Any) -> UiConfig:
 
 
 def parse_config(data: Any) -> AppConfig:
-    """Validate an already decoded JSON value and return schema-v3 snapshot."""
+    """Validate an already decoded JSON value and return schema-v4 snapshot."""
     obj = _fields(
         data,
         "",
@@ -762,6 +798,7 @@ def parse_config(data: Any) -> AppConfig:
             "vision",
             "aiming",
             "tracking-control",
+            "imu",
             "turret",
             "ui",
         },
@@ -775,6 +812,7 @@ def parse_config(data: Any) -> AppConfig:
         vision=_parse_vision(obj["vision"]),
         aiming=_parse_aiming(obj["aiming"]),
         tracking_control=_parse_tracking_control(obj["tracking-control"]),
+        imu=_parse_imu(obj["imu"]),
         turret=_parse_turret(obj["turret"]),
         ui=_parse_ui(obj["ui"]),
     )
@@ -842,7 +880,7 @@ def _aim_point_to_mapping(config: AimPointConfig) -> dict[str, Any]:
 
 
 def config_to_mapping(config: AppConfig) -> dict[str, Any]:
-    """Convert a typed schema-v3 snapshot to its persisted JSON structure."""
+    """Convert a typed schema-v4 snapshot to its persisted JSON structure."""
     return {
         "schema-version": config.schema_version,
         "vision": {
@@ -911,6 +949,13 @@ def config_to_mapping(config: AppConfig) -> dict[str, Any]:
             "platform-motion": {
                 "source": config.tracking_control.platform_motion.source.value,
             },
+        },
+        "imu": {
+            "enabled": config.imu.enabled,
+            "bind-address": config.imu.bind_address,
+            "port": config.imu.port,
+            "expected-source": config.imu.expected_source,
+            "calibration-file": config.imu.calibration_file,
         },
         "turret": {
             "serial": {

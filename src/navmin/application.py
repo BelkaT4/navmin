@@ -29,6 +29,7 @@ from navmin.diagnostics.stereo_runtime import (
     StereoDiagnosticsReporter,
     StereoRuntimeDiagnostics,
 )
+from navmin.imu import ImuCalibration, ImuRuntime, ImuRuntimeState
 from navmin.turret.worker import TransportFactory, TurretWorker
 from navmin.ui.bridge import CameraUiBinding
 from navmin.vision.camera_source import create_camera_source
@@ -61,6 +62,7 @@ _STEREO_RIGHT_COMPONENT = "Stereo Right CameraWorker"
 _STEREO_DISTANCE_COMPONENT = "Stereo Distance Worker"
 _STEREO_DIAGNOSTICS_COMPONENT = "Stereo Diagnostics Reporter"
 _TURRET_COMPONENT = "TurretWorker"
+_IMU_COMPONENT = "IMU Runtime"
 _TURRET_SAFETY_COMPONENT = "Turret safety shutdown"
 
 
@@ -72,6 +74,7 @@ class ApplicationFactories:
     stereo_left_source_factory: SourceFactory = create_camera_source
     stereo_right_source_factory: SourceFactory = create_camera_source
     turret_transport_factory: TransportFactory | None = None
+    imu_runtime_factory: Callable[..., ImuRuntime] = ImuRuntime
 
 
 @dataclass(frozen=True)
@@ -81,6 +84,7 @@ class UiRuntimeDependencies:
     mediator: Mediator
     camera_bindings: Mapping[CameraRole, CameraUiBinding]
     turret_states: LatestValue[TurretState]
+    imu_states: LatestValue[ImuRuntimeState] | None
     camera_stale_timeout_ms: int
     pid_controller_config: PidControllerConfig
     apply_pid_tuning: Callable[[PidControllerConfig], None]
@@ -108,7 +112,7 @@ class ApplicationShutdownError(RuntimeError):
 
 
 class ApplicationRuntime:
-    """Own normal cameras, optional Stereo Right, Turret, and Mediator."""
+    """Own cameras, optional IMU/Stereo helpers, Turret, and Mediator."""
 
     def __init__(
         self,
@@ -121,6 +125,7 @@ class ApplicationRuntime:
         stereo_target_joiner: StereoTargetJoiner | None,
         stereo_distance_worker: StereoDistanceWorker | None,
         stereo_diagnostics_reporter: StereoDiagnosticsReporter | None,
+        imu_runtime: ImuRuntime | None,
         turret_worker: TurretWorker,
         mediator: Mediator,
         camera_stale_timeout_ms: int,
@@ -139,6 +144,7 @@ class ApplicationRuntime:
         self.stereo_target_joiner = stereo_target_joiner
         self.stereo_distance_worker = stereo_distance_worker
         self.stereo_diagnostics_reporter = stereo_diagnostics_reporter
+        self.imu_runtime = imu_runtime
         self.turret_worker = turret_worker
         self.mediator = mediator
         self.camera_stale_timeout_ms = camera_stale_timeout_ms
@@ -164,6 +170,7 @@ class ApplicationRuntime:
             mediator=mediator,
             camera_bindings=self._camera_bindings,
             turret_states=turret_worker.state_updates,
+            imu_states=self.imu_states,
             camera_stale_timeout_ms=camera_stale_timeout_ms,
             pid_controller_config=turret_config.controller,
             apply_pid_tuning=self.apply_pid_tuning,
@@ -185,6 +192,10 @@ class ApplicationRuntime:
     @property
     def turret_states(self) -> LatestValue[TurretState]:
         return self.turret_worker.state_updates
+
+    @property
+    def imu_states(self) -> LatestValue[ImuRuntimeState] | None:
+        return None if self.imu_runtime is None else self.imu_runtime.state_updates
 
     @property
     def ui_dependencies(self) -> UiRuntimeDependencies:
@@ -320,6 +331,9 @@ class ApplicationRuntime:
                 initialize_gstreamer_runtime()
             self.turret_worker.start()
             self._active_components.add(_TURRET_COMPONENT)
+            if self.imu_runtime is not None:
+                self.imu_runtime.start()
+                self._active_components.add(_IMU_COMPONENT)
             self.overview_worker.start()
             self._active_components.add(_OVERVIEW_COMPONENT)
             self.stereo_left_worker.start()
@@ -333,7 +347,7 @@ class ApplicationRuntime:
             if self.stereo_diagnostics_reporter is not None:
                 self.stereo_diagnostics_reporter.start()
                 self._active_components.add(_STEREO_DIAGNOSTICS_COMPONENT)
-        except RuntimeError as startup_error:
+        except (OSError, RuntimeError) as startup_error:
             failures = self._stop_active(_DEFAULT_SHUTDOWN_TIMEOUT_SECONDS)
             if failures:
                 startup_error.add_note(
@@ -453,6 +467,7 @@ class ApplicationRuntime:
             (_STEREO_LEFT_COMPONENT, self.stereo_left_worker),
             (_OVERVIEW_COMPONENT, self.overview_worker),
             (_STEREO_DISTANCE_COMPONENT, self.stereo_distance_worker),
+            (_IMU_COMPONENT, self.imu_runtime),
             (_TURRET_COMPONENT, self.turret_worker),
         )
         for component, worker in ordered:
@@ -504,12 +519,22 @@ def build_application_runtime(
     config: AppConfig,
     overview_calibration: OverviewCalibration,
     stereo_calibration: StereoCalibration,
+    imu_calibration: ImuCalibration | None = None,
     factories: ApplicationFactories | None = None,
 ) -> ApplicationRuntime:
     """Compose the production NavMin runtime from already-loaded typed inputs."""
     if not isinstance(config, AppConfig):
         raise TypeError("config must be AppConfig")
     selected_factories = factories or ApplicationFactories()
+
+    imu_runtime = None
+    if config.imu.enabled:
+        imu_runtime = selected_factories.imu_runtime_factory(
+            bind_address=config.imu.bind_address,
+            port=config.imu.port,
+            expected_source=config.imu.expected_source,
+            calibration=imu_calibration,
+        )
 
     stereo_config = config.vision.distance.stereo
     stereo_pairer = None
@@ -628,6 +653,7 @@ def build_application_runtime(
         stereo_target_joiner=stereo_target_joiner,
         stereo_distance_worker=stereo_distance_worker,
         stereo_diagnostics_reporter=stereo_diagnostics_reporter,
+        imu_runtime=imu_runtime,
         turret_worker=turret_worker,
         mediator=mediator,
         camera_stale_timeout_ms=config.vision.camera_stale_timeout_ms,

@@ -34,8 +34,10 @@ from navmin.contracts import (
     VisionResult,
 )
 from navmin.core import DistanceMeasurementMode, Mediator
+from navmin.imu import ImuRuntimeState
 
 from .bridge import CameraUiBinding, UiStatePump
+from .imu_window import ImuWindow
 from .operator_window import OperatorWindow
 from .video_view import PreparedVisionFrame, VideoView, prepare_vision_frame
 
@@ -105,6 +107,7 @@ class MainWindow(QMainWindow):
         clock_ns: Callable[[], int] = monotonic_ns,
         wall_clock: Callable[[], datetime] = datetime.now,
         show_diagnostic_clock: bool = False,
+        imu_states: LatestValue[ImuRuntimeState] | None = None,
         frame_preparer: Callable[[VisionResult], PreparedVisionFrame] = prepare_vision_frame,
         start_timer: bool = True,
         start_fullscreen: bool = True,
@@ -219,10 +222,16 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("BelkaT4 / NavMin")
         self.resize(1280, 800)
 
+        self.imu_window = ImuWindow(
+            owner=self,
+            states=imu_states,
+            on_toggle_operator=self.toggle_operator_window,
+        )
         self.operator_window = OperatorWindow(
             owner=self,
             on_toggle_fullscreen=self.toggle_fullscreen,
             on_exit=self.request_exit,
+            on_show_imu=self.show_imu_window,
             pid_controller_config=pid_controller_config,
             on_apply_pid_tuning=apply_pid_tuning,
             tracking_control_config=tracking_control_config,
@@ -266,6 +275,7 @@ class MainWindow(QMainWindow):
             self.operator_window.set_fullscreen_state(self.isFullScreen())
 
     def closeEvent(self, event: QCloseEvent) -> None:
+        self.imu_window.close()
         self.operator_window.close()
         super().closeEvent(event)
 
@@ -283,6 +293,11 @@ class MainWindow(QMainWindow):
         self.operator_window.show()
         self.operator_window.raise_()
         self.operator_window.activateWindow()
+
+    def show_imu_window(self) -> None:
+        self.imu_window.show()
+        self.imu_window.raise_()
+        self.imu_window.activateWindow()
 
     def request_exit(self) -> None:
         if self._confirm_exit():

@@ -28,6 +28,7 @@ from navmin.config.models import (
     AxisMechanicsConfig,
     CameraConfig,
     CamerasConfig,
+    ImuConfig,
     OverviewCameraConfig,
     PidControllerConfig,
     ProcessingScope,
@@ -335,7 +336,7 @@ def _smoke_overview_config(port: int) -> OverviewCameraConfig:
 
 def _smoke_app_config() -> AppConfig:
     return AppConfig(
-        schema_version=3,
+        schema_version=4,
         vision=VisionConfig(
             processing_scope=ProcessingScope.MAIN_AND_PREVIEW,
             cameras=CamerasConfig(
@@ -368,6 +369,13 @@ def _smoke_app_config() -> AppConfig:
             / "defaults"
             / "navmin.json"
         ).tracking_control,
+        imu=ImuConfig(
+            enabled=False,
+            bind_address="0.0.0.0",
+            port=8891,
+            expected_source=None,
+            calibration_file="calibration/imu.json",
+        ),
         turret=_smoke_turret_config(),
         ui=_smoke_ui_config(),
     )
