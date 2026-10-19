@@ -207,7 +207,7 @@ def test_linux_host_shell_files_are_posix_syntax_valid() -> None:
         assert script.stat().st_mode & 0o111
 
 
-def test_default_host_config_is_safe_and_working_inputs_are_ignored() -> None:
+def test_default_host_config_is_safe_and_working_inputs_are_tracked() -> None:
     default = (REPO_ROOT / "config" / "defaults" / "host.env").read_text(
         encoding="utf-8"
     )
@@ -219,12 +219,16 @@ def test_default_host_config_is_safe_and_working_inputs_are_ignored() -> None:
     assert "CAMERA_HOST_ADDRESS=192.0.2.2/24" in default
     assert "CAMERA_PROFILE_NAME=NavMin Cameras CONFIGURE BEFORE USE" in default
     assert not (REPO_ROOT / "config" / "host.example.env").exists()
-    assert "/config/*.json" in ignore
-    assert "/config/*.env" in ignore
-    assert "/config/**/*.json" in ignore
-    assert "/config/**/*.env" in ignore
-    assert "!/config/defaults/" in ignore
-    assert "!/config/defaults/**" in ignore
+
+    for pattern in (
+        "/config/*.json",
+        "/config/*.env",
+        "/config/**/*.json",
+        "/config/**/*.env",
+        "!/config/defaults/",
+        "!/config/defaults/**",
+    ):
+        assert pattern not in ignore
 
 
 def _write_minimal_run_navmin_tree(tmp_path: Path) -> tuple[Path, Path]:
