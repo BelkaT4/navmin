@@ -34,7 +34,7 @@ from navmin.contracts import (
     VisionResult,
 )
 from navmin.core import DistanceMeasurementMode, Mediator
-from navmin.imu import ImuRuntimeState
+from navmin.imu import ImuCalibrationControls, ImuRuntimeState
 
 from .bridge import CameraUiBinding, UiStatePump
 from .imu_window import ImuWindow
@@ -108,6 +108,7 @@ class MainWindow(QMainWindow):
         wall_clock: Callable[[], datetime] = datetime.now,
         show_diagnostic_clock: bool = False,
         imu_states: LatestValue[ImuRuntimeState] | None = None,
+        imu_controls: ImuCalibrationControls | None = None,
         frame_preparer: Callable[[VisionResult], PreparedVisionFrame] = prepare_vision_frame,
         start_timer: bool = True,
         start_fullscreen: bool = True,
@@ -225,6 +226,7 @@ class MainWindow(QMainWindow):
         self.imu_window = ImuWindow(
             owner=self,
             states=imu_states,
+            controls=imu_controls,
             on_toggle_operator=self.toggle_operator_window,
         )
         self.operator_window = OperatorWindow(

@@ -347,6 +347,7 @@ def test_imu_disabled_does_not_construct_runtime() -> None:
     assert calls == []
     assert runtime.imu_runtime is None
     assert runtime.imu_states is None
+    assert runtime.ui_dependencies.imu_controls is None
 
 
 def test_imu_enabled_constructs_runtime_from_config_and_loaded_calibration() -> None:
@@ -387,6 +388,7 @@ def test_imu_enabled_constructs_runtime_from_config_and_loaded_calibration() -> 
     }
     assert runtime.imu_runtime is fake
     assert runtime.imu_states is fake.state_updates
+    assert runtime.ui_dependencies.imu_controls is fake
 
 
 def test_imu_enabled_follows_startup_and_shutdown_lifecycle(monkeypatch) -> None:
@@ -1020,6 +1022,7 @@ def test_shared_runtime_starts_and_exposes_complete_ui_dependency_surface() -> N
         assert ui.camera_bindings is runtime.camera_bindings
         assert ui.turret_states is runtime.turret_worker.state_updates
         assert ui.imu_states is runtime.imu_states
+        assert ui.imu_controls is runtime.imu_runtime
         assert ui.camera_stale_timeout_ms == 500
     finally:
         runtime.shutdown(timeout=1.0)

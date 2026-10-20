@@ -305,6 +305,7 @@ def _window(
     stereo_target_joiner: StereoTargetJoiner | None = None,
     stereo_distance_results: LatestValue[StereoDistanceCandidate] | None = None,
     imu_states: LatestValue[ImuRuntimeState] | None = None,
+    imu_controls=None,
 ) -> tuple[
     MainWindow,
     Mediator,
@@ -333,6 +334,7 @@ def _window(
             apply_tracking_control_tuning or (lambda _config: None)
         ),
         imu_states=imu_states,
+        imu_controls=imu_controls,
         clock_ns=clock or _Clock(),
         wall_clock=wall_clock
         or _WallClock(datetime(2026, 9, 22, 12, 0, 0, tzinfo=UTC)),
@@ -355,6 +357,11 @@ def _imu_state(
     gyro_bias_state: GyroBiasState = GyroBiasState.READY,
     orientation_valid: bool = True,
     euler: tuple[float, float, float] = (1.0, 2.0, 3.0),
+    accel_faces_captured: tuple[int, ...] = (),
+    mag_calibration_active: bool = False,
+    mag_calibration_sample_count: int = 0,
+    mag_calibration_octants: int = 0,
+    calibration_message: str | None = None,
 ) -> ImuRuntimeState:
     return ImuRuntimeState(
         running=running,
@@ -385,6 +392,11 @@ def _imu_state(
         out_of_order_packets=3,
         foreign_packets=4,
         last_error=None,
+        accel_faces_captured=accel_faces_captured,
+        mag_calibration_active=mag_calibration_active,
+        mag_calibration_sample_count=mag_calibration_sample_count,
+        mag_calibration_octants=mag_calibration_octants,
+        calibration_message=calibration_message,
     )
 
 def _publish_camera(
@@ -1355,6 +1367,108 @@ def test_escape_toggles_single_modeless_operator_window(
     assert window.isVisible()
     window.close()
 
+
+
+class _ImuControlRecorder:
+    def __init__(self) -> None:
+        self.events: list[tuple[str, int | None]] = []
+
+    def request_gyro_bias_calibration(self) -> bool:
+        self.events.append(("gyro", None))
+        return True
+
+    def request_accelerometer_face(self, face: int) -> bool:
+        self.events.append(("accel", face))
+        return True
+
+    def request_magnetometer_start(self) -> bool:
+        self.events.append(("mag-start", None))
+        return True
+
+    def request_magnetometer_finish(self) -> bool:
+        self.events.append(("mag-finish", None))
+        return True
+
+    def request_relative_zero(self) -> bool:
+        self.events.append(("zero", None))
+        return True
+
+
+def test_imu_calibration_controls_use_only_passive_imu_ingress(
+    qt_application: QApplication,
+) -> None:
+    controls = _ImuControlRecorder()
+    imu_states: LatestValue[ImuRuntimeState] = LatestValue()
+    imu_states.publish(_imu_state())
+    window, _mediator_value, turret, _bindings_value, _states = _window(
+        qt_application,
+        imu_states=imu_states,
+        imu_controls=controls,
+    )
+    imu = window.imu_window
+    imu.show()
+    qt_application.processEvents()
+    before = (
+        len(turret.relative_commands),
+        len(turret.tracking_controls),
+        turret.invalidations,
+        len(turret.mode_requests),
+        turret.stop_requests,
+        turret.motor_on_requests,
+        turret.motor_off_requests,
+        turret.emergency_requests,
+    )
+
+    QTest.mouseClick(imu.gyro_calibration_button, Qt.MouseButton.LeftButton)
+    QTest.mouseClick(imu.accel_face_buttons[1], Qt.MouseButton.LeftButton)
+    QTest.mouseClick(imu.relative_zero_button, Qt.MouseButton.LeftButton)
+    QTest.mouseClick(imu.mag_start_button, Qt.MouseButton.LeftButton)
+
+    imu_states.publish(
+        _imu_state(
+            accel_faces_captured=(1,),
+            mag_calibration_active=True,
+            mag_calibration_sample_count=321,
+            mag_calibration_octants=6,
+            calibration_message="Магнитометр: идёт сбор.",
+        )
+    )
+    imu.refresh_once()
+    assert not imu.gyro_calibration_button.isEnabled()
+    assert not imu.accel_face_buttons[1].isEnabled()
+    assert not imu.mag_start_button.isEnabled()
+    assert imu.mag_finish_button.isEnabled()
+    assert "X+ ✓" == imu.accel_face_buttons[1].text()
+    assert "сбор MAG=321" in imu.quality_label.text()
+    assert "охват≈6/8" in imu.quality_label.text()
+    QTest.mouseClick(imu.mag_finish_button, Qt.MouseButton.LeftButton)
+
+    assert controls.events == [
+        ("gyro", None),
+        ("accel", 1),
+        ("zero", None),
+        ("mag-start", None),
+        ("mag-finish", None),
+    ]
+    after = (
+        len(turret.relative_commands),
+        len(turret.tracking_controls),
+        turret.invalidations,
+        len(turret.mode_requests),
+        turret.stop_requests,
+        turret.motor_on_requests,
+        turret.motor_off_requests,
+        turret.emergency_requests,
+    )
+    assert after == before
+
+    imu_states.publish(_imu_state(fresh=False, orientation_valid=False))
+    imu.refresh_once()
+    assert not imu.gyro_calibration_button.isEnabled()
+    assert not imu.accel_face_buttons[1].isEnabled()
+    assert not imu.mag_start_button.isEnabled()
+    assert not imu.relative_zero_button.isEnabled()
+    window.close()
 
 
 def test_position_button_reuses_one_modeless_imu_window_and_esc_does_not_hide_it(

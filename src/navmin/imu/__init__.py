@@ -19,6 +19,9 @@ from .core import (
 )
 from .runtime import (
     GyroBiasState,
+    ImuCalibrationCommand,
+    ImuCalibrationCommandType,
+    ImuCalibrationControls,
     ImuRuntime,
     ImuRuntimeState,
     ImuSourceIdentity,
@@ -31,6 +34,9 @@ __all__ = [
     "PROTOCOL_VERSION",
     "GyroBiasState",
     "ImuCalibration",
+    "ImuCalibrationCommand",
+    "ImuCalibrationCommandType",
+    "ImuCalibrationControls",
     "ImuRuntime",
     "ImuRuntimeState",
     "ImuSample",

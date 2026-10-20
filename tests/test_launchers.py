@@ -74,7 +74,7 @@ from navmin.preflight import (
     StartupPreflightCheck,
     StartupPreflightReport,
 )
-from navmin.session_artifacts import SessionArtifacts
+from navmin.session_artifacts import SessionArtifacts, SourceInputPaths
 
 WIDTH = 64
 HEIGHT = 48
@@ -447,6 +447,7 @@ def test_run_loaded_application_uses_shared_runtime_ui_surface_and_shutdown() ->
         camera_bindings={CameraRole.OVERVIEW: object()},
         turret_states=object(),
         imu_states=object(),
+        imu_controls=object(),
         camera_stale_timeout_ms=321,
         pid_controller_config=pid_config,
         apply_pid_tuning=apply_pid_tuning,
@@ -456,6 +457,7 @@ def test_run_loaded_application_uses_shared_runtime_ui_surface_and_shutdown() ->
 
     class FakeRuntime:
         def __init__(self) -> None:
+            self.imu_runtime = None
             self.ui_dependencies = ui_dependencies
 
         def start(self) -> None:
@@ -479,6 +481,7 @@ def test_run_loaded_application_uses_shared_runtime_ui_surface_and_shutdown() ->
         assert kwargs["camera_bindings"] is ui_dependencies.camera_bindings
         assert kwargs["turret_states"] is ui_dependencies.turret_states
         assert kwargs["imu_states"] is ui_dependencies.imu_states
+        assert kwargs["imu_controls"] is ui_dependencies.imu_controls
         assert kwargs["camera_stale_timeout_ms"] == 321
         assert kwargs["pid_controller_config"] is pid_config
         assert kwargs["apply_pid_tuning"] is apply_pid_tuning
@@ -501,6 +504,70 @@ def test_run_loaded_application_uses_shared_runtime_ui_surface_and_shutdown() ->
         == 7
     )
     assert events == ["start", "ui", "shutdown"]
+
+
+def test_run_loaded_application_installs_launcher_owned_imu_calibration_writer(
+    tmp_path: Path,
+) -> None:
+    config_path = tmp_path / "config" / "navmin.json"
+    expected_imu_path = tmp_path / "config" / "calibration" / "imu.json"
+    base = _inputs()
+    config = replace(base.config, imu=replace(base.config.imu, enabled=True))
+    inputs = LoadedApplicationInputs(
+        config=config,
+        overview_calibration=base.overview_calibration,
+        stereo_calibration=base.stereo_calibration,
+        imu_calibration=ImuCalibration(),
+        source_paths=SourceInputPaths(
+            config=config_path,
+            overview_calibration=tmp_path / "overview.json",
+            stereo_calibration=tmp_path / "stereo.json",
+        ),
+    )
+
+    class FakeImuRuntime:
+        def __init__(self) -> None:
+            self.writer = None
+
+        def set_calibration_writer(self, writer) -> None:
+            self.writer = writer
+
+    class FakeRuntime:
+        def __init__(self) -> None:
+            self.imu_runtime = FakeImuRuntime()
+            self.ui_dependencies = SimpleNamespace(
+                mediator=object(),
+                camera_bindings={},
+                turret_states=object(),
+                imu_states=object(),
+                imu_controls=object(),
+                camera_stale_timeout_ms=500,
+                pid_controller_config=config.turret.controller,
+                apply_pid_tuning=lambda _config: None,
+                tracking_control_config=config.tracking_control,
+                apply_tracking_control_tuning=lambda _config: None,
+            )
+
+        def start(self) -> None:
+            assert self.imu_runtime.writer is not None
+            self.imu_runtime.writer(
+                ImuCalibration(gyro_bias=[1.0, 2.0, 3.0], gyro_ready=True)
+            )
+
+        def shutdown(self) -> None:
+            pass
+
+    runtime = FakeRuntime()
+    result = run_loaded_application(
+        inputs,
+        runtime_builder=lambda **_kwargs: runtime,
+        ui_runner=lambda **_kwargs: 0,
+    )
+
+    assert result == 0
+    saved = ImuCalibration.load(expected_imu_path)
+    assert saved.gyro_ready
+    assert saved.gyro_bias == [1.0, 2.0, 3.0]
 
 
 def test_normal_launcher_rejects_legacy_fake_turret_configuration() -> None:

@@ -1,4 +1,4 @@
-"""Read-only modeless display for the passive GY-85 runtime state."""
+"""Modeless display and passive calibration controls for the GY-85 runtime."""
 
 from __future__ import annotations
 
@@ -18,13 +18,29 @@ from PyQt6.QtGui import (
 from PyQt6.QtWidgets import (
     QGridLayout,
     QGroupBox,
+    QHBoxLayout,
     QLabel,
+    QPushButton,
     QVBoxLayout,
     QWidget,
 )
 
 from navmin.concurrency import LatestValue
-from navmin.imu import GyroBiasState, ImuRuntimeState, rotation_matrix
+from navmin.imu import (
+    GyroBiasState,
+    ImuCalibrationControls,
+    ImuRuntimeState,
+    rotation_matrix,
+)
+
+_FACE_LABELS = {
+    1: "X+",
+    -1: "X−",
+    2: "Y+",
+    -2: "Y−",
+    3: "Z+",
+    -3: "Z−",
+}
 
 
 class AttitudeView(QWidget):
@@ -125,22 +141,25 @@ class AttitudeView(QWidget):
 
 
 class ImuWindow(QWidget):
-    """Modeless read-only view over one ApplicationRuntime-owned IMU state slot."""
+    """Modeless view over one ApplicationRuntime-owned passive IMU channel."""
 
     def __init__(
         self,
         *,
         owner: QWidget,
         states: LatestValue[ImuRuntimeState] | None,
+        controls: ImuCalibrationControls | None,
         on_toggle_operator: Callable[[], None],
     ) -> None:
         super().__init__(owner, Qt.WindowType.Tool)
         self._states = states
+        self._controls = controls
         self._on_toggle_operator = on_toggle_operator
+        self._local_control_message = ""
         self.setWindowTitle("NavMin — положение / GY-85")
         self.setWindowModality(Qt.WindowModality.NonModal)
         self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, False)
-        self.resize(900, 680)
+        self.resize(900, 820)
 
         self.attitude_view = AttitudeView(self)
         self.status_label = QLabel("STALE — состояние IMU ещё не получено")
@@ -175,9 +194,61 @@ class ImuWindow(QWidget):
         details_layout.setColumnStretch(1, 1)
         layout.addWidget(details)
 
+        calibration = QGroupBox("Калибровка GY-85")
+        calibration_layout = QVBoxLayout(calibration)
+        self.calibration_status_label = QLabel(
+            "Команды калибровки доступны только при работающем IMU."
+        )
+        self.calibration_status_label.setWordWrap(True)
+        calibration_layout.addWidget(self.calibration_status_label)
+
+        self.gyro_calibration_button = QPushButton("Гироскоп: повторить 5 с")
+        self.gyro_calibration_button.clicked.connect(self._restart_gyro_bias)
+        calibration_layout.addWidget(self.gyro_calibration_button)
+
+        accel_note = QLabel(
+            "Акселерометр: положите датчик неподвижно выбранной сырой осью вверх "
+            "или вниз, затем нажмите соответствующую грань."
+        )
+        accel_note.setWordWrap(True)
+        calibration_layout.addWidget(accel_note)
+        accel_row = QHBoxLayout()
+        self.accel_face_buttons: dict[int, QPushButton] = {}
+        for face in (1, -1, 2, -2, 3, -3):
+            button = QPushButton(_FACE_LABELS[face])
+            button.clicked.connect(
+                lambda _checked=False, selected_face=face: self._capture_accel_face(
+                    selected_face
+                )
+            )
+            self.accel_face_buttons[face] = button
+            accel_row.addWidget(button)
+        calibration_layout.addLayout(accel_row)
+
+        mag_note = QLabel(
+            "Магнитометр: начните сбор, затем плавно поворачивайте датчик во всех "
+            "направлениях не менее 10 секунд и завершите сбор."
+        )
+        mag_note.setWordWrap(True)
+        calibration_layout.addWidget(mag_note)
+        mag_row = QHBoxLayout()
+        self.mag_start_button = QPushButton("Магнитометр: начать")
+        self.mag_finish_button = QPushButton("Магнитометр: завершить")
+        self.mag_start_button.clicked.connect(self._start_magnetometer)
+        self.mag_finish_button.clicked.connect(self._finish_magnetometer)
+        mag_row.addWidget(self.mag_start_button)
+        mag_row.addWidget(self.mag_finish_button)
+        calibration_layout.addLayout(mag_row)
+
+        self.relative_zero_button = QPushButton("Принять текущую ориентацию как ноль")
+        self.relative_zero_button.clicked.connect(self._set_relative_zero)
+        calibration_layout.addWidget(self.relative_zero_button)
+        layout.addWidget(calibration)
+
         note = QLabel(
-            "GY-85 работает только как измерительный слой. Это окно не управляет "
-            "двигателями, режимом наведения или сопровождением цели."
+            "GY-85 работает только как измерительный слой. Калибровка изменяет только "
+            "данные IMU и его calibration-файл; она не управляет двигателями, режимом "
+            "наведения или сопровождением цели."
         )
         note.setWordWrap(True)
         layout.addWidget(note)
@@ -208,6 +279,10 @@ class ImuWindow(QWidget):
         self.sensor_label.setText("Показания датчика ещё не получены")
         self.source_label.setText("Источник: —")
         self.error_label.setText("")
+        self.calibration_status_label.setText(
+            "Команды калибровки недоступны без работающего IMU."
+        )
+        self._set_calibration_controls_enabled(None)
         self.attitude_view.set_orientation((1.0, 0.0, 0.0, 0.0), fresh=False)
 
     def _render_state(self, state: ImuRuntimeState) -> None:
@@ -215,11 +290,10 @@ class ImuWindow(QWidget):
             status = "ERROR — IMU receiver остановлен"
         elif state.stale or not state.fresh:
             status = "STALE — нет свежих данных IMU"
-        elif (
-            state.gyro_bias_state is not GyroBiasState.READY
-            or not state.orientation_valid
-        ):
+        elif state.gyro_bias_state is not GyroBiasState.READY:
             status = "CALIBRATING — калибровка смещения гироскопа"
+        elif state.mag_calibration_active:
+            status = "CALIBRATING — сбор данных магнитометра"
         elif state.last_error:
             status = "ERROR — ошибка IMU runtime"
         else:
@@ -236,10 +310,18 @@ class ImuWindow(QWidget):
         accel_status = "калиброван" if state.accel_calibrated else "не калиброван"
         mag_status = "калиброван" if state.mag_calibrated else "не калиброван"
         heading_status = "VALID" if state.heading_valid else "UNAVAILABLE"
+        faces = ", ".join(_FACE_LABELS[face] for face in state.accel_faces_captured)
+        faces = faces or "нет"
+        mag_capture = (
+            f"; сбор MAG={state.mag_calibration_sample_count}; "
+            f"охват≈{state.mag_calibration_octants}/8"
+            if state.mag_calibration_active
+            else ""
+        )
         self.quality_label.setText(
             f"Гироскоп: {state.gyro_bias_state.value}; "
-            f"акселерометр: {accel_status}; "
-            f"магнитометр: {mag_status}; "
+            f"акселерометр: {accel_status}; грани: {faces}; "
+            f"магнитометр: {mag_status}{mag_capture}; "
             f"магнитная коррекция: {heading_status}; "
             f"монтаж: {state.mounting_axes}"
         )
@@ -271,10 +353,85 @@ class ImuWindow(QWidget):
         if state.last_error:
             diagnostics += f"; last error: {state.last_error}"
         self.error_label.setText(diagnostics)
+        message = state.calibration_message or self._local_control_message
+        if not message:
+            message = "Калибровка готова к действиям оператора."
+        self.calibration_status_label.setText(message)
+        self._set_calibration_controls_enabled(state)
+        for face, button in self.accel_face_buttons.items():
+            mark = " ✓" if face in state.accel_faces_captured else ""
+            button.setText(_FACE_LABELS[face] + mark)
         self.attitude_view.set_orientation(
             state.relative_quaternion,
             fresh=state.fresh and state.orientation_valid,
         )
+
+    def _set_calibration_controls_enabled(
+        self,
+        state: ImuRuntimeState | None,
+    ) -> None:
+        available = self._controls is not None and state is not None and state.running
+        fresh = bool(available and state is not None and state.fresh)
+        mag_active = bool(state is not None and state.mag_calibration_active)
+        self.gyro_calibration_button.setEnabled(fresh and not mag_active)
+        for button in self.accel_face_buttons.values():
+            button.setEnabled(fresh and not mag_active)
+        self.mag_start_button.setEnabled(fresh and not mag_active)
+        self.mag_finish_button.setEnabled(available and mag_active)
+        self.relative_zero_button.setEnabled(
+            fresh and not mag_active and bool(state and state.orientation_valid)
+        )
+
+    def _restart_gyro_bias(self) -> None:
+        self._request_control(
+            "request_gyro_bias_calibration",
+            queued="Гироскоп: команда отправлена; не двигайте датчик 5 секунд.",
+        )
+
+    def _capture_accel_face(self, face: int) -> None:
+        self._request_control(
+            "request_accelerometer_face",
+            face,
+            queued=f"Акселерометр: измерение {_FACE_LABELS[face]} отправлено.",
+        )
+
+    def _start_magnetometer(self) -> None:
+        self._request_control(
+            "request_magnetometer_start",
+            queued="Магнитометр: начало сбора отправлено.",
+        )
+
+    def _finish_magnetometer(self) -> None:
+        self._request_control(
+            "request_magnetometer_finish",
+            queued="Магнитометр: завершение сбора отправлено.",
+        )
+
+    def _set_relative_zero(self) -> None:
+        self._request_control(
+            "request_relative_zero",
+            queued="Установка относительного нуля отправлена.",
+        )
+
+    def _request_control(self, method_name: str, *args: object, queued: str) -> None:
+        if self._controls is None:
+            self._local_control_message = "Команды калибровки недоступны."
+            self.calibration_status_label.setText(self._local_control_message)
+            return
+        method = getattr(self._controls, method_name, None)
+        if method is None:
+            self._local_control_message = "Команда калибровки не поддерживается runtime."
+            self.calibration_status_label.setText(self._local_control_message)
+            return
+        try:
+            accepted = bool(method(*args))
+        except (TypeError, ValueError, RuntimeError) as exc:
+            self._local_control_message = f"Команда отклонена: {exc}"
+        else:
+            self._local_control_message = (
+                queued if accepted else "Очередь команд IMU занята; повторите действие."
+            )
+        self.calibration_status_label.setText(self._local_control_message)
 
     @staticmethod
     def _format_vector(values: tuple[float, ...] | None) -> str:

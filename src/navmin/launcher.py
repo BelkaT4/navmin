@@ -212,6 +212,15 @@ def run_loaded_application(
         stereo_calibration=inputs.stereo_calibration,
         imu_calibration=inputs.imu_calibration,
     )
+    imu_runtime = runtime.imu_runtime
+    if imu_runtime is not None and inputs.source_paths is not None:
+        imu_calibration_path = resolve_imu_calibration_path(
+            inputs.source_paths.config,
+            inputs.config,
+        )
+        imu_runtime.set_calibration_writer(
+            lambda calibration, path=imu_calibration_path: calibration.save(path)
+        )
     runtime.start()
     try:
         ui = runtime.ui_dependencies
@@ -220,6 +229,7 @@ def run_loaded_application(
             camera_bindings=ui.camera_bindings,
             turret_states=ui.turret_states,
             imu_states=ui.imu_states,
+            imu_controls=ui.imu_controls,
             camera_stale_timeout_ms=ui.camera_stale_timeout_ms,
             pid_controller_config=ui.pid_controller_config,
             apply_pid_tuning=ui.apply_pid_tuning,

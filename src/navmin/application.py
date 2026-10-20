@@ -29,7 +29,12 @@ from navmin.diagnostics.stereo_runtime import (
     StereoDiagnosticsReporter,
     StereoRuntimeDiagnostics,
 )
-from navmin.imu import ImuCalibration, ImuRuntime, ImuRuntimeState
+from navmin.imu import (
+    ImuCalibration,
+    ImuCalibrationControls,
+    ImuRuntime,
+    ImuRuntimeState,
+)
 from navmin.turret.worker import TransportFactory, TurretWorker
 from navmin.ui.bridge import CameraUiBinding
 from navmin.vision.camera_source import create_camera_source
@@ -85,6 +90,7 @@ class UiRuntimeDependencies:
     camera_bindings: Mapping[CameraRole, CameraUiBinding]
     turret_states: LatestValue[TurretState]
     imu_states: LatestValue[ImuRuntimeState] | None
+    imu_controls: ImuCalibrationControls | None
     camera_stale_timeout_ms: int
     pid_controller_config: PidControllerConfig
     apply_pid_tuning: Callable[[PidControllerConfig], None]
@@ -171,6 +177,7 @@ class ApplicationRuntime:
             camera_bindings=self._camera_bindings,
             turret_states=turret_worker.state_updates,
             imu_states=self.imu_states,
+            imu_controls=self.imu_runtime,
             camera_stale_timeout_ms=camera_stale_timeout_ms,
             pid_controller_config=turret_config.controller,
             apply_pid_tuning=self.apply_pid_tuning,
