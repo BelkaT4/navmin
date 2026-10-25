@@ -11,8 +11,14 @@ from time import monotonic_ns
 from typing import Protocol
 
 from navmin.concurrency import LatestValue, TargetControlChannel
-from navmin.config.models import AimingConfig, TrackingControlConfig, UiConfig
+from navmin.config.models import (
+    AimingConfig,
+    AxesConfig,
+    TrackingControlConfig,
+    UiConfig,
+)
 from navmin.contracts import (
+    CameraModel,
     CameraRole,
     CameraSessionStarted,
     CameraState,
@@ -38,10 +44,12 @@ from navmin.contracts import (
     TurretState,
     VisionResult,
 )
+from navmin.motion_curve import interpolate_motion
 from navmin.vision.stereo_target_join import StereoPairingKind
 
 from .aiming import Aiming
 from .distance import DistanceMeasurementMode, quantize_constant_distance
+from .motion_calibration import MotionObservation, axis_angle
 from .session_gate import CameraSessionGate
 from .tracking_estimator import TrackingEstimator, TrackingEstimatorDiagnostics
 
@@ -153,6 +161,8 @@ class Mediator:
         initial_manual_distance_m: float = 100.0,
         distance_stale_timeout_ms: int = 300,
         clock_ns: Callable[[], int] = monotonic_ns,
+        calibration_axes: AxesConfig | None = None,
+        camera_stale_timeout_ms: int = 500,
     ) -> None:
         if ui_config.default_camera not in _NORMAL_CAMERAS:
             raise ValueError("ui.default_camera must be Overview or Stereo Left")
@@ -196,6 +206,11 @@ class Mediator:
         self._stereo_distance_results = stereo_distance_results
         self._stereo_distance_result_revision = 0
         self._aiming = Aiming(aiming_config)
+        self.calibration_axes = calibration_axes
+        self.calibration_observations: list[MotionObservation] = []
+        self._calibration_pending: tuple[FramePacket, str, float, float] | None = None
+        self._calibration_previous: tuple[str, float] | None = None
+        self._calibration_stale_ns = camera_stale_timeout_ms * 1_000_000
         self._tracking_estimator = TrackingEstimator(tracking_control_config)
         self._tracking_control_config_revision = 0
         self._tracking_gap_timeout_ns = tracking_gap_timeout_ms * 1_000_000
@@ -380,6 +395,8 @@ class Mediator:
         """Accept a generation barrier before any data from that generation."""
         if not self._session_gate.accept(session):
             return False
+        if session.camera is self._main_camera:
+            self.cancel_motion_calibration()
         if session.camera is CameraRole.STEREO_LEFT:
             self._invalidate_distance_intent()
             if self._stereo_target_joiner is not None:
@@ -424,6 +441,8 @@ class Mediator:
         accepted_generation = self._session_gate.accepted_generation(status.camera)
         if accepted_generation is not None and status.generation != accepted_generation:
             return False
+        if status.camera is self._main_camera and status.state in _DISCONNECTED_CAMERA_STATES:
+            self.cancel_motion_calibration()
         if (
             status.camera is self._main_camera
             and status.state in _DISCONNECTED_CAMERA_STATES
@@ -439,6 +458,12 @@ class Mediator:
             raise TypeError("state must be TurretState")
         previous = self._turret_state
         self._turret_state = state
+        if (
+            state.connection_state is not TurretConnectionState.READY
+            or state.motor_state is not MotorState.ON
+            or state.control_mode is not TurretControlMode.RELATIVE
+        ):
+            self.cancel_motion_calibration()
 
         if self._pending_control_mode is state.control_mode:
             self._pending_control_mode = None
@@ -471,6 +496,9 @@ class Mediator:
         x_px: float,
         y_px: float,
     ) -> bool:
+        if self._calibration_pending is not None:
+            return False
+        self._calibration_previous = None
         if self._turret_state.control_mode is not TurretControlMode.RELATIVE:
             return False
         if self._pending_control_mode is not None:
@@ -487,8 +515,95 @@ class Mediator:
             x_px=x_px,
             y_px=y_px,
         )
+        if self.calibration_axes is not None:
+            for axis, angle in (("x", command.delta_x_deg), ("y", command.delta_y_deg)):
+                mechanics = getattr(self.calibration_axes, axis)
+                try:
+                    corrected = interpolate_motion(mechanics.relative_motion_curve, angle)
+                except ValueError:
+                    return False
+                if abs(corrected) > mechanics.max_relative_move_deg:
+                    return False
         self._turret.submit_move_relative(command)
         return True
+
+    @property
+    def calibration_pending(self) -> bool:
+        return self._calibration_pending is not None
+
+    def cancel_motion_calibration(self) -> None:
+        self._calibration_pending = None
+        self._calibration_previous = None
+
+    def _calibration_model(self, result: VisionResult, x: float, y: float) -> CameraModel:
+        state = self._turret_state
+        frame = result.frame
+        if (
+            state.control_mode is not TurretControlMode.RELATIVE
+            or state.motor_state is not MotorState.ON
+            or state.connection_state is not TurretConnectionState.READY
+            or self._pending_control_mode is not None
+            or frame.camera is not self._main_camera
+            or not self._pixel_in_frame(frame, x, y)
+            or not 0 <= self._clock_ns() - frame.receive_timestamp_ns < self._calibration_stale_ns
+        ):
+            raise ValueError("Нужны свежий кадр, RELATIVE, связь READY и моторы ON")
+        model = self._session_gate.camera_model(frame.camera, frame.generation)
+        if model is None:
+            raise ValueError("Сессия камеры изменилась")
+        return model
+
+    def begin_motion_measurement(
+        self, result: VisionResult, x: float, y: float, axis: str,
+    ) -> float:
+        if self.calibration_axes is None or axis not in ("x", "y"):
+            raise ValueError("Нет настроек механики для калибровки")
+        if getattr(self.calibration_axes, axis).relative_motion_curve:
+            raise ValueError("Для новой серии удалите relative-motion-curve выбранной оси и перезапустите приложение")
+        if self._calibration_pending is not None:
+            raise ValueError("Сначала завершите или отмените текущий замер")
+        model = self._calibration_model(result, x, y)
+        aim = self._aiming.aim_point(result.frame.camera, result.frame)
+        before = axis_angle(model, x, y, axis)
+        command = before - axis_angle(model, *aim, axis)
+        if not 0.1 <= abs(command) <= getattr(self.calibration_axes, axis).max_relative_move_deg:
+            raise ValueError("Угол меньше 0.1° либо превышает предел relative move")
+        self._turret.submit_move_relative(MoveRelativeCommand(
+            delta_x_deg=command if axis == "x" else 0.0,
+            delta_y_deg=command if axis == "y" else 0.0,
+        ))
+        self._calibration_pending = (result.frame, axis, command, before)
+        return command
+
+    def finish_motion_measurement(
+        self, result: VisionResult, x: float, y: float,
+    ) -> MotionObservation:
+        pending = self._calibration_pending
+        if pending is None:
+            raise ValueError("Нет начатого замера")
+        model = self._calibration_model(result, x, y)
+        before_frame, axis, command, before = pending
+        frame = result.frame
+        if (
+            frame.camera is not before_frame.camera
+            or frame.generation != before_frame.generation
+            or frame.frame_id <= before_frame.frame_id
+            or frame.receive_timestamp_ns <= before_frame.receive_timestamp_ns
+        ):
+            raise ValueError("Нужен новый кадр той же камеры и сессии")
+        measured = before - axis_angle(model, x, y, axis)
+        previous = self._calibration_previous
+        reversal = None if previous is None or previous[0] != axis else previous[1] * command < 0
+        observation = MotionObservation(
+            axis, frame.camera, frame.generation, before_frame.frame_id, frame.frame_id,
+            command, measured, reversal,
+        )
+        self.calibration_observations.append(observation)
+        self._calibration_pending = None
+        self._calibration_previous = (
+            (axis, command) if measured * command > 0 else None
+        )
+        return observation
 
     def request_target_selection(
         self,
@@ -551,6 +666,7 @@ class Mediator:
         return True
 
     def swap_main_preview(self) -> CameraRole:
+        self.cancel_motion_calibration()
         old_main = self._main_camera
         self._invalidate_distance_intent()
         self._main_camera = (
@@ -569,6 +685,7 @@ class Mediator:
         return self._main_camera
 
     def request_control_mode(self, mode: TurretControlMode) -> bool:
+        self.cancel_motion_calibration()
         if not isinstance(mode, TurretControlMode):
             raise TypeError("mode must be TurretControlMode")
         if not self._turret.set_control_mode(mode):
@@ -584,6 +701,7 @@ class Mediator:
         return True
 
     def stop_motion(self) -> bool:
+        self.cancel_motion_calibration()
         if self._turret_state.control_mode is TurretControlMode.TRACKING:
             cameras = self._target_intent_cameras(default=self._main_camera)
             self._invalidate_target_intent(stop_motion=False)
@@ -591,6 +709,7 @@ class Mediator:
         return self._turret.stop_motion()
 
     def emergency_stop(self) -> None:
+        self.cancel_motion_calibration()
         cameras = self._target_intent_cameras(default=self._main_camera)
         self._invalidate_target_intent(stop_motion=False)
         self._publish_clear(cameras)
@@ -601,6 +720,7 @@ class Mediator:
         return self._turret.motor_on()
 
     def motor_off(self) -> bool:
+        self.cancel_motion_calibration()
         if not self._turret.motor_off():
             return False
         cameras = self._target_intent_cameras(default=self._main_camera)

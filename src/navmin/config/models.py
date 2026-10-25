@@ -171,6 +171,7 @@ class AxisMechanicsConfig:
     full_steps_per_revolution: int
     microstep_divider: int
     max_relative_move_deg: float
+    relative_motion_curve: tuple[tuple[float, float], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -296,6 +297,9 @@ def config_apply_policy(path: str) -> ConfigApplyPolicy | None:
         return ConfigApplyPolicy.CONTROLLED_SERIAL_TRANSITION
     if path == "turret.emulate-stm32":
         return ConfigApplyPolicy.APPLICATION_RESTART
+
+    if len(parts) == 4 and parts[:2] == ["turret", "axes"] and parts[3] == "relative-motion-curve":
+        return ConfigApplyPolicy.DYNAMIC
 
     if (
         len(parts) == 4

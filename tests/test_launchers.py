@@ -404,14 +404,18 @@ def test_cli_override_paths_are_the_paths_recorded_in_session_source_hashes(
     assert sources["stereo_calibration"]["path"] == str(override_stereo.resolve())
 
 
-def test_run_loaded_application_uses_shared_runtime_ui_surface_and_shutdown() -> None:
+@pytest.mark.parametrize("save_fails", [False, True])
+def test_run_loaded_application_uses_shared_runtime_ui_surface_and_shutdown(tmp_path, save_fails) -> None:
+    from navmin.config import load_config
+    from navmin.core.motion_calibration import MotionEstimate
+
     events: list[str] = []
     inputs = _inputs()
     pid_config = inputs.config.turret.controller
     pid_updates: list[PidControllerConfig] = []
     apply_pid_tuning = pid_updates.append
     ui_dependencies = SimpleNamespace(
-        mediator=object(),
+        mediator=SimpleNamespace(calibration_axes=inputs.config.turret.axes, calibration_pending=False),
         camera_bindings={CameraRole.OVERVIEW: object()},
         turret_states=object(),
         camera_stale_timeout_ms=321,
@@ -430,6 +434,11 @@ def test_run_loaded_application_uses_shared_runtime_ui_surface_and_shutdown() ->
 
         def shutdown(self) -> None:
             events.append("shutdown")
+
+        def apply_motion_calibration(self, axes):
+            assert load_config(destination).turret.axes == axes
+            ui_dependencies.mediator.calibration_axes = axes
+            events.append("apply")
 
     def builder(**kwargs) -> FakeRuntime:
         assert kwargs == {
@@ -454,18 +463,34 @@ def test_run_loaded_application_uses_shared_runtime_ui_surface_and_shutdown() ->
         )
         assert kwargs["show_diagnostic_clock"] is False
         assert kwargs["argv"] == ("--qt-test",)
+        curve = ((-0.5, -0.6), (0.0, 0.0), (0.5, 0.6))
+        estimate = MotionEstimate(1.0, 0.0, None, None, curve)
+        save = kwargs["save_motion_calibration"]
+        if save_fails:
+            with pytest.raises(ValueError, match="failed to save"):
+                save("x", estimate)
+            assert ui_dependencies.mediator.calibration_axes == inputs.config.turret.axes
+        else:
+            assert save("x", estimate) == str(destination)
+            save("y", estimate)
+            saved = load_config(destination)
+            assert saved.turret.axes.x.relative_motion_curve == curve
+            assert saved.turret.axes.y.relative_motion_curve == curve
+            assert saved.vision == inputs.config.vision
         return 7
 
+    destination = (tmp_path / "missing" if save_fails else tmp_path) / "config.json"
     assert (
         run_loaded_application(
             inputs,
             qt_argv=("--qt-test",),
             runtime_builder=builder,
             ui_runner=ui_runner,
+            calibration_config_path=destination,
         )
         == 7
     )
-    assert events == ["start", "ui", "shutdown"]
+    assert events == (["start", "ui", "shutdown"] if save_fails else ["start", "ui", "apply", "apply", "shutdown"])
 
 
 def test_normal_launcher_rejects_legacy_fake_turret_configuration() -> None:

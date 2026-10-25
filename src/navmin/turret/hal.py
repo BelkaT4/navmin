@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from math import isfinite
 from time import monotonic_ns
 from typing import Literal
@@ -17,6 +17,7 @@ from navmin.contracts import (
     MoveRelativeCommand,
     PlatformMotionSnapshot,
 )
+from navmin.motion_curve import interpolate_motion, validate_motion_curve
 
 from .platform_motion import CommandMotionModel
 from .protocol import (
@@ -67,9 +68,11 @@ class TurretHal:
             raise TypeError("config must be TurretConfig")
         self._session = session
         self._command_clock_ns = command_clock_ns
-        # Mechanical conversion is restart-only in v1: keep this snapshot forever.
+        # Mechanical conversion is restart-only; only relative curves update live.
         self._mechanics_x = config.axes.x
         self._mechanics_y = config.axes.y
+        for mechanics in (self._mechanics_x, self._mechanics_y):
+            validate_motion_curve(mechanics.relative_motion_curve, mechanics.max_relative_move_deg)
         self._desired_stm32_config = config.stm32
         self._latest_config_revision = 0
         self._pending_config: _PendingConfig | None = None
@@ -189,9 +192,16 @@ class TurretHal:
             raise TypeError("command must be MoveRelativeCommand")
         self._validate_relative_limit("x", command.delta_x_deg)
         self._validate_relative_limit("y", command.delta_y_deg)
+        try:
+            corrected_x = interpolate_motion(self._mechanics_x.relative_motion_curve, command.delta_x_deg)
+            corrected_y = interpolate_motion(self._mechanics_y.relative_motion_curve, command.delta_y_deg)
+        except ValueError as exc:
+            raise RelativeMoveLimitError(str(exc)) from exc
+        self._validate_relative_limit("x", corrected_x)
+        self._validate_relative_limit("y", corrected_y)
         payload = MoveRelativePayload(
-            delta_x_steps=self.degrees_to_steps("x", command.delta_x_deg),
-            delta_y_steps=self.degrees_to_steps("y", command.delta_y_deg),
+            delta_x_steps=self.degrees_to_steps("x", corrected_x),
+            delta_y_steps=self.degrees_to_steps("y", corrected_y),
         )
         result = self._ordinary(CommandCode.MOVE_RELATIVE, payload)
         if self._response_ok(result):
@@ -267,6 +277,14 @@ class TurretHal:
             raise TypeError("update.config must be TurretConfig")
         if update.revision <= self._latest_config_revision:
             return False
+
+        # Only the empirical curve is live; mechanical conversion and limits
+        # retain their startup values. Worker applies config before new motion.
+        curves = (update.config.axes.x.relative_motion_curve, update.config.axes.y.relative_motion_curve)
+        for mechanics, curve in zip((self._mechanics_x, self._mechanics_y), curves):
+            validate_motion_curve(curve, mechanics.max_relative_move_deg)
+        self._mechanics_x = replace(self._mechanics_x, relative_motion_curve=curves[0])
+        self._mechanics_y = replace(self._mechanics_y, relative_motion_curve=curves[1])
         self._latest_config_revision = update.revision
 
         if update.config.stm32 != self._desired_stm32_config:

@@ -1007,3 +1007,22 @@ def test_motor_off_invalidates_tracking_motion_and_resets_pid() -> None:
     assert [decode_request(raw).command for raw in transport.raw_write_history] == [
         CommandCode.MOTOR_OFF
     ]
+
+
+def test_hal_nonlinear_relative_curve_is_signed_bounded_and_dynamic() -> None:
+    config = _config(invert_x=True, max_relative_x=10)
+    curve = ((-7.0, -10.0), (-4.0, -5.0), (0.0, 0.0), (3.0, 5.0), (6.0, 10.0))
+    calibrated = replace(config, axes=replace(config.axes, x=replace(config.axes.x, relative_motion_curve=curve)))
+    _, hal, _, transport, _ = _stack(config)
+    hal.apply_config_update(ConfigUpdate(1, calibrated))
+    hal.move_relative(MoveRelativeCommand(4.5, 0))
+    assert decode_request(transport.raw_write_history[-1]).payload == MoveRelativePayload(hal.degrees_to_steps('x', 7.5), 0)
+    for requested, command in [(4.5, 7.5), (-5.5, -7.5), (0, 0)]:
+        hal.move_relative(MoveRelativeCommand(requested, 0))
+        assert decode_request(transport.raw_write_history[-1]).payload == MoveRelativePayload(hal.degrees_to_steps('x', command), 0)
+    writes = len(transport.raw_write_history)
+    for requested in (6.01, -7.01):
+        with pytest.raises(RelativeMoveLimitError):
+            hal.move_relative(MoveRelativeCommand(requested, 0))
+    assert len(transport.raw_write_history) == writes
+    assert hal.velocity_to_steps_s('x', 4.5) == hal.degrees_to_steps('x', 4.5)

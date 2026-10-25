@@ -673,7 +673,7 @@ Localhost senders, PTY emulator, `QApplication`, file/CLI loading и diagnostic
 session artifacts не принадлежат `ApplicationRuntime` и управляются launcher на
 внешней стороне shared composition.
 
-`InMemoryFrameSource` и `FakeTransport/FakeStm32Endpoint` остаются deterministic automated-test boundaries и не становятся пользовательскими diagnostic runtime modes. Localhost RTP/JPEG нужен именно для проверки production GStreamer receiver без Raspberry Pi, а Linux PTY — для проверки production `SerialTransport`/pyserial byte path без физического controller.
+`InMemoryFrameSource` остаётся deterministic automated-test boundary. Для пользовательского DEMO без оборудования разрешён явный `--turret fake`: `FakeTransport/FakeStm32Endpoint` заменяют только внешний контроллер. Опция `--motion-demo` с `--synthetic-inputs` и двумя localhost-камерами связывает принятые команды с launcher-owned моделью положения и проекцией сцены. Это позволяет пройти ручную калибровку и показать tracking без аппаратуры. Модель идеальная, без люфта и инерции; она не подтверждает физику STM32 или стереодальность. Localhost RTP/JPEG сохраняет production GStreamer receiver, а Linux PTY остаётся проверкой production `SerialTransport`/pyserial byte path.
 
 Normal GUI launcher также владеет operator-approved recovery для локальных `config.json`/calibration inputs. Recovery выполняется только после явной input error и до preflight/runtime: strict loaders остаются strict, существующие файлы сначала получают timestamped backup, safe defaults не считаются hardware configuration, а текущий startup после восстановления завершается. Эта boundary не принадлежит `ApplicationRuntime`, Config Manager или diagnostic launcher.
 
@@ -890,3 +890,30 @@ Backoff совпадает с уже принятым для Turret recovery п�
 - вводит ограничение, которое будущий разработчик может попытаться «исправить», не зная причины.
 
 Мелкие implementation details сюда не переносятся.
+
+
+## Ручные замеры нелинейного движения и люфта
+
+Решение: отмечать один неподвижный ориентир сцены до и после движения,
+по одной оси, с ручным подтверждением остановки. Результат — монотонная
+кусочно-линейная кривая величины и направления relative move. Её применяет HAL
+как динамическую поправку к следующим командам RELATIVE. Люфт пока только измеряется.
+
+Причина: камеры вращаются с платформой, а ошибка может нелинейно зависеть
+от угла. Положение лазерного пятна само по себе не измеряет поворот.
+Единственный коэффициент масштаба не способен описать такую зависимость;
+он остаётся диагностикой, а не применяемой поправкой. Полином высокой степени
+не используется: интерполяция сохраняет измеренные узлы и монотонность.
+Экстраполяция за измеренный диапазон запрещена.
+
+Реверсы исключаются из построения кривой, чтобы потеря хода не смешивалась
+с зависимостью от величины движения. Новый lifecycle завершения MOVE_RELATIVE
+не вводится: ответ OK по-прежнему означает принятие команды. Автоматическое
+изменение шагов, инверсии и лимитов механики остаётся restart-only. Для кривой
+по запросу оператора используется сохранение без файловых диалогов и немедленная
+публикация через существующий ConfigUpdate: сначала успешная атомарная запись,
+затем обновление HAL перед следующей командой. Это исключает перезапуск для каждой
+оси и не меняет уже отправленное движение; отдельная очередь применения не нужна.
+Статическая относительная кривая не переносится на velocity/PID/TRACKING:
+для этих режимов нужны отдельные измерения. Место и режимы компенсации люфта
+остаются открытым вопросом после аппаратных измерений.

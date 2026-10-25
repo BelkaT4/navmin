@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 import sys
 from collections.abc import Sequence
 from dataclasses import dataclass, replace
 from enum import Enum
+from functools import partial
 from pathlib import Path
 
 from navmin.config import (
@@ -66,6 +68,7 @@ class CameraEndpoint(Enum):
 class TurretEndpoint(Enum):
     REAL = "real"
     PTY = "pty"
+    FAKE = "fake"
 
 
 @dataclass(frozen=True)
@@ -83,12 +86,19 @@ class DiagnosticEndpoints:
         *,
         selection: DiagnosticSelection,
         inputs: LoadedApplicationInputs,
+        motion_demo: bool = False,
     ) -> None:
         self.selection = selection
         self._base_inputs = inputs
-        self._senders: list[LocalhostRtpJpegSender] = []
+        self._senders: list[object] = []
         self._pty: PtyStm32Emulator | None = None
         self._started = False
+        self.platform = None
+        if motion_demo:
+            if selection != DiagnosticSelection(CameraEndpoint.LOCALHOST, CameraEndpoint.LOCALHOST, TurretEndpoint.FAKE):
+                raise ValueError("Motion demo requires localhost cameras and fake turret")
+            from navmin.diagnostics.motion_demo import DemoPlatform
+            self.platform = DemoPlatform(inputs.config.turret.axes)
 
     def start(self) -> LoadedApplicationInputs:
         if self._started:
@@ -97,7 +107,10 @@ class DiagnosticEndpoints:
 
         config = replace(
             self._base_inputs.config,
-            turret=replace(self._base_inputs.config.turret, emulate_stm32=False),
+            turret=replace(
+                self._base_inputs.config.turret,
+                emulate_stm32=self.selection.turret is TurretEndpoint.FAKE,
+            ),
         )
         config = _disable_stereo_right(config)
         try:
@@ -179,13 +192,25 @@ class DiagnosticEndpoints:
         width: int,
         height: int,
     ) -> None:
-        sender = LocalhostRtpJpegSender(
+        if os.name == "nt":
+            from navmin.diagnostics.windows_rtp import WindowsRtpJpegSender
+            sender_type = WindowsRtpJpegSender
+        else:
+            sender_type = LocalhostRtpJpegSender
+        options = {}
+        if self.platform is not None:
+            from navmin.diagnostics.motion_demo import DemoScene
+            calibration = (self._base_inputs.overview_calibration if camera_role is CameraRole.OVERVIEW
+                           else self._base_inputs.stereo_calibration)
+            options["frame_generator"] = DemoScene(self.platform, camera_role, calibration)
+        sender = sender_type(
             RtpJpegSenderConfig(
                 port=port,
                 width=width,
                 height=height,
                 camera=camera_role,
-            )
+            ),
+            **options,
         )
         sender.start()
         self._senders.append(sender)
@@ -316,7 +341,10 @@ def _planned_preflight_inputs(
     """Apply only pure endpoint overrides needed to preflight the planned profile."""
     config = replace(
         inputs.config,
-        turret=replace(inputs.config.turret, emulate_stm32=False),
+        turret=replace(
+            inputs.config.turret,
+            emulate_stm32=selection.turret is TurretEndpoint.FAKE,
+        ),
     )
     config = _disable_stereo_right(config)
     if selection.overview is CameraEndpoint.LOCALHOST:
@@ -355,6 +383,8 @@ def _parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument("--config", type=Path, default=Path("config/navmin.json"))
+    parser.add_argument("--motion-demo", action="store_true", help="Couple simulated turret motion to synthetic camera images (fake + synthetic only).")
+    parser.add_argument("--demo-config", type=Path, help="Reload a saved demo configuration, with built-in camera calibrations.")
     parser.add_argument(
         "--overview-calibration",
         type=Path,
@@ -381,7 +411,7 @@ def _parser() -> argparse.ArgumentParser:
         action="store_true",
         help=(
             "Use built-in 320x240 diagnostic config/calibrations. "
-            "Allowed only with localhost/localhost/pty."
+            "Allowed with localhost/localhost/(pty or fake)."
         ),
     )
     parser.add_argument(
@@ -416,16 +446,21 @@ def main(argv: Sequence[str] | None = None) -> int:
         stereo_left=CameraEndpoint(args.stereo_left),
         turret=TurretEndpoint(args.turret),
     )
-    fully_synthetic = selection == DiagnosticSelection(
-        overview=CameraEndpoint.LOCALHOST,
-        stereo_left=CameraEndpoint.LOCALHOST,
-        turret=TurretEndpoint.PTY,
+    fully_synthetic = (
+        selection.overview is CameraEndpoint.LOCALHOST
+        and selection.stereo_left is CameraEndpoint.LOCALHOST
+        and selection.turret in (TurretEndpoint.PTY, TurretEndpoint.FAKE)
     )
     if args.synthetic_inputs and not fully_synthetic:
         parser.error(
             "--synthetic-inputs requires --overview localhost "
-            "--stereo-left localhost --turret pty"
+            "--stereo-left localhost --turret pty|fake"
         )
+    if (args.motion_demo or args.demo_config) and not (args.synthetic_inputs and selection.turret is TurretEndpoint.FAKE and fully_synthetic):
+        parser.error("--motion-demo/--demo-config require --synthetic-inputs, localhost cameras and --turret fake")
+    demo_config_path = None
+    if args.synthetic_inputs and selection.turret is TurretEndpoint.FAKE:
+        demo_config_path = args.demo_config or Path("config/demo-motion.json")
 
     artifacts = SessionArtifacts.create(
         paths.log_dir,
@@ -456,6 +491,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                 if args.synthetic_inputs
                 else load_application_inputs(paths)
             )
+            if args.demo_config or (demo_config_path is not None and demo_config_path.exists()):
+                saved = load_config(demo_config_path)
+                inputs = replace(inputs, config=replace(inputs.config, turret=replace(
+                    inputs.config.turret, axes=saved.turret.axes, controller=saved.turret.controller,
+                )))
         except (OSError, ValueError) as exc:
             LOGGER.exception("NavMin diagnostic input loading failed")
             print(f"INPUT ERROR: {exc}", file=sys.stderr)
@@ -506,7 +546,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         status = SessionStatus.RUNTIME_FAILED
         exit_code = 2
         try:
-            endpoints = DiagnosticEndpoints(selection=selection, inputs=inputs)
+            endpoints = DiagnosticEndpoints(selection=selection, inputs=inputs, motion_demo=args.motion_demo)
             effective_inputs = endpoints.start()
             artifacts.write_effective_inputs(
                 config=effective_inputs.config,
@@ -514,12 +554,24 @@ def main(argv: Sequence[str] | None = None) -> int:
                 stereo_calibration=effective_inputs.stereo_calibration,
                 source_paths=effective_inputs.source_paths,
             )
+            runtime_options = {}
+            if demo_config_path is not None:
+                runtime_options["calibration_config_path"] = demo_config_path
+            if endpoints.platform is not None:
+                from navmin.application import (
+                    ApplicationFactories,
+                    build_application_runtime,
+                )
+                runtime_options["runtime_builder"] = partial(build_application_runtime, factories=ApplicationFactories(
+                    turret_transport_factory=endpoints.platform.transport,
+                ))
             exit_code = run_loaded_application(
                 effective_inputs,
                 show_diagnostic_clock=(
                     CameraEndpoint.LOCALHOST
                     in (selection.overview, selection.stereo_left)
                 ),
+                **runtime_options,
             )
             if exit_code == 0:
                 status = SessionStatus.COMPLETED

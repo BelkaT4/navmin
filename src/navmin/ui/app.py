@@ -27,6 +27,7 @@ def run_ui(
     apply_tracking_control_tuning: Callable[[TrackingControlConfig], None],
     show_diagnostic_clock: bool = False,
     argv: Sequence[str] = (),
+    save_motion_calibration=None,
 ) -> int:
     """Run only the Qt UI; application composition owns all workers."""
     application = QApplication.instance()
@@ -42,6 +43,7 @@ def run_ui(
         tracking_control_config=tracking_control_config,
         apply_tracking_control_tuning=apply_tracking_control_tuning,
         show_diagnostic_clock=show_diagnostic_clock,
+        save_motion_calibration=save_motion_calibration,
     )
     window.showFullScreen()
     return application.exec()

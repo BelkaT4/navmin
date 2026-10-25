@@ -194,10 +194,12 @@ def _mediator(
     aim_points: AimPointsConfig | None = None,
     stereo_target_joiner: StereoTargetJoiner | None = None,
     stereo_distance_results: LatestValue[StereoDistanceCandidate] | None = None,
+    clock_ns: Callable[[], int] = monotonic_ns,
 ) -> tuple[Mediator, _FakeTurret]:
     turret = _FakeTurret(_turret_state(mode=mode, motor=motor))
     mediator_type = _CountingMediator if counting else Mediator
     mediator = mediator_type(
+        clock_ns=clock_ns,
         aiming_config=AimingConfig(
             target_lost_timeout_ms=500,
             aim_points=aim_points
@@ -310,6 +312,7 @@ def _window(
     LatestValue[TurretState],
 ]:
     mediator, turret = _mediator(
+        clock_ns=clock or monotonic_ns,
         mode=mode,
         motor=motor,
         aim_points=aim_points,
@@ -1585,4 +1588,41 @@ def test_main_window_can_request_fullscreen_at_startup(qt_application: QApplicat
     qt_application.processEvents()
     assert window.isFullScreen()
     assert window.state_pump.timer.interval() == 16
+    window.close()
+
+
+def test_motion_calibration_ui_requires_confirmation_and_blocks_aborted_second_click(qt_application: QApplication) -> None:
+    clock = _Clock()
+    window, mediator, turret, bindings, _ = _window(qt_application, clock=clock)
+    mediator.calibration_axes = load_config(Path(__file__).resolve().parents[1] / 'config/defaults/navmin.json').turret.axes
+    first = _result(CameraRole.OVERVIEW, 1)
+    _publish_camera(window, bindings, first)
+    dialog = window.motion_calibration_window
+    dialog.show()
+    window._handle_main_click(first, 50.5, 25)
+    assert mediator.calibration_pending
+    window._handle_main_click(first, 50.25, 25)
+    assert not mediator.calibration_observations
+    assert len(turret.relative_commands) == 1
+    clock.now_ns += 1_000_000
+    second = _result(CameraRole.OVERVIEW, 1, frame_id=2, timestamp_ns=clock.now_ns)
+    bindings[CameraRole.OVERVIEW].latest_result.publish(second)
+    window.state_pump.pump_once()
+    dialog.settled.click()
+    window._handle_main_click(second, 50.25, 25)
+    assert len(mediator.calibration_observations) == 1
+    assert len(turret.relative_commands) == 1
+    window._handle_main_click(second, 50.5, 25)
+    mediator.emergency_stop()
+    window.refresh_presentation()
+    window._handle_main_click(second, 50.25, 25)
+    assert len(turret.relative_commands) == 2
+    assert not mediator.calibration_pending
+    dialog.cancel.click()
+    window._handle_main_click(second, 50.5, 25)
+    assert mediator.calibration_pending
+    stops = turret.stop_requests
+    dialog.reject()
+    assert not mediator.calibration_pending
+    assert turret.stop_requests == stops + 1
     window.close()

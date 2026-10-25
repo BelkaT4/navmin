@@ -35,7 +35,7 @@ from navmin.vision.gstreamer_source import (
 
 _PREFLIGHT_SCHEMA_VERSION = 1
 _CAMERA_BACKENDS = frozenset({"real", "localhost"})
-_TURRET_BACKENDS = frozenset({"real", "pty"})
+_TURRET_BACKENDS = frozenset({"real", "pty", "fake"})
 
 
 class PreflightStatus(StrEnum):
@@ -262,13 +262,17 @@ def run_startup_preflight(
         )
 
     if localhost_selected:
-        sender_result = sender_check()
+        if os.name == "nt":
+            from navmin.diagnostics.windows_rtp import check_windows_sender
+            sender_result = check_windows_sender()
+        else:
+            sender_result = sender_check()
         if sender_result.ok:
             checks.append(
                 StartupPreflightCheck(
                     name="GStreamer localhost sender",
                     status=PreflightStatus.PASS,
-                    detail="gst-launch/gst-inspect and sender elements available",
+                    detail="diagnostic GStreamer sender elements available",
                 )
             )
         else:
@@ -310,6 +314,14 @@ def run_startup_preflight(
                 name="STM32 protocol reachability",
                 status=PreflightStatus.WARN,
                 detail="static preflight does not open the serial device or query STM32",
+            )
+        )
+    elif selection.turret == "fake":
+        checks.append(
+            StartupPreflightCheck(
+                name="Software STM32 emulator",
+                status=PreflightStatus.PASS,
+                detail="in-process FakeStm32Endpoint; no physical serial port",
             )
         )
     else:

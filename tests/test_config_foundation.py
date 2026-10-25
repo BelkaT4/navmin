@@ -953,3 +953,33 @@ def test_atomic_replace_failure_preserves_existing_file(tmp_path, monkeypatch) -
 
     assert path.read_bytes() == original
     assert not list(tmp_path.glob(".config.json.*.tmp"))
+
+
+def test_relative_motion_curve_roundtrip_and_dynamic_policy() -> None:
+    data = _valid_config()
+    points = [(-7, -10), (-4, -5), (0, 0), (3, 5), (6, 10)]
+    data['turret']['axes']['x']['relative-motion-curve'] = [
+        {'measured-deg': measured, 'command-deg': command} for measured, command in points
+    ]
+    parsed = parse_config(data)
+    assert parsed.turret.axes.x.relative_motion_curve == tuple(points)
+    assert parse_config(config_to_mapping(parsed)) == parsed
+    assert config_apply_policy('turret.axes.x.relative-motion-curve') is ConfigApplyPolicy.DYNAMIC
+    assert changed_config_paths(parse_config(_valid_config()), parsed) == ('turret.axes.x.relative-motion-curve',)
+
+
+@pytest.mark.parametrize('points', [
+    [(0, 0), (1, 1)],
+    [(-1, -1), (0, 0), (1, -1)],
+    [(-1, -1), (0, 0), (1, 2), (2, 1)],
+    [(-1, -1), (0, 0), (1, 46)],
+    [(-1, -1), (0, 0), (float('nan'), 1)],
+    [(-1, -1), (0, 0), (1, 1), (1, 2)],
+])
+def test_relative_motion_curve_rejects_invalid_mapping(points) -> None:
+    data = _valid_config()
+    data['turret']['axes']['x']['relative-motion-curve'] = [
+        {'measured-deg': measured, 'command-deg': command} for measured, command in points
+    ]
+    with pytest.raises(ConfigValidationError):
+        parse_config(data)

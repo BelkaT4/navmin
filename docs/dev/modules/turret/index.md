@@ -132,6 +132,17 @@ STM32 дополнительно применяет static firmware sanity bound
 
 При внезапной потере связи уже принятый ограниченный `MOVE_RELATIVE` может завершиться полностью. Отдельного communication watchdog для relative move нет.
 
+### Нелинейная калибровка relative move
+
+HAL хранит optional `relative-motion-curve` каждой оси и обновляет её через
+существующий ConfigUpdate в worker перед следующей командой. Остальные параметры
+механического преобразования сохраняют startup snapshot.
+Перед переводом в шаги он интерполирует требуемую исходную команду по
+измеренному физическому углу. Диапазон и оба предела проверяются до UART;
+экстраполяция запрещена. Кривая не меняет velocity/PID или протокол STM32,
+не компенсирует реверс и не применяется динамически.
+Контракт полей — [Конфигурация](../../architecture/configuration.md#кривая-калибровки-relative).
+
 ## TRACKING
 
 Controller получает `TrackingError` через latest-state с monotonic revision:

@@ -219,6 +219,14 @@ EMERGENCY_STOP → OK
 
 Auto `MOTOR_ON` отсутствует. Уже принятый ограниченный `MOVE_RELATIVE` при внезапной потере связи может закончиться; velocity control защищён watchdog.
 
+## Калибровка relative move
+
+Ручные замеры по одному неподвижному ориентиру до и после поворота формируют
+нелинейную кривую движения каждой оси. Core рассчитывает её, UI сохраняет
+настройки, HAL применяет после перезапуска перед переводом relative move в шаги.
+Пути владения движением и UART остаются прежними; автоматической компенсации
+люфта нет. [Контракт конфигурации](./configuration.md#кривая-калибровки-relative).
+
 ## Relative move без completion lifecycle
 
 `MOVE_RELATIVE → OK` означает только принятие новой relative target. `MOVE_COMPLETED`, `command_id`, terminal lifecycle и completion polling отсутствуют.
@@ -332,6 +340,14 @@ Normal и diagnostic launchers передают сюда effective typed inputs 
 `FakeTransport`.
 
 Эти file-backed inputs являются локальными site-specific файлами и не входят в repository baseline. Strict loaders не создают и не чинят их автоматически. Если обычный GUI startup получает missing/invalid input, launcher до preflight/workers может предложить оператору закрыть программу либо выполнить явный recovery: timestamped backup всего существующего input set → safe non-hardware-ready defaults → завершение текущего startup для ручной проверки параметров. `--preflight-only` и diagnostic/headless paths такого диалога не открывают.
+
+Пользовательский DEMO использует явные localhost камеры и `--turret fake`.
+С `--synthetic-inputs --motion-demo` diagnostic launcher владеет общей моделью
+положения виртуальной платформы: принятые команды внешнего fake endpoint меняют
+проекцию неподвижных ориентиров и движущейся цели в обоих RTP/JPEG потоках.
+Production UI/Core/HAL и camera receivers используются без отдельного demo пути.
+Модель позволяет показать RELATIVE, TRACKING и ручную калибровку движения;
+стереодальность, люфт и физическая динамика оборудования не моделируются.
 
 Diagnostic entrypoint — `python tools/run_diagnostic_app.py`. Он требует явного
 выбора `--overview real|localhost`, `--stereo-left real|localhost` и

@@ -629,6 +629,15 @@ def test_runtime_pid_tuning_dependencies_use_loaded_config_and_monotonic_updates
     assert queued[-1].config == replace(config.turret, controller=third)
     assert "PID tuning update queued revision=3" in caplog.text
 
+    axes = replace(config.turret.axes, x=replace(config.turret.axes.x,
+        relative_motion_curve=((-0.5, -0.6), (0.0, 0.0), (0.5, 0.6))))
+    runtime.apply_motion_calibration(axes)
+    ui.apply_pid_tuning(first)
+    assert [update.revision for update in queued] == [1, 2, 3, 4, 5]
+    assert queued[-2].config.controller == third
+    assert queued[-1].config.axes == axes
+    assert runtime.mediator.calibration_axes == axes
+
 
 @pytest.mark.parametrize("invalid", [-0.1, float("nan"), float("inf")])
 def test_runtime_pid_tuning_rejects_invalid_gains_without_publishing(

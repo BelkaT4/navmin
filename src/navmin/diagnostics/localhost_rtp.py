@@ -403,6 +403,7 @@ class LocalhostRtpJpegSender:
         monotonic_clock: Callable[[], float] = monotonic,
         sleep_fn: Callable[[float], None] = sleep,
         wall_clock: Callable[[], datetime] = datetime.now,
+        frame_generator=None,
     ) -> None:
         if startup_probe_seconds < 0.0:
             raise ValueError("startup_probe_seconds must be >= 0")
@@ -415,7 +416,7 @@ class LocalhostRtpJpegSender:
         self._terminate_timeout_seconds = terminate_timeout_seconds
         self._monotonic_clock = monotonic_clock
         self._sleep = sleep_fn
-        self._frame_generator = SyntheticDiagnosticFrameGenerator(
+        self._frame_generator = frame_generator or SyntheticDiagnosticFrameGenerator(
             camera=config.camera,
             width=config.width,
             height=config.height,

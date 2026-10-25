@@ -3,6 +3,7 @@ from __future__ import annotations
 import math
 
 import numpy as np
+import pytest
 
 from navmin.config.models import AimingConfig, AimPointConfig, AimPointsConfig
 from navmin.contracts import (
@@ -164,3 +165,71 @@ def test_tracking_error_contains_target_frame_timestamp_and_finite_angles() -> N
     assert error.timestamp_ns == frame.receive_timestamp_ns
     assert math.isfinite(error.error_x_deg)
     assert math.isfinite(error.error_y_deg)
+
+
+def test_motion_calibration_separates_scale_from_directional_backlash() -> None:
+    from navmin.core.motion_calibration import MotionObservation, estimate_motion
+
+    samples = [
+        MotionObservation('x', CameraRole.OVERVIEW, 1, 1, 2, command, measured, reversal)
+        for command, measured, reversal in [
+            (5, 1, None), (2, 1.6, False), (5, 4, False), (10, 8, False),
+            (-2, -1.6, False), (-5, -4, False), (-10, -8, False),
+            (5, 3.7, True), (10, 7.7, True),
+            (-5, -3.5, True), (-10, -7.5, True),
+        ]
+    ]
+    estimate = estimate_motion(samples, 'x')
+    assert estimate.gain == pytest.approx(0.8)
+    assert estimate.correction == pytest.approx(1.25)
+    assert estimate.rms_deg == pytest.approx(0)
+    assert estimate.backlash_positive_deg == pytest.approx(0.3)
+    assert estimate.backlash_negative_deg == pytest.approx(0.5)
+    with pytest.raises(ValueError):
+        estimate_motion(samples[:3], 'x')
+
+
+def test_motion_calibration_config_uses_startup_baseline_and_preserves_other_fields() -> None:
+    from dataclasses import replace
+    from pathlib import Path
+
+    from navmin.config import load_config
+    from navmin.core.motion_calibration import MotionEstimate, corrected_config
+
+    config = load_config(Path(__file__).resolve().parents[1] / 'config/defaults/navmin.json')
+    baseline = config.turret.axes.x
+    estimate = MotionEstimate(0.8, 0, None, None, ((-0.8, -1.0), (0.0, 0.0), (0.8, 1.0)))
+    corrected = corrected_config(config, 'x', baseline, estimate)
+    assert corrected.turret.axes.x.relative_motion_curve == estimate.curve
+    assert corrected.turret.axes.x.full_steps_per_revolution == baseline.full_steps_per_revolution
+    assert corrected.turret.axes.y == config.turret.axes.y
+    assert corrected.aiming == config.aiming
+    assert corrected.turret.axes.x.microstep_divider == baseline.microstep_divider
+    with pytest.raises(ValueError):
+        corrected_config(corrected, 'x', baseline, MotionEstimate(0.8, 0, None, None))
+    with pytest.raises(ValueError):
+        corrected_config(config, 'x', replace(baseline, invert=not baseline.invert), MotionEstimate(1, 0, None, None))
+
+
+def test_nonlinear_motion_curve_reconstructs_angles_without_extrapolation() -> None:
+    from navmin.core.motion_calibration import MotionObservation, estimate_motion
+    from navmin.motion_curve import interpolate_motion
+
+    samples = [
+        MotionObservation('x', CameraRole.OVERVIEW, 1, 1, 2, command, measured, False)
+        for command, measured in [(-10, -7), (-5, -4.5), (-2, -1.9), (2, 1.8), (5, 4), (10, 6)]
+    ]
+    estimate = estimate_motion(samples, 'x')
+    assert estimate.rms_deg > 0.1  # A single scale cannot explain these measurements.
+    assert interpolate_motion(estimate.curve, 1.8) == pytest.approx(2)
+    assert interpolate_motion(estimate.curve, 6) == pytest.approx(10)
+    assert interpolate_motion(estimate.curve, 5) == pytest.approx(7.5)
+    assert interpolate_motion(estimate.curve, -5.75) == pytest.approx(-7.5)
+    assert interpolate_motion(estimate.curve, 0) == 0
+    with pytest.raises(ValueError):
+        interpolate_motion(estimate.curve, 6.01)
+    with pytest.raises(ValueError):
+        interpolate_motion(estimate.curve, -7.01)
+    samples[-1] = MotionObservation('x', CameraRole.OVERVIEW, 1, 1, 2, 10, 3, False)
+    with pytest.raises(ValueError):
+        estimate_motion(samples, 'x')

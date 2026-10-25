@@ -36,6 +36,7 @@ from navmin.contracts import (
 from navmin.core import DistanceMeasurementMode, Mediator
 
 from .bridge import CameraUiBinding, UiStatePump
+from .motion_calibration import MotionCalibrationWindow
 from .operator_window import OperatorWindow
 from .video_view import PreparedVisionFrame, VideoView, prepare_vision_frame
 
@@ -108,6 +109,7 @@ class MainWindow(QMainWindow):
         frame_preparer: Callable[[VisionResult], PreparedVisionFrame] = prepare_vision_frame,
         start_timer: bool = True,
         start_fullscreen: bool = True,
+        save_motion_calibration=None,
     ) -> None:
         super().__init__()
         if set(camera_bindings) != set(_NORMAL_CAMERAS):
@@ -228,6 +230,9 @@ class MainWindow(QMainWindow):
             tracking_control_config=tracking_control_config,
             on_apply_tracking_control_tuning=apply_tracking_control_tuning,
         )
+        self.motion_calibration_window = MotionCalibrationWindow(self, mediator, save_motion_calibration)
+        calibration_action = self.menuBar().addAction("Калибровка движения")
+        calibration_action.triggered.connect(self.motion_calibration_window.show)
 
         self.state_pump = UiStatePump(
             mediator=mediator,
@@ -266,6 +271,7 @@ class MainWindow(QMainWindow):
             self.operator_window.set_fullscreen_state(self.isFullScreen())
 
     def closeEvent(self, event: QCloseEvent) -> None:
+        self.motion_calibration_window.close()
         self.operator_window.close()
         super().closeEvent(event)
 
@@ -308,6 +314,11 @@ class MainWindow(QMainWindow):
         self.refresh_presentation()
 
     def refresh_presentation(self) -> None:
+        if self._mediator.calibration_pending and not self.main_view.interaction_allowed(
+            self._mediator.session_gate, self._clock_ns(),
+        ):
+            self._mediator.cancel_motion_calibration()
+        self.motion_calibration_window.refresh()
         self.operator_window.set_tracking_diagnostics(
             self._mediator.tracking_diagnostics
         )
@@ -448,8 +459,15 @@ class MainWindow(QMainWindow):
         ):
             return
         mode = self._mediator.turret_state.control_mode
+        if self.motion_calibration_window.isVisible():
+            self.motion_calibration_window.handle_click(displayed_result, x_px, y_px)
+            self.refresh_presentation()
+            return
         if mode is TurretControlMode.RELATIVE:
-            self._mediator.handle_relative_click(displayed_result, x_px, y_px)
+            if not self._mediator.handle_relative_click(displayed_result, x_px, y_px):
+                self.statusBar().showMessage(
+                    "Наведение отклонено: проверьте режим, пределы и диапазон калибровки", 5000,
+                )
         elif mode is TurretControlMode.TRACKING:
             self._mediator.request_target_selection(
                 displayed_result,

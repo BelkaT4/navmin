@@ -446,6 +446,35 @@ turret.emulate-stm32: bool
 
 В v1 `emulate-stm32` — application-restart setting: runtime сохранение допустимо, но уже работающий Turret worker не переключает real ↔ fake transport до application restart.
 
+### Кривая калибровки RELATIVE
+
+Каждая ось может содержать optional `relative-motion-curve`. Отсутствие поля или
+пустой массив означает прежнее преобразование без поправки. Непустой массив
+содержит объекты `{"measured-deg": число, "command-deg": число}`: подписанный
+фактически измеренный угол и исходная команда в градусах для этой механики.
+Требуются отрицательные и положительные узлы, точный `(0,0)`, конечные значения,
+строго возрастающие обе координаты и одинаковые знаки каждой пары. Командные
+координаты не могут превышать действующий `max-relative-move-deg`.
+
+HAL для `MOVE_RELATIVE` интерполирует команду по требуемому физическому углу.
+Вне крайних измеренных углов движение отклоняется без экстраполяции. Между нулём
+и ближайшим измеренным узлом используется линейная интерполяция к нулю.
+Предел relative move проверяется для исходного и скорректированного угла до
+degrees → steps и передачи UART. Преобразование шагов, `invert`, velocity,
+скорости, ускорения, PID и TRACKING сохраняют прежнюю семантику.
+
+Кривая применяется динамически в HAL через существующий `ConfigUpdate[TurretConfig]`:
+worker принимает её перед следующей командой движения. Уже переданная STM32
+команда не пересчитывается; отдельного wire-поля нет. Кнопка калибровки сначала
+атомарно сохраняет конфигурацию, затем публикует поправку; ошибка записи не
+меняет runtime. REAL сохраняет в выбранный при запуске config, DEMO — отдельно
+в `config/demo-motion.json` (либо явно выбранный `--demo-config`), с автоматической
+загрузкой при следующем DEMO startup. Изменение передаточного отношения,
+микрошагов, направления или монтажа требует новых измерений: прежнюю кривую
+нельзя переносить на изменённую механику. Для повторной калибровки удалите поле
+выбранной оси и перезапустите приложение. Сбор замеров и экспорт описаны в
+[Core/Aiming](../modules/core/aiming.md#ручная-калибровка-движения).
+
 ### Backlash
 
 Backlash compensation пока не входит в обязательную конфигурацию. Добавлять параметры следует только после механических измерений и отдельного решения о месте компенсации.
@@ -484,6 +513,7 @@ UI overlays не являются частью recorded working frame.
 | desired serial baudrate | controlled `SET_BAUDRATE` / reconnect path; при motors ON/UNKNOWN сохраняется latest desired baud и physical transition откладывается до confirmed motors OFF или recovery |
 | max speed / acceleration / velocity watchdog | dynamic full STM32 `SET_CONFIG` snapshot; уменьшение max speed также clamp'ит application-side PID I-term соответствующей оси без полного reset |
 | `invert`, steps/rev, microstep, `max-relative-move-deg` | restart-only; применяются только после Turret/application restart, не dynamic |
+| `relative-motion-curve` | dynamic; HAL применяет перед следующей командой RELATIVE |
 | `emulate-stm32` | application restart; runtime real ↔ fake transport switching в v1 отсутствует |
 | UI-only display settings | dynamic |
 

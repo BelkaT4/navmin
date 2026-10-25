@@ -10,6 +10,7 @@ from typing import Any, NoReturn
 from urllib.parse import urlsplit
 
 from navmin.contracts import CameraRole, DistanceSource, PlatformMotionSource
+from navmin.motion_curve import validate_motion_curve
 
 from .models import (
     AimingConfig,
@@ -579,8 +580,27 @@ def _parse_axis(value: Any, path: str) -> AxisMechanicsConfig:
             "microstep-divider",
             "max-relative-move-deg",
         },
+        optional={"relative-motion-curve"},
     )
+    limit = _number(obj["max-relative-move-deg"], f"{path}.max-relative-move-deg", strictly_positive=True)
+    raw_curve = obj.get("relative-motion-curve", [])
+    if not isinstance(raw_curve, list):
+        _validation(f"{path}.relative-motion-curve", "expected array")
+    points = []
+    for index, raw in enumerate(raw_curve):
+        point_path = f"{path}.relative-motion-curve[{index}]"
+        point = _fields(raw, point_path, required={"measured-deg", "command-deg"})
+        points.append((
+            _number(point["measured-deg"], f"{point_path}.measured-deg"),
+            _number(point["command-deg"], f"{point_path}.command-deg"),
+        ))
+    curve = tuple(points)
+    try:
+        validate_motion_curve(curve, limit)
+    except ValueError as exc:
+        _validation(f"{path}.relative-motion-curve", str(exc))
     return AxisMechanicsConfig(
+        relative_motion_curve=curve,
         invert=_bool(obj["invert"], f"{path}.invert"),
         full_steps_per_revolution=_int(
             obj["full-steps-per-revolution"],
@@ -590,11 +610,7 @@ def _parse_axis(value: Any, path: str) -> AxisMechanicsConfig:
         microstep_divider=_int(
             obj["microstep-divider"], f"{path}.microstep-divider", minimum=1
         ),
-        max_relative_move_deg=_number(
-            obj["max-relative-move-deg"],
-            f"{path}.max-relative-move-deg",
-            strictly_positive=True,
-        ),
+        max_relative_move_deg=limit,
     )
 
 
@@ -928,6 +944,10 @@ def config_to_mapping(config: AppConfig) -> dict[str, Any]:
                     ),
                     "microstep-divider": config.turret.axes.x.microstep_divider,
                     "max-relative-move-deg": config.turret.axes.x.max_relative_move_deg,
+                    **({"relative-motion-curve": [
+                        {"measured-deg": measured, "command-deg": command}
+                        for measured, command in config.turret.axes.x.relative_motion_curve
+                    ]} if config.turret.axes.x.relative_motion_curve else {}),
                 },
                 "y": {
                     "invert": config.turret.axes.y.invert,
@@ -936,6 +956,10 @@ def config_to_mapping(config: AppConfig) -> dict[str, Any]:
                     ),
                     "microstep-divider": config.turret.axes.y.microstep_divider,
                     "max-relative-move-deg": config.turret.axes.y.max_relative_move_deg,
+                    **({"relative-motion-curve": [
+                        {"measured-deg": measured, "command-deg": command}
+                        for measured, command in config.turret.axes.y.relative_motion_curve
+                    ]} if config.turret.axes.y.relative_motion_curve else {}),
                 },
             },
             "controller": {

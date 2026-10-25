@@ -212,6 +212,16 @@ class ApplicationRuntime:
             config.pid_kd_y,
         )
 
+    def apply_motion_calibration(self, axes) -> None:
+        """Queue saved curves through the same revision stream as PID updates."""
+        next_config = replace(self._runtime_turret_config, axes=axes)
+        revision = self._pid_tuning_revision + 1
+        self.turret_worker.submit_config_update(ConfigUpdate(revision, next_config))
+        self._runtime_turret_config = next_config
+        self._pid_tuning_revision = revision
+        self.mediator.calibration_axes = axes
+        self.mediator.cancel_motion_calibration()
+
     def apply_tracking_control_tuning(
         self,
         config: TrackingControlConfig,
@@ -570,6 +580,8 @@ def build_application_runtime(
         transport_factory=selected_factories.turret_transport_factory,
     )
     mediator = Mediator(
+        calibration_axes=config.turret.axes,
+        camera_stale_timeout_ms=config.vision.camera_stale_timeout_ms,
         aiming_config=config.aiming,
         tracking_control_config=config.tracking_control,
         tracking_gap_timeout_ms=config.turret.stm32.velocity_watchdog_timeout_ms,

@@ -170,6 +170,7 @@ def run_loaded_application(
     show_diagnostic_clock: bool = False,
     runtime_builder: RuntimeBuilder | None = None,
     ui_runner: UiRunner | None = None,
+    calibration_config_path: Path | None = None,
 ) -> int:
     """Build/start one shared runtime, run Qt, then always perform safe shutdown."""
     if runtime_builder is None:
@@ -189,6 +190,30 @@ def run_loaded_application(
     runtime.start()
     try:
         ui = runtime.ui_dependencies
+        destination = calibration_config_path or (
+            inputs.source_paths.config if inputs.source_paths is not None else None
+        )
+
+        def save_motion_calibration(axis, estimate):
+            from navmin.config import load_config, save_config
+            from navmin.core.motion_calibration import corrected_config
+
+            if destination is None:
+                raise ValueError("Для этого запуска не задан файл сохранения калибровки")
+            if ui.mediator.calibration_pending:
+                raise ValueError("Сначала завершите замер")
+            baseline = ui.mediator.calibration_axes
+            if baseline is None:
+                raise ValueError("Нет настроек механики")
+            source = load_config(destination) if destination.exists() else inputs.config
+            corrected = corrected_config(source, axis, getattr(baseline, axis), estimate)
+            # Persist before publishing: a write failure must not change live motion.
+            save_config(destination, corrected)
+            from dataclasses import replace
+            axes = replace(baseline, **{axis: getattr(corrected.turret.axes, axis)})
+            runtime.apply_motion_calibration(axes)
+            return str(destination)
+
         return ui_runner(
             mediator=ui.mediator,
             camera_bindings=ui.camera_bindings,
@@ -200,6 +225,7 @@ def run_loaded_application(
             apply_tracking_control_tuning=ui.apply_tracking_control_tuning,
             show_diagnostic_clock=show_diagnostic_clock,
             argv=qt_argv,
+            save_motion_calibration=save_motion_calibration,
         )
     finally:
         runtime.shutdown()

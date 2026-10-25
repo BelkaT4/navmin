@@ -1652,3 +1652,82 @@ def test_s5_3_mode_switch_rejects_late_old_kind_and_clears_distance(
         capture_id=77 if new_kind is StereoPairingKind.EXACT else None,
     ))
     assert mediator.current_distance is not None
+
+
+def test_manual_motion_measurement_uses_same_landmark_and_never_moves_on_second_click() -> None:
+    clock = _FakeClock(2000)
+    mediator, turret, _ = _mediator(clock_ns=clock)
+    mediator.calibration_axes = load_config(Path(__file__).resolve().parents[1] / 'config/defaults/navmin.json').turret.axes
+    before = _accept_main(mediator)
+    command = mediator.begin_motion_measurement(before, 50.5, 40, 'x')
+    assert command > 0
+    assert len(turret.relative_commands) == 1
+    assert turret.relative_commands[0].delta_y_deg == 0
+    assert not mediator.handle_relative_click(before, 70, 40)
+    with pytest.raises(ValueError):
+        mediator.finish_motion_measurement(before, 50.25, 40)
+    after = _result(CameraRole.OVERVIEW, 1, frame_id=5, timestamp_ns=1500)
+    sample = mediator.finish_motion_measurement(after, 50.25, 40)
+    assert 0 < sample.measured_deg < command
+    assert sample.error_deg > 0
+    assert sample.reversal is None
+    assert len(turret.relative_commands) == 1
+    mediator.begin_motion_measurement(after, 49.5, 40, 'x')
+    last = _result(CameraRole.OVERVIEW, 1, frame_id=6, timestamp_ns=1800)
+    sample = mediator.finish_motion_measurement(last, 49.9, 40)
+    assert sample.reversal is True
+
+
+@pytest.mark.parametrize('boundary', ['swap', 'session', 'emergency', 'stop', 'off', 'disconnect', 'mode'])
+def test_manual_motion_measurement_invalidates_on_control_boundaries(boundary: str) -> None:
+    mediator, turret, _ = _mediator(clock_ns=_FakeClock(2000))
+    mediator.calibration_axes = load_config(Path(__file__).resolve().parents[1] / 'config/defaults/navmin.json').turret.axes
+    before = _accept_main(mediator)
+    mediator.begin_motion_measurement(before, 50.5, 40, 'x')
+    actions = {
+        'swap': mediator.swap_main_preview,
+        'session': lambda: mediator.accept_camera_session(_session(CameraRole.OVERVIEW, 2)),
+        'emergency': mediator.emergency_stop,
+        'stop': mediator.stop_motion,
+        'off': mediator.motor_off,
+        'disconnect': lambda: mediator.accept_turret_state(_turret_state(connection=TurretConnectionState.DISCONNECTED)),
+        'mode': lambda: mediator.request_control_mode(TurretControlMode.TRACKING),
+    }
+    actions[boundary]()
+    assert not mediator.calibration_pending
+    with pytest.raises(ValueError):
+        mediator.finish_motion_measurement(_result(CameraRole.OVERVIEW, 1, frame_id=5, timestamp_ns=1500), 55, 40)
+    assert len(turret.relative_commands) == 1
+
+
+def test_manual_motion_measurement_rejects_stale_off_and_oversized_commands() -> None:
+    clock = _FakeClock(2000)
+    mediator, turret, _ = _mediator(clock_ns=clock)
+    defaults = load_config(Path(__file__).resolve().parents[1] / 'config/defaults/navmin.json')
+    mediator.calibration_axes = replace(defaults.turret.axes, x=replace(defaults.turret.axes.x, max_relative_move_deg=1))
+    before = _accept_main(mediator)
+    with pytest.raises(ValueError):
+        mediator.begin_motion_measurement(before, 52, 40, 'x')
+    mediator.calibration_axes = defaults.turret.axes
+    clock.advance_ms(501)
+    with pytest.raises(ValueError):
+        mediator.begin_motion_measurement(before, 52, 40, 'x')
+    clock.now_ns = 2000
+    mediator.accept_turret_state(_turret_state(motor=MotorState.OFF))
+    with pytest.raises(ValueError):
+        mediator.begin_motion_measurement(before, 52, 40, 'x')
+    assert not turret.relative_commands
+
+
+def test_calibrated_click_keeps_physical_units_and_rejects_outside_curve_before_ingress() -> None:
+    mediator, turret, _ = _mediator()
+    axes = load_config(Path(__file__).resolve().parents[1] / 'config/defaults/navmin.json').turret.axes
+    curve = ((-0.8, -1.0), (0.0, 0.0), (0.8, 1.0))
+    mediator.calibration_axes = replace(axes, x=replace(axes.x, relative_motion_curve=curve))
+    result = _accept_main(mediator)
+    assert mediator.handle_relative_click(result, 50.5, 40)
+    assert turret.relative_commands[-1].delta_x_deg == pytest.approx(0.5729386976834859)
+    assert not mediator.handle_relative_click(result, 51, 40)
+    assert len(turret.relative_commands) == 1
+    with pytest.raises(ValueError):
+        mediator.begin_motion_measurement(result, 50.5, 40, 'x')
