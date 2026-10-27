@@ -17,6 +17,7 @@ from navmin.config import AppConfig, load_config
 from navmin.imu import ImuCalibration
 from navmin.logging_setup import session_file_logging
 from navmin.session_artifacts import SourceInputPaths
+from navmin.vision.camera_worker import SourceFactory
 
 if TYPE_CHECKING:
     from navmin.application import ApplicationRuntime
@@ -195,6 +196,9 @@ def run_loaded_application(
     show_diagnostic_clock: bool = False,
     runtime_builder: RuntimeBuilder | None = None,
     ui_runner: UiRunner | None = None,
+    overview_source_factory: SourceFactory | None = None,
+    stereo_left_source_factory: SourceFactory | None = None,
+    stereo_right_source_factory: SourceFactory | None = None,
 ) -> int:
     """Build/start one shared runtime, run Qt, then always perform safe shutdown."""
     if runtime_builder is None:
@@ -206,12 +210,28 @@ def run_loaded_application(
 
         ui_runner = run_ui
 
-    runtime = runtime_builder(
-        config=inputs.config,
-        overview_calibration=inputs.overview_calibration,
-        stereo_calibration=inputs.stereo_calibration,
-        imu_calibration=inputs.imu_calibration,
+    runtime_kwargs = {
+        "config": inputs.config,
+        "overview_calibration": inputs.overview_calibration,
+        "stereo_calibration": inputs.stereo_calibration,
+        "imu_calibration": inputs.imu_calibration,
+    }
+    source_factories = (
+        overview_source_factory,
+        stereo_left_source_factory,
+        stereo_right_source_factory,
     )
+    if any(factory is not None for factory in source_factories):
+        if any(factory is None for factory in source_factories):
+            raise ValueError("all three camera source factories must be provided together")
+        from navmin.application import ApplicationFactories
+
+        runtime_kwargs["factories"] = ApplicationFactories(
+            overview_source_factory=overview_source_factory,
+            stereo_left_source_factory=stereo_left_source_factory,
+            stereo_right_source_factory=stereo_right_source_factory,
+        )
+    runtime = runtime_builder(**runtime_kwargs)
     imu_runtime = runtime.imu_runtime
     if imu_runtime is not None and inputs.source_paths is not None:
         imu_calibration_path = resolve_imu_calibration_path(

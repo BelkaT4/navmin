@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import shutil
+from contextlib import contextmanager
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -11,8 +12,16 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
-from navmin.__main__ import _parser as normal_parser
-from navmin.__main__ import main as normal_main
+from navmin.__main__ import (
+    _interactive_options,
+    _run_interactive,
+)
+from navmin.__main__ import (
+    _parser as normal_parser,
+)
+from navmin.__main__ import (
+    main as normal_main,
+)
 from navmin.calibration import (
     OverviewCalibration,
     StereoCalibration,
@@ -57,8 +66,24 @@ from navmin.diagnostic_launcher import (
     _parser as diagnostic_parser,
 )
 from navmin.diagnostic_launcher import main as diagnostic_main
+from navmin.diagnostics.synthetic_sources import SyntheticFrameSource
+from navmin.host_environment import WindowsHostEnvironment
 from navmin.imu import ImuCalibration
 from navmin.input_recovery import InputRecoveryError, recover_default_inputs
+from navmin.launch_options import (
+    CameraSourceMode,
+    LaunchOptions,
+    LaunchSelectionError,
+    StereoRightMode,
+    Stm32Mode,
+    apply_launch_options,
+    default_launch_options,
+    resolve_launch_options,
+)
+from navmin.launch_runtime import (
+    LaunchRuntimeBindingError,
+    build_launch_runtime_bindings,
+)
 from navmin.launcher import (
     ApplicationInputError,
     LauncherPaths,
@@ -75,6 +100,7 @@ from navmin.preflight import (
     StartupPreflightReport,
 )
 from navmin.session_artifacts import SessionArtifacts, SourceInputPaths
+from navmin.vision.gstreamer_source import GStreamerRtpJpegSource
 
 WIDTH = 64
 HEIGHT = 48
@@ -97,6 +123,10 @@ def _deterministic_launcher_preflight(monkeypatch) -> None:
     monkeypatch.setattr("navmin.__main__.run_startup_preflight", check)
     monkeypatch.setattr("navmin.diagnostic_launcher.run_startup_preflight", check)
     monkeypatch.setattr("navmin.__main__._prompt_input_recovery", lambda _error: False)
+    monkeypatch.setattr(
+        "navmin.__main__.create_host_environment",
+        lambda _root: WindowsHostEnvironment(),
+    )
 
 
 def _camera(port: int) -> CameraConfig:
@@ -210,6 +240,369 @@ def _config(*, emulate_stm32: bool = False) -> AppConfig:
     )
 
 
+def test_default_launch_options_follow_persistent_source_defaults() -> None:
+    config = _config(emulate_stm32=True)
+    config = replace(
+        config,
+        vision=replace(
+            config.vision,
+            cameras=replace(
+                config.vision.cameras,
+                stereo_right=replace(
+                    config.vision.cameras.stereo_right,
+                    enabled=False,
+                ),
+            ),
+        ),
+    )
+
+    options = default_launch_options(
+        config,
+        config_path=Path("config/site-a/navmin.json"),
+    )
+
+    assert options == LaunchOptions(
+        overview=CameraSourceMode.ON,
+        stereo_left=CameraSourceMode.ON,
+        stereo_right=StereoRightMode.OFF,
+        stm32=Stm32Mode.SIM,
+        config_path=Path("config/site-a/navmin.json"),
+    )
+
+
+@pytest.mark.parametrize("camera_name", ["overview", "stereo_left"])
+def test_default_launch_options_reject_disabled_mandatory_camera(
+    camera_name: str,
+) -> None:
+    config = _config()
+    cameras = config.vision.cameras
+    camera = getattr(cameras, camera_name)
+    config = replace(
+        config,
+        vision=replace(
+            config.vision,
+            cameras=replace(cameras, **{camera_name: replace(camera, enabled=False)}),
+        ),
+    )
+
+    with pytest.raises(LaunchSelectionError, match="current runtime requires it"):
+        default_launch_options(config)
+
+
+def test_apply_launch_options_is_immutable_and_resolves_stm32_sim() -> None:
+    config = _config()
+    options = LaunchOptions(
+        overview=CameraSourceMode.SIM,
+        stereo_left=CameraSourceMode.SIM,
+        stereo_right=StereoRightMode.SIM,
+        stm32=Stm32Mode.SIM,
+    )
+
+    effective = apply_launch_options(config, options)
+
+    assert effective.config is not config
+    assert config.turret.emulate_stm32 is False
+    assert effective.config.turret.emulate_stm32 is True
+    assert effective.config.vision.cameras.overview.source is config.vision.cameras.overview.source
+    assert (
+        effective.config.vision.cameras.stereo_left.source
+        is config.vision.cameras.stereo_left.source
+    )
+    assert effective.config.vision.distance.stereo.stereo_enabled is False
+    assert effective.warnings == ()
+    assert effective.real_camera_roles == ()
+    assert effective.simulated_camera_roles == (
+        CameraRole.OVERVIEW,
+        CameraRole.STEREO_LEFT,
+        CameraRole.STEREO_RIGHT,
+    )
+    assert effective.requires_camera_network is False
+
+
+@pytest.mark.parametrize(
+    ("left_mode", "right_mode"),
+    [
+        (CameraSourceMode.ON, StereoRightMode.ON),
+        (CameraSourceMode.SIM, StereoRightMode.SIM),
+    ],
+)
+def test_apply_launch_options_keeps_compatible_stereo_enabled(
+    left_mode: CameraSourceMode,
+    right_mode: StereoRightMode,
+) -> None:
+    config = _config()
+    config = replace(
+        config,
+        vision=replace(
+            config.vision,
+            distance=replace(
+                config.vision.distance,
+                stereo=replace(
+                    config.vision.distance.stereo,
+                    stereo_enabled=True,
+                ),
+            ),
+        ),
+    )
+    options = LaunchOptions(
+        overview=CameraSourceMode.ON,
+        stereo_left=left_mode,
+        stereo_right=right_mode,
+        stm32=Stm32Mode.ON,
+    )
+
+    effective = apply_launch_options(config, options)
+
+    assert effective.config.vision.distance.stereo.stereo_enabled is True
+    assert effective.warnings == ()
+    expected_real_roles = [CameraRole.OVERVIEW]
+    if left_mode is CameraSourceMode.ON:
+        expected_real_roles.extend((CameraRole.STEREO_LEFT, CameraRole.STEREO_RIGHT))
+    assert effective.real_camera_roles == tuple(expected_real_roles)
+    assert effective.requires_camera_network is True
+
+
+@pytest.mark.parametrize(
+    ("left_mode", "right_mode"),
+    [
+        (CameraSourceMode.ON, StereoRightMode.SIM),
+        (CameraSourceMode.SIM, StereoRightMode.ON),
+    ],
+)
+def test_apply_launch_options_disables_mixed_stereo_pairing(
+    left_mode: CameraSourceMode,
+    right_mode: StereoRightMode,
+) -> None:
+    config = _config()
+    config = replace(
+        config,
+        vision=replace(
+            config.vision,
+            distance=replace(
+                config.vision.distance,
+                stereo=replace(
+                    config.vision.distance.stereo,
+                    stereo_enabled=True,
+                ),
+            ),
+        ),
+    )
+    options = LaunchOptions(
+        overview=CameraSourceMode.ON,
+        stereo_left=left_mode,
+        stereo_right=right_mode,
+        stm32=Stm32Mode.ON,
+    )
+
+    effective = apply_launch_options(config, options)
+
+    assert effective.config.vision.cameras.stereo_left.enabled is True
+    assert effective.config.vision.cameras.stereo_right.enabled is True
+    assert effective.config.vision.distance.stereo.stereo_enabled is False
+    assert len(effective.warnings) == 1
+    assert "mixed real/sim" in effective.warnings[0]
+
+
+def test_apply_launch_options_right_off_disables_only_optional_stereo_feature() -> None:
+    config = _config()
+    config = replace(
+        config,
+        vision=replace(
+            config.vision,
+            distance=replace(
+                config.vision.distance,
+                stereo=replace(
+                    config.vision.distance.stereo,
+                    stereo_enabled=True,
+                ),
+            ),
+        ),
+    )
+    options = LaunchOptions(
+        overview=CameraSourceMode.ON,
+        stereo_left=CameraSourceMode.ON,
+        stereo_right=StereoRightMode.OFF,
+        stm32=Stm32Mode.ON,
+    )
+
+    effective = apply_launch_options(config, options)
+
+    assert effective.config.vision.cameras.overview.enabled is True
+    assert effective.config.vision.cameras.stereo_left.enabled is True
+    assert effective.config.vision.cameras.stereo_right.enabled is False
+    assert effective.config.vision.distance.stereo.stereo_enabled is False
+    assert len(effective.warnings) == 1
+    assert "Stereo Right is OFF" in effective.warnings[0]
+    assert effective.real_camera_roles == (
+        CameraRole.OVERVIEW,
+        CameraRole.STEREO_LEFT,
+    )
+
+
+def _inputs_with_working_range_stereo() -> LoadedApplicationInputs:
+    stereo = load_stereo_calibration(
+        REPO_ROOT / "config" / "defaults" / "calibration" / "stereo.json"
+    )
+    return replace(_inputs(), stereo_calibration=stereo)
+
+
+def test_launch_runtime_bindings_all_sim_are_in_process_and_show_clock() -> None:
+    inputs = _inputs_with_working_range_stereo()
+    options = LaunchOptions(
+        overview=CameraSourceMode.SIM,
+        stereo_left=CameraSourceMode.SIM,
+        stereo_right=StereoRightMode.SIM,
+        stm32=Stm32Mode.SIM,
+    )
+
+    bindings = build_launch_runtime_bindings(inputs, options)
+
+    assert bindings.show_diagnostic_clock is True
+    assert bindings.inputs.config.turret.emulate_stm32 is True
+    assert bindings.inputs.overview_calibration is not inputs.overview_calibration
+    assert bindings.inputs.stereo_calibration is not inputs.stereo_calibration
+    assert inputs.config.turret.emulate_stm32 is False
+
+    cameras = bindings.inputs.config.vision.cameras
+    overview_source = bindings.factories.overview_source_factory(cameras.overview)
+    left_source = bindings.factories.stereo_left_source_factory(cameras.stereo_left)
+    right_source = bindings.factories.stereo_right_source_factory(cameras.stereo_right)
+    for source in (overview_source, left_source, right_source):
+        assert isinstance(source, SyntheticFrameSource)
+        source.start()
+        frame = source.read()
+        assert frame is not None
+        assert frame.capture_id is None
+        assert frame.receive_timestamp_ns is not None
+        source.stop()
+
+    assert overview_source.read() is None
+    assert left_source.read() is None
+    assert right_source.read() is None
+
+
+def test_launch_runtime_bindings_shared_stereo_scene_is_used_by_both_factories(
+    monkeypatch,
+) -> None:
+    inputs = _inputs_with_working_range_stereo()
+    instances = []
+
+    class FakeSharedStereo:
+        def __init__(self, calibration) -> None:
+            self.calibration = calibration
+            self.calls = []
+            instances.append(self)
+
+        def next_frame(self, camera: CameraRole) -> np.ndarray:
+            self.calls.append(camera)
+            return np.zeros(
+                (self.calibration.image_height, self.calibration.image_width, 3),
+                dtype=np.uint8,
+            )
+
+    monkeypatch.setattr(
+        "navmin.launch_runtime.SynchronizedSyntheticStereoSource",
+        FakeSharedStereo,
+    )
+    bindings = build_launch_runtime_bindings(
+        inputs,
+        LaunchOptions(
+            overview=CameraSourceMode.ON,
+            stereo_left=CameraSourceMode.SIM,
+            stereo_right=StereoRightMode.SIM,
+            stm32=Stm32Mode.ON,
+        ),
+    )
+    left = bindings.factories.stereo_left_source_factory(
+        bindings.inputs.config.vision.cameras.stereo_left
+    )
+    right = bindings.factories.stereo_right_source_factory(
+        bindings.inputs.config.vision.cameras.stereo_right
+    )
+    left.start()
+    right.start()
+    assert left.read() is not None
+    assert right.read() is not None
+
+    assert len(instances) == 1
+    assert instances[0].calls == [CameraRole.STEREO_LEFT, CameraRole.STEREO_RIGHT]
+
+
+@pytest.mark.parametrize(
+    ("left_mode", "right_mode", "synthetic_side"),
+    [
+        (CameraSourceMode.SIM, StereoRightMode.ON, "left"),
+        (CameraSourceMode.ON, StereoRightMode.SIM, "right"),
+    ],
+)
+def test_launch_runtime_bindings_mixed_stereo_keep_real_side_calibration(
+    left_mode: CameraSourceMode,
+    right_mode: StereoRightMode,
+    synthetic_side: str,
+) -> None:
+    inputs = _inputs_with_working_range_stereo()
+    reference = inputs.stereo_calibration
+    bindings = build_launch_runtime_bindings(
+        inputs,
+        LaunchOptions(
+            overview=CameraSourceMode.ON,
+            stereo_left=left_mode,
+            stereo_right=right_mode,
+            stm32=Stm32Mode.ON,
+        ),
+    )
+    effective = bindings.inputs.stereo_calibration
+
+    assert bindings.inputs.config.vision.distance.stereo.stereo_enabled is False
+    assert len(bindings.selection.warnings) == 1
+    if synthetic_side == "left":
+        assert effective.K_left == tuple(tuple(row[:3]) for row in reference.P1)
+        assert effective.D_left == (0.0, 0.0, 0.0, 0.0, 0.0)
+        assert effective.K_right == reference.K_right
+        assert effective.D_right == reference.D_right
+        assert effective.R2 == reference.R2
+    else:
+        assert effective.K_right == tuple(tuple(row[:3]) for row in reference.P2)
+        assert effective.D_right == (0.0, 0.0, 0.0, 0.0, 0.0)
+        assert effective.K_left == reference.K_left
+        assert effective.D_left == reference.D_left
+        assert effective.R1 == reference.R1
+
+
+def test_launch_runtime_bindings_real_sources_preserve_production_factories() -> None:
+    inputs = _inputs_with_working_range_stereo()
+    bindings = build_launch_runtime_bindings(
+        inputs,
+        LaunchOptions(
+            overview=CameraSourceMode.ON,
+            stereo_left=CameraSourceMode.ON,
+            stereo_right=StereoRightMode.ON,
+            stm32=Stm32Mode.ON,
+        ),
+    )
+
+    assert bindings.show_diagnostic_clock is False
+    cameras = bindings.inputs.config.vision.cameras
+    assert isinstance(
+        bindings.factories.overview_source_factory(cameras.overview),
+        GStreamerRtpJpegSource,
+    )
+    assert bindings.inputs.overview_calibration is inputs.overview_calibration
+    assert bindings.inputs.stereo_calibration is inputs.stereo_calibration
+
+
+def test_launch_runtime_bindings_reject_unsupported_synthetic_stereo_size() -> None:
+    with pytest.raises(LaunchRuntimeBindingError, match="1296x976"):
+        build_launch_runtime_bindings(
+            _inputs(),
+            LaunchOptions(
+                overview=CameraSourceMode.ON,
+                stereo_left=CameraSourceMode.SIM,
+                stereo_right=StereoRightMode.OFF,
+                stm32=Stm32Mode.ON,
+            ),
+        )
+
 def _overview() -> OverviewCalibration:
     return OverviewCalibration(
         schema_version=1,
@@ -295,31 +688,26 @@ def _copy_default_calibrations(target_root: Path) -> tuple[Path, Path]:
     return overview, stereo
 
 
-def test_normal_and_diagnostic_parsers_share_new_file_defaults() -> None:
+def test_public_and_diagnostic_parsers_keep_separate_contracts() -> None:
     normal_args = normal_parser().parse_args([])
+    assert normal_args.config == Path("config/navmin.json")
+    assert normal_args.overview is None
+    assert normal_args.stereo_left is None
+    assert normal_args.stereo_right is None
+    assert normal_args.stm32 is None
+    assert normal_args.preflight_only is False
+    assert normal_args.verbose is False
+    assert not hasattr(normal_args, "overview_calibration")
+    assert not hasattr(normal_args, "stereo_calibration")
+    assert not hasattr(normal_args, "log_dir")
+
     diagnostic_args = diagnostic_parser().parse_args(
         ["--overview", "real", "--stereo-left", "real", "--turret", "real"]
     )
-
-    for args in (normal_args, diagnostic_args):
-        assert args.config == Path("config/navmin.json")
-        assert args.overview_calibration is None
-        assert args.stereo_calibration is None
+    assert diagnostic_args.config == Path("config/navmin.json")
+    assert diagnostic_args.overview_calibration is None
+    assert diagnostic_args.stereo_calibration is None
     assert diagnostic_args.stereo_right is None
-    explicit_right = diagnostic_parser().parse_args(
-        [
-            "--overview",
-            "real",
-            "--stereo-left",
-            "real",
-            "--stereo-right",
-            "real",
-            "--turret",
-            "pty",
-        ]
-    )
-    assert explicit_right.stereo_right == "real"
-
 
 def test_config_owned_relative_calibration_paths_follow_selected_config_directory(
     monkeypatch,
@@ -802,7 +1190,6 @@ def test_all_localhost_profile_uses_image_identity_calibrations(monkeypatch) -> 
     assert planned.stereo_calibration == effective.stereo_calibration
 
 
-
 def test_all_localhost_working_range_profile_shares_stereo_frame_source(
     monkeypatch,
 ) -> None:
@@ -1088,57 +1475,14 @@ def test_load_application_inputs_identifies_exact_failing_file(tmp_path) -> None
 
 
 @pytest.mark.parametrize(
-    ("flag", "filename", "label"),
-    [
-        ("--overview-calibration", "bad-overview.json", "overview calibration"),
-        ("--stereo-calibration", "bad-stereo.json", "stereo calibration"),
-    ],
+    "flag",
+    ["--overview-calibration", "--stereo-calibration", "--log-dir"],
 )
-def test_explicit_bad_calibration_override_never_triggers_recovery_or_mutation(
-    monkeypatch,
-    tmp_path,
-    capsys,
-    flag: str,
-    filename: str,
-    label: str,
-) -> None:
-    selected_root = tmp_path / "config-set"
-    selected_root.mkdir()
-    config_path = selected_root / "navmin.json"
-    save_config(config_path, _config())
-    canonical_overview, canonical_stereo = _copy_default_calibrations(selected_root)
-    canonical_before = {
-        canonical_overview: canonical_overview.read_bytes(),
-        canonical_stereo: canonical_stereo.read_bytes(),
-        config_path: config_path.read_bytes(),
-    }
-    bad_override = tmp_path / filename
-    bad_override.write_text("{broken-override", encoding="utf-8")
-    bad_before = bad_override.read_bytes()
+def test_public_parser_rejects_removed_operator_overrides(flag: str) -> None:
+    with pytest.raises(SystemExit) as exc_info:
+        normal_parser().parse_args([flag, "unused"])
 
-    monkeypatch.setattr(
-        "navmin.__main__._prompt_input_recovery",
-        lambda _error: pytest.fail("explicit CLI calibration failure must not recover"),
-    )
-    argv = [
-        "--config",
-        str(config_path),
-        flag,
-        str(bad_override),
-        "--log-dir",
-        str(tmp_path / "logs"),
-    ]
-    exit_code = normal_main(argv)
-
-    captured = capsys.readouterr()
-    assert exit_code == 2
-    assert f"INPUT ERROR: {label}" in captured.err
-    assert str(bad_override) in captured.err
-    assert bad_override.read_bytes() == bad_before
-    for path, content in canonical_before.items():
-        assert path.read_bytes() == content
-    assert not list(tmp_path.rglob("*.bak"))
-
+    assert exc_info.value.code == 2
 
 def test_recovery_uses_canonical_targets_and_leaves_custom_calibration_files_untouched(
     tmp_path,
@@ -1368,13 +1712,14 @@ def test_input_recovery_install_failure_rolls_back_original_set(
     assert not list(tmp_path.rglob("*.rollback.tmp"))
 
 
-def test_normal_input_failure_can_restore_defaults_but_never_continues_startup(
+def test_zero_argument_interactive_input_failure_can_restore_defaults(
     monkeypatch,
     tmp_path,
-    capsys,
 ) -> None:
     paths = _recovery_paths(tmp_path)
     shown_results = []
+    monkeypatch.setattr("navmin.__main__._DEFAULT_CONFIG", paths.config)
+    monkeypatch.setattr("navmin.__main__._DEFAULT_LOG_DIR", paths.log_dir)
     monkeypatch.setattr("navmin.__main__._prompt_input_recovery", lambda _error: True)
     monkeypatch.setattr(
         "navmin.__main__._show_input_recovery_result", shown_results.append
@@ -1383,122 +1728,61 @@ def test_normal_input_failure_can_restore_defaults_but_never_continues_startup(
         "navmin.__main__.run_startup_preflight",
         lambda *args, **kwargs: pytest.fail("preflight must wait for a new launch"),
     )
-    monkeypatch.setattr(
-        "navmin.__main__.run_loaded_application",
-        lambda _inputs: pytest.fail("runtime must wait for a new launch"),
-    )
 
-    exit_code = normal_main(
-        [
-            "--config",
-            str(paths.config),
-            "--overview-calibration",
-            str(paths.overview_calibration),
-            "--stereo-calibration",
-            str(paths.stereo_calibration),
-            "--log-dir",
-            str(paths.log_dir),
-        ]
-    )
-
-    assert exit_code == 2
+    assert normal_main([]) == 2
     assert len(shown_results) == 1
     assert paths.config.is_file()
     assert paths.overview_calibration.is_file()
     assert paths.stereo_calibration.is_file()
-    assert "INPUT ERROR: config" in capsys.readouterr().err
-    manifest = json.loads(
-        (_single_session(paths.log_dir) / "manifest.json").read_text(encoding="utf-8")
-    )
-    assert manifest["status"] == "input-failed"
 
-
-def test_normal_preflight_only_input_failure_never_opens_recovery_dialog(
+def test_noninteractive_input_failure_never_opens_recovery_dialog(
     monkeypatch,
     tmp_path,
 ) -> None:
-    paths = _recovery_paths(tmp_path)
+    log_dir = tmp_path / "logs"
+    monkeypatch.setattr("navmin.__main__._DEFAULT_LOG_DIR", log_dir)
     monkeypatch.setattr(
         "navmin.__main__._prompt_input_recovery",
-        lambda _error: pytest.fail("--preflight-only must remain headless"),
+        lambda _error: pytest.fail("non-interactive launch must not ask questions"),
     )
 
-    assert normal_main(
-        [
-            "--config",
-            str(paths.config),
-            "--overview-calibration",
-            str(paths.overview_calibration),
-            "--stereo-calibration",
-            str(paths.stereo_calibration),
-            "--preflight-only",
-            "--log-dir",
-            str(paths.log_dir),
-        ]
-    ) == 2
+    assert normal_main(["--config", str(tmp_path / "missing.json"), "-p"]) == 2
+    session = _single_session(log_dir)
+    manifest = json.loads((session / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["status"] == "input-failed"
 
-    assert not paths.config.exists()
-    assert not paths.overview_calibration.exists()
-    assert not paths.stereo_calibration.exists()
-
-
-def test_normal_missing_config_keeps_input_failure_session_evidence(
+def test_noninteractive_missing_config_keeps_input_failure_session_evidence(
     monkeypatch,
     tmp_path,
 ) -> None:
+    log_dir = tmp_path / "logs"
+    monkeypatch.setattr("navmin.__main__._DEFAULT_LOG_DIR", log_dir)
     monkeypatch.setattr(
         "navmin.__main__.run_loaded_application",
-        lambda _inputs: pytest.fail("runtime must not start after input failure"),
-    )
-    log_dir = tmp_path / "logs"
-    exit_code = normal_main(
-        [
-            "--config",
-            str(tmp_path / "missing-config.json"),
-            "--overview-calibration",
-            str(tmp_path / "missing-overview.json"),
-            "--stereo-calibration",
-            str(tmp_path / "missing-stereo.json"),
-            "--log-dir",
-            str(log_dir),
-        ]
+        lambda _inputs, **_kwargs: pytest.fail("runtime must not start"),
     )
 
-    assert exit_code == 2
+    assert normal_main(["--config", str(tmp_path / "missing-config.json")]) == 2
     session = _single_session(log_dir)
     assert (session / "runtime.log").is_file()
     manifest = json.loads((session / "manifest.json").read_text(encoding="utf-8"))
     assert manifest["status"] == "input-failed"
-    assert manifest["exit_code"] == 2
-    assert not (session / "inputs" / "effective-config.json").exists()
-    assert not (session / "preflight.json").exists()
-
 
 def test_normal_runtime_failure_and_clean_run_finalize_manifest(
     monkeypatch,
     tmp_path,
 ) -> None:
-    config_path, overview_path, stereo_path = _write_source_placeholders(tmp_path)
+    config_path, _overview_path, _stereo_path = _write_source_placeholders(tmp_path)
     inputs = _inputs()
     monkeypatch.setattr("navmin.__main__.load_application_inputs", lambda _paths: inputs)
 
-    def run_failure(_inputs) -> int:
+    def run_failure(_inputs, **_kwargs) -> int:
         raise RuntimeError("runtime-boom")
 
-    monkeypatch.setattr("navmin.__main__.run_loaded_application", run_failure)
     failed_logs = tmp_path / "failed-logs"
-    assert normal_main(
-        [
-            "--config",
-            str(config_path),
-            "--overview-calibration",
-            str(overview_path),
-            "--stereo-calibration",
-            str(stereo_path),
-            "--log-dir",
-            str(failed_logs),
-        ]
-    ) == 2
+    monkeypatch.setattr("navmin.__main__._DEFAULT_LOG_DIR", failed_logs)
+    monkeypatch.setattr("navmin.__main__.run_loaded_application", run_failure)
+    assert normal_main(["--config", str(config_path)]) == 2
     failed_session = _single_session(failed_logs)
     failed_manifest = json.loads(
         (failed_session / "manifest.json").read_text(encoding="utf-8")
@@ -1509,26 +1793,18 @@ def test_normal_runtime_failure_and_clean_run_finalize_manifest(
     assert "runtime-boom" in runtime_log
     assert "Traceback (most recent call last)" in runtime_log
 
-    monkeypatch.setattr("navmin.__main__.run_loaded_application", lambda _inputs: 0)
     clean_logs = tmp_path / "clean-logs"
-    assert normal_main(
-        [
-            "--config",
-            str(config_path),
-            "--overview-calibration",
-            str(overview_path),
-            "--stereo-calibration",
-            str(stereo_path),
-            "--log-dir",
-            str(clean_logs),
-        ]
-    ) == 0
+    monkeypatch.setattr("navmin.__main__._DEFAULT_LOG_DIR", clean_logs)
+    monkeypatch.setattr(
+        "navmin.__main__.run_loaded_application",
+        lambda _inputs, **_kwargs: 0,
+    )
+    assert normal_main(["--config", str(config_path)]) == 0
     clean_manifest = json.loads(
         (_single_session(clean_logs) / "manifest.json").read_text(encoding="utf-8")
     )
     assert clean_manifest["status"] == "completed"
     assert clean_manifest["exit_code"] == 0
-
 
 def test_diagnostic_cleanup_failure_preserves_primary_runtime_failure(
     monkeypatch,
@@ -1578,28 +1854,18 @@ def test_normal_preflight_only_pass_skips_runtime_and_keeps_evidence(
     monkeypatch,
     tmp_path,
 ) -> None:
-    config_path, overview_path, stereo_path = _write_source_placeholders(tmp_path)
+    config_path, _overview_path, _stereo_path = _write_source_placeholders(tmp_path)
     monkeypatch.setattr("navmin.__main__.load_application_inputs", lambda _paths: _inputs())
     monkeypatch.setattr(
         "navmin.__main__.run_loaded_application",
-        lambda _inputs: pytest.fail("runtime must not start in --preflight-only"),
+        lambda _inputs, **_kwargs: pytest.fail(
+            "runtime must not start in --preflight-only"
+        ),
     )
-
     log_dir = tmp_path / "logs"
-    assert normal_main(
-        [
-            "--config",
-            str(config_path),
-            "--overview-calibration",
-            str(overview_path),
-            "--stereo-calibration",
-            str(stereo_path),
-            "--preflight-only",
-            "--log-dir",
-            str(log_dir),
-        ]
-    ) == 0
+    monkeypatch.setattr("navmin.__main__._DEFAULT_LOG_DIR", log_dir)
 
+    assert normal_main(["--config", str(config_path), "--preflight-only"]) == 0
     session = _single_session(log_dir)
     manifest = json.loads((session / "manifest.json").read_text(encoding="utf-8"))
     preflight = json.loads((session / "preflight.json").read_text(encoding="utf-8"))
@@ -1608,7 +1874,6 @@ def test_normal_preflight_only_pass_skips_runtime_and_keeps_evidence(
     assert preflight["overall_status"] == "pass"
     assert (session / "runtime.log").is_file()
     assert not (session / "inputs" / "effective-config.json").exists()
-
 
 def test_planned_localhost_backend_replaces_rtsp_source_with_rtp_jpeg() -> None:
     inputs = _inputs()
@@ -1790,7 +2055,7 @@ def test_preflight_failure_blocks_endpoints_runtime_and_records_status(
             ]
         )
     else:
-        config_path, overview_path, stereo_path = _write_source_placeholders(tmp_path)
+        config_path, _overview_path, _stereo_path = _write_source_placeholders(tmp_path)
         monkeypatch.setattr(
             "navmin.__main__.load_application_inputs",
             lambda _paths: _inputs(),
@@ -1801,21 +2066,13 @@ def test_preflight_failure_blocks_endpoints_runtime_and_records_status(
         )
         monkeypatch.setattr(
             "navmin.__main__.run_loaded_application",
-            lambda _inputs: pytest.fail("runtime must not start after preflight FAIL"),
+            lambda _inputs, **_kwargs: pytest.fail(
+                "runtime must not start after preflight FAIL"
+            ),
         )
         log_dir = tmp_path / "normal-logs"
-        exit_code = normal_main(
-            [
-                "--config",
-                str(config_path),
-                "--overview-calibration",
-                str(overview_path),
-                "--stereo-calibration",
-                str(stereo_path),
-                "--log-dir",
-                str(log_dir),
-            ]
-        )
+        monkeypatch.setattr("navmin.__main__._DEFAULT_LOG_DIR", log_dir)
+        exit_code = normal_main(["--config", str(config_path)])
 
     assert exit_code == 2
     session = _single_session(log_dir)
@@ -1886,9 +2143,10 @@ def test_diagnostic_full_launch_orders_preflight_before_endpoints_and_runtime(
 
 
 def test_normal_full_launch_orders_preflight_before_runtime(monkeypatch, tmp_path) -> None:
-    config_path, overview_path, stereo_path = _write_source_placeholders(tmp_path)
+    config_path, _overview_path, _stereo_path = _write_source_placeholders(tmp_path)
     events: list[str] = []
     monkeypatch.setattr("navmin.__main__.load_application_inputs", lambda _paths: _inputs())
+    monkeypatch.setattr("navmin.__main__._DEFAULT_LOG_DIR", tmp_path / "logs")
 
     def preflight(inputs, **kwargs):
         assert inputs.config.vision.cameras.stereo_right.enabled is True
@@ -1896,40 +2154,28 @@ def test_normal_full_launch_orders_preflight_before_runtime(monkeypatch, tmp_pat
         events.append("preflight")
         return _preflight_report()
 
-    def run(_inputs) -> int:
+    def run(_inputs, **kwargs) -> int:
+        assert kwargs["overview_source_factory"] is not None
+        assert kwargs["stereo_left_source_factory"] is not None
+        assert kwargs["stereo_right_source_factory"] is not None
         events.append("runtime")
         return 0
 
     monkeypatch.setattr("navmin.__main__.run_startup_preflight", preflight)
     monkeypatch.setattr("navmin.__main__.run_loaded_application", run)
 
-    assert normal_main(
-        [
-            "--config",
-            str(config_path),
-            "--overview-calibration",
-            str(overview_path),
-            "--stereo-calibration",
-            str(stereo_path),
-            "--log-dir",
-            str(tmp_path / "logs"),
-        ]
-    ) == 0
+    assert normal_main(["--config", str(config_path)]) == 0
     assert events == ["preflight", "runtime"]
-
 
 def test_normal_launcher_omits_disabled_stereo_right_from_preflight(
     monkeypatch,
     tmp_path,
 ) -> None:
-    config_path, overview_path, stereo_path = _write_source_placeholders(tmp_path)
+    config_path, _overview_path, _stereo_path = _write_source_placeholders(tmp_path)
     inputs = _inputs()
     cameras = replace(
         inputs.config.vision.cameras,
-        stereo_right=replace(
-            inputs.config.vision.cameras.stereo_right,
-            enabled=False,
-        ),
+        stereo_right=replace(inputs.config.vision.cameras.stereo_right, enabled=False),
     )
     disabled_inputs = replace(
         inputs,
@@ -1942,30 +2188,23 @@ def test_normal_launcher_omits_disabled_stereo_right_from_preflight(
         "navmin.__main__.load_application_inputs",
         lambda _paths: disabled_inputs,
     )
+    monkeypatch.setattr("navmin.__main__._DEFAULT_LOG_DIR", tmp_path / "logs")
 
-    def preflight(_inputs, **kwargs):
+    def preflight(effective_inputs, **kwargs):
+        assert effective_inputs.config.vision.cameras.stereo_right.enabled is False
         assert kwargs["selection"].stereo_right is None
         return _preflight_report()
 
     monkeypatch.setattr("navmin.__main__.run_startup_preflight", preflight)
-    monkeypatch.setattr("navmin.__main__.run_loaded_application", lambda _inputs: 0)
+    monkeypatch.setattr(
+        "navmin.__main__.run_loaded_application",
+        lambda _inputs, **_kwargs: 0,
+    )
 
-    assert normal_main(
-        [
-            "--config",
-            str(config_path),
-            "--overview-calibration",
-            str(overview_path),
-            "--stereo-calibration",
-            str(stereo_path),
-            "--log-dir",
-            str(tmp_path / "logs"),
-        ]
-    ) == 0
-
+    assert normal_main(["--config", str(config_path)]) == 0
 
 def test_preflight_only_warn_is_success(monkeypatch, tmp_path) -> None:
-    config_path, overview_path, stereo_path = _write_source_placeholders(tmp_path)
+    config_path, _overview_path, _stereo_path = _write_source_placeholders(tmp_path)
     monkeypatch.setattr("navmin.__main__.load_application_inputs", lambda _paths: _inputs())
     monkeypatch.setattr(
         "navmin.__main__.run_startup_preflight",
@@ -1973,34 +2212,24 @@ def test_preflight_only_warn_is_success(monkeypatch, tmp_path) -> None:
     )
     monkeypatch.setattr(
         "navmin.__main__.run_loaded_application",
-        lambda _inputs: pytest.fail("runtime must not start in --preflight-only"),
+        lambda _inputs, **_kwargs: pytest.fail(
+            "runtime must not start in --preflight-only"
+        ),
     )
-
     log_dir = tmp_path / "logs"
-    assert normal_main(
-        [
-            "--config",
-            str(config_path),
-            "--overview-calibration",
-            str(overview_path),
-            "--stereo-calibration",
-            str(stereo_path),
-            "--preflight-only",
-            "--log-dir",
-            str(log_dir),
-        ]
-    ) == 0
+    monkeypatch.setattr("navmin.__main__._DEFAULT_LOG_DIR", log_dir)
+
+    assert normal_main(["--config", str(config_path), "-p"]) == 0
     preflight = json.loads(
         (_single_session(log_dir) / "preflight.json").read_text(encoding="utf-8")
     )
     assert preflight["overall_status"] == "warn"
 
-
 def test_unexpected_preflight_exception_is_runtime_failure_before_runtime(
     monkeypatch,
     tmp_path,
 ) -> None:
-    config_path, overview_path, stereo_path = _write_source_placeholders(tmp_path)
+    config_path, _overview_path, _stereo_path = _write_source_placeholders(tmp_path)
     monkeypatch.setattr("navmin.__main__.load_application_inputs", lambda _paths: _inputs())
 
     def explode(*args, **kwargs):
@@ -2010,23 +2239,14 @@ def test_unexpected_preflight_exception_is_runtime_failure_before_runtime(
     monkeypatch.setattr("navmin.__main__.run_startup_preflight", explode)
     monkeypatch.setattr(
         "navmin.__main__.run_loaded_application",
-        lambda _inputs: pytest.fail("runtime must not start after preflight exception"),
+        lambda _inputs, **_kwargs: pytest.fail(
+            "runtime must not start after preflight exception"
+        ),
     )
-
     log_dir = tmp_path / "logs"
-    assert normal_main(
-        [
-            "--config",
-            str(config_path),
-            "--overview-calibration",
-            str(overview_path),
-            "--stereo-calibration",
-            str(stereo_path),
-            "--log-dir",
-            str(log_dir),
-        ]
-    ) == 2
+    monkeypatch.setattr("navmin.__main__._DEFAULT_LOG_DIR", log_dir)
 
+    assert normal_main(["--config", str(config_path)]) == 2
     session = _single_session(log_dir)
     manifest = json.loads((session / "manifest.json").read_text(encoding="utf-8"))
     assert manifest["status"] == "runtime-failed"
@@ -2036,3 +2256,402 @@ def test_unexpected_preflight_exception_is_runtime_failure_before_runtime(
     runtime_log = (session / "runtime.log").read_text(encoding="utf-8")
     assert "Traceback (most recent call last)" in runtime_log
     assert "preflight-bug" in runtime_log
+
+
+
+@pytest.mark.parametrize(
+    ("flag", "value"),
+    [
+        ("--overview", "on"),
+        ("--overview", "sim"),
+        ("--stereo-left", "on"),
+        ("--stereo-left", "sim"),
+        ("--stereo-right", "on"),
+        ("--stereo-right", "sim"),
+        ("--stereo-right", "off"),
+        ("--stm32", "on"),
+        ("--stm32", "sim"),
+    ],
+)
+def test_public_cli_accepts_source_contract(flag: str, value: str) -> None:
+    args = normal_parser().parse_args([flag, value])
+    attribute = flag.removeprefix("--").replace("-", "_")
+    assert getattr(args, attribute) == value
+
+
+@pytest.mark.parametrize(
+    ("flag", "value"),
+    [
+        ("--overview", "off"),
+        ("--stereo-left", "off"),
+        ("--stereo-right", "invalid"),
+        ("--stm32", "off"),
+    ],
+)
+def test_public_cli_rejects_invalid_source_contract(flag: str, value: str) -> None:
+    with pytest.raises(SystemExit) as exc_info:
+        normal_parser().parse_args([flag, value])
+
+    assert exc_info.value.code == 2
+
+
+def test_help_exits_before_launcher_side_effects(monkeypatch, capsys) -> None:
+    monkeypatch.setattr(
+        "navmin.__main__._run_noninteractive",
+        lambda _args: pytest.fail("help must not enter non-interactive execution"),
+    )
+    monkeypatch.setattr(
+        "navmin.__main__._run_interactive",
+        lambda: pytest.fail("help must not enter interactive execution"),
+    )
+    monkeypatch.setattr(
+        "navmin.__main__.create_host_environment",
+        lambda _root: pytest.fail("help must not prepare host networking"),
+    )
+
+    with pytest.raises(SystemExit) as exc_info:
+        normal_main(["--help"])
+
+    assert exc_info.value.code == 0
+    output = capsys.readouterr().out
+    assert "--overview {on,sim}" in output
+    assert "--stereo-left {on,sim}" in output
+    assert "--stereo-right {on,sim,off}" in output
+    assert "--stm32 {on,sim}" in output
+    assert "--preflight-only" in output
+    assert "--verbose" in output
+    assert "--config" in output
+
+
+def _scripted_input(*answers: str):
+    iterator = iter(answers)
+
+    def read(_prompt: str) -> str:
+        return next(iterator)
+
+    return read
+
+
+def test_zero_arguments_use_interactive_path(monkeypatch) -> None:
+    monkeypatch.setattr("navmin.__main__._run_interactive", lambda: 23)
+    monkeypatch.setattr(
+        "navmin.__main__._run_noninteractive",
+        lambda _args: pytest.fail("zero arguments must not use non-interactive path"),
+    )
+
+    assert normal_main([]) == 23
+
+
+def test_interactive_defaults_come_from_config_and_summary_is_complete() -> None:
+    config = _config(emulate_stm32=True)
+    config = replace(
+        config,
+        vision=replace(
+            config.vision,
+            cameras=replace(
+                config.vision.cameras,
+                stereo_right=replace(
+                    config.vision.cameras.stereo_right,
+                    enabled=False,
+                ),
+            ),
+        ),
+    )
+    output: list[str] = []
+
+    options = _interactive_options(
+        config,
+        config_path=Path("config/navmin.json"),
+        input_fn=_scripted_input("", "", "", "", "", "", ""),
+        output_fn=output.append,
+    )
+
+    assert options == LaunchOptions(
+        overview=CameraSourceMode.ON,
+        stereo_left=CameraSourceMode.ON,
+        stereo_right=StereoRightMode.OFF,
+        stm32=Stm32Mode.SIM,
+        preflight_only=False,
+        verbose=False,
+        config_path=Path("config/navmin.json"),
+    )
+    text = "\n".join(output)
+    assert "Overview      ON" in text
+    assert "Stereo Left   ON" in text
+    assert "Stereo Right  OFF" in text
+    assert "STM32         SIM" in text
+    assert "Preflight     OFF" in text
+    assert "Logs          NORMAL" in text
+
+
+def test_interactive_accepts_explicit_source_preflight_and_logging_choices() -> None:
+    output: list[str] = []
+
+    options = _interactive_options(
+        _config(),
+        config_path=Path("config/site.json"),
+        input_fn=_scripted_input("sim", "2", "sim", "sim", "on", "verbose", "Y"),
+        output_fn=output.append,
+    )
+
+    assert options == LaunchOptions(
+        overview=CameraSourceMode.SIM,
+        stereo_left=CameraSourceMode.SIM,
+        stereo_right=StereoRightMode.SIM,
+        stm32=Stm32Mode.SIM,
+        preflight_only=True,
+        verbose=True,
+        config_path=Path("config/site.json"),
+    )
+
+
+def test_interactive_invalid_choice_and_confirmation_reprompt() -> None:
+    output: list[str] = []
+
+    options = _interactive_options(
+        _config(),
+        config_path=Path("config/navmin.json"),
+        input_fn=_scripted_input(
+            "invalid",
+            "on",
+            "",
+            "off",
+            "",
+            "",
+            "",
+            "maybe",
+            "y",
+        ),
+        output_fn=output.append,
+    )
+
+    assert options is not None
+    assert options.stereo_right is StereoRightMode.OFF
+    assert "Некорректный выбор. Повторите ввод." in output
+    assert "Введите Y, N или нажмите Enter." in output
+
+
+def test_interactive_n_cancels_without_launch(monkeypatch) -> None:
+    monkeypatch.setattr("navmin.__main__.load_application_inputs", lambda _paths: _inputs())
+    monkeypatch.setattr(
+        "navmin.__main__._run_noninteractive",
+        lambda *_args, **_kwargs: pytest.fail("cancel must not launch"),
+    )
+    output: list[str] = []
+
+    result = _run_interactive(
+        input_fn=_scripted_input("", "", "", "", "", "", "n"),
+        output_fn=output.append,
+    )
+
+    assert result == 0
+    assert output[-1] == "Запуск отменён."
+
+
+def test_interactive_ctrl_c_cancels_cleanly(monkeypatch) -> None:
+    monkeypatch.setattr("navmin.__main__.load_application_inputs", lambda _paths: _inputs())
+    monkeypatch.setattr(
+        "navmin.__main__._run_noninteractive",
+        lambda *_args, **_kwargs: pytest.fail("Ctrl+C must not launch"),
+    )
+    output: list[str] = []
+
+    def interrupt(_prompt: str) -> str:
+        raise KeyboardInterrupt
+
+    assert _run_interactive(input_fn=interrupt, output_fn=output.append) == 0
+    assert output[-1] == "Запуск отменён."
+
+
+def test_interactive_confirmation_launches_through_unified_execution(monkeypatch) -> None:
+    monkeypatch.setattr("navmin.__main__.load_application_inputs", lambda _paths: _inputs())
+    calls = []
+
+    def run(args, *, origin="non-interactive") -> int:
+        calls.append((args, origin))
+        return 29
+
+    monkeypatch.setattr("navmin.__main__._run_noninteractive", run)
+
+    result = _run_interactive(
+        input_fn=_scripted_input("sim", "sim", "off", "sim", "on", "verbose", ""),
+        output_fn=lambda _line: None,
+    )
+
+    assert result == 29
+    assert len(calls) == 1
+    args, origin = calls[0]
+    assert origin == "interactive"
+    assert args.overview == "sim"
+    assert args.stereo_left == "sim"
+    assert args.stereo_right == "off"
+    assert args.stm32 == "sim"
+    assert args.preflight_only is True
+    assert args.verbose is True
+    assert args.config == Path("config/navmin.json")
+
+
+def test_any_cli_argument_uses_noninteractive_path(monkeypatch) -> None:
+    calls = []
+    monkeypatch.setattr(
+        "navmin.__main__._run_interactive",
+        lambda: pytest.fail("CLI arguments must not use interactive path"),
+    )
+
+    def run(args) -> int:
+        calls.append(args)
+        return 17
+
+    monkeypatch.setattr("navmin.__main__._run_noninteractive", run)
+    assert normal_main(["-v"]) == 17
+    assert len(calls) == 1
+    assert calls[0].verbose is True
+
+
+def test_resolve_launch_options_allows_explicit_mandatory_source_override() -> None:
+    config = _config()
+    disabled = replace(
+        config,
+        vision=replace(
+            config.vision,
+            cameras=replace(
+                config.vision.cameras,
+                overview=replace(config.vision.cameras.overview, enabled=False),
+                stereo_left=replace(config.vision.cameras.stereo_left, enabled=False),
+            ),
+        ),
+    )
+
+    options = resolve_launch_options(
+        disabled,
+        overview=CameraSourceMode.SIM,
+        stereo_left=CameraSourceMode.ON,
+    )
+
+    assert options.overview is CameraSourceMode.SIM
+    assert options.stereo_left is CameraSourceMode.ON
+    with pytest.raises(LaunchSelectionError, match="Overview is disabled"):
+        resolve_launch_options(disabled)
+
+
+def test_noninteractive_source_selection_drives_effective_preflight(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    inputs = _inputs()
+    captured = []
+    monkeypatch.setattr("navmin.__main__.load_application_inputs", lambda _paths: inputs)
+    monkeypatch.setattr("navmin.__main__._DEFAULT_LOG_DIR", tmp_path / "logs")
+
+    def preflight(effective_inputs, **kwargs):
+        captured.append((effective_inputs, kwargs))
+        return _preflight_report(PreflightStatus.WARN)
+
+    monkeypatch.setattr("navmin.__main__.run_startup_preflight", preflight)
+    monkeypatch.setattr(
+        "navmin.__main__.run_loaded_application",
+        lambda _inputs, **_kwargs: pytest.fail("preflight-only must not run UI"),
+    )
+
+    assert normal_main(
+        [
+            "--config",
+            "config/site.json",
+            "--overview",
+            "sim",
+            "--stereo-right",
+            "off",
+            "--stm32",
+            "sim",
+            "-p",
+        ]
+    ) == 0
+    effective_inputs, kwargs = captured[0]
+    selection = kwargs["selection"]
+    assert selection.overview == "sim"
+    assert selection.stereo_left == "real"
+    assert selection.stereo_right is None
+    assert selection.turret == "sim"
+    assert effective_inputs.config.vision.cameras.stereo_right.enabled is False
+    assert effective_inputs.config.vision.distance.stereo.stereo_enabled is False
+    assert effective_inputs.config.turret.emulate_stm32 is True
+    assert kwargs["selection_warnings"]
+
+
+def test_host_activation_follows_effective_real_camera_selection(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    inputs = load_application_inputs(
+        LauncherPaths(config=REPO_ROOT / "config" / "defaults" / "navmin.json")
+    )
+    requirements: list[bool] = []
+
+    class RecordingHost:
+        @contextmanager
+        def activation(self, *, camera_network_required: bool):
+            requirements.append(camera_network_required)
+            yield
+
+    monkeypatch.setattr("navmin.__main__.load_application_inputs", lambda _paths: inputs)
+    monkeypatch.setattr(
+        "navmin.__main__.create_host_environment", lambda _root: RecordingHost()
+    )
+    monkeypatch.setattr(
+        "navmin.__main__.run_loaded_application",
+        lambda _inputs, **_kwargs: pytest.fail("preflight-only must not run UI"),
+    )
+
+    monkeypatch.setattr("navmin.__main__._DEFAULT_LOG_DIR", tmp_path / "sim-logs")
+    assert normal_main(
+        [
+            "--overview",
+            "sim",
+            "--stereo-left",
+            "sim",
+            "--stereo-right",
+            "off",
+            "--stm32",
+            "sim",
+            "-p",
+        ]
+    ) == 0
+
+    monkeypatch.setattr("navmin.__main__._DEFAULT_LOG_DIR", tmp_path / "mixed-logs")
+    assert normal_main(
+        [
+            "--overview",
+            "on",
+            "--stereo-left",
+            "sim",
+            "--stereo-right",
+            "off",
+            "--stm32",
+            "sim",
+            "-p",
+        ]
+    ) == 0
+
+    assert requirements == [False, True]
+
+
+def test_verbose_flag_selects_debug_session_file_logging(monkeypatch, tmp_path) -> None:
+    levels = []
+
+    @contextmanager
+    def capture_logging(_path, *, level):
+        levels.append(level)
+        yield _path
+
+    monkeypatch.setattr("navmin.__main__.session_file_logging", capture_logging)
+    monkeypatch.setattr(
+        "navmin.__main__.load_application_inputs",
+        lambda _paths: (_ for _ in ()).throw(ValueError("stop after logging setup")),
+    )
+
+    monkeypatch.setattr("navmin.__main__._DEFAULT_LOG_DIR", tmp_path / "normal")
+    assert normal_main(["--config", "missing-a.json"]) == 2
+    monkeypatch.setattr("navmin.__main__._DEFAULT_LOG_DIR", tmp_path / "verbose")
+    assert normal_main(["--config", "missing-b.json", "-v"]) == 2
+
+    assert levels == [logging.INFO, logging.DEBUG]

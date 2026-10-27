@@ -15,6 +15,7 @@ from navmin.config.models import (
     RtspSourceConfig,
 )
 from navmin.contracts import CameraRole, CameraState
+from navmin.diagnostics.synthetic_sources import SyntheticFrameSource
 from navmin.vision import gstreamer_source
 from navmin.vision.camera_source import create_camera_source
 from navmin.vision.camera_worker import CameraWorker, build_camera_worker
@@ -130,6 +131,59 @@ class _BackendFactory:
         self.backend = _FakeBackend(on_frame, on_failure)
         return self.backend
 
+
+def test_synthetic_frame_source_is_paced_latest_only_and_stoppable() -> None:
+    now_ns = [1_000_000_000]
+    generated = [0]
+
+    def clock() -> int:
+        return now_ns[0]
+
+    def frame_supplier() -> np.ndarray:
+        generated[0] += 1
+        return np.full((HEIGHT, WIDTH, 3), generated[0], dtype=np.uint8)
+
+    source = SyntheticFrameSource(
+        frame_supplier,
+        fps=20,
+        monotonic_clock_ns=clock,
+    )
+    assert source.read() is None
+
+    source.start()
+    first = source.read()
+    assert first is not None
+    assert first.receive_timestamp_ns == 1_000_000_000
+    assert first.capture_id is None
+    assert generated == [1]
+    assert source.read() is None
+
+    now_ns[0] += 49_000_000
+    assert source.read() is None
+    now_ns[0] += 1_000_000
+    second = source.read()
+    assert second is not None
+    assert generated == [2]
+
+    now_ns[0] += 250_000_000
+    third = source.read()
+    assert third is not None
+    assert generated == [3]
+    assert source.read() is None
+
+    source.stop()
+    now_ns[0] += 1_000_000_000
+    assert source.read() is None
+
+
+def test_synthetic_frame_source_surfaces_supplier_failure_as_camera_error() -> None:
+    def fail() -> np.ndarray:
+        raise ValueError("forced synthetic failure")
+
+    source = SyntheticFrameSource(fail, fps=20)
+    source.start()
+    with pytest.raises(CameraSourceError, match="synthetic frame generation failed"):
+        source.read()
 
 def test_gstreamer_runtime_initialization_is_serialized_and_cached(monkeypatch) -> None:
     calls: list[int] = []

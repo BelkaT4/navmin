@@ -740,3 +740,68 @@ def test_session_directory_probe_is_removed(tmp_path) -> None:
     before = set(tmp_path.iterdir())
     assert preflight_module._check_session_directory(tmp_path) is None
     assert set(tmp_path.iterdir()) == before
+
+
+def test_all_sim_preflight_skips_gstreamer_udp_serial_and_pty(tmp_path) -> None:
+    inputs = _inputs(8888, 8889)
+
+    def must_not_run(*_args, **_kwargs):
+        raise AssertionError("hardware-specific preflight check must not run")
+
+    report = run_startup_preflight(
+        inputs,
+        selection=StartupBackendSelection("sim", "sim", "sim", stereo_right="sim"),
+        session_dir=tmp_path,
+        session_directory_check=lambda _path: None,
+        qt_check=lambda: None,
+        receiver_check=must_not_run,
+        sender_check=must_not_run,
+        pyserial_check=must_not_run,
+        pty_check=must_not_run,
+        udp_check=must_not_run,
+        serial_path_check=must_not_run,
+    )
+
+    assert report.ok
+    names = {check.name for check in report.checks}
+    assert "Overview synthetic source" in names
+    assert "Stereo Left synthetic source" in names
+    assert "Stereo Right synthetic source" in names
+    assert "STM32 simulation" in names
+    assert "GStreamer receiver" not in names
+    assert "pyserial" not in names
+    assert "PTY capability" not in names
+    assert all("UDP endpoint" not in name for name in names)
+
+
+def test_right_off_is_not_required_by_preflight(tmp_path) -> None:
+    inputs = _inputs(8888, 8889)
+    report = _run(
+        tmp_path,
+        inputs,
+        StartupBackendSelection("real", "real", "sim", stereo_right=None),
+    )
+
+    names = {check.name for check in report.checks}
+    assert all(not name.startswith("Stereo Right") for name in names)
+    assert report.ok
+
+
+def test_selection_degradation_warning_is_warn_not_fail(tmp_path) -> None:
+    inputs = _inputs(8888, 8889)
+    warning = "mixed real/sim stereo disables pairing"
+    report = _run(
+        tmp_path,
+        inputs,
+        StartupBackendSelection("real", "sim", "sim", stereo_right="sim"),
+        selection_warnings=(warning,),
+    )
+
+    assert report.ok
+    assert report.overall_status is PreflightStatus.WARN
+    matching = [
+        check for check in report.checks if check.name == "Runtime source selection"
+    ]
+    assert len(matching) == 1
+    assert matching[0].status is PreflightStatus.WARN
+    assert matching[0].detail == warning

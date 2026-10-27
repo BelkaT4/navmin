@@ -67,7 +67,7 @@
   },
   "turret": {
     "serial": {
-      "port": "/dev/navmin-turret",
+      "port": "/dev/ttyUSB0",
       "baudrate": 9600,
       "response-timeout-ms": 100,
       "max-retries": 2,
@@ -102,7 +102,7 @@
       "acceleration-y-deg-s2": 150.0,
       "velocity-watchdog-timeout-ms": 200
     },
-    "emulate-stm32": true
+    "emulate-stm32": false
   },
   "ui": {
     "default-camera": "overview",

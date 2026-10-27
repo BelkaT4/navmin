@@ -450,7 +450,7 @@ def _select_stereo_right(
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="run_diagnostic_app.py",
+        prog="navmin.diagnostic_launcher",
         description=(
             "Run the shared NavMin application with explicit real/localhost camera "
             "endpoints and a real/PTY controller endpoint."

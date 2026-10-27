@@ -78,6 +78,40 @@ def rectified_synthetic_calibration(reference: StereoCalibration) -> StereoCalib
     )
 
 
+def rectified_synthetic_side_calibration(
+    reference: StereoCalibration,
+    *,
+    left_synthetic: bool,
+    right_synthetic: bool,
+) -> StereoCalibration:
+    """Make only selected stereo correction paths identity-like for synthetic frames.
+
+    Mixed real/synthetic launches keep the physical camera side untouched while
+    the simulated side consumes already-rectified frames. Stereo pairing is
+    disabled by launch selection for such mixed pairs, so shared Q/T geometry is
+    retained only as inactive reference data.
+    """
+    if not left_synthetic and not right_synthetic:
+        return reference
+    if left_synthetic and right_synthetic:
+        return rectified_synthetic_calibration(reference)
+
+    changes: dict[str, object] = {}
+    if left_synthetic:
+        changes.update(
+            K_left=tuple(tuple(row[:3]) for row in reference.P1),
+            D_left=_ZERO_DISTORTION,
+            R1=_IDENTITY_3X3,
+        )
+    if right_synthetic:
+        changes.update(
+            K_right=tuple(tuple(row[:3]) for row in reference.P2),
+            D_right=_ZERO_DISTORTION,
+            R2=_IDENTITY_3X3,
+        )
+    return replace(reference, **changes)
+
+
 class SyntheticWorkingRangeStereoScene:
     """Three plain circular rectified targets at 100/150/200 m.
 
@@ -245,4 +279,5 @@ __all__ = [
     "SyntheticStereoTargetState",
     "SyntheticWorkingRangeStereoScene",
     "rectified_synthetic_calibration",
+    "rectified_synthetic_side_calibration",
 ]
