@@ -4,13 +4,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
-from math import ceil, isfinite, sqrt
+from math import ceil, isfinite, log, sqrt
 
 import cv2
 import numpy as np
 
 from navmin.calibration import StereoCalibration
-from navmin.contracts import BBox
+from navmin.contracts import BBox, TrackedObject
 from navmin.vision.stereo_pairing import StereoFramePair
 from navmin.vision.stereo_timestamp_pairing import TimestampStereoFramePair
 
@@ -33,12 +33,15 @@ class StereoDistanceFailureReason(Enum):
     ROI_OUT_OF_FRAME = "roi_out_of_frame"
     EMPTY_ROI = "empty_roi"
     INSUFFICIENT_VALID_PIXELS = "insufficient_valid_pixels"
+    DETECTOR_NO_MATCH = "detector_no_match"
+    DETECTOR_AMBIGUOUS = "detector_ambiguous"
 
 
 class StereoDistanceMethod(Enum):
     """Pure source/method used to derive an internal stereo estimate."""
 
     DISPARITY_MAP_ROI_MEDIAN = "disparity_map_roi_median"
+    DETECTOR_CENTER_DISPARITY = "detector_center_disparity"
 
 
 @dataclass(frozen=True, slots=True)
@@ -126,6 +129,74 @@ def estimate_distance_from_stereo_pair(
         target_roi,
         length_scale_to_m=length_scale_to_m,
         min_valid_pixel_count=min_valid_pixel_count,
+    )
+
+
+def estimate_distance_from_detector_pair(
+    pair: StereoDistancePair,
+    calibration: StereoCalibration,
+    left_roi: BBox,
+    right_detections: tuple[TrackedObject, ...],
+    *,
+    length_scale_to_m: float,
+) -> StereoDistanceEstimateOutcome:
+    """Match independent detections by rectified epipolar geometry."""
+    geometry_failure = validate_stereo_pair_geometry(pair, calibration)
+    if geometry_failure is not None:
+        return geometry_failure
+    if left_roi.width <= 0 or left_roi.height <= 0:
+        return StereoDistanceFailure(StereoDistanceFailureReason.EMPTY_ROI)
+    frame_height, frame_width = pair.left.image.shape[:2]
+    if (
+        left_roi.x < 0
+        or left_roi.y < 0
+        or left_roi.x + left_roi.width > frame_width
+        or left_roi.y + left_roi.height > frame_height
+    ):
+        return StereoDistanceFailure(StereoDistanceFailureReason.ROI_OUT_OF_FRAME)
+    left_x = left_roi.x + left_roi.width / 2.0
+    left_y = left_roi.y + left_roi.height / 2.0
+    candidates: list[tuple[float, float]] = []
+    for detection in right_detections:
+        bbox = detection.bbox
+        if bbox.width <= 0 or bbox.height <= 0:
+            continue
+        right_x = bbox.x + bbox.width / 2.0
+        right_y = bbox.y + bbox.height / 2.0
+        disparity = left_x - right_x
+        vertical_error = abs(left_y - right_y)
+        if disparity <= 0.0:
+            continue
+        if vertical_error > max(8.0, 0.3 * max(left_roi.height, bbox.height)):
+            continue
+        height_ratio = bbox.height / left_roi.height
+        if not 0.5 <= height_ratio <= 2.0:
+            continue
+        score = vertical_error / max(left_roi.height, bbox.height) + abs(
+            log(height_ratio)
+        )
+        candidates.append((score, disparity))
+    if not candidates:
+        return StereoDistanceFailure(StereoDistanceFailureReason.DETECTOR_NO_MATCH)
+    candidates.sort(key=lambda item: item[0])
+    if len(candidates) > 1 and candidates[1][0] - candidates[0][0] < 0.05:
+        return StereoDistanceFailure(StereoDistanceFailureReason.DETECTOR_AMBIGUOUS)
+    best_disparity = candidates[0][1]
+    point = reproject_disparity_point(
+        calibration,
+        x_px=left_x,
+        y_px=left_y,
+        disparity_px=best_disparity,
+        length_scale_to_m=length_scale_to_m,
+    )
+    if isinstance(point, StereoDistanceFailure):
+        return point
+    return StereoDistanceEstimate(
+        distance_m=point.distance_m,
+        median_disparity_px=best_disparity,
+        valid_pixel_count=1,
+        valid_pixel_fraction=1.0,
+        method=StereoDistanceMethod.DETECTOR_CENTER_DISPARITY,
     )
 
 

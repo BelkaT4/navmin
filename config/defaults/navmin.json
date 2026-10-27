@@ -1,5 +1,5 @@
 {
-  "schema-version": 3,
+  "schema-version": 4,
   "vision": {
     "processing-scope": "main-and-preview",
     "cameras": {
@@ -27,14 +27,14 @@
         "vision-processor-class": "Legacy14VisionProcessor"
       },
       "stereo-right": {
-        "enabled": false,
+        "enabled": true,
         "source": {
           "type": "rtp-jpeg",
           "bind-address": "0.0.0.0",
           "port": 8890,
           "buffer-size": 1
         },
-        "processing-enabled": false,
+        "processing-enabled": true,
         "vision-processor-class": "Legacy14VisionProcessor"
       }
     },
@@ -43,10 +43,12 @@
       "manual-distance-m": 100.0,
       "distance-stale-timeout-ms": 300,
       "stereo": {
-        "stereo-enabled": false,
+        "stereo-enabled": true,
         "right-frame-buffer-size": 4,
         "pair-timeout-ms": 100,
-        "calibration-file": "calibration/stereo.json"
+        "calibration-file": "calibration/stereo.json",
+        "method": "roi",
+        "aggregation-frame-count": 5
       }
     },
     "camera-stale-timeout-ms": 500,
@@ -84,7 +86,9 @@
       "enabled": false,
       "horizon-ms": 0,
       "max-angle-x-deg": 1.0,
-      "max-angle-y-deg": 1.0
+      "max-angle-y-deg": 1.0,
+      "projectile-speed-m-s": 825.0,
+      "projectile-mass-g": 9.6
     },
     "platform-motion": {
       "source": "command-model"

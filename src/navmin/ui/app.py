@@ -19,6 +19,7 @@ def run_ui(
     *,
     mediator: Mediator,
     camera_bindings: Mapping[CameraRole, CameraUiBinding],
+    stereo_right_binding: CameraUiBinding | None = None,
     turret_states: LatestValue[TurretState],
     camera_stale_timeout_ms: int,
     pid_controller_config: PidControllerConfig,
@@ -36,6 +37,7 @@ def run_ui(
     window = MainWindow(
         mediator=mediator,
         camera_bindings=camera_bindings,
+        stereo_right_binding=stereo_right_binding,
         turret_states=turret_states,
         camera_stale_timeout_ms=camera_stale_timeout_ms,
         pid_controller_config=pid_controller_config,

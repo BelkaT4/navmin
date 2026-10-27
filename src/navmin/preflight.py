@@ -130,6 +130,7 @@ def run_startup_preflight(
     session_directory_check = session_directory_check or _check_session_directory
     qt_check = qt_check or _check_pyqt6
     receiver_check = receiver_check or _check_gstreamer_receiver
+    custom_sender_check = sender_check is not None
     sender_check = sender_check or check_gstreamer_sender_runtime
     pyserial_check = pyserial_check or _check_pyserial
     pty_check = pty_check or check_pty_preflight
@@ -262,7 +263,7 @@ def run_startup_preflight(
         )
 
     if localhost_selected:
-        if os.name == "nt":
+        if os.name == "nt" and not custom_sender_check:
             from navmin.diagnostics.windows_rtp import check_windows_sender
             sender_result = check_windows_sender()
         else:

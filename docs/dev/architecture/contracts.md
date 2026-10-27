@@ -44,7 +44,7 @@ class FramePacket:
 
 Video Source / camera pipeline должен гарантировать стабильность памяти опубликованного `image`. Если backend может повторно использовать буфер, перед публикацией выполняется один `image.copy()`.
 
-Точный механизм создания и синхронизации `capture_id` остаётся открытым вопросом до включения полноценного Stereo distance.
+Production RTP/JPEG cameras пока не синхронизируют `capture_id`; поэтому точное pairing доступно только источникам, которые его публикуют. Timestamp pairing использует bounded skew. Правила добавления `capture_id` на sender остаются открытым вопросом.
 
 ## `CameraRay` и `CameraModel`
 
@@ -212,6 +212,8 @@ UI рисует bbox поверх `VisionResult.frame`, поэтому отде�
 
 На границе worker → main thread `VisionResult` имеет latest-only семантику per camera: старые результаты можно пропускать, но нельзя принимать result до barrier `CameraSessionStarted` той же generation.
 
+Stereo Right `VisionResult` может приниматься UI для выбранного экранного представления после проверки camera-session generation. В ROI distance mode этот путь ограничен отображением и не передаёт right detections в `StereoTargetJoiner`; в detector mode сохраняется существующий путь сопоставления. Выбор отображаемой камеры не меняет `main_camera` или стереорасчёты.
+
 ## `TargetRef`
 
 ```python
@@ -265,6 +267,8 @@ class DistanceResult:
 - Manual-result имеет `source_frame_id = None`, `capture_id = None`;
 - `generation` отдельно не дублируется, поскольку входит в `target`;
 - Stereo-result используется не дольше `distance-stale-timeout-ms`;
+- Stereo-result публикуется после накопления заданного числа успешных пар и содержит медиану их оценок;
+- метод `roi` использует disparity map внутри выбранной рамки Stereo Left; метод `detector` использует выбранную рамку слева и однозначно сопоставленную рамку Stereo Right;
 - Manual-result действителен, пока источник manual и `TargetRef` актуален;
 - при смене/снятии цели или camera generation результат старой цели немедленно инвалидируется;
 - межпотоковая семантика — latest state, который должен уметь явно переходить в `None`/invalid.

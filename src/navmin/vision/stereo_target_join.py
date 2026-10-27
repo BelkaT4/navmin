@@ -14,6 +14,7 @@ from navmin.contracts import (
     CameraSessionStarted,
     FramePacket,
     TargetRef,
+    TrackedObject,
     VisionResult,
 )
 
@@ -33,12 +34,13 @@ type StereoTargetPair = StereoFramePair | TimestampStereoFramePair
 
 @dataclass(frozen=True, slots=True)
 class StereoTargetObservation:
-    """Exact target ROI bound to one distance-intent revision and stereo pair."""
+    """Selected left target and paired frame detections for one stereo pair."""
 
     target: TargetRef
     intent_revision: int
     pair: StereoTargetPair
     roi: BBox
+    right_detections: tuple[TrackedObject, ...] = ()
     pairing_kind: StereoPairingKind = StereoPairingKind.EXACT
 
     def __post_init__(self) -> None:
@@ -84,14 +86,19 @@ class StereoTargetJoiner:
     """Join pair/result identity for only the active Stereo Left target.
 
     The joiner intentionally keeps one latest-useful pair and one latest-useful
-    ``VisionResult``. It never searches nearest frames, timestamps, or target
-    candidates. Target/generation boundaries clear pending and published state.
+    result per camera. It never searches nearest frames, timestamps, or target
+    candidates. Detector mode also requires the result for the pair's exact right
+    frame. Target/generation boundaries clear pending and published state.
     """
 
     def __init__(
         self,
         observation_sink: Callable[[StereoTargetObservation], object] | None = None,
+        *,
+        require_right_result: bool = False,
     ) -> None:
+        if type(require_right_result) is not bool:
+            raise TypeError("require_right_result must be bool")
         self._lock = Lock()
         self._left_generation: int | None = None
         self._target: TargetRef | None = None
@@ -99,6 +106,9 @@ class StereoTargetJoiner:
         self._observation_sink = observation_sink
         self._pending_pair: StereoTargetPair | None = None
         self._pending_result: VisionResult | None = None
+        self._pending_right_result: VisionResult | None = None
+        self._right_generation: int | None = None
+        self._require_right_result = require_right_result
         self.observations: InvalidatableLatest[StereoTargetObservation] = (
             InvalidatableLatest()
         )
@@ -136,6 +146,10 @@ class StereoTargetJoiner:
             )
 
     @property
+    def requires_right_result(self) -> bool:
+        return self._require_right_result
+
+    @property
     def diagnostics(self) -> StereoTargetJoinerDiagnostics:
         with self._lock:
             return StereoTargetJoinerDiagnostics(
@@ -169,6 +183,30 @@ class StereoTargetJoiner:
             self._intent_revision = 0
             self._count_pending_discards_locked()
             self._clear_inputs_locked()
+            self.observations.invalidate()
+
+    def start_right_generation(self, generation: int) -> None:
+        """Accept the authoritative Stereo Right generation barrier."""
+        if isinstance(generation, bool) or not isinstance(generation, int):
+            raise TypeError("generation must be an integer")
+        if generation < 1:
+            raise ValueError("generation must be >= 1")
+        with self._lock:
+            if self._right_generation == generation:
+                return
+            self._right_generation = generation
+            self._count_pending_discards_locked()
+            self._clear_inputs_locked()
+            self.observations.invalidate()
+
+    def set_require_right_result(self, required: bool) -> None:
+        if type(required) is not bool:
+            raise TypeError("required must be bool")
+        with self._lock:
+            if self._require_right_result == required:
+                return
+            self._require_right_result = required
+            self._pending_right_result = None
             self.observations.invalidate()
 
     def set_target(
@@ -253,10 +291,32 @@ class StereoTargetJoiner:
         self._notify_observation(observation)
         return observation
 
+    def offer_right_vision_result(
+        self,
+        result: VisionResult,
+    ) -> StereoTargetObservation | None:
+        """Offer the right camera's independent detections for a stereo pair."""
+        if not isinstance(result, VisionResult):
+            raise TypeError("result must be VisionResult")
+        if result.frame.camera is not CameraRole.STEREO_RIGHT:
+            raise ValueError("right-camera result must belong to Stereo Right")
+        with self._lock:
+            if (
+                self._right_generation is None
+                or result.frame.generation != self._right_generation
+            ):
+                self._pending_right_result = None
+                return None
+            self._pending_right_result = result
+            observation = self._try_join_locked()
+        self._notify_observation(observation)
+        return observation
+
     def reset(self) -> None:
         """Clear generation, target, pending inputs, and published observation."""
         with self._lock:
             self._left_generation = None
+            self._right_generation = None
             self._target = None
             self._intent_revision = 0
             self._count_pending_discards_locked()
@@ -267,6 +327,7 @@ class StereoTargetJoiner:
         pair = self._pending_pair
         result = self._pending_result
         target = self._target
+        right_result = self._pending_right_result
         if pair is None or result is None or target is None:
             return None
 
@@ -291,6 +352,26 @@ class StereoTargetJoiner:
             self.observations.invalidate()
             return None
 
+        if self._require_right_result:
+            if right_result is None:
+                return None
+            if (
+                right_result.frame.generation != pair.right.generation
+                or right_result.frame.frame_id != pair.right.frame_id
+                or right_result.frame.receive_timestamp_ns
+                != pair.right.receive_timestamp_ns
+            ):
+                if (
+                    right_result.frame.receive_timestamp_ns
+                    < pair.right.receive_timestamp_ns
+                ):
+                    self._pending_right_result = None
+                else:
+                    self._pending_pair = None
+                    self._pending_result = None
+                self.observations.invalidate()
+                return None
+
         tracked = next(
             (item for item in result.tracked_objects if item.track_id == target.track_id),
             None,
@@ -306,6 +387,11 @@ class StereoTargetJoiner:
             intent_revision=self._intent_revision,
             pair=pair,
             roi=tracked.bbox,
+            right_detections=(
+                right_result.tracked_objects
+                if self._require_right_result and right_result is not None
+                else ()
+            ),
             pairing_kind=(
                 StereoPairingKind.EXACT
                 if isinstance(pair, StereoFramePair)
@@ -338,6 +424,7 @@ class StereoTargetJoiner:
     def _clear_inputs_locked(self) -> None:
         self._pending_pair = None
         self._pending_result = None
+        self._pending_right_result = None
 
     def _count_pending_discards_locked(self) -> None:
         if self._pending_pair is not None:

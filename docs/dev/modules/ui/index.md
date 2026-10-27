@@ -9,7 +9,8 @@
 UI:
 
 - запускает основной интерфейс fullscreen;
-- показывает Overview и Stereo Left как main + preview;
+- всегда показывает Overview и один выбранный стереокадр как main + preview;
+- позволяет кнопками `L` / `R` выбрать для отображения Stereo Left или Stereo Right;
 - рисует overlays поверх working frame;
 - показывает camera/Turret/distance state и diagnostics;
 - принимает target selection только на main image;
@@ -25,20 +26,22 @@ UI не выполняет VisionProcessor, calibration math, Aiming, PID или
 
 ## `main_camera` и preview
 
-Одна из двух камер является main:
+Core выбирает main camera для управления и target selection:
 
 ```text
 OVERVIEW
 STEREO_LEFT
 ```
 
-Вторая автоматически является preview.
+UI всегда показывает Overview и выбранную Stereo Left/Right ленту. `main_camera` определяет, какая из этих картинок занимает основную область; вторая остаётся preview.
 
 Startup `main_camera` берётся из `ui.default-camera`. `STEREO_RIGHT` обычной main camera не является.
 
 Preview отображается небольшим отдельным окном в правом нижнем углу области main video, выше нижней operational bar. Оно не участвует в target selection/click-to-move.
 
-Пользователь может явно swap main/preview click'ом по preview либо кликабельным swap-icon внутри preview. Swap проходит через Core, потому что он влияет на selection и processing scope. Название камеры отображается прямо в соответствующем view; swap-icon означает действие, а не отдельный state indicator.
+Кнопки `L` / `R` в preview выбирают стереокадр только для отображения; при старте выбрана `L`, а `R` отключена, если Stereo Right camera не включена. Этот выбор не меняет `main_camera`, стереопару, calibration или distance calculation. Если в основной области показывается Stereo Right при `main_camera = Stereo Left`, click-to-move и target selection отключены; вычисления Core продолжаются с прежней Stereo Left лентой.
+
+Пользователь может явно swap main/preview click'ом по preview либо кликабельным swap-icon внутри preview. Swap по-прежнему проходит через Core и сохраняет прежнее влияние на selection и processing scope. Название камеры отображается прямо в соответствующем view; swap-icon означает действие, а не отдельный state indicator.
 
 При отказе main camera UI **не переключается автоматически** на preview. Текущий `main_camera` сохраняется, UI показывает реальный camera status и presentation-признак `НЕТ НОВЫХ КАДРОВ`, а swap остаётся явным действием пользователя.
 
@@ -77,7 +80,7 @@ VisionResult.tracked_objects
 `FramePacket.image` уже corrected working frame:
 
 - Overview undistorted;
-- Stereo Left rectified.
+- Stereo Left / Right rectified.
 
 Все UI clicks находятся в coordinates того же working frame.
 
@@ -85,9 +88,13 @@ Overlays не изменяют сам `FramePacket.image`.
 
 Baseline object overlay минимален: bbox всех текущих `TrackedObject` и явное выделение selected target. Постоянные `track_id`, distance, velocity и `age_frames` рядом с каждым bbox не показываются; расширенный diagnostic overlay может быть добавлен отдельно без изменения общего `TrackedObject` contract.
 
-На основном видео UI также показывает прицельную метку фактической `aim point`, которую использует Aiming для этой камеры. UI не хранит отдельную точку наведения. Если `aiming.aim-points.<camera>.x-px` / `y-px` не заданы, Aiming использует центр working frame, и метка отображается в этом же центре. После swap метка соответствует новой main camera; на preview она не рисуется. При новом `CameraSessionStarted` метка исчезает вместе со старым displayed result и появляется только после принятия кадра новой generation.
+На основном видео UI также показывает прицельную метку фактической `aim point`, которую использует Aiming для этой камеры, если отображаемый кадр совпадает с Core `main_camera`. UI не хранит отдельную точку наведения. Если `aiming.aim-points.<camera>.x-px` / `y-px` не заданы, Aiming использует центр working frame, и метка отображается в этом же центре. При отображении Stereo Right вместо Stereo Left aim point скрывается: Core продолжает использовать исходный Stereo Left frame. На preview метка не рисуется. При новом `CameraSessionStarted` метка исчезает вместе со старым displayed result и появляется только после принятия кадра новой generation.
 
 Прицельная метка состоит из четырёх тонких красных отрезков вокруг свободного центра: толщина линии `3 px`, зазор от центра `4 px`, длина каждого отрезка `10 px`. Размеры относятся к экранному отображению и не масштабируются вместе с working frame. Центральная область остаётся свободной, чтобы метка не закрывала небольшую цель. Координаты `aim point` переводятся через тот же rendered image rect с учётом aspect ratio и letterbox.
+
+Когда управление находится в `TRACKING`, для выбранной цели и включённого `tracking-control.prediction` на основном видео рисуется голубая линия от центра bbox к точке, экстраполированной по скорости цели на настроенный `horizon-ms`. На preview линия не отображается. Это только UI overlay: точка упреждения не подменяет `aim point` и не меняет расчёт команд управления.
+
+В окне оператора для будущей баллистической поправки также доступны поля скорости снаряда (`м/с`) и его массы (`г`), начальные значения — `825` и `9.6`. После нажатия Apply tracking значения попадают во временный runtime snapshot, но в расчёте линии не используются и в config-файл не записываются.
 
 ## Основной layout и menu bar
 
@@ -112,7 +119,7 @@ Operator Window показывает только уже существующе�
 
 Верхний menu bar содержит редко используемые действия, в том числе recording, view, diagnostics и settings. Motor control в menu bar не дублируется, потому что motor state/control постоянно доступен в нижней bar.
 
-Stereo Right не входит в normal main/preview pair. Он открывается через Diagnostics как отдельный diagnostic view и не меняет `main_camera`, selection или обычный swap contract.
+Stereo Right может заменять Stereo Left только в отображаемой паре через кнопку `R`. У него нет пользовательского `TargetRef`; эта экранная замена не меняет `main_camera`, selection или стереорасчёты. Его diagnostics также остаются доступны отдельно.
 
 ## Запись видео
 

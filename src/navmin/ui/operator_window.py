@@ -92,6 +92,16 @@ class OperatorWindow(QWidget):
             "horizon_ms": QLineEdit(
                 str(tracking_control_config.prediction.horizon_ms)
             ),
+            "projectile_speed_m_s": QLineEdit(
+                self._format_gain(
+                    tracking_control_config.prediction.projectile_speed_m_s
+                )
+            ),
+            "projectile_mass_g": QLineEdit(
+                self._format_gain(
+                    tracking_control_config.prediction.projectile_mass_g
+                )
+            ),
             "window_ms": QLineEdit(
                 str(tracking_control_config.velocity_estimator.window_ms)
             ),
@@ -167,11 +177,18 @@ class OperatorWindow(QWidget):
         tracking_layout.addWidget(self.prediction_enabled_checkbox, 3, 0, 1, 2)
         tracking_layout.addWidget(QLabel("Prediction horizon, ms"), 4, 0)
         tracking_layout.addWidget(self.tracking_inputs["horizon_ms"], 4, 1)
-        tracking_layout.addWidget(QLabel("Estimator window, ms"), 5, 0)
-        tracking_layout.addWidget(self.tracking_inputs["window_ms"], 5, 1)
-        tracking_layout.addWidget(self.tracking_apply_button, 6, 0, 1, 2)
-        tracking_layout.addWidget(self.tracking_status_label, 7, 0, 1, 2)
-        tracking_layout.addWidget(self.tracking_error_label, 8, 0, 1, 2)
+        tracking_layout.addWidget(QLabel("Скорость снаряда, м/с"), 5, 0)
+        tracking_layout.addWidget(self.tracking_inputs["projectile_speed_m_s"], 5, 1)
+        tracking_layout.addWidget(QLabel("Масса снаряда, г"), 6, 0)
+        tracking_layout.addWidget(self.tracking_inputs["projectile_mass_g"], 6, 1)
+        tracking_layout.addWidget(QLabel("Estimator window, ms"), 7, 0)
+        tracking_layout.addWidget(self.tracking_inputs["window_ms"], 7, 1)
+        tracking_layout.addWidget(
+            QLabel("Пока параметры не влияют на точку упреждения."), 8, 0, 1, 2
+        )
+        tracking_layout.addWidget(self.tracking_apply_button, 9, 0, 1, 2)
+        tracking_layout.addWidget(self.tracking_status_label, 10, 0, 1, 2)
+        tracking_layout.addWidget(self.tracking_error_label, 11, 0, 1, 2)
         layout.addWidget(tracking_group)
 
         diagnostics_group = QGroupBox("Tracking estimator — диагностика")
@@ -255,6 +272,12 @@ class OperatorWindow(QWidget):
                     horizon_ms=self._read_tracking_integer(
                         "horizon_ms", "Prediction horizon", minimum=0
                     ),
+                    projectile_speed_m_s=self._read_tracking_number(
+                        "projectile_speed_m_s", "Projectile speed", strictly_positive=True
+                    ),
+                    projectile_mass_g=self._read_tracking_number(
+                        "projectile_mass_g", "Projectile mass", strictly_positive=True
+                    ),
                 ),
             )
             window_ms = self._read_tracking_integer(
@@ -281,18 +304,29 @@ class OperatorWindow(QWidget):
             f"{config.feed_forward.gain_y:g}); "
             f"Prediction={'ON' if config.prediction.enabled else 'OFF'} "
             f"horizon={config.prediction.horizon_ms} ms; "
+            f"projectile={config.prediction.projectile_speed_m_s:g} m/s, "
+            f"{config.prediction.projectile_mass_g:g} g; "
             f"window={config.velocity_estimator.window_ms} ms"
         )
 
-    def _read_tracking_number(self, field: str, label: str) -> float:
+    def _read_tracking_number(
+        self,
+        field: str,
+        label: str,
+        *,
+        strictly_positive: bool = False,
+    ) -> float:
         text = self.tracking_inputs[field].text().strip()
         try:
             value = float(text)
         except ValueError as exc:
-            raise ValueError(f"{label}: введите число >= 0") from exc
+            requirement = "> 0" if strictly_positive else ">= 0"
+            raise ValueError(f"{label}: введите число {requirement}") from exc
         if not isfinite(value):
             raise ValueError(f"{label}: значение должно быть конечным")
-        if value < 0:
+        if strictly_positive and value <= 0:
+            raise ValueError(f"{label}: значение должно быть > 0")
+        if not strictly_positive and value < 0:
             raise ValueError(f"{label}: значение должно быть >= 0")
         return value
 

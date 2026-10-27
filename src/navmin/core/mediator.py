@@ -401,6 +401,11 @@ class Mediator:
             self._invalidate_distance_intent()
             if self._stereo_target_joiner is not None:
                 self._stereo_target_joiner.start_generation(session.generation)
+        elif session.camera is CameraRole.STEREO_RIGHT:
+            if self._stereo_target_joiner is not None:
+                self._stereo_target_joiner.start_right_generation(
+                    session.generation
+                )
         if session.camera in self._latest_results:
             self._latest_results[session.camera] = None
         if self._target_intent_uses_camera(session.camera):
@@ -430,6 +435,19 @@ class Mediator:
             self._stereo_target_joiner.offer_vision_result(result)
         if camera is self._main_camera and self._selected_target is not None:
             self._update_tracking_from_result(result)
+        return True
+
+    def accept_stereo_right_vision_result(self, result: VisionResult) -> bool:
+        """Accept right detections for stereo correspondence without UI targeting."""
+        if result.frame.camera is not CameraRole.STEREO_RIGHT:
+            return False
+        if not self._session_gate.accepts(
+            CameraRole.STEREO_RIGHT, result.frame.generation
+        ):
+            return False
+        if self._stereo_target_joiner is None:
+            return False
+        self._stereo_target_joiner.offer_right_vision_result(result)
         return True
 
     def accept_camera_status(self, status: CameraStatus) -> bool:

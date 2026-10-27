@@ -115,7 +115,7 @@ class WindowsRtpJpegSender:
                     break
                 deadline += period
                 self._stop.wait(max(0.0, deadline - monotonic()))
-        except Exception as exc:
+        except (SenderProcessError, cv2.error, OSError, RuntimeError, TypeError, ValueError) as exc:
             self._error = exc
 
     def stop(self) -> None:

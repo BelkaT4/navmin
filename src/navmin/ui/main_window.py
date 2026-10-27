@@ -97,6 +97,7 @@ class MainWindow(QMainWindow):
         *,
         mediator: Mediator,
         camera_bindings: Mapping[CameraRole, CameraUiBinding],
+        stereo_right_binding: CameraUiBinding | None = None,
         turret_states: LatestValue[TurretState],
         camera_stale_timeout_ms: int,
         pid_controller_config: PidControllerConfig,
@@ -118,12 +119,15 @@ class MainWindow(QMainWindow):
             raise ValueError("camera binding keys must match binding.camera")
         self._mediator = mediator
         self._camera_bindings = dict(camera_bindings)
+        self._tracking_control_config = tracking_control_config
+        self._apply_tracking_control_tuning_callback = apply_tracking_control_tuning
         self._clock_ns = clock_ns
         self._wall_clock = wall_clock
         self._show_diagnostic_clock = show_diagnostic_clock
         self._frame_preparer = frame_preparer
         self._prepared_frames: dict[CameraRole, PreparedVisionFrame] = {}
         self._camera_statuses: dict[CameraRole, CameraStatus] = {}
+        self._selected_stereo_display_camera = CameraRole.STEREO_LEFT
         self._shown_main_camera = mediator.main_camera
         self._shown_selection = mediator.selected_target
         stale_timeout_ns = camera_stale_timeout_ms * 1_000_000
@@ -140,6 +144,8 @@ class MainWindow(QMainWindow):
             preview=True,
             stale_timeout_ns=stale_timeout_ns,
             on_swap=self.swap_main_preview,
+            on_stereo_camera_select=self._set_stereo_display_camera,
+            stereo_right_available=stereo_right_binding is not None,
         )
         self.video_area = _VideoArea(self.main_view, self.preview_view)
 
@@ -228,7 +234,7 @@ class MainWindow(QMainWindow):
             pid_controller_config=pid_controller_config,
             on_apply_pid_tuning=apply_pid_tuning,
             tracking_control_config=tracking_control_config,
-            on_apply_tracking_control_tuning=apply_tracking_control_tuning,
+            on_apply_tracking_control_tuning=self._apply_tracking_control_tuning,
         )
         self.motion_calibration_window = MotionCalibrationWindow(self, mediator, save_motion_calibration)
         calibration_action = self.menuBar().addAction("Калибровка движения")
@@ -237,10 +243,12 @@ class MainWindow(QMainWindow):
         self.state_pump = UiStatePump(
             mediator=mediator,
             camera_bindings=self._camera_bindings,
+            stereo_right_binding=stereo_right_binding,
             turret_states=turret_states,
             on_camera_session=self._camera_session_accepted,
             on_vision_result=self._vision_result_accepted,
             on_camera_status=self._camera_status_changed,
+            on_stereo_right_status=self._stereo_right_status_changed,
             on_turret_state=self._turret_state_changed,
             on_presentation_tick=self.refresh_presentation,
             parent=self,
@@ -314,8 +322,13 @@ class MainWindow(QMainWindow):
         self.refresh_presentation()
 
     def refresh_presentation(self) -> None:
-        if self._mediator.calibration_pending and not self.main_view.interaction_allowed(
-            self._mediator.session_gate, self._clock_ns(),
+        if (
+            self._mediator.calibration_pending
+            and self.main_view.camera is self._mediator.main_camera
+            and not self.main_view.interaction_allowed(
+                self._mediator.session_gate,
+                self._clock_ns(),
+            )
         ):
             self._mediator.cancel_motion_calibration()
         self.motion_calibration_window.refresh()
@@ -368,6 +381,7 @@ class MainWindow(QMainWindow):
         display_distance = (
             distance
             if stereo_left_main
+            and self.main_view.camera is self._mediator.main_camera
             and distance is not None
             and distance.source is expected_source
             else None
@@ -382,7 +396,10 @@ class MainWindow(QMainWindow):
             self.distance_slider.setVisible(show_slider)
             self.distance_slider.setEnabled(show_slider)
 
-            if not stereo_left_main:
+            if (
+                not stereo_left_main
+                or self.main_view.camera is not self._mediator.main_camera
+            ):
                 self.distance_value_label.setText("—")
             elif mode is DistanceMeasurementMode.CONSTANT:
                 self.distance_value_label.setText(f"{manual_distance_m} м")
@@ -402,14 +419,52 @@ class MainWindow(QMainWindow):
         result = self.main_view.displayed_result
         point = (
             None
-            if result is None
+            if result is None or result.frame.camera is not self._mediator.main_camera
             else self._mediator.aiming.aim_point(result.frame.camera, result.frame)
         )
         self.main_view.set_aim_point(point)
         self.preview_view.set_aim_point(None)
+        self.main_view.set_lead_point(self._selected_target_lead_point(result))
+        self.preview_view.set_lead_point(None)
+
+    def _selected_target_lead_point(
+        self,
+        result: VisionResult | None,
+    ) -> tuple[float, float] | None:
+        config = self._tracking_control_config.prediction
+        target = self._mediator.selected_target
+        if (
+            result is None
+            or not config.enabled
+            or self._mediator.turret_state.control_mode is not TurretControlMode.TRACKING
+            or target is None
+            or target.camera is not result.frame.camera
+            or target.generation != result.frame.generation
+        ):
+            return None
+        tracked = next(
+            (item for item in result.tracked_objects if item.track_id == target.track_id),
+            None,
+        )
+        if tracked is None:
+            return None
+        horizon_s = config.horizon_ms / 1000.0
+        return (
+            tracked.bbox.x + tracked.bbox.width / 2.0
+            + tracked.velocity_x_px_s * horizon_s,
+            tracked.bbox.y + tracked.bbox.height / 2.0
+            + tracked.velocity_y_px_s * horizon_s,
+        )
+
+    def _apply_tracking_control_tuning(self, config: TrackingControlConfig) -> None:
+        self._apply_tracking_control_tuning_callback(config)
+        self._tracking_control_config = config
+        self.refresh_presentation()
 
     def _camera_session_accepted(self, session: CameraSessionStarted) -> None:
         self._prepared_frames.pop(session.camera, None)
+        if session.camera is CameraRole.STEREO_RIGHT:
+            self._camera_statuses.pop(session.camera, None)
         self._apply_camera_to_views(session.camera)
         self.refresh_presentation()
 
@@ -417,6 +472,10 @@ class MainWindow(QMainWindow):
         prepared = self._frame_preparer(result)
         self._prepared_frames[result.frame.camera] = prepared
         self._apply_camera_to_views(result.frame.camera)
+
+    def _stereo_right_status_changed(self, status: CameraStatus) -> None:
+        self._camera_statuses[CameraRole.STEREO_RIGHT] = status
+        self._apply_camera_to_views(CameraRole.STEREO_RIGHT)
 
     def _camera_status_changed(self, status: CameraStatus) -> None:
         self._camera_statuses[status.camera] = status
@@ -428,8 +487,13 @@ class MainWindow(QMainWindow):
         self.refresh_presentation()
 
     def _refresh_view_roles(self) -> None:
-        main_camera = self._mediator.main_camera
-        preview_camera = self._other_camera(main_camera)
+        # Core keeps its original camera roles; L/R only chooses the displayed stereo feed.
+        if self._mediator.main_camera is CameraRole.OVERVIEW:
+            main_camera = CameraRole.OVERVIEW
+            preview_camera = self._selected_stereo_display_camera
+        else:
+            main_camera = self._selected_stereo_display_camera
+            preview_camera = CameraRole.OVERVIEW
         self.main_view.set_camera(main_camera)
         self.preview_view.set_camera(preview_camera)
         self.main_view.set_prepared_frame(self._prepared_frames.get(main_camera))
@@ -438,6 +502,29 @@ class MainWindow(QMainWindow):
         self.preview_view.set_camera_status(self._camera_statuses.get(preview_camera))
         self.main_view.set_selected_target(self._mediator.selected_target)
         self.preview_view.set_selected_target(self._mediator.selected_target)
+
+    def _set_stereo_display_camera(self, camera: CameraRole) -> None:
+        # This presentation preference must not alter Mediator.main_camera.
+        if camera not in (CameraRole.STEREO_LEFT, CameraRole.STEREO_RIGHT):
+            raise ValueError("display camera must be Stereo Left or Stereo Right")
+        if (
+            camera is CameraRole.STEREO_RIGHT
+            and self.preview_view.stereo_right_button is not None
+            and not self.preview_view.stereo_right_button.isEnabled()
+        ):
+            return
+        if camera is self._selected_stereo_display_camera:
+            return
+        self._selected_stereo_display_camera = camera
+        self.preview_view.set_stereo_display_camera(camera)
+        self._refresh_view_roles()
+        if self.main_view.camera is not self._mediator.main_camera:
+            self.statusBar().showMessage(
+                "Stereo Right отображается отдельно; расчёты сохраняют исходную камеру Stereo Left",
+                5000,
+            )
+        self._refresh_distance_presentation()
+        self._refresh_aim_point()
 
     def _apply_camera_to_views(self, camera: CameraRole) -> None:
         for view in (self.main_view, self.preview_view):
@@ -452,6 +539,12 @@ class MainWindow(QMainWindow):
         y_px: float,
     ) -> None:
         if displayed_result is not self.main_view.displayed_result:
+            return
+        if displayed_result.frame.camera is not self._mediator.main_camera:
+            self.statusBar().showMessage(
+                "Экранный выбор Stereo Right не меняет камеру расчётов; выбор цели недоступен",
+                5000,
+            )
             return
         if not self.main_view.interaction_allowed(
             self._mediator.session_gate,

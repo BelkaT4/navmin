@@ -217,6 +217,7 @@ def run_loaded_application(
         return ui_runner(
             mediator=ui.mediator,
             camera_bindings=ui.camera_bindings,
+            stereo_right_binding=ui.stereo_right_binding,
             turret_states=ui.turret_states,
             camera_stale_timeout_ms=ui.camera_stale_timeout_ms,
             pid_controller_config=ui.pid_controller_config,

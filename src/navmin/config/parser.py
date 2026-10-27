@@ -1,4 +1,4 @@
-"""Strict parser and serializer for NavMin config schema v3."""
+"""Strict parser and serializer for NavMin config schema v4."""
 
 from __future__ import annotations
 
@@ -33,6 +33,7 @@ from .models import (
     RtspSourceConfig,
     SerialConfig,
     StereoDistanceConfig,
+    StereoDistanceMethod,
     Stm32Config,
     TrackingControlConfig,
     TurretConfig,
@@ -42,7 +43,7 @@ from .models import (
     VisionDistanceConfig,
 )
 
-SUPPORTED_SCHEMA_VERSION = 3
+SUPPORTED_SCHEMA_VERSION = 4
 SUPPORTED_BAUDRATES = frozenset({9600, 19200, 38400, 57600, 115200})
 
 
@@ -340,6 +341,8 @@ def _parse_vision(value: Any) -> VisionConfig:
             "right-frame-buffer-size",
             "pair-timeout-ms",
             "calibration-file",
+            "method",
+            "aggregation-frame-count",
         },
     )
     distance = VisionDistanceConfig(
@@ -373,8 +376,35 @@ def _parse_vision(value: Any) -> VisionConfig:
                 stereo_obj["calibration-file"],
                 f"{path}.distance.stereo.calibration-file",
             ),
+            method=StereoDistanceMethod(
+                _enum_string(
+                    stereo_obj["method"],
+                    f"{path}.distance.stereo.method",
+                    {item.value for item in StereoDistanceMethod},
+                )
+            ),
+            aggregation_frame_count=_int(
+                stereo_obj["aggregation-frame-count"],
+                f"{path}.distance.stereo.aggregation-frame-count",
+                minimum=2,
+            ),
         ),
     )
+
+    if distance.stereo.stereo_enabled and (
+        not cameras.stereo_left.enabled or not cameras.stereo_right.enabled
+    ):
+        _validation(
+            f"{path}.distance.stereo.stereo-enabled",
+            "requires both Stereo Left and Stereo Right cameras enabled",
+        )
+    if distance.stereo.method is StereoDistanceMethod.DETECTOR and (
+        not cameras.stereo_right.processing_enabled
+    ):
+        _validation(
+            f"{path}.cameras.stereo-right.processing-enabled",
+            "must be true when stereo distance method is detector",
+        )
 
     return VisionConfig(
         processing_scope=ProcessingScope(scope),
@@ -530,6 +560,7 @@ def _parse_tracking_control(value: Any) -> TrackingControlConfig:
             "max-angle-x-deg",
             "max-angle-y-deg",
         },
+        optional={"projectile-speed-m-s", "projectile-mass-g"},
     )
     prediction = PredictionConfig(
         enabled=_bool(prediction_obj["enabled"], f"{prediction_path}.enabled"),
@@ -546,6 +577,16 @@ def _parse_tracking_control(value: Any) -> TrackingControlConfig:
         max_angle_y_deg=_number(
             prediction_obj["max-angle-y-deg"],
             f"{prediction_path}.max-angle-y-deg",
+            strictly_positive=True,
+        ),
+        projectile_speed_m_s=_number(
+            prediction_obj.get("projectile-speed-m-s", 825.0),
+            f"{prediction_path}.projectile-speed-m-s",
+            strictly_positive=True,
+        ),
+        projectile_mass_g=_number(
+            prediction_obj.get("projectile-mass-g", 9.6),
+            f"{prediction_path}.projectile-mass-g",
             strictly_positive=True,
         ),
     )
@@ -769,7 +810,7 @@ def _parse_ui(value: Any) -> UiConfig:
 
 
 def parse_config(data: Any) -> AppConfig:
-    """Validate an already decoded JSON value and return schema-v3 snapshot."""
+    """Validate an already decoded JSON value and return schema-v4 snapshot."""
     obj = _fields(
         data,
         "",
@@ -858,7 +899,7 @@ def _aim_point_to_mapping(config: AimPointConfig) -> dict[str, Any]:
 
 
 def config_to_mapping(config: AppConfig) -> dict[str, Any]:
-    """Convert a typed schema-v3 snapshot to its persisted JSON structure."""
+    """Convert a typed schema-v4 snapshot to its persisted JSON structure."""
     return {
         "schema-version": config.schema_version,
         "vision": {
@@ -882,6 +923,10 @@ def config_to_mapping(config: AppConfig) -> dict[str, Any]:
                     "pair-timeout-ms": config.vision.distance.stereo.pair_timeout_ms,
                     "calibration-file": (
                         config.vision.distance.stereo.calibration_file
+                    ),
+                    "method": config.vision.distance.stereo.method.value,
+                    "aggregation-frame-count": (
+                        config.vision.distance.stereo.aggregation_frame_count
                     ),
                 },
             },
@@ -923,6 +968,12 @@ def config_to_mapping(config: AppConfig) -> dict[str, Any]:
                 "horizon-ms": config.tracking_control.prediction.horizon_ms,
                 "max-angle-x-deg": (config.tracking_control.prediction.max_angle_x_deg),
                 "max-angle-y-deg": (config.tracking_control.prediction.max_angle_y_deg),
+                "projectile-speed-m-s": (
+                    config.tracking_control.prediction.projectile_speed_m_s
+                ),
+                "projectile-mass-g": (
+                    config.tracking_control.prediction.projectile_mass_g
+                ),
             },
             "platform-motion": {
                 "source": config.tracking_control.platform_motion.source.value,

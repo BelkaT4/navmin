@@ -6,7 +6,7 @@
 
 - `Config Manager` в Core — единственный источник актуальной общей конфигурации;
 - файл хранения — `config.json`;
-- первая версия schema: `schema-version = 1`;
+- текущая schema: `schema-version = 4`;
 - после загрузки настройки валидируются и преобразуются в typed config objects;
 - изменения UI проходят через Core/Config Manager;
 - рабочие модули не записывают общий файл напрямую;
@@ -44,7 +44,7 @@ Recovery defaults валидны по schema, но намеренно не яв�
 
 ### Строгая validation policy v1
 
-`config.json` schema v1 валидируется строго и атомарно до публикации typed snapshots.
+`config.json` schema v4 валидируется строго и атомарно до публикации typed snapshots.
 
 ```text
 parse JSON
@@ -58,7 +58,7 @@ parse JSON
 
 Правила:
 
-- `schema-version` обязателен, имеет тип integer (не `bool`) и в v1 равен ровно `1`;
+- `schema-version` обязателен, имеет тип integer (не `bool`) и в v4 равен ровно `4`;
 - отсутствующий или неверного типа `schema-version` — invalid config;
 - любое другое значение `schema-version` — unsupported schema error;
 - автоматической migration для неизвестной schema нет; migration проектируется только после появления реальной schema v2;
@@ -72,7 +72,7 @@ parse JSON
 - ошибка по возможности содержит точный path поля и причину;
 - при invalid runtime update остаётся активным последний полностью валидный snapshot; partial apply/publication запрещены.
 
-После того как schema v1 реализована и считается опубликованной, добавление/удаление/переименование persisted fields требует нового `schema-version`, если старый v1 parser не сможет строго принять новый файл.
+После публикации schema добавление/удаление/переименование persisted fields требует нового `schema-version`, если текущий parser не сможет строго принять старый файл.
 
 ## Calibration отдельно от `config.json`
 
@@ -131,20 +131,24 @@ config
 └── ui
 ```
 
-## Required и optional fields schema v1
+## Required и optional fields schema v4
 
 Базовое правило v1: **все перечисленные ниже поля required**, если явно не указано обратное. Это сделано намеренно: hardware/control параметры не получают скрытых аппаратных defaults.
 
-Единственные optional fields базовой schema v1:
+Единственные optional fields базовой schema v4:
 
 ```text
 aiming.aim-points.overview.x-px
 aiming.aim-points.overview.y-px
 aiming.aim-points.stereo-left.x-px
 aiming.aim-points.stereo-left.y-px
+tracking-control.prediction.projectile-speed-m-s
+tracking-control.prediction.projectile-mass-g
 ```
 
-Для каждого из них отсутствие поля или JSON `null` означает center соответствующего working frame. Если значение задано, это integer `>= 0`; проверка попадания в фактическое разрешение выполняется относительно принятого `CameraModel`/working frame.
+Отсутствие координат aim point или JSON `null` означает center соответствующего working frame. Если координата задана, это integer `>= 0`; проверка попадания в фактическое разрешение выполняется относительно принятого `CameraModel`/working frame.
+
+Если optional параметры снаряда отсутствуют в старом config v4, используются значения `825 м/с` и `9.6 г`. JSON `null` для них недопустим; явно заданные значения должны быть finite number `> 0`.
 
 Все остальные поля в описанной ниже v1-схеме, включая booleans simulation/emulation и camera processing switches, должны присутствовать явно.
 
@@ -271,9 +275,13 @@ vision.distance.distance-stale-timeout-ms
 right-frame-buffer-size
 pair-timeout-ms
 stereo-enabled
+method = roi | detector
+aggregation-frame-count: integer >= 1
 ```
 
-Точный `capture_id`/resync определяется перед полноценным Stereo distance.
+`method = roi` вычисляет disparity и берёт медиану точек внутри ROI выбранной цели на Stereo Left. `method = detector` использует детекции VisionProcessor обеих камер, сопоставляет Stereo Right кандидатов по эпиполярной близости и размеру рамки, затем пересчитывает дистанцию по центрам рамок. При равнозначных кандидатах результат отбрасывается.
+
+Оба метода публикуют скользящую медиану успешных результатов из `aggregation-frame-count` пар. Окно очищается при смене цели, pairing mode или camera generation, после неудачного расчёта и при паузе длиннее `distance-stale-timeout-ms`. Новая method/count настройка применяется после перезапуска приложения.
 
 ### Camera stale / simulation
 
@@ -309,6 +317,15 @@ aiming.aim-points.stereo-left.y-px
 Если X/Y отсутствуют, используется center working frame.
 
 `R_camera_to_turret` в первой реализации не используется.
+
+## Tracking control
+
+```text
+tracking-control.prediction.projectile-speed-m-s
+tracking-control.prediction.projectile-mass-g
+```
+
+Скорость снаряда задаётся в м/с, масса — в граммах. Начальные значения: `825 м/с` и `9.6 г`. Поля доступны для настройки оператором и передаются вместе с runtime tracking snapshot. Изменение в окне оператора временное и не записывается в config-файл; для постоянного значения его нужно указать в `config.json`. Пока параметры не участвуют в расчёте точки упреждения; текущая визуальная линия использует скорость цели и `horizon-ms`.
 
 ## Turret
 
@@ -396,6 +413,8 @@ Runtime apply policy принадлежит Turret Controller и применя�
 - config update сам по себе не создаёт motion command и не меняет `control_mode`.
 
 Core/Config Manager не посылает отдельный `PID_RESET`: внутреннее PID state и его reset/apply semantics остаются ответственностью Turret Controller.
+
+Скорость снаряда (`tracking-control.prediction.projectile-speed-m-s`) и его масса (`tracking-control.prediction.projectile-mass-g`) применяются dynamic вместе с tracking settings. Окно оператора передаёт эти параметры во временный runtime snapshot, но пока не использует их в расчёте визуальной точки упреждения.
 
 ### STM32 config
 
@@ -502,6 +521,7 @@ UI overlays не являются частью recorded working frame.
 | PID `Kp/Ki/Kd` | dynamic; изменение gains reset'ит PID state только соответствующей оси перед следующим новым sample в TRACKING |
 | `lead-time-ms` | dynamic |
 | aim point | dynamic |
+| projectile speed / mass | dynamic tracking snapshot; currently not used by lead calculation |
 | `target-lost-timeout-ms` | dynamic, точная семантика для уже потерянной цели уточняется при реализации |
 | `processing-scope` | dynamic |
 | `processing-enabled` | dynamic |
@@ -521,11 +541,11 @@ Processor-specific tuning в v1 не является частью config schema
 
 ## Пример `config.json`
 
-Все числа ниже демонстрационные и не являются аппаратными пределами. Пример показывает полную required schema v1; optional aim-point coordinates приведены как `null` для явности.
+Все числа ниже демонстрационные и не являются аппаратными пределами. Пример показывает полную schema v4; optional aim-point coordinates приведены как `null` для явности.
 
 ```json
 {
-  "schema-version": 1,
+  "schema-version": 4,
   "vision": {
     "processing-scope": "main-only",
     "cameras": {
@@ -570,7 +590,10 @@ Processor-specific tuning в v1 не является частью config schema
       "stereo": {
         "stereo-enabled": false,
         "right-frame-buffer-size": 4,
-        "pair-timeout-ms": 100
+        "pair-timeout-ms": 100,
+        "calibration-file": "calibration/stereo.json",
+        "method": "roi",
+        "aggregation-frame-count": 5
       }
     },
     "camera-stale-timeout-ms": 500,
@@ -583,6 +606,31 @@ Processor-specific tuning в v1 не является частью config schema
       "overview": {"x-px": null, "y-px": null},
       "stereo-left": {"x-px": null, "y-px": null}
     }
+  },
+  "tracking-control": {
+    "velocity-estimator": {
+      "window-ms": 200,
+      "min-span-ms": 100,
+      "min-samples": 4,
+      "max-samples": 16,
+      "max-fit-rms-deg": 1.0,
+      "max-target-rate-x-deg-s": 90.0,
+      "max-target-rate-y-deg-s": 90.0
+    },
+    "feed-forward": {
+      "enabled": false,
+      "gain-x": 0.0,
+      "gain-y": 0.0
+    },
+    "prediction": {
+      "enabled": false,
+      "horizon-ms": 0,
+      "max-angle-x-deg": 1.0,
+      "max-angle-y-deg": 1.0,
+      "projectile-speed-m-s": 825.0,
+      "projectile-mass-g": 9.6
+    },
+    "platform-motion": {"source": "command-model"}
   },
   "turret": {
     "serial": {

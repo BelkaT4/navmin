@@ -40,6 +40,7 @@ _RETICLE_PEN_WIDTH_PX = 3
 _CAMERA_NAMES = {
     CameraRole.OVERVIEW: "Overview",
     CameraRole.STEREO_LEFT: "Stereo Left",
+    CameraRole.STEREO_RIGHT: "Stereo Right",
 }
 
 
@@ -163,6 +164,8 @@ class VideoView(QWidget):
         stale_timeout_ns: int,
         on_main_click: Callable[[VisionResult, float, float], None] | None = None,
         on_swap: Callable[[], None] | None = None,
+        on_stereo_camera_select: Callable[[CameraRole], None] | None = None,
+        stereo_right_available: bool = False,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
@@ -176,13 +179,33 @@ class VideoView(QWidget):
         self._selected_target: TargetRef | None = None
         self._target_distance: DistanceResult | None = None
         self._aim_point: tuple[float, float] | None = None
+        self._lead_point: tuple[float, float] | None = None
         self._stale = False
         self.setMinimumSize(1, 1)
         self.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent)
 
         self._preview_hovered = False
         self.swap_button: QPushButton | None = None
+        self.stereo_left_button: QPushButton | None = None
+        self.stereo_right_button: QPushButton | None = None
         if preview:
+            if on_stereo_camera_select is not None:
+                self.stereo_left_button = QPushButton("L", self)
+                self.stereo_left_button.setFixedSize(28, 26)
+                self.stereo_left_button.setCheckable(True)
+                self.stereo_left_button.setToolTip("Показывать Stereo Left")
+                self.stereo_left_button.clicked.connect(
+                    lambda: on_stereo_camera_select(CameraRole.STEREO_LEFT)
+                )
+                self.stereo_right_button = QPushButton("R", self)
+                self.stereo_right_button.setFixedSize(28, 26)
+                self.stereo_right_button.setCheckable(True)
+                self.stereo_right_button.setEnabled(stereo_right_available)
+                self.stereo_right_button.setToolTip("Показывать Stereo Right")
+                self.stereo_right_button.clicked.connect(
+                    lambda: on_stereo_camera_select(CameraRole.STEREO_RIGHT)
+                )
+                self.set_stereo_display_camera(CameraRole.STEREO_LEFT)
             button = QPushButton("⇄", self)
             button.setFixedSize(30, 26)
             button.setToolTip("Поменять main и preview")
@@ -247,6 +270,7 @@ class VideoView(QWidget):
         self._camera = camera
         self._target_distance = None
         self._aim_point = None
+        self._lead_point = None
         self.update()
 
     def set_prepared_frame(self, prepared: PreparedVisionFrame | None) -> None:
@@ -255,6 +279,7 @@ class VideoView(QWidget):
         self._prepared = prepared
         if prepared is None:
             self._aim_point = None
+            self._lead_point = None
         self.update()
 
     def set_camera_status(self, status: CameraStatus | None) -> None:
@@ -284,6 +309,27 @@ class VideoView(QWidget):
             return
         self._aim_point = point
         self.update()
+
+    def set_lead_point(self, point: tuple[float, float] | None) -> None:
+        if point == self._lead_point:
+            return
+        self._lead_point = point
+        self.update()
+
+    def set_stereo_display_camera(self, camera: CameraRole) -> None:
+        if camera not in (CameraRole.STEREO_LEFT, CameraRole.STEREO_RIGHT):
+            raise ValueError("display camera must be Stereo Left or Stereo Right")
+        if self.stereo_left_button is None or self.stereo_right_button is None:
+            return
+        self.stereo_left_button.setChecked(camera is CameraRole.STEREO_LEFT)
+        self.stereo_right_button.setChecked(camera is CameraRole.STEREO_RIGHT)
+        for button in (self.stereo_left_button, self.stereo_right_button):
+            button.setStyleSheet(
+                "QPushButton { background: rgba(35, 35, 35, 190); color: white;"
+                " border: 1px solid rgba(255, 255, 255, 150); border-radius: 4px; }"
+                "QPushButton:checked { background: rgba(0, 115, 150, 230); }"
+                "QPushButton:disabled { color: rgba(255, 255, 255, 90); }"
+            )
 
     def refresh_freshness(self, now_ns: int) -> None:
         stale = self._prepared is not None and is_camera_stale(
@@ -338,6 +384,10 @@ class VideoView(QWidget):
         button = self.swap_button
         if button is not None:
             button.move(max(0, self.width() - button.width() - 8), 8)
+        if self.stereo_left_button is not None:
+            self.stereo_left_button.move(8, 8)
+        if self.stereo_right_button is not None:
+            self.stereo_right_button.move(40, 8)
         super().resizeEvent(event)
 
     def _apply_swap_button_style(self) -> None:
@@ -392,6 +442,7 @@ class VideoView(QWidget):
             display_rect = self.rendered_rect()
             painter.drawPixmap(display_rect, prepared.pixmap, QRectF(prepared.pixmap.rect()))
             self._draw_objects(painter, display_rect, prepared.result)
+            self._draw_lead_line(painter, display_rect, prepared.result)
             self._draw_reticle(painter, display_rect, prepared.result)
             if self._stale:
                 painter.fillRect(display_rect, QColor(0, 0, 0, 110))
@@ -458,6 +509,42 @@ class VideoView(QWidget):
         painter.fillRect(label_rect, QColor(0, 0, 0, 175))
         painter.setPen(QColor(255, 235, 90))
         painter.drawText(label_rect, Qt.AlignmentFlag.AlignCenter, text)
+
+    def _draw_lead_line(
+        self,
+        painter: QPainter,
+        display_rect: QRectF,
+        result: VisionResult,
+    ) -> None:
+        target = self._selected_target
+        if (
+            self._preview
+            or self._lead_point is None
+            or target is None
+            or target.camera is not result.frame.camera
+            or target.generation != result.frame.generation
+        ):
+            return
+        tracked = next(
+            (item for item in result.tracked_objects if item.track_id == target.track_id),
+            None,
+        )
+        if tracked is None:
+            return
+        height, width = result.frame.image.shape[:2]
+        source_size = QSize(width, height)
+        center = (
+            tracked.bbox.x + tracked.bbox.width / 2.0,
+            tracked.bbox.y + tracked.bbox.height / 2.0,
+        )
+        start = map_source_to_widget(center, display_rect, source_size)
+        end = map_source_to_widget(self._lead_point, display_rect, source_size)
+        if start is None or end is None:
+            return
+        painter.setPen(QPen(QColor(0, 220, 255), 3, Qt.PenStyle.SolidLine))
+        painter.drawLine(start, end)
+        painter.setBrush(QColor(0, 220, 255))
+        painter.drawEllipse(end, 3.0, 3.0)
 
     @staticmethod
     def _format_distance(distance: DistanceResult) -> str:

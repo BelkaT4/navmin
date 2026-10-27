@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import shutil
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
@@ -138,7 +139,7 @@ def _config(*, emulate_stm32: bool = False) -> AppConfig:
         max_relative_move_deg=45.0,
     )
     return AppConfig(
-        schema_version=3,
+        schema_version=4,
         vision=VisionConfig(
             processing_scope=ProcessingScope.MAIN_AND_PREVIEW,
             cameras=CamerasConfig(
@@ -417,6 +418,7 @@ def test_run_loaded_application_uses_shared_runtime_ui_surface_and_shutdown(tmp_
     ui_dependencies = SimpleNamespace(
         mediator=SimpleNamespace(calibration_axes=inputs.config.turret.axes, calibration_pending=False),
         camera_bindings={CameraRole.OVERVIEW: object()},
+        stereo_right_binding=None,
         turret_states=object(),
         camera_stale_timeout_ms=321,
         pid_controller_config=pid_config,
@@ -523,7 +525,10 @@ def test_diagnostic_selection_overrides_only_requested_external_endpoints(monkey
         def stop(self) -> None:
             pty_events.append("stop")
 
-    monkeypatch.setattr("navmin.diagnostic_launcher.LocalhostRtpJpegSender", FakeSender)
+    if os.name == "nt":
+        monkeypatch.setattr("navmin.diagnostics.windows_rtp.WindowsRtpJpegSender", FakeSender)
+    else:
+        monkeypatch.setattr("navmin.diagnostic_launcher.LocalhostRtpJpegSender", FakeSender)
     monkeypatch.setattr("navmin.diagnostic_launcher.PtyStm32Emulator", FakePty)
 
     endpoints = DiagnosticEndpoints(
@@ -605,7 +610,9 @@ def test_diagnostic_synthetic_inputs_run_without_config_files(
         raise AssertionError("file-backed inputs must not be loaded")
 
     class FakeEndpoints:
-        def __init__(self, *, selection, inputs) -> None:
+        def __init__(self, *, selection, inputs, motion_demo=False) -> None:
+            del motion_demo
+            self.platform = None
             assert selection == DiagnosticSelection(
                 overview=CameraEndpoint.LOCALHOST,
                 stereo_left=CameraEndpoint.LOCALHOST,
@@ -861,7 +868,7 @@ def test_input_recovery_creates_valid_safe_defaults_without_existing_files(
     overview = load_overview_calibration(paths.overview_calibration)
     stereo = load_stereo_calibration(paths.stereo_calibration)
     assert config.turret.serial.port == "/dev/navmin-configure-serial-port"
-    assert config.schema_version == 3
+    assert config.schema_version == 4
     assert config.vision.cameras.overview.calibration_file == "calibration/overview.json"
     assert config.vision.distance.stereo.calibration_file == "calibration/stereo.json"
     assert isinstance(config.vision.cameras.overview.source, RtpJpegSourceConfig)
@@ -899,7 +906,7 @@ def test_input_recovery_replaces_malformed_root_and_invalid_canonical_calibratio
 
     assert len(result.backups) == 3
     recovered = load_config(paths.config)
-    assert recovered.schema_version == 3
+    assert recovered.schema_version == 4
     assert recovered.vision.cameras.overview.calibration_file == "calibration/overview.json"
     assert recovered.vision.distance.stereo.calibration_file == "calibration/stereo.json"
     assert load_overview_calibration(paths.overview_calibration).schema_version == 1
@@ -1179,8 +1186,10 @@ def test_diagnostic_cleanup_failure_preserves_primary_runtime_failure(
     tmp_path,
 ) -> None:
     class FakeEndpoints:
-        def __init__(self, *, selection, inputs) -> None:
+        def __init__(self, *, selection, inputs, motion_demo=False) -> None:
+            del motion_demo
             self.inputs = inputs
+            self.platform = None
 
         def start(self):
             return self.inputs
@@ -1433,9 +1442,11 @@ def test_diagnostic_full_launch_orders_preflight_before_endpoints_and_runtime(
         return _preflight_report()
 
     class FakeEndpoints:
-        def __init__(self, *, selection, inputs) -> None:
+        def __init__(self, *, selection, inputs, motion_demo=False) -> None:
+            del motion_demo
             del selection
             self.inputs = inputs
+            self.platform = None
             events.append("construct-endpoints")
 
         def start(self):

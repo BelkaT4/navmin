@@ -26,6 +26,7 @@ from navmin.config import (
     RtpJpegSourceConfig,
     SerialConfig,
     StereoDistanceConfig,
+    StereoDistanceMethod,
     Stm32Config,
     TurretConfig,
     UiConfig,
@@ -246,7 +247,7 @@ def _synthetic_diagnostic_inputs() -> LoadedApplicationInputs:
     stereo_left = replace(diagnostic_camera_config(8889), processing_enabled=True)
     stereo_right = diagnostic_camera_config(8890)
     config = AppConfig(
-        schema_version=3,
+        schema_version=4,
         vision=VisionConfig(
             processing_scope=ProcessingScope.MAIN_AND_PREVIEW,
             cameras=CamerasConfig(
@@ -263,6 +264,8 @@ def _synthetic_diagnostic_inputs() -> LoadedApplicationInputs:
                     right_frame_buffer_size=4,
                     pair_timeout_ms=100,
                     calibration_file="calibration/stereo.json",
+                    method=StereoDistanceMethod.ROI,
+                    aggregation_frame_count=5,
                 ),
             ),
             camera_stale_timeout_ms=500,

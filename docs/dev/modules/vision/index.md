@@ -376,7 +376,7 @@ src/navmin/vision/tracking/settings.py
 
 ## Processing scope main / preview
 
-Обычный UI показывает Overview + Stereo Left. Processing scope:
+UI показывает Overview и выбранную для отображения Stereo Left/Right. Core main camera остаётся Overview или Stereo Left. Processing scope:
 
 ```text
 main-only
@@ -389,7 +389,7 @@ main-and-preview
 
 Per-camera `processing-enabled`, если сохраняется, является дополнительным master switch; effective processing определяется совместно с `processing-scope`.
 
-Stereo Right processing используется только для diagnostics и не участвует в user selection.
+Stereo Right result может отображаться в UI по явному выбору оператора. Этот display-only путь не делает его `main_camera` и не участвует в target selection. Экранный выбор не меняет processing scope или Stereo Left/Right distance pairing; Right detections участвуют в distance calculation только при detector method.
 
 ## `VisionResult`
 
@@ -428,7 +428,7 @@ Working frame — rectified.
 
 ## Stereo Right
 
-Stereo Right прежде всего нужен для Stereo Distance. Он может иметь VisionProcessor и diagnostic display.
+Stereo Right прежде всего нужен для Stereo Distance. Он может иметь VisionProcessor, diagnostic display и отдельное display-only представление в обычной UI паре с Overview.
 
 Пользовательского `TargetRef` для Stereo Right нет.
 
@@ -448,7 +448,7 @@ right generation
 
 Stereo Right использует небольшой bounded buffer по `capture_id`; это pairing buffer, а не очередь последовательной обработки старых кадров.
 
-Точный механизм генерации `capture_id`, resync, wraparound и pair timeout остаётся открытым до включения полноценного Stereo distance.
+Production RTP/JPEG cameras пока публикуют `capture_id = None`, поэтому для них используется timestamp pairing. Общая синхронизация `capture_id` на sender и recovery после рассинхронизации остаются открытыми вопросами.
 
 ## Stereo / Distance Provider
 
@@ -472,7 +472,11 @@ Distance вычисляется только в TRACKING, если текущи�
 - `capture_id`;
 - `measured_timestamp_ns`.
 
-Неуспешный расчёт не публикует invalid-object. Последний успешный result живёт до `distance-stale-timeout-ms`; точный owner invalidation остаётся открытым до включения Stereo distance.
+`vision.distance.stereo.method` выбирает расчёт по ROI или по детекциям обеих камер. ROI-вариант агрегирует valid disparity в рамке выбранной Stereo Left цели. Detector-вариант использует независимые `VisionProcessor` результаты: выбранная рамка Stereo Left сопоставляется с Stereo Right рамками по вертикальной близости после rectification и отношению высот; при неоднозначном соответствии измерение отклоняется.
+
+Каждый вариант собирает `aggregation-frame-count` успешных пар и публикует их медианную дистанцию. Окно ограничено числом кадров и очищается при смене target intent, pairing kind, camera generation, неуспешном измерении или паузе дольше `distance-stale-timeout-ms`. Пока окно не набрано, новый result не публикуется.
+
+Неуспешный расчёт не публикует invalid-object. Последний успешный result живёт до `distance-stale-timeout-ms`; новый stereo result проходит прежнюю Core-проверку target, generation, pairing mode и freshness.
 
 ### Manual
 

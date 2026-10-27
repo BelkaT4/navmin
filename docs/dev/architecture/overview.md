@@ -81,13 +81,17 @@ CameraModel.pixel_to_ray(x, y) → normalized CameraRay
 
 ## UI: main / preview
 
-В обычном интерфейсе одновременно отображаются Overview и Stereo Left:
+В обычном интерфейсе одновременно отображаются Overview и выбранный стереокадр
+Stereo Left или Stereo Right. Overview остаётся в паре всегда:
 
-- одна камера — `main_camera`, занимает основную область;
-- вторая — preview;
-- пользователь может явно выполнить swap.
+- основная область и preview располагаются по текущему `main_camera`;
+- Overview и выбранная Stereo Left/Right остаются видимыми в паре;
+- кнопки `L` / `R` выбирают источник второго изображения только для UI;
+- пользователь может явно выполнить прежний main/preview swap.
 
 Начальная `main_camera` берётся из `ui.default-camera`; допустимы только `overview` и `stereo-left`.
+
+Положение широкой Overview и выбранной стереокамеры следует текущему `main_camera`; Stereo Right может только занять отображаемый стереослот. Выбор Stereo Right не меняет `main_camera`, Stereo Left/Right calibration, pairing или Distance Provider. Если в основной области показывается Stereo Right при `main_camera = stereo-left`, click selection и click-to-move отключены: Core продолжает работать с исходной ролью камеры.
 
 Автоматического переключения `main_camera` при отказе камеры нет. UI показывает stale/error для текущей main camera, а swap остаётся явным действием пользователя.
 
@@ -450,7 +454,7 @@ Emergency Stop       → dedicated priority operation
 
 Config Manager загружает `config.json`, валидирует его и публикует типизированные snapshots. Calibration хранится отдельно.
 
-`config.json` имеет `schema-version = 1`; сохранение выполняется через temporary file + atomic replace. Подробно: [Конфигурация](./configuration.md).
+`config.json` имеет `schema-version = 4`; сохранение выполняется через temporary file + atomic replace. Подробно: [Конфигурация](./configuration.md).
 
 ## Контракты и открытые вопросы
 

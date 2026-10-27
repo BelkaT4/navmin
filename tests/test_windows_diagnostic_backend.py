@@ -1,14 +1,12 @@
 """Regression tests for Windows diagnostics without physical peripherals."""
-from dataclasses import replace
 
 from navmin.diagnostic_launcher import (
     CameraEndpoint,
-    DiagnosticEndpoints,
     DiagnosticSelection,
     TurretEndpoint,
+    _parser,
     _planned_preflight_inputs,
     _synthetic_diagnostic_inputs,
-    _parser,
 )
 from navmin.preflight import StartupBackendSelection
 

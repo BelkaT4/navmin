@@ -72,7 +72,7 @@ Queued callbacks и latest-state могут пережить restart worker. О�
 
 ### Решение
 
-Overview и Stereo Left отображаются одновременно: одна камера main, вторая preview. Selection разрешён только на main image и только после подтверждённого `TRACKING`.
+Overview и выбранный стереокадр отображаются одновременно: одна камера main, вторая preview. Вторая лента может быть Stereo Left или Stereo Right. `L` / `R` меняет только отображение; `main_camera` остаётся Overview или Stereo Left, а selection разрешён только на соответствующем main image и только после подтверждённого `TRACKING`.
 
 Допустимые состояния:
 
@@ -357,15 +357,15 @@ Wire-format может сохранять reserved `EVENTS` section, но пок
 
 ---
 
-## 18. Stereo distance можно отложить; manual distance остаётся полноценным источником v1
+## 18. Stereo distance дополняет manual distance и агрегирует пары во времени
 
 ### Решение
 
-Distance Provider поддерживает `manual` и `stereo`. Полная `capture_id` pairing/resync логика не блокирует первую реализацию: manual distance остаётся допустимым источником.
+Distance Provider поддерживает `manual` и `stereo`. Stereo предлагает ROI-disparity и detector-correspondence варианты. Каждый вариант публикует медиану нескольких успешных пар и сбрасывает окно на границах target intent, session и pairing mode. Manual остаётся доступным при отказе камер или stereo оценки.
 
 ### Почему
 
-Stereo pairing — отдельная сложная задача синхронизации двух camera sessions. Она не должна блокировать проверку остальной цепочки Vision → Aiming → Turret.
+Одиночный кадр чувствителен к локальным ошибкам disparity и рамок. Короткое bounded median окно уменьшает временной шум без неограниченного хранения кадров. Независимые детекторы могут дать более узкую и дешёвую оценку по центрам рамок; эпиполярное и размерное сопоставление с отказом при неоднозначности не принимает сомнительную пару.
 
 ### Отвергнутая альтернатива
 
@@ -397,7 +397,7 @@ Stereo pairing — отдельная сложная задача синхрон
 
 После такой ошибки обычный GUI launcher может **отдельно и только по явному выбору оператора** выполнить recovery всего local input set (`config.json` + calibration): сначала timestamped backups по локальному системному времени, затем schema-valid safe defaults, после чего startup завершается и требует ручной проверки hardware-specific values перед новым запуском. Headless/preflight/diagnostic paths recovery-dialog не открывают. Это recovery workflow, а не fallback внутри parser/Config Manager.
 
-Schema v1 использует `schema-version = 1`; automatic migration не проектируется до появления реальной schema v2.
+Schema changes require an explicit version increment. Config schema v4 is the current strict schema; automatic migration is not performed for unsupported versions.
 
 ### Почему
 
@@ -588,7 +588,7 @@ Baseline overlay показывает bbox и selection highlight без пос�
 - **Dedicated ordinary Stop button в первом prototype.** Отложен: архитектурный `StopMotion` остаётся, но отдельная пользовательская кнопка пока не нужна.
 - **Выбор nearest object вне bbox.** Отклонён для v1 как неочевидное действие; click должен попадать в отображаемый bbox.
 - **Постоянные diagnostic labels возле каждого bbox.** Отклонены ради читаемого основного изображения; расширенная диагностика может включаться отдельно.
-- **Stereo Right как обычная main/preview camera.** Отклонено: её роль остаётся diagnostic/stereo и не должна менять обычный two-camera interaction contract.
+- **Stereo Right как authoritative `main_camera`.** Отклонено: её роль остаётся stereo/diagnostic; экранный показ не меняет targeting camera contract.
 
 ## 29. Camera transport v1 — типизированные RTP/JPEG и RTSP sources через GStreamer; Overview correction — OpenCV fisheye без silent scaling
 

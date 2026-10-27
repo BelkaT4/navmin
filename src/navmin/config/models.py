@@ -33,6 +33,11 @@ class RtspDecoderMode(Enum):
     SOFTWARE = "software"
 
 
+class StereoDistanceMethod(Enum):
+    ROI = "roi"
+    DETECTOR = "detector"
+
+
 @dataclass(frozen=True)
 class RtpJpegSourceConfig:
     bind_address: str
@@ -79,6 +84,8 @@ class StereoDistanceConfig:
     right_frame_buffer_size: int
     pair_timeout_ms: int
     calibration_file: str
+    method: StereoDistanceMethod = StereoDistanceMethod.ROI
+    aggregation_frame_count: int = 5
 
 
 @dataclass(frozen=True)
@@ -140,6 +147,8 @@ class PredictionConfig:
     horizon_ms: int
     max_angle_x_deg: float
     max_angle_y_deg: float
+    projectile_speed_m_s: float
+    projectile_mass_g: float
 
 
 @dataclass(frozen=True)
@@ -243,6 +252,8 @@ _DYNAMIC_EXACT_PATHS = frozenset(
         "tracking-control.prediction.horizon-ms",
         "tracking-control.prediction.max-angle-x-deg",
         "tracking-control.prediction.max-angle-y-deg",
+        "tracking-control.prediction.projectile-speed-m-s",
+        "tracking-control.prediction.projectile-mass-g",
         "ui.show-fps",
         "ui.show-stereo-right-diagnostics",
     }
@@ -265,6 +276,8 @@ def config_apply_policy(path: str) -> ConfigApplyPolicy | None:
     if path in {
         "vision.cameras.overview.calibration-file",
         "vision.distance.stereo.calibration-file",
+        "vision.distance.stereo.method",
+        "vision.distance.stereo.aggregation-frame-count",
     }:
         return ConfigApplyPolicy.APPLICATION_RESTART
 

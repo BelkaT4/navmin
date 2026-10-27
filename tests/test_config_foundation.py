@@ -25,7 +25,7 @@ from navmin.contracts import CameraRole, DistanceSource
 
 def _valid_config() -> dict:
     return {
-        "schema-version": 3,
+        "schema-version": 4,
         "vision": {
             "processing-scope": "main-only",
             "cameras": {
@@ -73,6 +73,8 @@ def _valid_config() -> dict:
                     "right-frame-buffer-size": 4,
                     "pair-timeout-ms": 100,
                     "calibration-file": "calibration/stereo.json",
+                    "method": "roi",
+                    "aggregation-frame-count": 5,
                 },
             },
             "camera-stale-timeout-ms": 500,
@@ -162,7 +164,7 @@ def _write_json(path, data) -> None:
 def test_valid_schema_v3_builds_typed_immutable_snapshot() -> None:
     config = parse_config(_valid_config())
 
-    assert config.schema_version == 3
+    assert config.schema_version == 4
     assert (
         config.vision.cameras.overview.calibration_file == "calibration/overview.json"
     )
@@ -404,7 +406,7 @@ def test_missing_config_is_explicit_error(tmp_path) -> None:
 
 def test_malformed_json_is_preserved(tmp_path) -> None:
     path = tmp_path / "config.json"
-    original = b'{"schema-version": 3, broken}'
+    original = b'{"schema-version": 4, broken}'
     path.write_bytes(original)
 
     with pytest.raises(ConfigJsonError):
@@ -418,7 +420,7 @@ def test_malformed_json_is_preserved(tmp_path) -> None:
     [
         (lambda data: data.pop("schema-version"), "schema-version"),
         (lambda data: data.__setitem__("schema-version", True), "schema-version"),
-        (lambda data: data.__setitem__("schema-version", "3"), "schema-version"),
+        (lambda data: data.__setitem__("schema-version", "4"), "schema-version"),
     ],
 )
 def test_missing_or_invalid_schema_version_is_validation_error(mutation, path) -> None:
@@ -432,7 +434,7 @@ def test_missing_or_invalid_schema_version_is_validation_error(mutation, path) -
     assert not isinstance(exc_info.value, UnsupportedConfigSchemaError)
 
 
-@pytest.mark.parametrize("unsupported", [1, 2, 4])
+@pytest.mark.parametrize("unsupported", [1, 2, 3])
 def test_unsupported_schema_is_distinct_error(unsupported: int) -> None:
     data = _valid_config()
     data["schema-version"] = unsupported
@@ -442,7 +444,7 @@ def test_unsupported_schema_is_distinct_error(unsupported: int) -> None:
 
     assert exc_info.value.path == "schema-version"
     assert exc_info.value.actual == unsupported
-    assert "expected 3" in str(exc_info.value)
+    assert "expected 4" in str(exc_info.value)
 
 
 @pytest.mark.parametrize(
@@ -561,7 +563,7 @@ def test_repository_defaults_parse_with_production_loaders() -> None:
     overview = load_overview_calibration(defaults / "calibration" / "overview.json")
     stereo = load_stereo_calibration(defaults / "calibration" / "stereo.json")
 
-    assert config.schema_version == 3
+    assert config.schema_version == 4
     assert (
         config.vision.cameras.overview.calibration_file == "calibration/overview.json"
     )
@@ -761,7 +763,7 @@ def test_rtsp_config_round_trip_preserves_source_specific_fields(tmp_path) -> No
     save_config(path, config)
 
     saved = json.loads(path.read_text(encoding="utf-8"))
-    assert saved["schema-version"] == 3
+    assert saved["schema-version"] == 4
     assert (
         saved["vision"]["cameras"]["overview"]["source"]
         == data["vision"]["cameras"]["overview"]["source"]

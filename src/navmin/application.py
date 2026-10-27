@@ -17,6 +17,7 @@ from navmin.config.models import (
     TrackingControlConfig,
     TurretConfig,
 )
+from navmin.config.models import StereoDistanceMethod as ConfigStereoDistanceMethod
 from navmin.contracts import (
     CameraRole,
     ConfigUpdate,
@@ -86,6 +87,7 @@ class UiRuntimeDependencies:
     apply_pid_tuning: Callable[[PidControllerConfig], None]
     tracking_control_config: TrackingControlConfig
     apply_tracking_control_tuning: Callable[[TrackingControlConfig], None]
+    stereo_right_binding: CameraUiBinding | None = None
 
 
 @dataclass(frozen=True)
@@ -169,6 +171,17 @@ class ApplicationRuntime:
             apply_pid_tuning=self.apply_pid_tuning,
             tracking_control_config=tracking_control_config,
             apply_tracking_control_tuning=self.apply_tracking_control_tuning,
+            stereo_right_binding=(
+                None
+                if stereo_right_worker is None
+                else self._binding(
+                    stereo_right_worker,
+                    stereo_right_for_detector_distance=(
+                        stereo_target_joiner is not None
+                        and stereo_target_joiner.requires_right_result
+                    ),
+                )
+            ),
         )
         self._active_components: set[str] = set()
         self._start_attempted = False
@@ -278,6 +291,8 @@ class ApplicationRuntime:
             ("gain_y", feed_forward.gain_y, False),
             ("max_angle_x_deg", prediction.max_angle_x_deg, True),
             ("max_angle_y_deg", prediction.max_angle_y_deg, True),
+            ("projectile_speed_m_s", prediction.projectile_speed_m_s, True),
+            ("projectile_mass_g", prediction.projectile_mass_g, True),
         ):
             if isinstance(value, bool) or not isinstance(value, int | float):
                 raise TypeError(f"{name} must be a number")
@@ -489,7 +504,11 @@ class ApplicationRuntime:
         )
 
     @staticmethod
-    def _binding(worker: CameraWorker) -> CameraUiBinding:
+    def _binding(
+        worker: CameraWorker,
+        *,
+        stereo_right_for_detector_distance: bool = False,
+    ) -> CameraUiBinding:
         pipeline = worker.pipeline
         return CameraUiBinding(
             camera=pipeline.camera,
@@ -497,6 +516,7 @@ class ApplicationRuntime:
             target_events=pipeline.target_events,
             latest_result=pipeline.latest_result,
             status=pipeline.status,
+            stereo_right_for_detector_distance=stereo_right_for_detector_distance,
         )
 
     @staticmethod
@@ -542,9 +562,17 @@ def build_application_runtime(
         )
         stereo_distance_worker = StereoDistanceWorker(
             calibration=stereo_calibration,
+            method=stereo_config.method,
+            aggregation_frame_count=stereo_config.aggregation_frame_count,
+            max_sample_gap_ms=(
+                config.vision.distance.distance_stale_timeout_ms
+            ),
         )
         stereo_target_joiner = StereoTargetJoiner(
-            stereo_distance_worker.submit_observation
+            stereo_distance_worker.submit_observation,
+            require_right_result=(
+                stereo_config.method is ConfigStereoDistanceMethod.DETECTOR
+            ),
         )
         stereo_frame_sink = StereoPairingTargetJoinSink(
             stereo_pairer,
