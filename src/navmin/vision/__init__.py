@@ -12,6 +12,7 @@ from .gstreamer_source import (
     build_rtsp_pipeline_description,
 )
 from .pipeline import (
+    CorrectedFrameSink,
     DecodedFrame,
     DecodedFrameSource,
     InMemoryFrameSource,
@@ -22,6 +23,7 @@ from .pipeline import (
     build_working_frame_corrector,
     overview_corrector,
     stereo_left_corrector,
+    stereo_right_corrector,
 )
 from .processor import (
     DEFAULT_VISION_PROCESSOR_CLASS,
@@ -35,6 +37,7 @@ __all__ = [
     "DEFAULT_VISION_PROCESSOR_CLASS",
     "CameraSourceError",
     "CameraWorker",
+    "CorrectedFrameSink",
     "DecodedFrame",
     "DecodedFrameSource",
     "GStreamerRtpJpegSource",
@@ -57,4 +60,5 @@ __all__ = [
     "create_vision_processor",
     "overview_corrector",
     "stereo_left_corrector",
+    "stereo_right_corrector",
 ]

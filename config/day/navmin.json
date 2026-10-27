@@ -1,0 +1,144 @@
+{
+  "schema-version": 4,
+  "vision": {
+    "processing-scope": "main-and-preview",
+    "cameras": {
+      "overview": {
+        "enabled": true,
+        "source": {
+          "type": "rtp-jpeg",
+          "bind-address": "0.0.0.0",
+          "port": 8888,
+          "buffer-size": 1
+        },
+        "processing-enabled": true,
+        "vision-processor-class": "Vt11VisionProcessor",
+        "calibration-file": "../calibration/overview_day.json"
+      },
+      "stereo-left": {
+        "enabled": true,
+        "source": {
+          "type": "rtp-jpeg",
+          "bind-address": "0.0.0.0",
+          "port": 8889,
+          "buffer-size": 1
+        },
+        "processing-enabled": true,
+        "vision-processor-class": "Vt11VisionProcessor"
+      },
+      "stereo-right": {
+        "enabled": false,
+        "source": {
+          "type": "rtp-jpeg",
+          "bind-address": "0.0.0.0",
+          "port": 8891,
+          "buffer-size": 1
+        },
+        "processing-enabled": false,
+        "vision-processor-class": "Legacy14VisionProcessor"
+      }
+    },
+    "distance": {
+      "source": "manual",
+      "manual-distance-m": 100.0,
+      "distance-stale-timeout-ms": 300,
+      "stereo": {
+        "stereo-enabled": false,
+        "right-frame-buffer-size": 4,
+        "pair-timeout-ms": 100,
+        "calibration-file": "../calibration/stereo.json"
+      }
+    },
+    "camera-stale-timeout-ms": 500,
+    "simulation-mode": false
+  },
+  "aiming": {
+    "target-lost-timeout-ms": 500,
+    "aim-points": {
+      "overview": {
+        "x-px": null,
+        "y-px": null
+      },
+      "stereo-left": {
+        "x-px": null,
+        "y-px": null
+      }
+    }
+  },
+  "turret": {
+    "serial": {
+      "port": "/dev/navmin-turret",
+      "baudrate": 9600,
+      "response-timeout-ms": 100,
+      "max-retries": 2,
+      "inter-request-delay-ms": 2
+    },
+    "axes": {
+      "x": {
+        "invert": false,
+        "full-steps-per-revolution": 4000,
+        "microstep-divider": 1,
+        "max-relative-move-deg": 45.0
+      },
+      "y": {
+        "invert": false,
+        "full-steps-per-revolution": 4000,
+        "microstep-divider": 1,
+        "max-relative-move-deg": 45.0
+      }
+    },
+    "controller": {
+      "pid-kp-x": 0.25,
+      "pid-ki-x": 0.0,
+      "pid-kd-x": 0.0,
+      "pid-kp-y": 0.25,
+      "pid-ki-y": 0.0,
+      "pid-kd-y": 0.0
+    },
+    "stm32": {
+      "max-speed-x-deg-s": 800.0,
+      "max-speed-y-deg-s": 800.0,
+      "acceleration-x-deg-s2": 150.0,
+      "acceleration-y-deg-s2": 150.0,
+      "velocity-watchdog-timeout-ms": 200
+    },
+    "emulate-stm32": false
+  },
+  "ui": {
+    "default-camera": "overview",
+    "show-fps": true,
+    "show-stereo-right-diagnostics": false
+  },
+  "tracking-control": {
+    "velocity-estimator": {
+      "window-ms": 200,
+      "min-span-ms": 100,
+      "min-samples": 4,
+      "max-samples": 16,
+      "max-fit-rms-deg": 1.0,
+      "max-target-rate-x-deg-s": 90.0,
+      "max-target-rate-y-deg-s": 90.0
+    },
+    "feed-forward": {
+      "enabled": false,
+      "gain-x": 0.0,
+      "gain-y": 0.0
+    },
+    "prediction": {
+      "enabled": false,
+      "horizon-ms": 0,
+      "max-angle-x-deg": 1.0,
+      "max-angle-y-deg": 1.0
+    },
+    "platform-motion": {
+      "source": "command-model"
+    }
+  },
+  "imu": {
+    "enabled": false,
+    "bind-address": "0.0.0.0",
+    "port": 8891,
+    "expected-source": null,
+    "calibration-file": "../calibration/imu.json"
+  }
+}

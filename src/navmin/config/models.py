@@ -155,6 +155,14 @@ class TrackingControlConfig:
     platform_motion: PlatformMotionConfig
 
 
+@dataclass(frozen=True)
+class ImuConfig:
+    enabled: bool
+    bind_address: str
+    port: int
+    expected_source: str | None
+    calibration_file: str
+
 
 @dataclass(frozen=True)
 class SerialConfig:
@@ -220,6 +228,7 @@ class AppConfig:
     vision: VisionConfig
     aiming: AimingConfig
     tracking_control: TrackingControlConfig
+    imu: ImuConfig
     turret: TurretConfig
     ui: UiConfig
 
@@ -259,6 +268,9 @@ def config_apply_policy(path: str) -> ConfigApplyPolicy | None:
 
     parts = path.split(".")
     if path == "tracking-control.platform-motion.source":
+        return ConfigApplyPolicy.APPLICATION_RESTART
+
+    if path.startswith("imu."):
         return ConfigApplyPolicy.APPLICATION_RESTART
 
     if path in {
@@ -354,6 +366,7 @@ __all__ = [
     "CamerasConfig",
     "ConfigApplyPolicy",
     "FeedForwardConfig",
+    "ImuConfig",
     "PidControllerConfig",
     "PlatformMotionConfig",
     "PredictionConfig",

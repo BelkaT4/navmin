@@ -19,6 +19,7 @@ from navmin.config.models import (
     AxisMechanicsConfig,
     CameraConfig,
     CamerasConfig,
+    ImuConfig,
     OverviewCameraConfig,
     PidControllerConfig,
     ProcessingScope,
@@ -61,9 +62,14 @@ def _default_tracking_control_config():
     return load_config(defaults).tracking_control
 
 
-def _camera(port: int, *, address: str = "127.0.0.1") -> CameraConfig:
+def _camera(
+    port: int,
+    *,
+    address: str = "127.0.0.1",
+    enabled: bool = True,
+) -> CameraConfig:
     return CameraConfig(
-        enabled=True,
+        enabled=enabled,
         source=RtpJpegSourceConfig(
             bind_address=address,
             port=port,
@@ -119,7 +125,7 @@ def _inputs(
         max_relative_move_deg=45.0,
     )
     config = AppConfig(
-        schema_version=3,
+        schema_version=4,
         vision=VisionConfig(
             processing_scope=ProcessingScope.MAIN_AND_PREVIEW,
             cameras=CamerasConfig(
@@ -146,6 +152,13 @@ def _inputs(
             aim_points=AimPointsConfig(overview=center, stereo_left=center),
         ),
         tracking_control=_default_tracking_control_config(),
+        imu=ImuConfig(
+            enabled=False,
+            bind_address="0.0.0.0",
+            port=8891,
+            expected_source=None,
+            calibration_file="calibration/imu.json",
+        ),
         turret=TurretConfig(
             serial=SerialConfig(
                 port=serial_port,
@@ -193,6 +206,7 @@ def _inputs(
     )
     stereo = StereoCalibration(
         schema_version=1,
+        translation_unit="m",
         image_width=64,
         image_height=48,
         K_left=K,
@@ -489,6 +503,111 @@ def test_duplicate_camera_endpoint_fails_before_runtime(tmp_path) -> None:
     assert f"127.0.0.1:{port}" in failure.detail
 
 
+def test_stereo_right_disabled_has_no_mandatory_preflight_checks(tmp_path) -> None:
+    inputs = _inputs(18_896, 18_897)
+    cameras = replace(
+        inputs.config.vision.cameras,
+        stereo_right=_camera(18_898, enabled=False),
+    )
+    config = replace(
+        inputs.config,
+        vision=replace(inputs.config.vision, cameras=cameras),
+    )
+    udp_calls: list[tuple[str, int]] = []
+
+    report = _run(
+        tmp_path,
+        replace(inputs, config=config),
+        StartupBackendSelection("real", "real", "pty", stereo_right="real"),
+        udp_check=lambda address, port: udp_calls.append((address, port)) or None,
+    )
+
+    assert report.ok
+    assert all("Stereo Right" not in check.name for check in report.checks)
+    assert ("127.0.0.1", 18_898) not in udp_calls
+
+
+def test_stereo_right_enabled_rtp_uses_stereo_calibration_and_udp_checks(
+    tmp_path,
+) -> None:
+    inputs = _inputs(18_899, 18_900)
+    udp_calls: list[tuple[str, int]] = []
+
+    report = _run(
+        tmp_path,
+        inputs,
+        StartupBackendSelection("real", "real", "pty", stereo_right="real"),
+        udp_check=lambda address, port: udp_calls.append((address, port)) or None,
+    )
+
+    assert report.ok
+    calibration = next(
+        check for check in report.checks if check.name == "Stereo Right calibration"
+    )
+    assert calibration.detail == "typed calibration loaded (64x48)"
+    assert any(
+        check.name == "Stereo Right RTP/JPEG configuration"
+        for check in report.checks
+    )
+    assert ("127.0.0.1", 18_901) in udp_calls
+
+
+def test_stereo_right_enabled_rtsp_checks_rtsp_dependencies_without_udp(
+    tmp_path,
+) -> None:
+    inputs = _inputs(18_902, 18_903)
+    cameras = replace(
+        inputs.config.vision.cameras,
+        stereo_right=_rtsp_camera("rtsp://stereo-right.local/stream"),
+    )
+    config = replace(
+        inputs.config,
+        vision=replace(inputs.config.vision, cameras=cameras),
+    )
+    element_calls: list[tuple[str, ...]] = []
+    udp_calls: list[tuple[str, int]] = []
+
+    report = _run(
+        tmp_path,
+        replace(inputs, config=config),
+        StartupBackendSelection("real", "real", "pty", stereo_right="real"),
+        receiver_check=lambda elements: element_calls.append(elements) or None,
+        udp_check=lambda address, port: udp_calls.append((address, port)) or None,
+    )
+
+    assert report.ok
+    assert any(
+        check.name == "Stereo Right RTSP configuration" for check in report.checks
+    )
+    assert "rtspsrc" in element_calls[0]
+    assert ("127.0.0.1", 18_904) not in udp_calls
+
+
+def test_duplicate_stereo_right_udp_endpoint_is_detected(tmp_path) -> None:
+    inputs = _inputs(18_905, 18_906)
+    cameras = replace(
+        inputs.config.vision.cameras,
+        stereo_right=_camera(18_906),
+    )
+    config = replace(
+        inputs.config,
+        vision=replace(inputs.config.vision, cameras=cameras),
+    )
+
+    report = _run(
+        tmp_path,
+        replace(inputs, config=config),
+        StartupBackendSelection("real", "real", "pty", stereo_right="real"),
+    )
+
+    assert not report.ok
+    failure = next(
+        check for check in report.checks if check.name == "Camera UDP endpoints"
+    )
+    assert "Stereo Left and Stereo Right" in failure.detail
+    assert "127.0.0.1:18906" in failure.detail
+
+
 def test_mixed_rtsp_and_rtp_preflight_checks_only_relevant_dependencies(
     tmp_path,
 ) -> None:
@@ -621,3 +740,68 @@ def test_session_directory_probe_is_removed(tmp_path) -> None:
     before = set(tmp_path.iterdir())
     assert preflight_module._check_session_directory(tmp_path) is None
     assert set(tmp_path.iterdir()) == before
+
+
+def test_all_sim_preflight_skips_gstreamer_udp_serial_and_pty(tmp_path) -> None:
+    inputs = _inputs(8888, 8889)
+
+    def must_not_run(*_args, **_kwargs):
+        raise AssertionError("hardware-specific preflight check must not run")
+
+    report = run_startup_preflight(
+        inputs,
+        selection=StartupBackendSelection("sim", "sim", "sim", stereo_right="sim"),
+        session_dir=tmp_path,
+        session_directory_check=lambda _path: None,
+        qt_check=lambda: None,
+        receiver_check=must_not_run,
+        sender_check=must_not_run,
+        pyserial_check=must_not_run,
+        pty_check=must_not_run,
+        udp_check=must_not_run,
+        serial_path_check=must_not_run,
+    )
+
+    assert report.ok
+    names = {check.name for check in report.checks}
+    assert "Overview synthetic source" in names
+    assert "Stereo Left synthetic source" in names
+    assert "Stereo Right synthetic source" in names
+    assert "STM32 simulation" in names
+    assert "GStreamer receiver" not in names
+    assert "pyserial" not in names
+    assert "PTY capability" not in names
+    assert all("UDP endpoint" not in name for name in names)
+
+
+def test_right_off_is_not_required_by_preflight(tmp_path) -> None:
+    inputs = _inputs(8888, 8889)
+    report = _run(
+        tmp_path,
+        inputs,
+        StartupBackendSelection("real", "real", "sim", stereo_right=None),
+    )
+
+    names = {check.name for check in report.checks}
+    assert all(not name.startswith("Stereo Right") for name in names)
+    assert report.ok
+
+
+def test_selection_degradation_warning_is_warn_not_fail(tmp_path) -> None:
+    inputs = _inputs(8888, 8889)
+    warning = "mixed real/sim stereo disables pairing"
+    report = _run(
+        tmp_path,
+        inputs,
+        StartupBackendSelection("real", "sim", "sim", stereo_right="sim"),
+        selection_warnings=(warning,),
+    )
+
+    assert report.ok
+    assert report.overall_status is PreflightStatus.WARN
+    matching = [
+        check for check in report.checks if check.name == "Runtime source selection"
+    ]
+    assert len(matching) == 1
+    assert matching[0].status is PreflightStatus.WARN
+    assert matching[0].detail == warning

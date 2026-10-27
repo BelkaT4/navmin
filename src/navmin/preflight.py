@@ -34,8 +34,8 @@ from navmin.vision.gstreamer_source import (
 )
 
 _PREFLIGHT_SCHEMA_VERSION = 1
-_CAMERA_BACKENDS = frozenset({"real", "localhost"})
-_TURRET_BACKENDS = frozenset({"real", "pty"})
+_CAMERA_BACKENDS = frozenset({"real", "localhost", "sim"})
+_TURRET_BACKENDS = frozenset({"real", "pty", "sim"})
 
 
 class PreflightStatus(StrEnum):
@@ -88,6 +88,7 @@ class StartupBackendSelection:
     overview: str
     stereo_left: str
     turret: str
+    stereo_right: str | None = None
 
     def __post_init__(self) -> None:
         if self.overview not in _CAMERA_BACKENDS:
@@ -96,6 +97,11 @@ class StartupBackendSelection:
             raise ValueError(f"unsupported Stereo Left backend: {self.stereo_left}")
         if self.turret not in _TURRET_BACKENDS:
             raise ValueError(f"unsupported Turret backend: {self.turret}")
+        if (
+            self.stereo_right is not None
+            and self.stereo_right not in _CAMERA_BACKENDS
+        ):
+            raise ValueError(f"unsupported Stereo Right backend: {self.stereo_right}")
 
 
 StringCheck = Callable[[], str | None]
@@ -119,6 +125,7 @@ def run_startup_preflight(
     pty_check: PtyCheck | None = None,
     udp_check: UdpCheck | None = None,
     serial_path_check: SerialPathCheck | None = None,
+    selection_warnings: tuple[str, ...] = (),
 ) -> StartupPreflightReport:
     """Run static checks required by exactly the selected startup backends."""
     session_directory_check = session_directory_check or _check_session_directory
@@ -134,7 +141,7 @@ def run_startup_preflight(
     checks.append(_result_check("Session directory", session_directory_check(session_dir)))
     checks.append(_result_check("PyQt6 QtWidgets", qt_check()))
 
-    camera_specs = (
+    camera_specs = [
         (
             "Overview",
             selection.overview,
@@ -149,7 +156,18 @@ def run_startup_preflight(
             inputs.stereo_calibration.image_width,
             inputs.stereo_calibration.image_height,
         ),
-    )
+    ]
+    stereo_right = inputs.config.vision.cameras.stereo_right
+    if stereo_right.enabled and selection.stereo_right is not None:
+        camera_specs.append(
+            (
+                "Stereo Right",
+                selection.stereo_right,
+                stereo_right,
+                inputs.stereo_calibration.image_width,
+                inputs.stereo_calibration.image_height,
+            )
+        )
 
     endpoints: list[tuple[str, str, int]] = []
     receiver_elements: list[str] = []
@@ -165,6 +183,16 @@ def run_startup_preflight(
                 detail=f"typed calibration loaded ({width}x{height})",
             )
         )
+
+        if backend == "sim":
+            checks.append(
+                StartupPreflightCheck(
+                    name=f"{label} synthetic source",
+                    status=PreflightStatus.PASS,
+                    detail="in-process synthetic source selected",
+                )
+            )
+            continue
 
         source = camera.source
         if isinstance(source, RtpJpegSourceConfig):
@@ -215,15 +243,17 @@ def run_startup_preflight(
             )
 
     unique_receiver_elements = tuple(dict.fromkeys(receiver_elements))
-    checks.append(
-        _result_check(
-            "GStreamer receiver",
-            receiver_check(unique_receiver_elements),
-            success_detail=(
-                "required elements available: " + ", ".join(unique_receiver_elements)
-            ),
+    if unique_receiver_elements:
+        checks.append(
+            _result_check(
+                "GStreamer receiver",
+                receiver_check(unique_receiver_elements),
+                success_detail=(
+                    "required elements available: "
+                    + ", ".join(unique_receiver_elements)
+                ),
+            )
         )
-    )
 
     duplicate_detail = _duplicate_endpoint_detail(endpoints)
     if duplicate_detail is not None:
@@ -279,36 +309,63 @@ def run_startup_preflight(
             )
         )
 
-    checks.append(_result_check("pyserial", pyserial_check()))
-    if selection.turret == "real":
-        checks.append(
-            _result_check(
-                "Serial device",
-                serial_path_check(inputs.config.turret.serial.port),
-                success_detail=f"accessible: {inputs.config.turret.serial.port}",
-            )
-        )
+    if selection.turret == "sim":
         checks.append(
             StartupPreflightCheck(
-                name="STM32 protocol reachability",
-                status=PreflightStatus.WARN,
-                detail="static preflight does not open the serial device or query STM32",
+                name="STM32 simulation",
+                status=PreflightStatus.PASS,
+                detail="in-process FakeStm32Endpoint selected",
             )
         )
     else:
-        pty = pty_check()
-        missing: list[str] = []
-        if not pty.linux:
-            missing.append("Linux required")
-        if not pty.openpty_available:
-            missing.append("os.openpty unavailable")
-        if not pty.pyserial_available:
-            missing.append("pyserial unavailable")
+        checks.append(_result_check("pyserial", pyserial_check()))
+        if selection.turret == "real":
+            checks.append(
+                _result_check(
+                    "Serial device",
+                    serial_path_check(inputs.config.turret.serial.port),
+                    success_detail=f"accessible: {inputs.config.turret.serial.port}",
+                )
+            )
+            checks.append(
+                StartupPreflightCheck(
+                    name="STM32 protocol reachability",
+                    status=PreflightStatus.WARN,
+                    detail=(
+                        "static preflight does not open the serial device or query "
+                        "STM32"
+                    ),
+                )
+            )
+        else:
+            pty = pty_check()
+            missing: list[str] = []
+            if not pty.linux:
+                missing.append("Linux required")
+            if not pty.openpty_available:
+                missing.append("os.openpty unavailable")
+            if not pty.pyserial_available:
+                missing.append("pyserial unavailable")
+            checks.append(
+                StartupPreflightCheck(
+                    name="PTY capability",
+                    status=(
+                        PreflightStatus.PASS if not missing else PreflightStatus.FAIL
+                    ),
+                    detail=(
+                        "Linux os.openpty available"
+                        if not missing
+                        else "; ".join(missing)
+                    ),
+                )
+            )
+
+    for warning in selection_warnings:
         checks.append(
             StartupPreflightCheck(
-                name="PTY capability",
-                status=PreflightStatus.PASS if not missing else PreflightStatus.FAIL,
-                detail="Linux os.openpty available" if not missing else "; ".join(missing),
+                name="Runtime source selection",
+                status=PreflightStatus.WARN,
+                detail=warning,
             )
         )
 
@@ -338,7 +395,6 @@ def _result_check(
         status=PreflightStatus.PASS if error is None else PreflightStatus.FAIL,
         detail=success_detail if error is None else error,
     )
-
 
 
 def _rtp_jpeg_config_error(source: RtpJpegSourceConfig) -> str | None:

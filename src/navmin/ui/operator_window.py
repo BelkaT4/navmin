@@ -38,6 +38,7 @@ class OperatorWindow(QWidget):
         owner: QWidget,
         on_toggle_fullscreen: Callable[[], None],
         on_exit: Callable[[], None],
+        on_show_imu: Callable[[], None],
         pid_controller_config: PidControllerConfig,
         on_apply_pid_tuning: Callable[[PidControllerConfig], None],
         tracking_control_config: TrackingControlConfig,
@@ -46,6 +47,7 @@ class OperatorWindow(QWidget):
         super().__init__(owner, Qt.WindowType.Tool)
         self._on_toggle_fullscreen = on_toggle_fullscreen
         self._on_exit = on_exit
+        self._on_show_imu = on_show_imu
         self._on_apply_pid_tuning = on_apply_pid_tuning
         self._tracking_control_config = tracking_control_config
         self._on_apply_tracking_control_tuning = on_apply_tracking_control_tuning
@@ -123,6 +125,8 @@ class OperatorWindow(QWidget):
             "prediction_offset_x": QLabel("0 deg"),
             "prediction_offset_y": QLabel("0 deg"),
         }
+        self.position_button = QPushButton("ПОЛОЖЕНИЕ")
+        self.position_button.clicked.connect(self._on_show_imu)
         self.fullscreen_button = QPushButton()
         self.fullscreen_button.clicked.connect(self._on_toggle_fullscreen)
         self.exit_button = QPushButton("Выход")
@@ -200,6 +204,7 @@ class OperatorWindow(QWidget):
             )
         layout.addWidget(diagnostics_group)
         layout.addSpacing(6)
+        layout.addWidget(self.position_button)
         layout.addWidget(self.fullscreen_button)
         layout.addWidget(self.exit_button)
         self.setMinimumWidth(420)

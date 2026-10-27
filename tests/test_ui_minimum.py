@@ -5,13 +5,14 @@ from collections.abc import Callable
 from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
+from time import monotonic_ns
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import numpy as np
 import pytest
 from PyQt6.QtCore import QPoint, QPointF, QSize, Qt
-from PyQt6.QtGui import QPixmap
+from PyQt6.QtGui import QPixmap, QWheelEvent
 from PyQt6.QtTest import QTest
 from PyQt6.QtWidgets import QApplication, QMessageBox
 
@@ -37,6 +38,8 @@ from navmin.contracts import (
     CameraSessionStarted,
     CameraState,
     CameraStatus,
+    DistanceResult,
+    DistanceSource,
     FramePacket,
     MotorState,
     MoveRelativeCommand,
@@ -53,10 +56,12 @@ from navmin.contracts import (
 )
 from navmin.core import (
     AxisTrackingEstimate,
+    DistanceMeasurementMode,
     Mediator,
     TrackingEstimateInvalidReason,
     TrackingEstimatorDiagnostics,
 )
+from navmin.imu import GyroBiasState, ImuRuntimeState, ImuSourceIdentity
 from navmin.ui import (
     CameraUiBinding,
     MainWindow,
@@ -69,6 +74,8 @@ from navmin.ui import (
     rendered_image_rect,
 )
 from navmin.ui.video_view import map_source_to_widget, reticle_segments
+from navmin.vision.stereo_distance_worker import StereoDistanceCandidate
+from navmin.vision.stereo_target_join import StereoPairingKind, StereoTargetJoiner
 
 
 class _Clock:
@@ -186,6 +193,9 @@ def _mediator(
     motor: MotorState = MotorState.ON,
     counting: bool = False,
     aim_points: AimPointsConfig | None = None,
+    stereo_target_joiner: StereoTargetJoiner | None = None,
+    stereo_distance_results: LatestValue[StereoDistanceCandidate] | None = None,
+    imu_states: LatestValue[ImuRuntimeState] | None = None,
 ) -> tuple[Mediator, _FakeTurret]:
     turret = _FakeTurret(_turret_state(mode=mode, motor=motor))
     mediator_type = _CountingMediator if counting else Mediator
@@ -211,6 +221,8 @@ def _mediator(
             camera: TargetControlChannel(camera)
             for camera in (CameraRole.OVERVIEW, CameraRole.STEREO_LEFT)
         },
+        stereo_target_joiner=stereo_target_joiner,
+        stereo_distance_results=stereo_distance_results,
     )
     return mediator, turret
 
@@ -290,6 +302,10 @@ def _window(
     apply_tracking_control_tuning: (
         Callable[[TrackingControlConfig], None] | None
     ) = None,
+    stereo_target_joiner: StereoTargetJoiner | None = None,
+    stereo_distance_results: LatestValue[StereoDistanceCandidate] | None = None,
+    imu_states: LatestValue[ImuRuntimeState] | None = None,
+    imu_controls=None,
 ) -> tuple[
     MainWindow,
     Mediator,
@@ -298,7 +314,11 @@ def _window(
     LatestValue[TurretState],
 ]:
     mediator, turret = _mediator(
-        mode=mode, motor=motor, aim_points=aim_points
+        mode=mode,
+        motor=motor,
+        aim_points=aim_points,
+        stereo_target_joiner=stereo_target_joiner,
+        stereo_distance_results=stereo_distance_results,
     )
     bindings = _bindings()
     turret_states: LatestValue[TurretState] = LatestValue()
@@ -313,6 +333,8 @@ def _window(
         apply_tracking_control_tuning=(
             apply_tracking_control_tuning or (lambda _config: None)
         ),
+        imu_states=imu_states,
+        imu_controls=imu_controls,
         clock_ns=clock or _Clock(),
         wall_clock=wall_clock
         or _WallClock(datetime(2026, 9, 22, 12, 0, 0, tzinfo=UTC)),
@@ -326,6 +348,56 @@ def _window(
     qt_application.processEvents()
     return window, mediator, turret, bindings, turret_states
 
+
+
+def _imu_state(
+    *,
+    running: bool = True,
+    fresh: bool = True,
+    gyro_bias_state: GyroBiasState = GyroBiasState.READY,
+    orientation_valid: bool = True,
+    euler: tuple[float, float, float] = (1.0, 2.0, 3.0),
+    accel_faces_captured: tuple[int, ...] = (),
+    mag_calibration_active: bool = False,
+    mag_calibration_sample_count: int = 0,
+    mag_calibration_octants: int = 0,
+    calibration_message: str | None = None,
+) -> ImuRuntimeState:
+    return ImuRuntimeState(
+        running=running,
+        fresh=fresh,
+        stale=not fresh,
+        source=ImuSourceIdentity("192.0.2.10", 54321),
+        sender_timestamp_s=12.5,
+        receive_timestamp_s=33.25,
+        accel_g=(0.0, 0.0, 1.0),
+        gyro_raw_dps=(1.0, 2.0, 3.0),
+        gyro_corrected_dps=(0.1, 0.2, 0.3),
+        mag_raw=(100.0, 200.0, 300.0),
+        mag_corrected=(10.0, 20.0, 30.0),
+        gyro_bias_state=gyro_bias_state,
+        gyro_bias_dps=(0.9, 1.8, 2.7),
+        gyro_bias_sample_count=17,
+        accel_calibrated=True,
+        mag_calibrated=True,
+        orientation_quaternion=(1.0, 0.0, 0.0, 0.0),
+        relative_quaternion=(1.0, 0.0, 0.0, 0.0),
+        euler_degrees=euler,
+        orientation_valid=orientation_valid,
+        heading_valid=True,
+        mounting_axes=(1, 2, 3),
+        relative_zero=(1.0, 0.0, 0.0, 0.0),
+        invalid_packets=1,
+        duplicate_packets=2,
+        out_of_order_packets=3,
+        foreign_packets=4,
+        last_error=None,
+        accel_faces_captured=accel_faces_captured,
+        mag_calibration_active=mag_calibration_active,
+        mag_calibration_sample_count=mag_calibration_sample_count,
+        mag_calibration_octants=mag_calibration_octants,
+        calibration_message=calibration_message,
+    )
 
 def _publish_camera(
     window: MainWindow,
@@ -643,6 +715,9 @@ def test_operational_bar_is_compact_and_emergency_remains_largest(
         window.motor_button,
         window.connection_label,
         window.now_label,
+        window.distance_mode_combo,
+        window.distance_slider,
+        window.distance_value_label,
     )
     assert all(control.height() <= 42 for control in ordinary_controls)
     assert window.emergency_button.height() > max(
@@ -651,6 +726,193 @@ def test_operational_bar_is_compact_and_emergency_remains_largest(
     assert window.emergency_button.width() > max(
         control.width() for control in ordinary_controls
     )
+    window.close()
+
+
+def test_distance_controls_follow_main_camera_and_preserve_runtime_mode(
+    qt_application: QApplication,
+) -> None:
+    window, mediator, _turret, _bindings, _states = _window(qt_application)
+
+    assert [
+        window.distance_mode_combo.itemText(index)
+        for index in range(window.distance_mode_combo.count())
+    ] == [
+        "Константа",
+        "Стерео — точная пара",
+        "Стерео — по времени",
+    ]
+    assert mediator.distance_mode is DistanceMeasurementMode.CONSTANT
+    assert not window.distance_mode_combo.isEnabled()
+    assert window.distance_slider.isHidden()
+    assert not window.distance_slider.isEnabled()
+    assert window.distance_value_label.text() == "—"
+
+    window.swap_main_preview()
+    assert mediator.main_camera is CameraRole.STEREO_LEFT
+    assert window.distance_mode_combo.isEnabled()
+    assert window.distance_slider.isVisible()
+    assert window.distance_slider.isEnabled()
+    assert window.distance_slider.minimum() == 10
+    assert window.distance_slider.maximum() == 500
+    assert window.distance_slider.singleStep() == 10
+    assert window.distance_slider.pageStep() == 10
+    assert window.distance_slider.value() == 100
+    assert window.distance_value_label.text() == "100 м"
+
+    window.distance_slider.setValue(247)
+    assert mediator.manual_distance_m == 250
+    assert window.distance_slider.value() == 250
+    assert window.distance_value_label.text() == "250 м"
+
+    window.distance_mode_combo.setCurrentIndex(1)
+    assert mediator.distance_mode is DistanceMeasurementMode.STEREO_EXACT
+    assert window.distance_slider.isHidden()
+    assert not window.distance_slider.isEnabled()
+    assert window.distance_value_label.text() == "—"
+
+    window.distance_mode_combo.setCurrentIndex(2)
+    assert mediator.distance_mode is DistanceMeasurementMode.STEREO_TIMESTAMP
+    assert window.distance_value_label.text() == "—"
+
+    window.swap_main_preview()
+    assert mediator.main_camera is CameraRole.OVERVIEW
+    assert not window.distance_mode_combo.isEnabled()
+    assert window.distance_value_label.text() == "—"
+
+    window.swap_main_preview()
+    assert mediator.main_camera is CameraRole.STEREO_LEFT
+    assert mediator.distance_mode is DistanceMeasurementMode.STEREO_TIMESTAMP
+    assert window.distance_mode_combo.currentIndex() == 2
+    assert window.distance_slider.isHidden()
+    assert window.distance_value_label.text() == "—"
+    window.close()
+
+
+def test_timestamp_distance_is_shown_without_approximation_marker(
+    qt_application: QApplication,
+) -> None:
+    joiner = StereoTargetJoiner()
+    results: LatestValue[StereoDistanceCandidate] = LatestValue()
+    window, mediator, _turret, bindings, _states = _window(
+        qt_application,
+        mode=TurretControlMode.TRACKING,
+        stereo_target_joiner=joiner,
+        stereo_distance_results=results,
+    )
+    _publish_camera(window, bindings, _result(CameraRole.OVERVIEW, 1))
+    stereo_result = _result(
+        CameraRole.STEREO_LEFT,
+        1,
+        timestamp_ns=monotonic_ns(),
+    )
+    _publish_camera(window, bindings, stereo_result)
+
+    window.swap_main_preview()
+    window._handle_main_click(stereo_result, 50.0, 25.0)
+    selected = _publish_acquired(window, mediator, bindings)
+    window.distance_mode_combo.setCurrentIndex(2)
+    assert mediator.distance_mode is DistanceMeasurementMode.STEREO_TIMESTAMP
+    assert window.distance_value_label.text() == "—"
+
+    results.publish(
+        StereoDistanceCandidate(
+            target=selected,
+            intent_revision=joiner.state.intent_revision,
+            distance_m=12.44,
+            source_frame_id=stereo_result.frame.frame_id,
+            capture_id=None,
+            measured_timestamp_ns=stereo_result.frame.receive_timestamp_ns,
+            pairing_kind=StereoPairingKind.TIMESTAMP,
+        )
+    )
+    window.refresh_presentation()
+
+    assert window.distance_value_label.text() == "12.4 м"
+    assert "~" not in window.distance_value_label.text()
+    assert window.main_view.distance_annotation_text == "12.4 м"
+    assert window.preview_view.distance_annotation_text is None
+    window.close()
+
+
+
+def test_distance_slider_standard_wheel_step_is_ten_metres(
+    qt_application: QApplication,
+) -> None:
+    window, mediator, _turret, _bindings, _states = _window(qt_application)
+    window.swap_main_preview()
+    assert window.distance_slider.value() == 100
+
+    up = QWheelEvent(
+        QPointF(20.0, 16.0),
+        QPointF(20.0, 16.0),
+        QPoint(),
+        QPoint(0, 120),
+        Qt.MouseButton.NoButton,
+        Qt.KeyboardModifier.NoModifier,
+        Qt.ScrollPhase.ScrollUpdate,
+        False,
+    )
+    QApplication.sendEvent(window.distance_slider, up)
+    assert mediator.manual_distance_m == 110
+    assert window.distance_slider.value() == 110
+
+    down = QWheelEvent(
+        QPointF(20.0, 16.0),
+        QPointF(20.0, 16.0),
+        QPoint(),
+        QPoint(0, -120),
+        Qt.MouseButton.NoButton,
+        Qt.KeyboardModifier.NoModifier,
+        Qt.ScrollPhase.ScrollUpdate,
+        False,
+    )
+    QApplication.sendEvent(window.distance_slider, down)
+    assert mediator.manual_distance_m == 100
+    assert window.distance_slider.value() == 100
+    window.close()
+
+
+def test_target_distance_annotation_is_main_stereo_target_bound(
+    qt_application: QApplication,
+) -> None:
+    window, mediator, _turret, bindings, _states = _window(
+        qt_application, mode=TurretControlMode.TRACKING
+    )
+    _publish_camera(window, bindings, _result(CameraRole.OVERVIEW, 1))
+    stereo_result = _result(CameraRole.STEREO_LEFT, 1)
+    _publish_camera(window, bindings, stereo_result)
+
+    window.swap_main_preview()
+    window._handle_main_click(stereo_result, 50.0, 25.0)
+    selected = _publish_acquired(window, mediator, bindings)
+
+    distance = mediator.current_distance
+    assert distance is not None
+    assert distance.target == selected
+    assert distance.source is DistanceSource.MANUAL
+    assert window.main_view.target_distance == distance
+    assert window.main_view.distance_annotation_text == "100 м"
+    assert window.preview_view.target_distance is None
+    assert window.preview_view.distance_annotation_text is None
+
+    window.main_view.set_target_distance(
+        DistanceResult(
+            target=selected,
+            distance_m=12.44,
+            source=DistanceSource.STEREO,
+            source_frame_id=stereo_result.frame.frame_id,
+            capture_id=7,
+            measured_timestamp_ns=stereo_result.frame.receive_timestamp_ns,
+        )
+    )
+    assert window.main_view.distance_annotation_text == "12.4 м"
+
+    window.swap_main_preview()
+    assert mediator.main_camera is CameraRole.OVERVIEW
+    assert window.main_view.target_distance is None
+    assert window.main_view.distance_annotation_text is None
+    assert window.preview_view.target_distance is None
     window.close()
 
 
@@ -1105,6 +1367,215 @@ def test_escape_toggles_single_modeless_operator_window(
     assert window.isVisible()
     window.close()
 
+
+
+class _ImuControlRecorder:
+    def __init__(self) -> None:
+        self.events: list[tuple[str, int | None]] = []
+
+    def request_gyro_bias_calibration(self) -> bool:
+        self.events.append(("gyro", None))
+        return True
+
+    def request_accelerometer_face(self, face: int) -> bool:
+        self.events.append(("accel", face))
+        return True
+
+    def request_magnetometer_start(self) -> bool:
+        self.events.append(("mag-start", None))
+        return True
+
+    def request_magnetometer_finish(self) -> bool:
+        self.events.append(("mag-finish", None))
+        return True
+
+    def request_relative_zero(self) -> bool:
+        self.events.append(("zero", None))
+        return True
+
+
+def test_imu_calibration_controls_use_only_passive_imu_ingress(
+    qt_application: QApplication,
+) -> None:
+    controls = _ImuControlRecorder()
+    imu_states: LatestValue[ImuRuntimeState] = LatestValue()
+    imu_states.publish(_imu_state())
+    window, _mediator_value, turret, _bindings_value, _states = _window(
+        qt_application,
+        imu_states=imu_states,
+        imu_controls=controls,
+    )
+    imu = window.imu_window
+    imu.show()
+    qt_application.processEvents()
+    before = (
+        len(turret.relative_commands),
+        len(turret.tracking_controls),
+        turret.invalidations,
+        len(turret.mode_requests),
+        turret.stop_requests,
+        turret.motor_on_requests,
+        turret.motor_off_requests,
+        turret.emergency_requests,
+    )
+
+    QTest.mouseClick(imu.gyro_calibration_button, Qt.MouseButton.LeftButton)
+    QTest.mouseClick(imu.accel_face_buttons[1], Qt.MouseButton.LeftButton)
+    QTest.mouseClick(imu.relative_zero_button, Qt.MouseButton.LeftButton)
+    QTest.mouseClick(imu.mag_start_button, Qt.MouseButton.LeftButton)
+
+    imu_states.publish(
+        _imu_state(
+            accel_faces_captured=(1,),
+            mag_calibration_active=True,
+            mag_calibration_sample_count=321,
+            mag_calibration_octants=6,
+            calibration_message="Магнитометр: идёт сбор.",
+        )
+    )
+    imu.refresh_once()
+    assert not imu.gyro_calibration_button.isEnabled()
+    assert not imu.accel_face_buttons[1].isEnabled()
+    assert not imu.mag_start_button.isEnabled()
+    assert imu.mag_finish_button.isEnabled()
+    assert "X+ ✓" == imu.accel_face_buttons[1].text()
+    assert "сбор MAG=321" in imu.quality_label.text()
+    assert "охват≈6/8" in imu.quality_label.text()
+    QTest.mouseClick(imu.mag_finish_button, Qt.MouseButton.LeftButton)
+
+    assert controls.events == [
+        ("gyro", None),
+        ("accel", 1),
+        ("zero", None),
+        ("mag-start", None),
+        ("mag-finish", None),
+    ]
+    after = (
+        len(turret.relative_commands),
+        len(turret.tracking_controls),
+        turret.invalidations,
+        len(turret.mode_requests),
+        turret.stop_requests,
+        turret.motor_on_requests,
+        turret.motor_off_requests,
+        turret.emergency_requests,
+    )
+    assert after == before
+
+    imu_states.publish(_imu_state(fresh=False, orientation_valid=False))
+    imu.refresh_once()
+    assert not imu.gyro_calibration_button.isEnabled()
+    assert not imu.accel_face_buttons[1].isEnabled()
+    assert not imu.mag_start_button.isEnabled()
+    assert not imu.relative_zero_button.isEnabled()
+    window.close()
+
+
+def test_position_button_reuses_one_modeless_imu_window_and_esc_does_not_hide_it(
+    qt_application: QApplication,
+) -> None:
+    imu_states: LatestValue[ImuRuntimeState] = LatestValue()
+    imu_states.publish(_imu_state())
+    window, _mediator_value, turret, _bindings_value, _states = _window(
+        qt_application,
+        imu_states=imu_states,
+    )
+    operator = window.operator_window
+    imu = window.imu_window
+    before = (
+        len(turret.relative_commands),
+        len(turret.tracking_controls),
+        turret.invalidations,
+        len(turret.mode_requests),
+        turret.stop_requests,
+        turret.motor_on_requests,
+        turret.motor_off_requests,
+        turret.emergency_requests,
+    )
+
+    operator.show()
+    QTest.mouseClick(operator.position_button, Qt.MouseButton.LeftButton)
+    qt_application.processEvents()
+
+    assert imu.isVisible()
+    assert imu.parentWidget() is window
+    assert imu.windowModality() is Qt.WindowModality.NonModal
+    assert imu.windowFlags() & Qt.WindowType.Tool
+    assert window.imu_window is imu
+    assert imu.states is imu_states
+    assert imu.status_label.text().startswith("LIVE")
+
+    imu.close()
+    qt_application.processEvents()
+    assert not imu.isVisible()
+    imu_states.publish(_imu_state(euler=(4.0, 5.0, 6.0)))
+
+    QTest.mouseClick(operator.position_button, Qt.MouseButton.LeftButton)
+    qt_application.processEvents()
+    assert window.imu_window is imu
+    assert imu.isVisible()
+    assert "Крен: +4.0°" in imu.angles_label.text()
+
+    QTest.keyClick(imu, Qt.Key.Key_Escape)
+    qt_application.processEvents()
+    assert not operator.isVisible()
+    assert imu.isVisible()
+    QTest.keyClick(imu, Qt.Key.Key_Escape)
+    qt_application.processEvents()
+    assert operator.isVisible()
+    assert imu.isVisible()
+
+    after = (
+        len(turret.relative_commands),
+        len(turret.tracking_controls),
+        turret.invalidations,
+        len(turret.mode_requests),
+        turret.stop_requests,
+        turret.motor_on_requests,
+        turret.motor_off_requests,
+        turret.emergency_requests,
+    )
+    assert after == before
+    window.close()
+
+
+def test_imu_window_distinguishes_calibrating_stale_error_and_disabled(
+    qt_application: QApplication,
+) -> None:
+    imu_states: LatestValue[ImuRuntimeState] = LatestValue()
+    window, _mediator_value, _turret, _bindings_value, _states = _window(
+        qt_application,
+        imu_states=imu_states,
+    )
+    imu = window.imu_window
+
+    imu_states.publish(
+        _imu_state(
+            gyro_bias_state=GyroBiasState.ACQUIRING,
+            orientation_valid=False,
+        )
+    )
+    imu.refresh_once()
+    assert imu.status_label.text().startswith("CALIBRATING")
+    assert not imu.attitude_view.fresh
+
+    imu_states.publish(_imu_state(fresh=False, orientation_valid=False))
+    imu.refresh_once()
+    assert imu.status_label.text().startswith("STALE")
+    assert not imu.attitude_view.fresh
+
+    imu_states.publish(_imu_state(running=False, fresh=False, orientation_valid=False))
+    imu.refresh_once()
+    assert imu.status_label.text().startswith("ERROR")
+    assert not imu.attitude_view.fresh
+    window.close()
+
+    disabled_window, *_ = _window(qt_application, imu_states=None)
+    disabled_window.imu_window.refresh_once()
+    assert disabled_window.imu_window.status_label.text() == (
+        "ERROR — IMU отключён в конфигурации"
+    )
+    disabled_window.close()
 
 def test_operator_window_statuses_follow_existing_ui_update_path(
     qt_application: QApplication,

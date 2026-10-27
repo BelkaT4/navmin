@@ -254,6 +254,7 @@ def _stereo_calibration_json(path: Path) -> None:
     ]
     payload = {
         "schema_version": 1,
+        "translation-unit": "m",
         "image_width": _WIDTH,
         "image_height": _HEIGHT,
         "K_left": k,

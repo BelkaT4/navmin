@@ -9,7 +9,7 @@ from contextlib import AbstractContextManager, contextmanager
 from dataclasses import dataclass
 from datetime import datetime
 from tempfile import TemporaryFile
-from threading import Event, Thread
+from threading import Event, Lock, Thread
 from time import monotonic, sleep
 from typing import IO, Any, Self
 
@@ -19,6 +19,12 @@ import numpy as np
 from navmin.calibration import OverviewCalibration, StereoCalibration
 from navmin.config.models import CameraConfig, RtpJpegSourceConfig
 from navmin.contracts import CameraRole
+from navmin.diagnostics.synthetic_stereo import (
+    DEFAULT_SYNTHETIC_FPS,
+    DEFAULT_SYNTHETIC_HEIGHT,
+    DEFAULT_SYNTHETIC_WIDTH,
+    SyntheticWorkingRangeStereoScene,
+)
 from navmin.vision.gstreamer_source import (
     GStreamerUnavailableError,
     initialize_gstreamer_runtime,
@@ -46,6 +52,7 @@ _TARGET_RADIUS_PX = 6
 _TARGET_SPEED_PX_PER_FRAME = 2
 _OVERVIEW_BACKGROUND_BGR = (32, 48, 64)
 _STEREO_LEFT_BACKGROUND_BGR = (70, 44, 30)
+_STEREO_RIGHT_BACKGROUND_BGR = (30, 54, 70)
 _TARGET_BGR = (245, 245, 245)
 _TEXT_BGR = (245, 245, 245)
 _FOOTER_TOP_RATIO = 0.85
@@ -55,6 +62,13 @@ _IDENTITY_3X3 = (
     (0.0, 1.0, 0.0),
     (0.0, 0.0, 1.0),
 )
+_FISHEYE_IDENTITY_DISTORTION = (
+    1.0 / 3.0,
+    2.0 / 15.0,
+    17.0 / 315.0,
+    62.0 / 2835.0,
+)
+
 _IDENTITY_4X4 = (
     (1.0, 0.0, 0.0, 0.0),
     (0.0, 1.0, 0.0, 0.0),
@@ -96,8 +110,12 @@ class RtpJpegSenderConfig:
                 raise ValueError(f"{name} must be a positive integer")
         if self.host != "127.0.0.1":
             raise ValueError("localhost diagnostic sender host must be 127.0.0.1")
-        if self.camera not in (CameraRole.OVERVIEW, CameraRole.STEREO_LEFT):
-            raise ValueError("camera must be Overview or Stereo Left")
+        if self.camera not in (
+            CameraRole.OVERVIEW,
+            CameraRole.STEREO_LEFT,
+            CameraRole.STEREO_RIGHT,
+        ):
+            raise ValueError("camera must be Overview, Stereo Left, or Stereo Right")
 
 
 def _ping_pong_coordinate(frame_index: int, start: int, end: int) -> int:
@@ -122,8 +140,12 @@ class SyntheticDiagnosticFrameGenerator:
         height: int,
         wall_clock: Callable[[], datetime] = datetime.now,
     ) -> None:
-        if camera not in (CameraRole.OVERVIEW, CameraRole.STEREO_LEFT):
-            raise ValueError("camera must be Overview or Stereo Left")
+        if camera not in (
+            CameraRole.OVERVIEW,
+            CameraRole.STEREO_LEFT,
+            CameraRole.STEREO_RIGHT,
+        ):
+            raise ValueError("camera must be Overview, Stereo Left, or Stereo Right")
         for name, value in (("width", width), ("height", height)):
             if type(value) is not int or value <= 0:
                 raise ValueError(f"{name} must be a positive integer")
@@ -152,11 +174,12 @@ class SyntheticDiagnosticFrameGenerator:
     def next_frame(self) -> np.ndarray:
         frame_counter = self._frame_counter
         timestamp = self._wall_clock()
-        background = (
-            _OVERVIEW_BACKGROUND_BGR
-            if self.camera is CameraRole.OVERVIEW
-            else _STEREO_LEFT_BACKGROUND_BGR
-        )
+        if self.camera is CameraRole.OVERVIEW:
+            background = _OVERVIEW_BACKGROUND_BGR
+        elif self.camera is CameraRole.STEREO_LEFT:
+            background = _STEREO_LEFT_BACKGROUND_BGR
+        else:
+            background = _STEREO_RIGHT_BACKGROUND_BGR
         frame = np.full((self.height, self.width, 3), background, dtype=np.uint8)
         scale = min(self.width / DEFAULT_WIDTH, self.height / DEFAULT_HEIGHT)
         radius = max(4, min(15, round(_TARGET_RADIUS_PX * scale)))
@@ -181,11 +204,12 @@ class SyntheticDiagnosticFrameGenerator:
         thickness = max(1, round(scale))
         first_baseline = round(self.height * 0.91)
         second_baseline = round(self.height * 0.975)
-        camera_name = (
-            "OVERVIEW"
-            if self.camera is CameraRole.OVERVIEW
-            else "STEREO LEFT"
-        )
+        if self.camera is CameraRole.OVERVIEW:
+            camera_name = "OVERVIEW"
+        elif self.camera is CameraRole.STEREO_LEFT:
+            camera_name = "STEREO LEFT"
+        else:
+            camera_name = "STEREO RIGHT"
         cv2.putText(
             frame,
             _source_timestamp(timestamp),
@@ -208,6 +232,51 @@ class SyntheticDiagnosticFrameGenerator:
         )
         self._frame_counter += 1
         return frame
+
+
+class SynchronizedSyntheticStereoSource:
+    """Provide one time-based working-range scene to both localhost stereo senders."""
+
+    def __init__(
+        self,
+        calibration: StereoCalibration,
+        *,
+        fps: int = DEFAULT_SYNTHETIC_FPS,
+        monotonic_clock: Callable[[], float] = monotonic,
+    ) -> None:
+        if (
+            calibration.image_width != DEFAULT_SYNTHETIC_WIDTH
+            or calibration.image_height != DEFAULT_SYNTHETIC_HEIGHT
+        ):
+            raise ValueError(
+                "working-range RTP stereo source requires 1296x976 calibration"
+            )
+        if fps <= 0:
+            raise ValueError("fps must be > 0")
+        self._scene = SyntheticWorkingRangeStereoScene(
+            calibration,
+            fps=fps,
+            moving=True,
+        )
+        self._fps = fps
+        self._clock = monotonic_clock
+        self._started_at = monotonic_clock()
+        self._lock = Lock()
+        self._cached_index = -1
+        self._cached_frame = None
+
+    def next_frame(self, camera: CameraRole) -> np.ndarray:
+        if camera not in (CameraRole.STEREO_LEFT, CameraRole.STEREO_RIGHT):
+            raise ValueError("camera must be Stereo Left or Stereo Right")
+        elapsed_s = max(0.0, self._clock() - self._started_at)
+        frame_index = int(elapsed_s * self._fps)
+        with self._lock:
+            if frame_index != self._cached_index:
+                self._cached_frame = self._scene.render(frame_index)
+                self._cached_index = frame_index
+            frame = self._cached_frame
+            assert frame is not None
+            return frame.left if camera is CameraRole.STEREO_LEFT else frame.right
 
 
 def build_sender_command(
@@ -403,6 +472,7 @@ class LocalhostRtpJpegSender:
         monotonic_clock: Callable[[], float] = monotonic,
         sleep_fn: Callable[[float], None] = sleep,
         wall_clock: Callable[[], datetime] = datetime.now,
+        frame_supplier: Callable[[], np.ndarray] | None = None,
     ) -> None:
         if startup_probe_seconds < 0.0:
             raise ValueError("startup_probe_seconds must be >= 0")
@@ -421,6 +491,8 @@ class LocalhostRtpJpegSender:
             height=config.height,
             wall_clock=wall_clock,
         )
+        self._frame_supplier = frame_supplier or self._frame_generator.next_frame
+        self._frames_generated = 0
         self._process: Any | None = None
         self._stderr_context: AbstractContextManager[IO[str]] | None = None
         self._stderr: IO[str] | None = None
@@ -444,7 +516,7 @@ class LocalhostRtpJpegSender:
 
     @property
     def frames_generated(self) -> int:
-        return self._frame_generator.frames_generated
+        return self._frames_generated
 
     def start(self) -> None:
         if self._process is not None:
@@ -552,7 +624,8 @@ class LocalhostRtpJpegSender:
         period_s = 1.0 / self.config.fps
         next_deadline = self._monotonic_clock()
         while not self._writer_stop.is_set():
-            frame = self._frame_generator.next_frame()
+            frame = self._frame_supplier()
+            self._frames_generated += 1
             try:
                 encoded, jpeg = cv2.imencode(
                     ".jpg",
@@ -635,7 +708,13 @@ def diagnostic_overview_calibration(
     width: int = DEFAULT_WIDTH,
     height: int = DEFAULT_HEIGHT,
 ) -> OverviewCalibration:
-    """Build exact-size zero-distortion fisheye calibration for diagnostics."""
+    """Build a fisheye calibration whose production remap is image-identity.
+
+    OpenCV fisheye undistortion with zero coefficients is not an identity map.
+    The coefficients below are the truncated ``tan(theta) / theta`` series,
+    which cancels the fisheye projection over the narrow synthetic field used
+    by diagnostics while keeping the normal Overview correction stage active.
+    """
     RtpJpegSenderConfig(port=1, width=width, height=height)
     matrix = _camera_matrix(
         width,
@@ -647,7 +726,7 @@ def diagnostic_overview_calibration(
         image_width=width,
         image_height=height,
         K=matrix,
-        D=(0.0, 0.0, 0.0, 0.0),
+        D=_FISHEYE_IDENTITY_DISTORTION,
         new_camera_matrix=matrix,
     )
 
@@ -670,6 +749,7 @@ def diagnostic_stereo_calibration(
     )
     return StereoCalibration(
         schema_version=1,
+        translation_unit="m",
         image_width=width,
         image_height=height,
         K_left=matrix,
@@ -697,6 +777,7 @@ __all__ = [
     "PreflightResult",
     "RtpJpegSenderConfig",
     "SenderProcessError",
+    "SynchronizedSyntheticStereoSource",
     "SyntheticDiagnosticFrameGenerator",
     "build_sender_command",
     "check_gstreamer_runtime",

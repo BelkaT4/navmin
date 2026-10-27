@@ -2,6 +2,7 @@
 
 from .app import run_ui
 from .bridge import CameraUiBinding, UiStatePump
+from .imu_window import AttitudeView, ImuWindow
 from .main_window import MainWindow
 from .operator_window import OperatorWindow
 from .video_view import (
@@ -16,7 +17,9 @@ from .video_view import (
 
 __all__ = [
     "STALE_MESSAGE",
+    "AttitudeView",
     "CameraUiBinding",
+    "ImuWindow",
     "MainWindow",
     "OperatorWindow",
     "PreparedVisionFrame",

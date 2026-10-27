@@ -7,14 +7,16 @@ from datetime import datetime
 from time import monotonic_ns
 
 from PyQt6.QtCore import QEvent, Qt
-from PyQt6.QtGui import QCloseEvent, QKeyEvent, QResizeEvent
+from PyQt6.QtGui import QCloseEvent, QKeyEvent, QResizeEvent, QWheelEvent
 from PyQt6.QtWidgets import (
+    QComboBox,
     QHBoxLayout,
     QLabel,
     QMainWindow,
     QMessageBox,
     QPushButton,
     QSizePolicy,
+    QSlider,
     QVBoxLayout,
     QWidget,
 )
@@ -25,18 +27,42 @@ from navmin.contracts import (
     CameraRole,
     CameraSessionStarted,
     CameraStatus,
+    DistanceSource,
     MotorState,
     TurretControlMode,
     TurretState,
     VisionResult,
 )
-from navmin.core import Mediator
+from navmin.core import DistanceMeasurementMode, Mediator
+from navmin.imu import ImuCalibrationControls, ImuRuntimeState
 
 from .bridge import CameraUiBinding, UiStatePump
+from .imu_window import ImuWindow
 from .operator_window import OperatorWindow
 from .video_view import PreparedVisionFrame, VideoView, prepare_vision_frame
 
 _NORMAL_CAMERAS = (CameraRole.OVERVIEW, CameraRole.STEREO_LEFT)
+_DISTANCE_MODE_OPTIONS = (
+    (DistanceMeasurementMode.CONSTANT, "Константа"),
+    (DistanceMeasurementMode.STEREO_EXACT, "Стерео — точная пара"),
+    (DistanceMeasurementMode.STEREO_TIMESTAMP, "Стерео — по времени"),
+)
+_DISTANCE_MODE_INDEX = {
+    mode: index for index, (mode, _label) in enumerate(_DISTANCE_MODE_OPTIONS)
+}
+
+
+class _DistanceSlider(QSlider):
+    """Keep one standard wheel event equal to one 10 m operator step."""
+
+    def wheelEvent(self, event: QWheelEvent) -> None:
+        delta = event.angleDelta().y()
+        if delta == 0:
+            super().wheelEvent(event)
+            return
+        step = self.singleStep() if delta > 0 else -self.singleStep()
+        self.setValue(self.value() + step)
+        event.accept()
 
 
 class _VideoArea(QWidget):
@@ -81,6 +107,8 @@ class MainWindow(QMainWindow):
         clock_ns: Callable[[], int] = monotonic_ns,
         wall_clock: Callable[[], datetime] = datetime.now,
         show_diagnostic_clock: bool = False,
+        imu_states: LatestValue[ImuRuntimeState] | None = None,
+        imu_controls: ImuCalibrationControls | None = None,
         frame_preparer: Callable[[VisionResult], PreparedVisionFrame] = prepare_vision_frame,
         start_timer: bool = True,
         start_fullscreen: bool = True,
@@ -126,6 +154,40 @@ class MainWindow(QMainWindow):
         self.connection_label = QLabel()
         self.connection_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.connection_label.setFixedSize(170, 40)
+
+        self.distance_panel = QWidget()
+        self.distance_panel.setFixedSize(325, 48)
+        distance_layout = QVBoxLayout(self.distance_panel)
+        distance_layout.setContentsMargins(0, 0, 0, 0)
+        distance_layout.setSpacing(0)
+        self.distance_title_label = QLabel("ДАЛЬНОСТЬ:")
+        self.distance_title_label.setFixedHeight(15)
+        distance_layout.addWidget(self.distance_title_label)
+        distance_row = QHBoxLayout()
+        distance_row.setContentsMargins(0, 0, 0, 0)
+        distance_row.setSpacing(5)
+        self.distance_mode_combo = QComboBox()
+        self.distance_mode_combo.setFixedSize(160, 32)
+        for _mode, label in _DISTANCE_MODE_OPTIONS:
+            self.distance_mode_combo.addItem(label)
+        self.distance_mode_combo.currentIndexChanged.connect(
+            self._distance_mode_changed
+        )
+        self.distance_slider = _DistanceSlider(Qt.Orientation.Horizontal)
+        self.distance_slider.setRange(10, 500)
+        self.distance_slider.setSingleStep(10)
+        self.distance_slider.setPageStep(10)
+        self.distance_slider.setFixedSize(100, 32)
+        self.distance_slider.valueChanged.connect(self._manual_distance_changed)
+        self.distance_value_label = QLabel("—")
+        self.distance_value_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.distance_value_label.setFixedSize(50, 32)
+        distance_row.addWidget(self.distance_mode_combo)
+        distance_row.addWidget(self.distance_slider)
+        distance_row.addWidget(self.distance_value_label)
+        distance_layout.addLayout(distance_row)
+        self._syncing_distance_controls = False
+
         self.now_label = QLabel()
         self.now_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.now_label.setFixedSize(175, 40)
@@ -147,6 +209,7 @@ class MainWindow(QMainWindow):
         bar_layout.addWidget(self.motor_button)
         bar_layout.addWidget(self.connection_label)
         bar_layout.addWidget(self.now_label)
+        bar_layout.addWidget(self.distance_panel)
         bar_layout.addStretch(1)
         bar_layout.addWidget(self.emergency_button)
 
@@ -160,10 +223,17 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("BelkaT4 / NavMin")
         self.resize(1280, 800)
 
+        self.imu_window = ImuWindow(
+            owner=self,
+            states=imu_states,
+            controls=imu_controls,
+            on_toggle_operator=self.toggle_operator_window,
+        )
         self.operator_window = OperatorWindow(
             owner=self,
             on_toggle_fullscreen=self.toggle_fullscreen,
             on_exit=self.request_exit,
+            on_show_imu=self.show_imu_window,
             pid_controller_config=pid_controller_config,
             on_apply_pid_tuning=apply_pid_tuning,
             tracking_control_config=tracking_control_config,
@@ -207,6 +277,7 @@ class MainWindow(QMainWindow):
             self.operator_window.set_fullscreen_state(self.isFullScreen())
 
     def closeEvent(self, event: QCloseEvent) -> None:
+        self.imu_window.close()
         self.operator_window.close()
         super().closeEvent(event)
 
@@ -224,6 +295,11 @@ class MainWindow(QMainWindow):
         self.operator_window.show()
         self.operator_window.raise_()
         self.operator_window.activateWindow()
+
+    def show_imu_window(self) -> None:
+        self.imu_window.show()
+        self.imu_window.raise_()
+        self.imu_window.activateWindow()
 
     def request_exit(self) -> None:
         if self._confirm_exit():
@@ -259,6 +335,7 @@ class MainWindow(QMainWindow):
             self._shown_selection = self._mediator.selected_target
             self.main_view.set_selected_target(self._shown_selection)
             self.preview_view.set_selected_target(self._shown_selection)
+        self._refresh_distance_presentation()
         self._refresh_aim_point()
         now_ns = self._clock_ns()
         self.main_view.refresh_freshness(now_ns)
@@ -267,6 +344,65 @@ class MainWindow(QMainWindow):
             now = self._wall_clock()
             milliseconds = now.microsecond // 1000
             self.now_label.setText(f"NOW {now:%H:%M:%S}.{milliseconds:03d}")
+
+    def _distance_mode_changed(self, index: int) -> None:
+        if self._syncing_distance_controls:
+            return
+        if not 0 <= index < len(_DISTANCE_MODE_OPTIONS):
+            return
+        mode, _label = _DISTANCE_MODE_OPTIONS[index]
+        self._mediator.set_distance_mode(mode)
+        self._refresh_distance_presentation()
+
+    def _manual_distance_changed(self, value_m: int) -> None:
+        if self._syncing_distance_controls:
+            return
+        self._mediator.set_manual_distance_m(value_m)
+        self._refresh_distance_presentation()
+
+    def _refresh_distance_presentation(self) -> None:
+        mode = self._mediator.distance_mode
+        manual_distance_m = self._mediator.manual_distance_m
+        stereo_left_main = self._mediator.main_camera is CameraRole.STEREO_LEFT
+
+        distance = self._mediator.current_distance
+        expected_source = (
+            DistanceSource.MANUAL
+            if mode is DistanceMeasurementMode.CONSTANT
+            else DistanceSource.STEREO
+        )
+        display_distance = (
+            distance
+            if stereo_left_main
+            and distance is not None
+            and distance.source is expected_source
+            else None
+        )
+
+        self._syncing_distance_controls = True
+        try:
+            self.distance_mode_combo.setCurrentIndex(_DISTANCE_MODE_INDEX[mode])
+            self.distance_mode_combo.setEnabled(stereo_left_main)
+            self.distance_slider.setValue(manual_distance_m)
+            show_slider = stereo_left_main and mode is DistanceMeasurementMode.CONSTANT
+            self.distance_slider.setVisible(show_slider)
+            self.distance_slider.setEnabled(show_slider)
+
+            if not stereo_left_main:
+                self.distance_value_label.setText("—")
+            elif mode is DistanceMeasurementMode.CONSTANT:
+                self.distance_value_label.setText(f"{manual_distance_m} м")
+            else:
+                self.distance_value_label.setText(
+                    "—"
+                    if display_distance is None
+                    else f"{display_distance.distance_m:.1f} м"
+                )
+        finally:
+            self._syncing_distance_controls = False
+
+        self.main_view.set_target_distance(display_distance)
+        self.preview_view.set_target_distance(None)
 
     def _refresh_aim_point(self) -> None:
         result = self.main_view.displayed_result

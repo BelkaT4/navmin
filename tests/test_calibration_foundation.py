@@ -36,6 +36,7 @@ def _overview_calibration() -> dict:
 def _stereo_calibration() -> dict:
     return {
         "schema_version": 1,
+        "translation-unit": "m",
         "image_width": 640,
         "image_height": 480,
         "K_left": [[500.0, 0.0, 320.0], [0.0, 500.0, 240.0], [0.0, 0.0, 1.0]],
@@ -92,6 +93,31 @@ def test_valid_stereo_calibration_normalizes_vector_shapes(tmp_path) -> None:
     assert len(calibration.D_right) == 5
     assert len(calibration.P1) == 3
     assert len(calibration.Q) == 4
+
+
+@pytest.mark.parametrize(("unit", "scale"), [("m", 1.0), ("mm", 0.001)])
+def test_stereo_translation_units_are_explicit(tmp_path, unit, scale) -> None:
+    path = tmp_path / "stereo.json"
+    data = _stereo_calibration()
+    data["translation-unit"] = unit
+    _write(path, data)
+    calibration = load_stereo_calibration(path)
+    assert calibration.translation_unit == unit
+    assert calibration.length_scale_to_m == scale
+
+
+@pytest.mark.parametrize("unit", [None, "cm", "MM", 1, True, ""])
+def test_stereo_translation_unit_invalid_or_missing_is_rejected(tmp_path, unit) -> None:
+    path = tmp_path / "stereo.json"
+    data = _stereo_calibration()
+    if unit is None:
+        del data["translation-unit"]
+    else:
+        data["translation-unit"] = unit
+    _write(path, data)
+    with pytest.raises(CalibrationValidationError) as exc_info:
+        load_stereo_calibration(path)
+    assert exc_info.value.path == "translation-unit"
 
 
 def test_overview_requires_exact_opencv_fisheye_distortion_length(tmp_path) -> None:

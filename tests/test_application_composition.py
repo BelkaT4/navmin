@@ -5,6 +5,7 @@ from dataclasses import replace
 from pathlib import Path
 from time import monotonic, sleep
 
+import numpy as np
 import pytest
 
 from navmin.application import (
@@ -13,6 +14,7 @@ from navmin.application import (
     build_application_runtime,
 )
 from navmin.calibration import OverviewCalibration, StereoCalibration
+from navmin.concurrency import LatestValue
 from navmin.config import load_config
 from navmin.config.models import (
     AimingConfig,
@@ -23,6 +25,7 @@ from navmin.config.models import (
     AxisMechanicsConfig,
     CameraConfig,
     CamerasConfig,
+    ImuConfig,
     OverviewCameraConfig,
     PidControllerConfig,
     ProcessingScope,
@@ -48,6 +51,8 @@ from navmin.contracts import (
     TrackingError,
     TurretConnectionState,
 )
+from navmin.core import DistanceMeasurementMode
+from navmin.imu import ImuCalibration, ImuRuntime
 from navmin.turret.protocol import CommandCode
 from navmin.turret.simulator import FakeStm32Endpoint, FakeTransport
 from navmin.turret.worker import TurretWorker
@@ -117,7 +122,13 @@ def _default_tracking_control_config():
     return load_config(defaults).tracking_control
 
 
-def _config() -> AppConfig:
+def _config(
+    *,
+    stereo_left_enabled: bool = True,
+    stereo_right_enabled: bool = False,
+    stereo_enabled: bool = False,
+    imu_enabled: bool = False,
+) -> AppConfig:
     center = AimPointConfig(x_px=None, y_px=None)
     axis = AxisMechanicsConfig(
         invert=False,
@@ -126,20 +137,20 @@ def _config() -> AppConfig:
         max_relative_move_deg=45.0,
     )
     return AppConfig(
-        schema_version=3,
+        schema_version=4,
         vision=VisionConfig(
             processing_scope=ProcessingScope.MAIN_AND_PREVIEW,
             cameras=CamerasConfig(
                 overview=_overview_camera(8888),
-                stereo_left=_camera(8889),
-                stereo_right=_camera(8890),
+                stereo_left=_camera(8889, enabled=stereo_left_enabled),
+                stereo_right=_camera(8890, enabled=stereo_right_enabled),
             ),
             distance=VisionDistanceConfig(
                 source=DistanceSource.MANUAL,
                 manual_distance_m=100.0,
                 distance_stale_timeout_ms=300,
                 stereo=StereoDistanceConfig(
-                    stereo_enabled=False,
+                    stereo_enabled=stereo_enabled,
                     right_frame_buffer_size=4,
                     pair_timeout_ms=100,
                     calibration_file="calibration/stereo.json",
@@ -153,6 +164,13 @@ def _config() -> AppConfig:
             aim_points=AimPointsConfig(overview=center, stereo_left=center),
         ),
         tracking_control=_default_tracking_control_config(),
+        imu=ImuConfig(
+            enabled=imu_enabled,
+            bind_address="0.0.0.0",
+            port=8891,
+            expected_source=None,
+            calibration_file="calibration/imu.json",
+        ),
         turret=TurretConfig(
             serial=SerialConfig(
                 port="/dev/ttyUSB0",
@@ -206,6 +224,7 @@ def _stereo_calibration() -> StereoCalibration:
     )
     return StereoCalibration(
         schema_version=1,
+        translation_unit="m",
         image_width=WIDTH,
         image_height=HEIGHT,
         K_left=K,
@@ -227,11 +246,20 @@ def _stereo_calibration() -> StereoCalibration:
     )
 
 
-def _injected_runtime():
+def _injected_runtime(
+    *,
+    stereo_left_enabled: bool = True,
+    stereo_right_enabled: bool = False,
+    stereo_enabled: bool = False,
+    imu_enabled: bool = False,
+    imu_runtime_factory=ImuRuntime,
+):
     sources = {
         CameraRole.OVERVIEW: InMemoryFrameSource(),
         CameraRole.STEREO_LEFT: InMemoryFrameSource(),
     }
+    if stereo_right_enabled:
+        sources[CameraRole.STEREO_RIGHT] = InMemoryFrameSource()
     endpoint = FakeStm32Endpoint()
 
     def overview_factory(_config: CameraConfig) -> InMemoryFrameSource:
@@ -239,6 +267,9 @@ def _injected_runtime():
 
     def stereo_left_factory(_config: CameraConfig) -> InMemoryFrameSource:
         return sources[CameraRole.STEREO_LEFT]
+
+    def stereo_right_factory(_config: CameraConfig) -> InMemoryFrameSource:
+        return sources[CameraRole.STEREO_RIGHT]
 
     def transport_factory(
         _port: str,
@@ -248,16 +279,46 @@ def _injected_runtime():
         return FakeTransport(endpoint, baudrate=baudrate)
 
     runtime = build_application_runtime(
-        config=_config(),
+        config=_config(
+            stereo_left_enabled=stereo_left_enabled,
+            stereo_right_enabled=stereo_right_enabled,
+            stereo_enabled=stereo_enabled,
+            imu_enabled=imu_enabled,
+        ),
         overview_calibration=_overview_calibration(),
         stereo_calibration=_stereo_calibration(),
         factories=ApplicationFactories(
             overview_source_factory=overview_factory,
             stereo_left_source_factory=stereo_left_factory,
+            stereo_right_source_factory=stereo_right_factory,
             turret_transport_factory=transport_factory,
+            imu_runtime_factory=imu_runtime_factory,
         ),
     )
     return runtime, sources, endpoint
+
+
+class _FakeImuRuntime:
+    def __init__(
+        self,
+        events: list[str] | None = None,
+        *,
+        fail_start: bool = False,
+    ) -> None:
+        self.state_updates = LatestValue()
+        self._events = events
+        self._fail_start = fail_start
+
+    def start(self) -> None:
+        if self._events is not None:
+            self._events.append("imu")
+        if self._fail_start:
+            raise OSError("forced IMU bind failure")
+
+    def shutdown(self, timeout: float) -> None:
+        del timeout
+        if self._events is not None:
+            self._events.append("stop-imu")
 
 
 def _wait_until(predicate, *, timeout: float = 2.0) -> None:
@@ -267,6 +328,191 @@ def _wait_until(predicate, *, timeout: float = 2.0) -> None:
             return
         sleep(0.005)
     raise AssertionError("condition did not become true")
+
+
+def test_imu_disabled_does_not_construct_runtime() -> None:
+    calls: list[dict[str, object]] = []
+
+    def forbidden_factory(**kwargs):
+        calls.append(kwargs)
+        raise AssertionError("disabled IMU runtime factory was called")
+
+    runtime = build_application_runtime(
+        config=_config(imu_enabled=False),
+        overview_calibration=_overview_calibration(),
+        stereo_calibration=_stereo_calibration(),
+        factories=ApplicationFactories(imu_runtime_factory=forbidden_factory),
+    )
+
+    assert calls == []
+    assert runtime.imu_runtime is None
+    assert runtime.imu_states is None
+    assert runtime.ui_dependencies.imu_controls is None
+
+
+def test_imu_enabled_constructs_runtime_from_config_and_loaded_calibration() -> None:
+    captured: dict[str, object] = {}
+    fake = _FakeImuRuntime()
+    calibration = ImuCalibration(
+        accel_bias=[0.1, 0.2, 0.3],
+        accel_ready=True,
+    )
+
+    def factory(**kwargs):
+        captured.update(kwargs)
+        return fake
+
+    config = replace(
+        _config(imu_enabled=True),
+        imu=ImuConfig(
+            enabled=True,
+            bind_address="127.0.0.1",
+            port=12345,
+            expected_source="192.0.2.10",
+            calibration_file="calibration/imu.json",
+        ),
+    )
+    runtime = build_application_runtime(
+        config=config,
+        overview_calibration=_overview_calibration(),
+        stereo_calibration=_stereo_calibration(),
+        imu_calibration=calibration,
+        factories=ApplicationFactories(imu_runtime_factory=factory),
+    )
+
+    assert captured == {
+        "bind_address": "127.0.0.1",
+        "port": 12345,
+        "expected_source": "192.0.2.10",
+        "calibration": calibration,
+    }
+    assert runtime.imu_runtime is fake
+    assert runtime.imu_states is fake.state_updates
+    assert runtime.ui_dependencies.imu_controls is fake
+
+
+def test_imu_enabled_follows_startup_and_shutdown_lifecycle(monkeypatch) -> None:
+    events: list[str] = []
+    fake = _FakeImuRuntime(events)
+    runtime, _sources, _endpoint = _injected_runtime(
+        imu_enabled=True,
+        imu_runtime_factory=lambda **_kwargs: fake,
+    )
+
+    monkeypatch.setattr(runtime.turret_worker, "start", lambda: events.append("turret"))
+    monkeypatch.setattr(
+        runtime.overview_worker,
+        "start",
+        lambda: events.append("overview"),
+    )
+    monkeypatch.setattr(
+        runtime.stereo_left_worker,
+        "start",
+        lambda: events.append("stereo-left"),
+    )
+    monkeypatch.setattr(
+        runtime.stereo_left_worker,
+        "stop",
+        lambda *, timeout: events.append("stop-stereo-left") or True,
+    )
+    monkeypatch.setattr(
+        runtime.overview_worker,
+        "stop",
+        lambda *, timeout: events.append("stop-overview") or True,
+    )
+    monkeypatch.setattr(
+        runtime.turret_worker,
+        "shutdown",
+        lambda *, timeout: events.append("stop-turret"),
+    )
+
+    runtime.start()
+    runtime.shutdown()
+
+    assert events == [
+        "turret",
+        "imu",
+        "overview",
+        "stereo-left",
+        "stop-stereo-left",
+        "stop-overview",
+        "stop-imu",
+        "stop-turret",
+    ]
+
+
+def test_imu_bind_failure_rolls_back_already_started_turret(monkeypatch) -> None:
+    events: list[str] = []
+    fake = _FakeImuRuntime(events, fail_start=True)
+    runtime, _sources, _endpoint = _injected_runtime(
+        imu_enabled=True,
+        imu_runtime_factory=lambda **_kwargs: fake,
+    )
+    monkeypatch.setattr(runtime.turret_worker, "start", lambda: events.append("turret"))
+    monkeypatch.setattr(
+        runtime.turret_worker,
+        "shutdown",
+        lambda *, timeout: events.append("stop-turret"),
+    )
+    monkeypatch.setattr(
+        runtime.overview_worker,
+        "start",
+        lambda: events.append("overview"),
+    )
+
+    with pytest.raises(OSError, match="forced IMU bind failure"):
+        runtime.start()
+
+    assert events == ["turret", "imu", "stop-turret"]
+
+
+def test_imu_enablement_does_not_change_tracking_estimator_output() -> None:
+    fake = _FakeImuRuntime()
+    disabled = build_application_runtime(
+        config=_config(imu_enabled=False),
+        overview_calibration=_overview_calibration(),
+        stereo_calibration=_stereo_calibration(),
+    )
+    enabled = build_application_runtime(
+        config=_config(imu_enabled=True),
+        overview_calibration=_overview_calibration(),
+        stereo_calibration=_stereo_calibration(),
+        imu_calibration=ImuCalibration(),
+        factories=ApplicationFactories(
+            imu_runtime_factory=lambda **_kwargs: fake,
+        ),
+    )
+    target = TargetRef(CameraRole.OVERVIEW, 1, 9)
+    samples = (
+        (1_000_000_000, 1.0, -2.0),
+        (1_050_000_000, 0.8, -1.7),
+        (1_100_000_000, 0.6, -1.4),
+        (1_150_000_000, 0.4, -1.1),
+    )
+
+    disabled_diagnostics = None
+    enabled_diagnostics = None
+    for timestamp_ns, error_x, error_y in samples:
+        error = TrackingError(target, error_x, error_y, timestamp_ns)
+        platform = PlatformMotionRate(timestamp_ns, 0.25, -0.5)
+        disabled_diagnostics = disabled.mediator.tracking_estimator.observe(
+            error,
+            platform,
+        )
+        enabled_diagnostics = enabled.mediator.tracking_estimator.observe(
+            error,
+            platform,
+        )
+
+    assert enabled_diagnostics == disabled_diagnostics
+    assert (
+        enabled.mediator.tracking_estimator.config
+        == disabled.mediator.tracking_estimator.config
+    )
+    assert (
+        enabled.turret_worker.platform_motion_snapshot()
+        == disabled.turret_worker.platform_motion_snapshot()
+    )
 
 
 def test_production_runtime_initializes_gstreamer_before_starting_workers(
@@ -316,6 +562,261 @@ def test_default_construction_uses_only_production_transport_boundaries() -> Non
     assert isinstance(runtime.stereo_left_worker.source, GStreamerRtpJpegSource)
     assert isinstance(runtime.turret_worker, TurretWorker)
     assert factories.turret_transport_factory is None
+
+
+def test_stereo_right_disabled_does_not_call_source_factory() -> None:
+    calls: list[CameraConfig] = []
+
+    def forbidden_right_factory(config: CameraConfig) -> InMemoryFrameSource:
+        calls.append(config)
+        raise AssertionError("disabled Stereo Right source factory was called")
+
+    runtime = build_application_runtime(
+        config=_config(stereo_right_enabled=False),
+        overview_calibration=_overview_calibration(),
+        stereo_calibration=_stereo_calibration(),
+        factories=ApplicationFactories(
+            stereo_right_source_factory=forbidden_right_factory,
+        ),
+    )
+
+    assert calls == []
+    assert runtime.stereo_right_worker is None
+    assert CameraRole.STEREO_RIGHT not in runtime.camera_workers
+    assert CameraRole.STEREO_RIGHT not in runtime.camera_bindings
+
+
+def test_stereo_right_enabled_is_owned_but_excluded_from_ui_and_targeting() -> None:
+    runtime, sources, _endpoint = _injected_runtime(stereo_right_enabled=True)
+
+    assert runtime.stereo_right_worker is not None
+    assert runtime.stereo_right_worker.source is sources[CameraRole.STEREO_RIGHT]
+    assert set(runtime.camera_workers) == {
+        CameraRole.OVERVIEW,
+        CameraRole.STEREO_LEFT,
+        CameraRole.STEREO_RIGHT,
+    }
+    assert set(runtime.camera_bindings) == {
+        CameraRole.OVERVIEW,
+        CameraRole.STEREO_LEFT,
+    }
+    assert set(runtime.mediator._target_controls) == {
+        CameraRole.OVERVIEW,
+        CameraRole.STEREO_LEFT,
+    }
+    assert set(runtime.mediator._vision_processing_enabled) == {
+        CameraRole.OVERVIEW,
+        CameraRole.STEREO_LEFT,
+    }
+
+
+@pytest.mark.parametrize(
+    ("stereo_left_enabled", "stereo_right_enabled", "stereo_enabled"),
+    [
+        (True, False, True),
+        (True, True, False),
+        (False, True, True),
+    ],
+)
+def test_stereo_pairer_is_inactive_when_any_prerequisite_is_disabled(
+    stereo_left_enabled: bool,
+    stereo_right_enabled: bool,
+    stereo_enabled: bool,
+) -> None:
+    runtime, _sources, _endpoint = _injected_runtime(
+        stereo_left_enabled=stereo_left_enabled,
+        stereo_right_enabled=stereo_right_enabled,
+        stereo_enabled=stereo_enabled,
+    )
+
+    assert runtime.stereo_pairer is None
+    assert runtime.stereo_target_joiner is None
+    assert runtime.stereo_distance_worker is None
+
+
+def test_stereo_disabled_keeps_modes_selectable_without_compute_path() -> None:
+    runtime, _sources, _endpoint = _injected_runtime(
+        stereo_right_enabled=True,
+        stereo_enabled=False,
+    )
+
+    assert runtime.stereo_pairer is None
+    assert runtime.stereo_target_joiner is None
+    assert runtime.stereo_distance_worker is None
+    assert runtime.mediator.swap_main_preview() is CameraRole.STEREO_LEFT
+
+    runtime.mediator.set_distance_mode(DistanceMeasurementMode.STEREO_EXACT)
+    assert runtime.mediator.distance_mode is DistanceMeasurementMode.STEREO_EXACT
+    assert runtime.mediator.current_distance is None
+
+    runtime.mediator.set_distance_mode(DistanceMeasurementMode.STEREO_TIMESTAMP)
+    assert runtime.mediator.distance_mode is DistanceMeasurementMode.STEREO_TIMESTAMP
+    assert runtime.mediator.current_distance is None
+
+
+def test_enabled_stereo_pairer_receives_both_corrected_frame_paths_and_resets() -> None:
+    runtime, sources, _endpoint = _injected_runtime(
+        stereo_right_enabled=True,
+        stereo_enabled=True,
+    )
+    pairer = runtime.stereo_pairer
+    joiner = runtime.stereo_target_joiner
+    distance_worker = runtime.stereo_distance_worker
+    diagnostics_reporter = runtime.stereo_diagnostics_reporter
+    assert pairer is not None
+    assert runtime.stereo_timestamp_pairer is not None
+    assert joiner is not None
+    assert distance_worker is not None
+    assert diagnostics_reporter is not None
+    assert runtime.stereo_right_worker is not None
+    assert set(runtime.camera_bindings) == {
+        CameraRole.OVERVIEW,
+        CameraRole.STEREO_LEFT,
+    }
+    assert CameraRole.STEREO_RIGHT not in runtime.mediator._target_controls
+    assert CameraRole.STEREO_RIGHT not in runtime.mediator._vision_processing_enabled
+
+    frame = np.zeros((HEIGHT, WIDTH, 3), dtype=np.uint8)
+    runtime.mediator.set_distance_mode(DistanceMeasurementMode.STEREO_EXACT)
+    runtime.start()
+    try:
+        sources[CameraRole.STEREO_LEFT].push(
+            frame,
+            capture_id=42,
+            receive_timestamp_ns=1_000_000,
+        )
+        sources[CameraRole.STEREO_RIGHT].push(
+            frame,
+            capture_id=42,
+            receive_timestamp_ns=2_000_000,
+        )
+        _wait_until(lambda: pairer.latest_pair is not None)
+
+        pair = pairer.latest_pair
+        assert pair is not None
+        assert pair.identity.capture_id == 42
+        assert pair.left.camera is CameraRole.STEREO_LEFT
+        assert pair.right.camera is CameraRole.STEREO_RIGHT
+        assert pair.left.generation == runtime.stereo_left_worker.pipeline.generation
+        assert pair.right.generation == runtime.stereo_right_worker.pipeline.generation
+
+        runtime.mediator.set_distance_mode(DistanceMeasurementMode.STEREO_TIMESTAMP)
+        sources[CameraRole.STEREO_RIGHT].push(
+            frame, capture_id=None, receive_timestamp_ns=10_000_000
+        )
+        sources[CameraRole.STEREO_LEFT].push(
+            frame, capture_id=None, receive_timestamp_ns=10_010_000
+        )
+        timestamp_pairer = runtime.stereo_timestamp_pairer
+        assert timestamp_pairer is not None
+        _wait_until(lambda: timestamp_pairer.latest_pair is not None)
+        timestamp_pair = timestamp_pairer.latest_pair
+        assert timestamp_pair is not None
+        assert timestamp_pair.left.capture_id is None
+        assert timestamp_pair.right.capture_id is None
+        assert pairer.latest_pair is None  # mode transition cleared old exact pair
+    finally:
+        runtime.shutdown()
+
+    assert pairer.latest_pair is None
+    assert runtime.stereo_timestamp_pairer is not None
+    assert runtime.stereo_timestamp_pairer.latest_pair is None
+    assert runtime.stereo_timestamp_pairer.state.left_generation is None
+    assert runtime.stereo_timestamp_pairer.state.right_generation is None
+    assert pairer.state.left_generation is None
+    assert pairer.state.right_generation is None
+    assert joiner.state.left_generation is None
+    assert joiner.state.target is None
+    assert joiner.observations.get() is None
+    assert not distance_worker.is_alive()
+    assert not diagnostics_reporter.is_alive()
+
+
+def test_stereo_right_enabled_follows_startup_and_reverse_shutdown_order(
+    monkeypatch,
+) -> None:
+    runtime, _sources, _endpoint = _injected_runtime(stereo_right_enabled=True)
+    assert runtime.stereo_right_worker is not None
+    events: list[str] = []
+
+    monkeypatch.setattr(runtime.turret_worker, "start", lambda: events.append("turret"))
+    monkeypatch.setattr(
+        runtime.overview_worker,
+        "start",
+        lambda: events.append("overview"),
+    )
+    monkeypatch.setattr(
+        runtime.stereo_left_worker,
+        "start",
+        lambda: events.append("stereo-left"),
+    )
+    monkeypatch.setattr(
+        runtime.stereo_right_worker,
+        "start",
+        lambda: events.append("stereo-right"),
+    )
+    monkeypatch.setattr(
+        runtime.stereo_right_worker,
+        "stop",
+        lambda *, timeout: events.append("stop-stereo-right") or True,
+    )
+    monkeypatch.setattr(
+        runtime.stereo_left_worker,
+        "stop",
+        lambda *, timeout: events.append("stop-stereo-left") or True,
+    )
+    monkeypatch.setattr(
+        runtime.overview_worker,
+        "stop",
+        lambda *, timeout: events.append("stop-overview") or True,
+    )
+    monkeypatch.setattr(
+        runtime.turret_worker,
+        "shutdown",
+        lambda *, timeout: events.append("stop-turret"),
+    )
+
+    runtime.start()
+    runtime.shutdown()
+
+    assert events == [
+        "turret",
+        "overview",
+        "stereo-left",
+        "stereo-right",
+        "stop-stereo-right",
+        "stop-stereo-left",
+        "stop-overview",
+        "stop-turret",
+    ]
+
+
+def test_production_gstreamer_detection_includes_stereo_right(monkeypatch) -> None:
+    sources = {
+        CameraRole.OVERVIEW: InMemoryFrameSource(),
+        CameraRole.STEREO_LEFT: InMemoryFrameSource(),
+    }
+    runtime = build_application_runtime(
+        config=_config(stereo_right_enabled=True),
+        overview_calibration=_overview_calibration(),
+        stereo_calibration=_stereo_calibration(),
+        factories=ApplicationFactories(
+            overview_source_factory=lambda _config: sources[CameraRole.OVERVIEW],
+            stereo_left_source_factory=lambda _config: sources[CameraRole.STEREO_LEFT],
+        ),
+    )
+    events: list[str] = []
+    monkeypatch.setattr(
+        "navmin.application.initialize_gstreamer_runtime",
+        lambda: events.append("gstreamer"),
+    )
+    monkeypatch.setattr(runtime.turret_worker, "start", lambda: None)
+    for worker in runtime.camera_workers.values():
+        monkeypatch.setattr(worker, "start", lambda: None)
+
+    runtime.start()
+
+    assert events == ["gstreamer"]
 
 
 def test_runtime_pid_tuning_dependencies_use_loaded_config_and_monotonic_updates(
@@ -520,6 +1021,8 @@ def test_shared_runtime_starts_and_exposes_complete_ui_dependency_surface() -> N
         assert ui.mediator is runtime.mediator
         assert ui.camera_bindings is runtime.camera_bindings
         assert ui.turret_states is runtime.turret_worker.state_updates
+        assert ui.imu_states is runtime.imu_states
+        assert ui.imu_controls is runtime.imu_runtime
         assert ui.camera_stale_timeout_ms == 500
     finally:
         runtime.shutdown(timeout=1.0)
@@ -578,6 +1081,54 @@ def test_synchronous_partial_start_failure_rolls_back_started_workers(
 
     assert not runtime.overview_worker.is_alive()
     assert not runtime.stereo_left_worker.is_alive()
+    assert not runtime.turret_worker.is_alive()
+    runtime.shutdown(timeout=1.0)
+    runtime.shutdown(timeout=1.0)
+
+
+def test_stereo_right_start_failure_rolls_back_started_workers(
+    monkeypatch,
+) -> None:
+    runtime, _sources, _endpoint = _injected_runtime(stereo_right_enabled=True)
+    assert runtime.stereo_right_worker is not None
+    calls: list[str] = []
+
+    original_stereo_left_stop = runtime.stereo_left_worker.stop
+    original_overview_stop = runtime.overview_worker.stop
+    original_turret_shutdown = runtime.turret_worker.shutdown
+
+    def fail_stereo_right_start() -> None:
+        raise RuntimeError("forced Stereo Right startup failure")
+
+    def forbidden_stereo_right_stop(*, timeout: float) -> bool:
+        calls.append("stereo-right")
+        return True
+
+    def stereo_left_stop(*, timeout: float) -> bool:
+        calls.append("stereo-left")
+        return original_stereo_left_stop(timeout=timeout)
+
+    def overview_stop(*, timeout: float) -> bool:
+        calls.append("overview")
+        return original_overview_stop(timeout=timeout)
+
+    def turret_shutdown(*, timeout: float) -> None:
+        calls.append("turret")
+        original_turret_shutdown(timeout=timeout)
+
+    monkeypatch.setattr(runtime.stereo_right_worker, "start", fail_stereo_right_start)
+    monkeypatch.setattr(runtime.stereo_right_worker, "stop", forbidden_stereo_right_stop)
+    monkeypatch.setattr(runtime.stereo_left_worker, "stop", stereo_left_stop)
+    monkeypatch.setattr(runtime.overview_worker, "stop", overview_stop)
+    monkeypatch.setattr(runtime.turret_worker, "shutdown", turret_shutdown)
+
+    with pytest.raises(RuntimeError, match="forced Stereo Right startup failure"):
+        runtime.start()
+
+    assert calls == ["stereo-left", "overview", "turret"]
+    assert not runtime.stereo_right_worker.is_alive()
+    assert not runtime.stereo_left_worker.is_alive()
+    assert not runtime.overview_worker.is_alive()
     assert not runtime.turret_worker.is_alive()
     runtime.shutdown(timeout=1.0)
     runtime.shutdown(timeout=1.0)

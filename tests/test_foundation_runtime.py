@@ -87,5 +87,10 @@ def test_package_module_help_executes_without_ui_or_hardware(tmp_path) -> None:
     )
 
     assert completed.returncode == 0
-    assert "configured real camera sources" in completed.stdout
+    assert "interactive launch menu" in completed.stdout
+    assert "--overview {on,sim}" in completed.stdout
+    assert "--stereo-right {on,sim,off}" in completed.stdout
+    assert "--stm32 {on,sim}" in completed.stdout
+    assert "-p, --preflight-only" in completed.stdout
+    assert "-v, --verbose" in completed.stdout
     assert completed.stderr == ""

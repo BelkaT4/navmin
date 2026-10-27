@@ -1,0 +1,43 @@
+{
+  "version": 1,
+  "gyro_bias": [
+    0.0,
+    0.0,
+    0.0
+  ],
+  "gyro_ready": false,
+  "accel_bias": [
+    0.0,
+    0.0,
+    0.0
+  ],
+  "accel_scale": [
+    1.0,
+    1.0,
+    1.0
+  ],
+  "accel_ready": false,
+  "mag_bias": [
+    0.0,
+    0.0,
+    0.0
+  ],
+  "mag_scale": [
+    1.0,
+    1.0,
+    1.0
+  ],
+  "mag_radius": 0.0,
+  "mag_ready": false,
+  "axes": [
+    1,
+    2,
+    3
+  ],
+  "zero": [
+    1.0,
+    0.0,
+    0.0,
+    0.0
+  ]
+}

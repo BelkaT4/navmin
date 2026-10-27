@@ -28,6 +28,7 @@ from navmin.config.models import (
     AxisMechanicsConfig,
     CameraConfig,
     CamerasConfig,
+    ImuConfig,
     OverviewCameraConfig,
     PidControllerConfig,
     ProcessingScope,
@@ -99,6 +100,7 @@ def synthetic_stereo_calibration() -> StereoCalibration:
     )
     return StereoCalibration(
         schema_version=1,
+        translation_unit="m",
         image_width=FRAME_WIDTH,
         image_height=FRAME_HEIGHT,
         K_left=camera_matrix,
@@ -303,9 +305,14 @@ def _smoke_turret_config() -> TurretConfig:
     )
 
 
-def _smoke_camera_config(port: int, *, processing_enabled: bool) -> CameraConfig:
+def _smoke_camera_config(
+    port: int,
+    *,
+    processing_enabled: bool,
+    enabled: bool = True,
+) -> CameraConfig:
     return CameraConfig(
-        enabled=True,
+        enabled=enabled,
         source=RtpJpegSourceConfig(
             bind_address="127.0.0.1",
             port=port,
@@ -329,13 +336,17 @@ def _smoke_overview_config(port: int) -> OverviewCameraConfig:
 
 def _smoke_app_config() -> AppConfig:
     return AppConfig(
-        schema_version=3,
+        schema_version=4,
         vision=VisionConfig(
             processing_scope=ProcessingScope.MAIN_AND_PREVIEW,
             cameras=CamerasConfig(
                 overview=_smoke_overview_config(8888),
                 stereo_left=_smoke_camera_config(8889, processing_enabled=True),
-                stereo_right=_smoke_camera_config(8890, processing_enabled=False),
+                stereo_right=_smoke_camera_config(
+                    8890,
+                    processing_enabled=False,
+                    enabled=False,
+                ),
             ),
             distance=VisionDistanceConfig(
                 source=DistanceSource.MANUAL,
@@ -358,6 +369,13 @@ def _smoke_app_config() -> AppConfig:
             / "defaults"
             / "navmin.json"
         ).tracking_control,
+        imu=ImuConfig(
+            enabled=False,
+            bind_address="0.0.0.0",
+            port=8891,
+            expected_source=None,
+            calibration_file="calibration/imu.json",
+        ),
         turret=_smoke_turret_config(),
         ui=_smoke_ui_config(),
     )

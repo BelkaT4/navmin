@@ -56,6 +56,14 @@ class MissingCalibrationError(VisionPipelineError):
     """Required calibration was not supplied for the camera role."""
 
 
+class CorrectedFrameSink(Protocol):
+    """Cheap non-blocking observer for corrected frame/session boundaries."""
+
+    def on_camera_session_started(self, session: CameraSessionStarted) -> None: ...
+
+    def on_corrected_frame(self, frame: FramePacket) -> None: ...
+
+
 class _FrameCorrector(Protocol):
     camera_model: CameraModel
 
@@ -147,6 +155,26 @@ def stereo_left_corrector(calibration: StereoCalibration) -> _FrameCorrector:
     )
 
 
+def stereo_right_corrector(calibration: StereoCalibration) -> _FrameCorrector:
+    size = (calibration.image_width, calibration.image_height)
+    map_x, map_y = cv2.initUndistortRectifyMap(
+        np.asarray(calibration.K_right, dtype=np.float64),
+        np.asarray(calibration.D_right, dtype=np.float64),
+        np.asarray(calibration.R2, dtype=np.float64),
+        np.asarray(calibration.P2, dtype=np.float64),
+        size,
+        cv2.CV_32FC1,
+    )
+    _left_model, right_model = stereo_camera_models(calibration)
+    return _OpenCvMapCorrector(
+        image_width=calibration.image_width,
+        image_height=calibration.image_height,
+        map_x=map_x,
+        map_y=map_y,
+        camera_model=right_model,
+    )
+
+
 def build_working_frame_corrector(
     camera: CameraRole,
     *,
@@ -161,6 +189,12 @@ def build_working_frame_corrector(
         if stereo_calibration is None:
             raise MissingCalibrationError("Stereo calibration is required for Stereo Left")
         return stereo_left_corrector(stereo_calibration)
+    if camera is CameraRole.STEREO_RIGHT:
+        if stereo_calibration is None:
+            raise MissingCalibrationError(
+                "Stereo calibration is required for Stereo Right"
+            )
+        return stereo_right_corrector(stereo_calibration)
     raise ValueError(f"prototype checkpoint does not build a pipeline for {camera.value}")
 
 
@@ -247,6 +281,22 @@ class _PendingFrame:
     receive_timestamp_ns: int
 
 
+@dataclass(frozen=True, slots=True)
+class CameraRuntimeDiagnostics:
+    """Bounded read-only metrics for the current camera generation."""
+
+    camera: CameraRole
+    generation: int
+    frames_received: int
+    first_frame_timestamp_ns: int | None
+    latest_frame_timestamp_ns: int | None
+    decoded_width: int | None
+    decoded_height: int | None
+    capture_id_present_count: int
+    capture_id_missing_count: int
+    received_fps: float | None
+
+
 class VisionPipeline:
     """Owner-local prototype pipeline with barrier and latest-only result semantics."""
 
@@ -259,13 +309,18 @@ class VisionPipeline:
         session_barriers: CameraSessionBarrierChannel | None = None,
         target_control: TargetControlChannel | None = None,
         target_events: TargetLifecycleEventChannel | None = None,
+        corrected_frame_sink: CorrectedFrameSink | None = None,
         latest_result: InvalidatableLatest[VisionResult] | None = None,
         status: LatestValue[CameraStatus] | None = None,
         timestamp_clock_ns: Callable[[], int] = monotonic_ns,
         processing_enabled: bool = True,
     ) -> None:
-        if camera not in (CameraRole.OVERVIEW, CameraRole.STEREO_LEFT):
-            raise ValueError("prototype pipeline supports Overview and Stereo Left only")
+        if camera not in (
+            CameraRole.OVERVIEW,
+            CameraRole.STEREO_LEFT,
+            CameraRole.STEREO_RIGHT,
+        ):
+            raise ValueError("unsupported camera role")
         self.camera = camera
         self._corrector = corrector
         self._processor = processor or create_vision_processor()
@@ -274,6 +329,7 @@ class VisionPipeline:
         if self.target_control.camera is not camera:
             raise ValueError("target-control channel belongs to another camera")
         self.target_events = target_events or TargetLifecycleEventChannel()
+        self._corrected_frame_sink = corrected_frame_sink
         self.latest_result = latest_result or InvalidatableLatest()
         self.status = status or LatestValue()
         self._timestamp_clock_ns = timestamp_clock_ns
@@ -283,11 +339,47 @@ class VisionPipeline:
         self._generation = 0
         self._frame_id = 0
         self._state_lock = Lock()
+        self._diagnostic_frames_received = 0
+        self._diagnostic_first_frame_timestamp_ns: int | None = None
+        self._diagnostic_latest_frame_timestamp_ns: int | None = None
+        self._diagnostic_decoded_width: int | None = None
+        self._diagnostic_decoded_height: int | None = None
+        self._diagnostic_capture_id_present_count = 0
+        self._diagnostic_capture_id_missing_count = 0
 
     @property
     def generation(self) -> int:
         with self._state_lock:
             return self._generation
+
+    @property
+    def diagnostics(self) -> CameraRuntimeDiagnostics:
+        with self._state_lock:
+            first_ns = self._diagnostic_first_frame_timestamp_ns
+            latest_ns = self._diagnostic_latest_frame_timestamp_ns
+            frames = self._diagnostic_frames_received
+            elapsed_ns = (
+                None
+                if first_ns is None or latest_ns is None or latest_ns <= first_ns
+                else latest_ns - first_ns
+            )
+            received_fps = (
+                None
+                if elapsed_ns is None or frames < 2
+                else (frames - 1) * 1_000_000_000.0 / elapsed_ns
+            )
+            return CameraRuntimeDiagnostics(
+                camera=self.camera,
+                generation=self._generation,
+                frames_received=frames,
+                first_frame_timestamp_ns=first_ns,
+                latest_frame_timestamp_ns=latest_ns,
+                decoded_width=self._diagnostic_decoded_width,
+                decoded_height=self._diagnostic_decoded_height,
+                capture_id_present_count=self._diagnostic_capture_id_present_count,
+                capture_id_missing_count=self._diagnostic_capture_id_missing_count,
+                received_fps=received_fps,
+            )
 
     def set_processing_enabled(self, enabled: bool) -> None:
         self._processing_enabled = bool(enabled)
@@ -301,6 +393,7 @@ class VisionPipeline:
             self.target_control.discard_pending()
             self._processor.reset()
             self.latest_result.invalidate()
+            self._reset_diagnostics_locked()
             timestamp_ns = self._timestamp_clock_ns()
             self.status.publish(
                 CameraStatus(
@@ -316,6 +409,8 @@ class VisionPipeline:
                 camera_model=self._corrector.camera_model,
                 timestamp_ns=timestamp_ns,
             )
+            if self._corrected_frame_sink is not None:
+                self._corrected_frame_sink.on_camera_session_started(session)
             self.session_barriers.publish(session)
         LOGGER.info("Vision pipeline started camera=%s generation=%d", self.camera.value, generation)
         return session
@@ -446,6 +541,36 @@ class VisionPipeline:
             if receive_timestamp_ns is None
             else receive_timestamp_ns
         )
+        first_frame_evidence: tuple[int, int, int] | None = None
+        with self._state_lock:
+            if generation != self._generation:
+                return
+            self._diagnostic_frames_received += 1
+            self._diagnostic_latest_frame_timestamp_ns = received_ns
+            if capture_id is None:
+                self._diagnostic_capture_id_missing_count += 1
+            else:
+                self._diagnostic_capture_id_present_count += 1
+            if self._diagnostic_first_frame_timestamp_ns is None:
+                self._diagnostic_first_frame_timestamp_ns = received_ns
+                if image.ndim >= 2:
+                    self._diagnostic_decoded_width = int(image.shape[1])
+                    self._diagnostic_decoded_height = int(image.shape[0])
+                    first_frame_evidence = (
+                        generation,
+                        self._diagnostic_decoded_width,
+                        self._diagnostic_decoded_height,
+                    )
+        if first_frame_evidence is not None:
+            evidence_generation, width, height = first_frame_evidence
+            LOGGER.info(
+                "Vision decoded first frame camera=%s generation=%d "
+                "decoded_resolution=%dx%d",
+                self.camera.value,
+                evidence_generation,
+                width,
+                height,
+            )
         self._pending.publish(
             _PendingFrame(
                 generation=generation,
@@ -485,12 +610,18 @@ class VisionPipeline:
                 frame_id=frame_id,
                 capture_id=(
                     pending.capture_id
-                    if self.camera is CameraRole.STEREO_LEFT
+                    if self.camera
+                    in (CameraRole.STEREO_LEFT, CameraRole.STEREO_RIGHT)
                     else None
                 ),
                 receive_timestamp_ns=pending.receive_timestamp_ns,
                 image=image,
             )
+            if self._corrected_frame_sink is not None:
+                with self._state_lock:
+                    if pending.generation != self._generation:
+                        return None
+                    self._corrected_frame_sink.on_corrected_frame(packet)
             processor_output = self._processor.process(
                 packet,
                 processing_enabled=self._processing_enabled,
@@ -538,8 +669,19 @@ class VisionPipeline:
             )
         return result
 
+    def _reset_diagnostics_locked(self) -> None:
+        self._diagnostic_frames_received = 0
+        self._diagnostic_first_frame_timestamp_ns = None
+        self._diagnostic_latest_frame_timestamp_ns = None
+        self._diagnostic_decoded_width = None
+        self._diagnostic_decoded_height = None
+        self._diagnostic_capture_id_present_count = 0
+        self._diagnostic_capture_id_missing_count = 0
+
 
 __all__ = [
+    "CameraRuntimeDiagnostics",
+    "CorrectedFrameSink",
     "DecodedFrame",
     "DecodedFrameSource",
     "InMemoryFrameSource",
@@ -550,4 +692,5 @@ __all__ = [
     "build_working_frame_corrector",
     "overview_corrector",
     "stereo_left_corrector",
+    "stereo_right_corrector",
 ]

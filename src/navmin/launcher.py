@@ -14,8 +14,10 @@ from navmin.calibration import (
     load_stereo_calibration,
 )
 from navmin.config import AppConfig, load_config
+from navmin.imu import ImuCalibration
 from navmin.logging_setup import session_file_logging
 from navmin.session_artifacts import SourceInputPaths
+from navmin.vision.camera_worker import SourceFactory
 
 if TYPE_CHECKING:
     from navmin.application import ApplicationRuntime
@@ -40,6 +42,7 @@ class LoadedApplicationInputs:
     config: AppConfig
     overview_calibration: OverviewCalibration
     stereo_calibration: StereoCalibration
+    imu_calibration: ImuCalibration | None = None
     source_paths: SourceInputPaths | None = None
 
 
@@ -82,6 +85,15 @@ def _config_owned_path(config_path: Path, reference: str) -> Path:
     if candidate.is_absolute():
         return candidate.resolve(strict=False)
     return (config_path.parent / candidate).resolve(strict=False)
+
+
+def resolve_imu_calibration_path(
+    config_path: str | Path,
+    config: AppConfig,
+) -> Path:
+    """Resolve config-owned IMU calibration using the selected root config."""
+    resolved_config = _cwd_resolved(config_path)
+    return _config_owned_path(resolved_config, config.imu.calibration_file)
 
 
 def resolve_application_source_paths(
@@ -155,10 +167,24 @@ def load_application_inputs(paths: LauncherPaths) -> LoadedApplicationInputs:
             exc,
             recoverable=paths.stereo_calibration is None,
         ) from exc
+
+    imu_calibration = None
+    if config.imu.enabled:
+        imu_path = resolve_imu_calibration_path(config_path, config)
+        try:
+            imu_calibration = ImuCalibration.load(imu_path)
+        except (OSError, ValueError) as exc:
+            raise ApplicationInputError(
+                "IMU calibration",
+                imu_path,
+                exc,
+                recoverable=True,
+            ) from exc
     return LoadedApplicationInputs(
         config,
         overview,
         stereo,
+        imu_calibration=imu_calibration,
         source_paths=source_paths,
     )
 
@@ -170,6 +196,9 @@ def run_loaded_application(
     show_diagnostic_clock: bool = False,
     runtime_builder: RuntimeBuilder | None = None,
     ui_runner: UiRunner | None = None,
+    overview_source_factory: SourceFactory | None = None,
+    stereo_left_source_factory: SourceFactory | None = None,
+    stereo_right_source_factory: SourceFactory | None = None,
 ) -> int:
     """Build/start one shared runtime, run Qt, then always perform safe shutdown."""
     if runtime_builder is None:
@@ -181,11 +210,37 @@ def run_loaded_application(
 
         ui_runner = run_ui
 
-    runtime = runtime_builder(
-        config=inputs.config,
-        overview_calibration=inputs.overview_calibration,
-        stereo_calibration=inputs.stereo_calibration,
+    runtime_kwargs = {
+        "config": inputs.config,
+        "overview_calibration": inputs.overview_calibration,
+        "stereo_calibration": inputs.stereo_calibration,
+        "imu_calibration": inputs.imu_calibration,
+    }
+    source_factories = (
+        overview_source_factory,
+        stereo_left_source_factory,
+        stereo_right_source_factory,
     )
+    if any(factory is not None for factory in source_factories):
+        if any(factory is None for factory in source_factories):
+            raise ValueError("all three camera source factories must be provided together")
+        from navmin.application import ApplicationFactories
+
+        runtime_kwargs["factories"] = ApplicationFactories(
+            overview_source_factory=overview_source_factory,
+            stereo_left_source_factory=stereo_left_source_factory,
+            stereo_right_source_factory=stereo_right_source_factory,
+        )
+    runtime = runtime_builder(**runtime_kwargs)
+    imu_runtime = runtime.imu_runtime
+    if imu_runtime is not None and inputs.source_paths is not None:
+        imu_calibration_path = resolve_imu_calibration_path(
+            inputs.source_paths.config,
+            inputs.config,
+        )
+        imu_runtime.set_calibration_writer(
+            lambda calibration, path=imu_calibration_path: calibration.save(path)
+        )
     runtime.start()
     try:
         ui = runtime.ui_dependencies
@@ -193,6 +248,8 @@ def run_loaded_application(
             mediator=ui.mediator,
             camera_bindings=ui.camera_bindings,
             turret_states=ui.turret_states,
+            imu_states=ui.imu_states,
+            imu_controls=ui.imu_controls,
             camera_stale_timeout_ms=ui.camera_stale_timeout_ms,
             pid_controller_config=ui.pid_controller_config,
             apply_pid_tuning=ui.apply_pid_tuning,
@@ -211,6 +268,7 @@ __all__ = [
     "LoadedApplicationInputs",
     "load_application_inputs",
     "resolve_application_source_paths",
+    "resolve_imu_calibration_path",
     "resolve_selected_config_path",
     "run_loaded_application",
     "session_file_logging",

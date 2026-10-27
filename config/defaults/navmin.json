@@ -1,5 +1,5 @@
 {
-  "schema-version": 3,
+  "schema-version": 4,
   "vision": {
     "processing-scope": "main-and-preview",
     "cameras": {
@@ -89,6 +89,13 @@
     "platform-motion": {
       "source": "command-model"
     }
+  },
+  "imu": {
+    "enabled": false,
+    "bind-address": "0.0.0.0",
+    "port": 8891,
+    "expected-source": null,
+    "calibration-file": "calibration/imu.json"
   },
   "turret": {
     "serial": {

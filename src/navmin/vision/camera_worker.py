@@ -15,7 +15,12 @@ from navmin.lifecycle import StopToken
 
 from .camera_source import create_camera_source
 from .gstreamer_source import CameraSourceError
-from .pipeline import DecodedFrameSource, VisionPipeline, VisionPipelineError
+from .pipeline import (
+    CorrectedFrameSink,
+    DecodedFrameSource,
+    VisionPipeline,
+    VisionPipelineError,
+)
 from .processor import create_vision_processor
 
 LOGGER = logging.getLogger(__name__)
@@ -187,6 +192,7 @@ def build_camera_worker(
     config: CameraConfig,
     corrector: _FrameCorrector,
     source_factory: SourceFactory = create_camera_source,
+    corrected_frame_sink: CorrectedFrameSink | None = None,
     idle_wait_s: float = 0.01,
 ) -> CameraWorker:
     """Bind typed camera config to one decoded source and VisionPipeline."""
@@ -196,6 +202,7 @@ def build_camera_worker(
         corrector=corrector,
         processor=create_vision_processor(config.vision_processor_class),
         processing_enabled=config.processing_enabled,
+        corrected_frame_sink=corrected_frame_sink,
     )
     return CameraWorker(
         source=source,

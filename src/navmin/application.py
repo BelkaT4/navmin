@@ -24,7 +24,17 @@ from navmin.contracts import (
     TurretConnectionState,
     TurretState,
 )
-from navmin.core import Mediator
+from navmin.core import DistanceMeasurementMode, Mediator
+from navmin.diagnostics.stereo_runtime import (
+    StereoDiagnosticsReporter,
+    StereoRuntimeDiagnostics,
+)
+from navmin.imu import (
+    ImuCalibration,
+    ImuCalibrationControls,
+    ImuRuntime,
+    ImuRuntimeState,
+)
 from navmin.turret.worker import TransportFactory, TurretWorker
 from navmin.ui.bridge import CameraUiBinding
 from navmin.vision.camera_source import create_camera_source
@@ -34,14 +44,30 @@ from navmin.vision.gstreamer_source import (
     GStreamerRtspSource,
     initialize_gstreamer_runtime,
 )
-from navmin.vision.pipeline import overview_corrector, stereo_left_corrector
+from navmin.vision.pipeline import (
+    overview_corrector,
+    stereo_left_corrector,
+    stereo_right_corrector,
+)
+from navmin.vision.stereo_distance_worker import StereoDistanceWorker
+from navmin.vision.stereo_pairing import StereoPairer
+from navmin.vision.stereo_target_join import (
+    StereoPairingKind,
+    StereoPairingTargetJoinSink,
+    StereoTargetJoiner,
+)
+from navmin.vision.stereo_timestamp_pairing import TimestampStereoPairer
 
 LOGGER = logging.getLogger(__name__)
 
 _DEFAULT_SHUTDOWN_TIMEOUT_SECONDS = 2.0
 _OVERVIEW_COMPONENT = "Overview CameraWorker"
 _STEREO_LEFT_COMPONENT = "Stereo Left CameraWorker"
+_STEREO_RIGHT_COMPONENT = "Stereo Right CameraWorker"
+_STEREO_DISTANCE_COMPONENT = "Stereo Distance Worker"
+_STEREO_DIAGNOSTICS_COMPONENT = "Stereo Diagnostics Reporter"
 _TURRET_COMPONENT = "TurretWorker"
+_IMU_COMPONENT = "IMU Runtime"
 _TURRET_SAFETY_COMPONENT = "Turret safety shutdown"
 
 
@@ -51,7 +77,9 @@ class ApplicationFactories:
 
     overview_source_factory: SourceFactory = create_camera_source
     stereo_left_source_factory: SourceFactory = create_camera_source
+    stereo_right_source_factory: SourceFactory = create_camera_source
     turret_transport_factory: TransportFactory | None = None
+    imu_runtime_factory: Callable[..., ImuRuntime] = ImuRuntime
 
 
 @dataclass(frozen=True)
@@ -61,6 +89,8 @@ class UiRuntimeDependencies:
     mediator: Mediator
     camera_bindings: Mapping[CameraRole, CameraUiBinding]
     turret_states: LatestValue[TurretState]
+    imu_states: LatestValue[ImuRuntimeState] | None
+    imu_controls: ImuCalibrationControls | None
     camera_stale_timeout_ms: int
     pid_controller_config: PidControllerConfig
     apply_pid_tuning: Callable[[PidControllerConfig], None]
@@ -88,13 +118,20 @@ class ApplicationShutdownError(RuntimeError):
 
 
 class ApplicationRuntime:
-    """One-shot owner of the two normal cameras, Turret, and Mediator."""
+    """Own cameras, optional IMU/Stereo helpers, Turret, and Mediator."""
 
     def __init__(
         self,
         *,
         overview_worker: CameraWorker,
         stereo_left_worker: CameraWorker,
+        stereo_right_worker: CameraWorker | None,
+        stereo_pairer: StereoPairer | None,
+        stereo_timestamp_pairer: TimestampStereoPairer | None,
+        stereo_target_joiner: StereoTargetJoiner | None,
+        stereo_distance_worker: StereoDistanceWorker | None,
+        stereo_diagnostics_reporter: StereoDiagnosticsReporter | None,
+        imu_runtime: ImuRuntime | None,
         turret_worker: TurretWorker,
         mediator: Mediator,
         camera_stale_timeout_ms: int,
@@ -107,6 +144,13 @@ class ApplicationRuntime:
             raise TypeError("tracking_control_config must be TrackingControlConfig")
         self.overview_worker = overview_worker
         self.stereo_left_worker = stereo_left_worker
+        self.stereo_right_worker = stereo_right_worker
+        self.stereo_pairer = stereo_pairer
+        self.stereo_timestamp_pairer = stereo_timestamp_pairer
+        self.stereo_target_joiner = stereo_target_joiner
+        self.stereo_distance_worker = stereo_distance_worker
+        self.stereo_diagnostics_reporter = stereo_diagnostics_reporter
+        self.imu_runtime = imu_runtime
         self.turret_worker = turret_worker
         self.mediator = mediator
         self.camera_stale_timeout_ms = camera_stale_timeout_ms
@@ -115,12 +159,13 @@ class ApplicationRuntime:
         self._runtime_tracking_control_config = tracking_control_config
         self._tracking_tuning_revision = 0
 
-        self._camera_workers = MappingProxyType(
-            {
-                CameraRole.OVERVIEW: overview_worker,
-                CameraRole.STEREO_LEFT: stereo_left_worker,
-            }
-        )
+        camera_workers = {
+            CameraRole.OVERVIEW: overview_worker,
+            CameraRole.STEREO_LEFT: stereo_left_worker,
+        }
+        if stereo_right_worker is not None:
+            camera_workers[CameraRole.STEREO_RIGHT] = stereo_right_worker
+        self._camera_workers = MappingProxyType(camera_workers)
         self._camera_bindings = MappingProxyType(
             {
                 CameraRole.OVERVIEW: self._binding(overview_worker),
@@ -131,6 +176,8 @@ class ApplicationRuntime:
             mediator=mediator,
             camera_bindings=self._camera_bindings,
             turret_states=turret_worker.state_updates,
+            imu_states=self.imu_states,
+            imu_controls=self.imu_runtime,
             camera_stale_timeout_ms=camera_stale_timeout_ms,
             pid_controller_config=turret_config.controller,
             apply_pid_tuning=self.apply_pid_tuning,
@@ -152,6 +199,10 @@ class ApplicationRuntime:
     @property
     def turret_states(self) -> LatestValue[TurretState]:
         return self.turret_worker.state_updates
+
+    @property
+    def imu_states(self) -> LatestValue[ImuRuntimeState] | None:
+        return None if self.imu_runtime is None else self.imu_runtime.state_updates
 
     @property
     def ui_dependencies(self) -> UiRuntimeDependencies:
@@ -275,7 +326,7 @@ class ApplicationRuntime:
                 raise ValueError(f"{name} must be >= 0")
 
     def start(self) -> None:
-        """Start Turret, Overview, and Stereo Left with automatic rollback."""
+        """Start owned workers in deterministic order with automatic rollback."""
         if self._start_attempted:
             raise RuntimeError("ApplicationRuntime is one-shot and start was attempted")
         if self._shutdown_complete:
@@ -287,11 +338,23 @@ class ApplicationRuntime:
                 initialize_gstreamer_runtime()
             self.turret_worker.start()
             self._active_components.add(_TURRET_COMPONENT)
+            if self.imu_runtime is not None:
+                self.imu_runtime.start()
+                self._active_components.add(_IMU_COMPONENT)
             self.overview_worker.start()
             self._active_components.add(_OVERVIEW_COMPONENT)
             self.stereo_left_worker.start()
             self._active_components.add(_STEREO_LEFT_COMPONENT)
-        except RuntimeError as startup_error:
+            if self.stereo_right_worker is not None:
+                self.stereo_right_worker.start()
+                self._active_components.add(_STEREO_RIGHT_COMPONENT)
+            if self.stereo_distance_worker is not None:
+                self.stereo_distance_worker.start()
+                self._active_components.add(_STEREO_DISTANCE_COMPONENT)
+            if self.stereo_diagnostics_reporter is not None:
+                self.stereo_diagnostics_reporter.start()
+                self._active_components.add(_STEREO_DIAGNOSTICS_COMPONENT)
+        except (OSError, RuntimeError) as startup_error:
             failures = self._stop_active(_DEFAULT_SHUTDOWN_TIMEOUT_SECONDS)
             if failures:
                 startup_error.add_note(
@@ -302,6 +365,12 @@ class ApplicationRuntime:
                     )
                 )
             self._shutdown_complete = not self._active_components
+            if self.stereo_pairer is not None:
+                self.stereo_pairer.reset()
+            if self.stereo_timestamp_pairer is not None:
+                self.stereo_timestamp_pairer.reset()
+            if self.stereo_target_joiner is not None:
+                self.stereo_target_joiner.reset()
             raise
 
         LOGGER.info("Application runtime workers started")
@@ -315,11 +384,18 @@ class ApplicationRuntime:
             self._start_attempted = True
 
         failures: list[ApplicationShutdownFailure] = []
+        self.mediator.invalidate_distance_computation()
         if _TURRET_COMPONENT in self._active_components:
             safety_failure = self._prepare_turret_for_shutdown(timeout)
             if safety_failure is not None:
                 failures.append(safety_failure)
         failures.extend(self._stop_active(timeout))
+        if self.stereo_pairer is not None:
+            self.stereo_pairer.reset()
+        if self.stereo_timestamp_pairer is not None:
+            self.stereo_timestamp_pairer.reset()
+        if self.stereo_target_joiner is not None:
+            self.stereo_target_joiner.reset()
         self._shutdown_complete = not self._active_components
         if failures:
             raise ApplicationShutdownError(tuple(failures))
@@ -393,12 +469,16 @@ class ApplicationRuntime:
     ) -> tuple[ApplicationShutdownFailure, ...]:
         failures: list[ApplicationShutdownFailure] = []
         ordered = (
+            (_STEREO_DIAGNOSTICS_COMPONENT, self.stereo_diagnostics_reporter),
+            (_STEREO_RIGHT_COMPONENT, self.stereo_right_worker),
             (_STEREO_LEFT_COMPONENT, self.stereo_left_worker),
             (_OVERVIEW_COMPONENT, self.overview_worker),
+            (_STEREO_DISTANCE_COMPONENT, self.stereo_distance_worker),
+            (_IMU_COMPONENT, self.imu_runtime),
             (_TURRET_COMPONENT, self.turret_worker),
         )
         for component, worker in ordered:
-            if component not in self._active_components:
+            if worker is None or component not in self._active_components:
                 continue
             try:
                 if isinstance(worker, CameraWorker):
@@ -417,7 +497,7 @@ class ApplicationRuntime:
     def _uses_production_gstreamer(self) -> bool:
         return any(
             isinstance(worker.source, (GStreamerRtpJpegSource, GStreamerRtspSource))
-            for worker in (self.overview_worker, self.stereo_left_worker)
+            for worker in self._camera_workers.values()
         )
 
     @staticmethod
@@ -446,12 +526,53 @@ def build_application_runtime(
     config: AppConfig,
     overview_calibration: OverviewCalibration,
     stereo_calibration: StereoCalibration,
+    imu_calibration: ImuCalibration | None = None,
     factories: ApplicationFactories | None = None,
 ) -> ApplicationRuntime:
     """Compose the production NavMin runtime from already-loaded typed inputs."""
     if not isinstance(config, AppConfig):
         raise TypeError("config must be AppConfig")
     selected_factories = factories or ApplicationFactories()
+
+    imu_runtime = None
+    if config.imu.enabled:
+        imu_runtime = selected_factories.imu_runtime_factory(
+            bind_address=config.imu.bind_address,
+            port=config.imu.port,
+            expected_source=config.imu.expected_source,
+            calibration=imu_calibration,
+        )
+
+    stereo_config = config.vision.distance.stereo
+    stereo_pairer = None
+    stereo_timestamp_pairer = None
+    stereo_target_joiner = None
+    stereo_distance_worker = None
+    stereo_frame_sink = None
+    if (
+        config.vision.cameras.stereo_left.enabled
+        and config.vision.cameras.stereo_right.enabled
+        and stereo_config.stereo_enabled
+    ):
+        stereo_pairer = StereoPairer(
+            right_frame_buffer_size=stereo_config.right_frame_buffer_size,
+            pair_timeout_ms=stereo_config.pair_timeout_ms,
+        )
+        stereo_timestamp_pairer = TimestampStereoPairer(
+            right_frame_buffer_size=stereo_config.right_frame_buffer_size,
+            pair_timeout_ms=stereo_config.pair_timeout_ms,
+        )
+        stereo_distance_worker = StereoDistanceWorker(
+            calibration=stereo_calibration,
+        )
+        stereo_target_joiner = StereoTargetJoiner(
+            stereo_distance_worker.submit_observation
+        )
+        stereo_frame_sink = StereoPairingTargetJoinSink(
+            stereo_pairer,
+            stereo_target_joiner,
+            timestamp_pairer=stereo_timestamp_pairer,
+        )
 
     overview_worker = build_camera_worker(
         camera=CameraRole.OVERVIEW,
@@ -464,7 +585,17 @@ def build_application_runtime(
         config=config.vision.cameras.stereo_left,
         corrector=stereo_left_corrector(stereo_calibration),
         source_factory=selected_factories.stereo_left_source_factory,
+        corrected_frame_sink=stereo_frame_sink,
     )
+    stereo_right_worker = None
+    if config.vision.cameras.stereo_right.enabled:
+        stereo_right_worker = build_camera_worker(
+            camera=CameraRole.STEREO_RIGHT,
+            config=config.vision.cameras.stereo_right,
+            corrector=stereo_right_corrector(stereo_calibration),
+            source_factory=selected_factories.stereo_right_source_factory,
+            corrected_frame_sink=stereo_frame_sink,
+        )
     turret_worker = TurretWorker(
         config.turret,
         config.tracking_control,
@@ -474,12 +605,18 @@ def build_application_runtime(
         aiming_config=config.aiming,
         tracking_control_config=config.tracking_control,
         tracking_gap_timeout_ms=config.turret.stm32.velocity_watchdog_timeout_ms,
+        initial_manual_distance_m=config.vision.distance.manual_distance_m,
         ui_config=config.ui,
         turret=turret_worker,
         target_controls={
             CameraRole.OVERVIEW: overview_worker.pipeline.target_control,
             CameraRole.STEREO_LEFT: stereo_left_worker.pipeline.target_control,
         },
+        stereo_target_joiner=stereo_target_joiner,
+        stereo_distance_results=(
+            None if stereo_distance_worker is None else stereo_distance_worker.results
+        ),
+        distance_stale_timeout_ms=config.vision.distance.distance_stale_timeout_ms,
         vision_processing_enabled={
             CameraRole.OVERVIEW: config.vision.cameras.overview.processing_enabled,
             CameraRole.STEREO_LEFT: (
@@ -487,9 +624,43 @@ def build_application_runtime(
             ),
         },
     )
+    if stereo_frame_sink is not None:
+        def active_pairing_kind() -> StereoPairingKind | None:
+            mode = mediator.distance_mode
+            if mode is DistanceMeasurementMode.STEREO_EXACT:
+                return StereoPairingKind.EXACT
+            if mode is DistanceMeasurementMode.STEREO_TIMESTAMP:
+                return StereoPairingKind.TIMESTAMP
+            return None
+
+        stereo_frame_sink.set_active_pairing_kind_provider(active_pairing_kind)
+    stereo_diagnostics_reporter = None
+    if (
+        stereo_right_worker is not None
+        and stereo_pairer is not None
+        and stereo_timestamp_pairer is not None
+    ):
+        stereo_diagnostics_reporter = StereoDiagnosticsReporter(
+            StereoRuntimeDiagnostics(
+                left_pipeline=stereo_left_worker.pipeline,
+                right_pipeline=stereo_right_worker.pipeline,
+                exact_pairer=stereo_pairer,
+                timestamp_pairer=stereo_timestamp_pairer,
+                target_joiner=stereo_target_joiner,
+                distance_worker=stereo_distance_worker,
+                mediator=mediator,
+            )
+        )
     return ApplicationRuntime(
         overview_worker=overview_worker,
         stereo_left_worker=stereo_left_worker,
+        stereo_right_worker=stereo_right_worker,
+        stereo_pairer=stereo_pairer,
+        stereo_timestamp_pairer=stereo_timestamp_pairer,
+        stereo_target_joiner=stereo_target_joiner,
+        stereo_distance_worker=stereo_distance_worker,
+        stereo_diagnostics_reporter=stereo_diagnostics_reporter,
+        imu_runtime=imu_runtime,
         turret_worker=turret_worker,
         mediator=mediator,
         camera_stale_timeout_ms=config.vision.camera_stale_timeout_ms,

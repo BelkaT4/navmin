@@ -5,10 +5,12 @@ from __future__ import annotations
 import argparse
 import logging
 import sys
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
 from enum import Enum
 from pathlib import Path
+
+import numpy as np
 
 from navmin.config import (
     AimingConfig,
@@ -18,6 +20,7 @@ from navmin.config import (
     AxesConfig,
     AxisMechanicsConfig,
     CamerasConfig,
+    ImuConfig,
     OverviewCameraConfig,
     PidControllerConfig,
     ProcessingScope,
@@ -36,11 +39,13 @@ from navmin.diagnostics.localhost_rtp import (
     LocalhostRtpJpegSender,
     RtpJpegSenderConfig,
     SenderProcessError,
+    SynchronizedSyntheticStereoSource,
     diagnostic_camera_config,
     diagnostic_overview_calibration,
     diagnostic_stereo_calibration,
 )
 from navmin.diagnostics.pty_stm32 import PtyDiagnosticError, PtyStm32Emulator
+from navmin.diagnostics.synthetic_stereo import rectified_synthetic_calibration
 from navmin.launcher import (
     LauncherPaths,
     LoadedApplicationInputs,
@@ -73,6 +78,7 @@ class DiagnosticSelection:
     overview: CameraEndpoint
     stereo_left: CameraEndpoint
     turret: TurretEndpoint
+    stereo_right: CameraEndpoint | None = None
 
 
 class DiagnosticEndpoints:
@@ -95,13 +101,31 @@ class DiagnosticEndpoints:
             raise RuntimeError("DiagnosticEndpoints is one-shot and already started")
         self._started = True
 
-        config = replace(
-            self._base_inputs.config,
-            turret=replace(self._base_inputs.config.turret, emulate_stm32=False),
+        effective_inputs = _apply_localhost_calibration_overrides(
+            self.selection, self._base_inputs
         )
+        config = replace(
+            effective_inputs.config,
+            turret=replace(effective_inputs.config.turret, emulate_stm32=False),
+        )
+        config = _select_stereo_right(config, self.selection.stereo_right)
+        stereo_source = None
+        if (
+            self.selection.stereo_left is CameraEndpoint.LOCALHOST
+            and self.selection.stereo_right is CameraEndpoint.LOCALHOST
+            and effective_inputs.stereo_calibration.image_width == 1296
+            and effective_inputs.stereo_calibration.image_height == 976
+        ):
+            stereo_source = SynchronizedSyntheticStereoSource(
+                effective_inputs.stereo_calibration
+            )
+            LOGGER.info(
+                "Diagnostic localhost stereo source=working-range "
+                "targets=100m/150m/200m speeds=30/70/120px-s"
+            )
         try:
             if self.selection.overview is CameraEndpoint.LOCALHOST:
-                overview = self._base_inputs.overview_calibration
+                overview = effective_inputs.overview_calibration
                 config = _replace_camera_endpoint(
                     config,
                     camera_name="overview",
@@ -117,7 +141,7 @@ class DiagnosticEndpoints:
                 )
 
             if self.selection.stereo_left is CameraEndpoint.LOCALHOST:
-                stereo = self._base_inputs.stereo_calibration
+                stereo = effective_inputs.stereo_calibration
                 config = _replace_camera_endpoint(
                     config,
                     camera_name="stereo_left",
@@ -130,6 +154,27 @@ class DiagnosticEndpoints:
                     port=source.port,
                     width=stereo.image_width,
                     height=stereo.image_height,
+                    frame_supplier=(
+                        None
+                        if stereo_source is None
+                        else lambda: stereo_source.next_frame(CameraRole.STEREO_LEFT)
+                    ),
+                )
+
+            if self.selection.stereo_right is CameraEndpoint.LOCALHOST:
+                stereo = effective_inputs.stereo_calibration
+                source = config.vision.cameras.stereo_right.source
+                assert isinstance(source, RtpJpegSourceConfig)
+                self._start_sender(
+                    camera_role=CameraRole.STEREO_RIGHT,
+                    port=source.port,
+                    width=stereo.image_width,
+                    height=stereo.image_height,
+                    frame_supplier=(
+                        None
+                        if stereo_source is None
+                        else lambda: stereo_source.next_frame(CameraRole.STEREO_RIGHT)
+                    ),
                 )
 
             if self.selection.turret is TurretEndpoint.PTY:
@@ -149,7 +194,7 @@ class DiagnosticEndpoints:
             self.stop()
             raise
 
-        return replace(self._base_inputs, config=config)
+        return replace(effective_inputs, config=config)
 
     def stop(self) -> None:
         errors: list[RuntimeError] = []
@@ -177,6 +222,7 @@ class DiagnosticEndpoints:
         port: int,
         width: int,
         height: int,
+        frame_supplier: Callable[[], np.ndarray] | None = None,
     ) -> None:
         sender = LocalhostRtpJpegSender(
             RtpJpegSenderConfig(
@@ -184,7 +230,8 @@ class DiagnosticEndpoints:
                 width=width,
                 height=height,
                 camera=camera_role,
-            )
+            ),
+            frame_supplier=frame_supplier,
         )
         sender.start()
         self._senders.append(sender)
@@ -220,7 +267,7 @@ def _synthetic_diagnostic_inputs() -> LoadedApplicationInputs:
     stereo_left = replace(diagnostic_camera_config(8889), processing_enabled=True)
     stereo_right = diagnostic_camera_config(8890)
     config = AppConfig(
-        schema_version=3,
+        schema_version=4,
         vision=VisionConfig(
             processing_scope=ProcessingScope.MAIN_AND_PREVIEW,
             cameras=CamerasConfig(
@@ -247,6 +294,13 @@ def _synthetic_diagnostic_inputs() -> LoadedApplicationInputs:
             aim_points=AimPointsConfig(overview=center, stereo_left=center),
         ),
         tracking_control=_default_tracking_control_config(),
+        imu=ImuConfig(
+            enabled=False,
+            bind_address="0.0.0.0",
+            port=8891,
+            expected_source=None,
+            calibration_file="calibration/imu.json",
+        ),
         turret=TurretConfig(
             serial=SerialConfig(
                 port="diagnostic-pty",
@@ -308,12 +362,57 @@ def _replace_camera_endpoint(
     return replace(config, vision=replace(config.vision, cameras=updated_cameras))
 
 
+def _apply_localhost_calibration_overrides(
+    selection: DiagnosticSelection,
+    inputs: LoadedApplicationInputs,
+) -> LoadedApplicationInputs:
+    """Keep localhost frames unchanged by production correction where safe.
+
+    Overview owns an independent calibration, so localhost can always use an
+    image-identity fisheye calibration. Stereo Left/Right share one calibration;
+    therefore the rectified synthetic calibration is used only when no active
+    Stereo camera in the diagnostic selection is real. Mixed real/localhost
+    Stereo profiles retain the file-backed physical calibration.
+    """
+    overview = inputs.overview_calibration
+    stereo = inputs.stereo_calibration
+    override_overview = selection.overview is CameraEndpoint.LOCALHOST
+    stereo_left_local = selection.stereo_left is CameraEndpoint.LOCALHOST
+    stereo_right_real = selection.stereo_right is CameraEndpoint.REAL
+    override_stereo = stereo_left_local and not stereo_right_real
+
+    if override_overview:
+        overview = diagnostic_overview_calibration(
+            inputs.overview_calibration.image_width,
+            inputs.overview_calibration.image_height,
+        )
+    if override_stereo:
+        stereo = rectified_synthetic_calibration(inputs.stereo_calibration)
+
+    if override_overview or override_stereo:
+        LOGGER.info(
+            "Diagnostic localhost calibration override overview=%s stereo=%s",
+            "identity" if override_overview else "physical",
+            "rectified-synthetic" if override_stereo else "physical",
+        )
+    return replace(
+        inputs,
+        overview_calibration=overview,
+        stereo_calibration=stereo,
+    )
+
+
 def _planned_preflight_inputs(
     selection: DiagnosticSelection,
     inputs: LoadedApplicationInputs,
 ) -> LoadedApplicationInputs:
-    """Apply only pure endpoint overrides needed to preflight the planned profile."""
-    config = replace(inputs.config, turret=replace(inputs.config.turret, emulate_stm32=False))
+    """Apply only pure endpoint/calibration overrides for the planned profile."""
+    inputs = _apply_localhost_calibration_overrides(selection, inputs)
+    config = replace(
+        inputs.config,
+        turret=replace(inputs.config.turret, emulate_stm32=False),
+    )
+    config = _select_stereo_right(config, selection.stereo_right)
     if selection.overview is CameraEndpoint.LOCALHOST:
         config = _replace_camera_endpoint(
             config, camera_name="overview", fallback_port=8888
@@ -325,9 +424,33 @@ def _planned_preflight_inputs(
     return replace(inputs, config=config)
 
 
+def _select_stereo_right(
+    config: AppConfig,
+    endpoint: CameraEndpoint | None,
+) -> AppConfig:
+    cameras = config.vision.cameras
+    enabled = endpoint is not None
+    if cameras.stereo_right.enabled != enabled:
+        config = replace(
+            config,
+            vision=replace(
+                config.vision,
+                cameras=replace(
+                    cameras,
+                    stereo_right=replace(cameras.stereo_right, enabled=enabled),
+                ),
+            ),
+        )
+    if endpoint is CameraEndpoint.LOCALHOST:
+        config = _replace_camera_endpoint(
+            config, camera_name="stereo_right", fallback_port=8890
+        )
+    return config
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="run_diagnostic_app.py",
+        prog="navmin.diagnostic_launcher",
         description=(
             "Run the shared NavMin application with explicit real/localhost camera "
             "endpoints and a real/PTY controller endpoint."
@@ -374,6 +497,15 @@ def _parser() -> argparse.ArgumentParser:
         required=True,
     )
     parser.add_argument(
+        "--stereo-right",
+        choices=tuple(item.value for item in CameraEndpoint),
+        default=None,
+        help=(
+            "Enable Stereo Right explicitly with the configured real source or a "
+            "localhost RTP/JPEG sender. Omit to keep it disabled."
+        ),
+    )
+    parser.add_argument(
         "--turret",
         choices=tuple(item.value for item in TurretEndpoint),
         required=True,
@@ -394,16 +526,23 @@ def main(argv: Sequence[str] | None = None) -> int:
         overview=CameraEndpoint(args.overview),
         stereo_left=CameraEndpoint(args.stereo_left),
         turret=TurretEndpoint(args.turret),
+        stereo_right=(
+            CameraEndpoint(args.stereo_right)
+            if args.stereo_right is not None
+            else None
+        ),
     )
-    fully_synthetic = selection == DiagnosticSelection(
-        overview=CameraEndpoint.LOCALHOST,
-        stereo_left=CameraEndpoint.LOCALHOST,
-        turret=TurretEndpoint.PTY,
+    fully_synthetic = (
+        selection.overview is CameraEndpoint.LOCALHOST
+        and selection.stereo_left is CameraEndpoint.LOCALHOST
+        and selection.turret is TurretEndpoint.PTY
+        and selection.stereo_right in (None, CameraEndpoint.LOCALHOST)
     )
     if args.synthetic_inputs and not fully_synthetic:
         parser.error(
             "--synthetic-inputs requires --overview localhost "
-            "--stereo-left localhost --turret pty"
+            "--stereo-left localhost --turret pty and, when provided, "
+            "--stereo-right localhost"
         )
 
     artifacts = SessionArtifacts.create(
@@ -416,11 +555,17 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     with session_file_logging(artifacts.runtime_log_path, level=logging.DEBUG):
         LOGGER.info(
-            "Diagnostic launcher selected overview=%s stereo_left=%s turret=%s; "
-            "inputs=%s config=%s overview_calibration_override=%s "
-            "stereo_calibration_override=%s session=%s",
+            "Diagnostic launcher selected overview=%s stereo_left=%s "
+            "stereo_right=%s turret=%s; inputs=%s config=%s "
+            "overview_calibration_override=%s stereo_calibration_override=%s "
+            "session=%s",
             selection.overview.value,
             selection.stereo_left.value,
+            (
+                selection.stereo_right.value
+                if selection.stereo_right is not None
+                else "disabled"
+            ),
             selection.turret.value,
             "synthetic" if args.synthetic_inputs else "files",
             paths.config,
@@ -453,6 +598,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                     overview=selection.overview.value,
                     stereo_left=selection.stereo_left.value,
                     turret=selection.turret.value,
+                    stereo_right=(
+                        selection.stereo_right.value
+                        if selection.stereo_right is not None
+                        else None
+                    ),
                 ),
                 session_dir=artifacts.session_dir,
             )
@@ -497,7 +647,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                 effective_inputs,
                 show_diagnostic_clock=(
                     CameraEndpoint.LOCALHOST
-                    in (selection.overview, selection.stereo_left)
+                    in (
+                        selection.overview,
+                        selection.stereo_left,
+                        selection.stereo_right,
+                    )
                 ),
             )
             if exit_code == 0:
