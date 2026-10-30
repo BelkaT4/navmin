@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import math
 from collections.abc import Callable
 from dataclasses import dataclass
 
 from PyQt6.QtCore import QEvent, QLineF, QPointF, QRectF, QSize, Qt
 from PyQt6.QtGui import (
+    QBrush,
     QColor,
     QEnterEvent,
     QFont,
@@ -21,6 +23,9 @@ from PyQt6.QtGui import (
 from PyQt6.QtWidgets import QPushButton, QWidget
 
 from navmin.contracts import (
+    BBox,
+    CameraModel,
+    CameraRay,
     CameraRole,
     CameraState,
     CameraStatus,
@@ -29,13 +34,19 @@ from navmin.contracts import (
     TargetRef,
     VisionResult,
 )
-from navmin.core import CameraSessionGate
+from navmin.core import CameraSessionGate, TrackingControlVisualization
+from navmin.vision.processor import VisionTrackingDiagnostics
 
 STALE_MESSAGE = "НЕТ НОВЫХ КАДРОВ"
 
 _RETICLE_GAP_PX = 4.0
 _RETICLE_LENGTH_PX = 10.0
 _RETICLE_PEN_WIDTH_PX = 3
+_TRACKING_OVERLAY_PEN_WIDTH_PX = 2
+_SEARCH_REGION_COLOR = QColor(255, 80, 180)
+_BEST_CANDIDATE_COLOR = QColor(255, 145, 40)
+_CONTROL_PREDICTION_COLOR = QColor(40, 185, 255)
+_CONTROL_PREDICTION_ENDPOINT_RADIUS_PX = 4.0
 
 _CAMERA_NAMES = {
     CameraRole.OVERVIEW: "Overview",
@@ -49,6 +60,83 @@ class PreparedVisionFrame:
 
     result: VisionResult
     pixmap: QPixmap
+
+
+@dataclass(frozen=True)
+class ControlPredictionOverlay:
+    """Display-only prediction geometry derived from one authoritative snapshot."""
+
+    observed_px: tuple[float, float]
+    predicted_px: tuple[float, float]
+
+
+def project_control_prediction(
+    visualization: TrackingControlVisualization,
+    camera_model: CameraModel,
+) -> ControlPredictionOverlay | None:
+    """Project raw angular forecast into pixels without feeding control state."""
+    if not (visualization.rate_valid_x or visualization.rate_valid_y):
+        return None
+
+    delta_x_deg = (
+        visualization.raw_prediction_offset_x_deg
+        if visualization.rate_valid_x
+        else 0.0
+    )
+    delta_y_deg = (
+        visualization.raw_prediction_offset_y_deg
+        if visualization.rate_valid_y
+        else 0.0
+    )
+    if delta_x_deg == 0.0 and delta_y_deg == 0.0:
+        return None
+
+    try:
+        observed_ray = camera_model.pixel_to_ray(*visualization.observed_center_px)
+    except (AttributeError, TypeError, ValueError, ZeroDivisionError):
+        return None
+    if not all(
+        math.isfinite(value)
+        for value in (observed_ray.x, observed_ray.y, observed_ray.z)
+    ) or (
+        observed_ray.x == 0.0
+        and observed_ray.y == 0.0
+        and observed_ray.z == 0.0
+    ):
+        return None
+    horizontal = math.atan2(observed_ray.x, observed_ray.z)
+    vertical = -math.atan2(
+        observed_ray.y,
+        math.hypot(observed_ray.x, observed_ray.z),
+    )
+    horizontal += math.radians(delta_x_deg)
+    vertical += math.radians(delta_y_deg)
+    cos_vertical = math.cos(vertical)
+    predicted_ray = CameraRay(
+        cos_vertical * math.sin(horizontal),
+        -math.sin(vertical),
+        cos_vertical * math.cos(horizontal),
+    )
+    try:
+        predicted_px = camera_model.ray_to_pixel(predicted_ray)
+    except (AttributeError, TypeError, ValueError, ZeroDivisionError):
+        return None
+    if not all(math.isfinite(value) for value in predicted_px):
+        return None
+    predicted_x = (
+        float(predicted_px[0])
+        if visualization.rate_valid_x
+        else visualization.observed_center_px[0]
+    )
+    predicted_y = (
+        float(predicted_px[1])
+        if visualization.rate_valid_y
+        else visualization.observed_center_px[1]
+    )
+    return ControlPredictionOverlay(
+        observed_px=visualization.observed_center_px,
+        predicted_px=(predicted_x, predicted_y),
+    )
 
 
 def prepare_vision_frame(result: VisionResult) -> PreparedVisionFrame:
@@ -127,6 +215,52 @@ def map_source_to_widget(
     )
 
 
+def _map_source_to_widget_unbounded(
+    point: tuple[float, float],
+    display_rect: QRectF,
+    source_size: QSize,
+) -> QPointF | None:
+    if display_rect.isEmpty() or source_size.isEmpty():
+        return None
+    x_px, y_px = point
+    return QPointF(
+        display_rect.left()
+        + (x_px + 0.5) * display_rect.width() / source_size.width(),
+        display_rect.top()
+        + (y_px + 0.5) * display_rect.height() / source_size.height(),
+    )
+
+
+def map_source_radius_to_widget(
+    radius_px: float,
+    display_rect: QRectF,
+    source_size: QSize,
+) -> tuple[float, float] | None:
+    """Map a source-space radius into the aspect-preserving display rectangle."""
+    if radius_px < 0 or display_rect.isEmpty() or source_size.isEmpty():
+        return None
+    return (
+        radius_px * display_rect.width() / source_size.width(),
+        radius_px * display_rect.height() / source_size.height(),
+    )
+
+
+def map_bbox_to_widget(
+    bbox: BBox,
+    display_rect: QRectF,
+    source_size: QSize,
+) -> QRectF | None:
+    """Map an integer source bbox into the rendered image rectangle."""
+    if display_rect.isEmpty() or source_size.isEmpty():
+        return None
+    return QRectF(
+        display_rect.left() + bbox.x * display_rect.width() / source_size.width(),
+        display_rect.top() + bbox.y * display_rect.height() / source_size.height(),
+        bbox.width * display_rect.width() / source_size.width(),
+        bbox.height * display_rect.height() / source_size.height(),
+    )
+
+
 def reticle_segments(center: QPointF) -> tuple[QLineF, QLineF, QLineF, QLineF]:
     """Return the four fixed-size reticle segments around a clear center."""
     x = center.x()
@@ -176,6 +310,12 @@ class VideoView(QWidget):
         self._selected_target: TargetRef | None = None
         self._target_distance: DistanceResult | None = None
         self._aim_point: tuple[float, float] | None = None
+        self._tracking_diagnostics: VisionTrackingDiagnostics | None = None
+        self._tracking_control_visualization: TrackingControlVisualization | None = None
+        self._control_prediction_overlay: ControlPredictionOverlay | None = None
+        self._show_search_region = False
+        self._show_best_candidate = False
+        self._show_control_prediction = False
         self._stale = False
         self.setMinimumSize(1, 1)
         self.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent)
@@ -216,6 +356,18 @@ class VideoView(QWidget):
         return self._target_distance
 
     @property
+    def tracking_diagnostics(self) -> VisionTrackingDiagnostics | None:
+        return self._tracking_diagnostics
+
+    @property
+    def tracking_control_visualization(self) -> TrackingControlVisualization | None:
+        return self._tracking_control_visualization
+
+    @property
+    def control_prediction_overlay(self) -> ControlPredictionOverlay | None:
+        return self._control_prediction_overlay
+
+    @property
     def distance_annotation_text(self) -> str | None:
         result = self.displayed_result
         target = self._selected_target
@@ -247,6 +399,9 @@ class VideoView(QWidget):
         self._camera = camera
         self._target_distance = None
         self._aim_point = None
+        self._tracking_diagnostics = None
+        self._tracking_control_visualization = None
+        self._control_prediction_overlay = None
         self.update()
 
     def set_prepared_frame(self, prepared: PreparedVisionFrame | None) -> None:
@@ -255,7 +410,108 @@ class VideoView(QWidget):
         self._prepared = prepared
         if prepared is None:
             self._aim_point = None
+            self._tracking_diagnostics = None
+            self._tracking_control_visualization = None
+            self._control_prediction_overlay = None
+        else:
+            if not self._diagnostics_match_result(
+                self._tracking_diagnostics,
+                prepared.result,
+            ):
+                self._tracking_diagnostics = None
+            if not self._control_visualization_matches_result(
+                self._tracking_control_visualization,
+                prepared.result,
+            ):
+                self._tracking_control_visualization = None
+                self._control_prediction_overlay = None
         self.update()
+
+    def set_tracking_diagnostics(
+        self,
+        diagnostics: VisionTrackingDiagnostics | None,
+    ) -> None:
+        result = self.displayed_result
+        if diagnostics is not None and (
+            self._preview
+            or result is None
+            or not self._diagnostics_match_result(diagnostics, result)
+        ):
+            diagnostics = None
+        if diagnostics == self._tracking_diagnostics:
+            return
+        self._tracking_diagnostics = diagnostics
+        self.update()
+
+    def set_tracking_control_visualization(
+        self,
+        visualization: TrackingControlVisualization | None,
+        camera_model: CameraModel | None,
+    ) -> None:
+        result = self.displayed_result
+        if visualization is not None and (
+            self._preview
+            or result is None
+            or camera_model is None
+            or not self._control_visualization_matches_result(visualization, result)
+            or visualization.target != self._selected_target
+        ):
+            visualization = None
+        overlay = (
+            None
+            if visualization is None or camera_model is None
+            else project_control_prediction(visualization, camera_model)
+        )
+        if (
+            visualization == self._tracking_control_visualization
+            and overlay == self._control_prediction_overlay
+        ):
+            return
+        self._tracking_control_visualization = visualization
+        self._control_prediction_overlay = overlay
+        self.update()
+
+    def set_tracking_visualization(
+        self,
+        *,
+        show_search_region: bool,
+        show_best_candidate: bool,
+        show_control_prediction: bool = False,
+    ) -> None:
+        changed = (
+            self._show_search_region != show_search_region
+            or self._show_best_candidate != show_best_candidate
+            or self._show_control_prediction != show_control_prediction
+        )
+        self._show_search_region = show_search_region
+        self._show_best_candidate = show_best_candidate
+        self._show_control_prediction = show_control_prediction
+        if changed:
+            self.update()
+
+    @staticmethod
+    def _diagnostics_match_result(
+        diagnostics: VisionTrackingDiagnostics | None,
+        result: VisionResult,
+    ) -> bool:
+        return bool(
+            diagnostics is not None
+            and diagnostics.camera is result.frame.camera
+            and diagnostics.generation == result.frame.generation
+            and diagnostics.frame_id == result.frame.frame_id
+        )
+
+    @staticmethod
+    def _control_visualization_matches_result(
+        visualization: TrackingControlVisualization | None,
+        result: VisionResult,
+    ) -> bool:
+        return bool(
+            visualization is not None
+            and visualization.camera is result.frame.camera
+            and visualization.generation == result.frame.generation
+            and visualization.frame_id == result.frame.frame_id
+        )
 
     def set_camera_status(self, status: CameraStatus | None) -> None:
         if status == self._status:
@@ -269,6 +525,12 @@ class VideoView(QWidget):
         self._selected_target = target
         if self._target_distance is not None and self._target_distance.target != target:
             self._target_distance = None
+        if (
+            self._tracking_control_visualization is not None
+            and self._tracking_control_visualization.target != target
+        ):
+            self._tracking_control_visualization = None
+            self._control_prediction_overlay = None
         self.update()
 
     def set_target_distance(self, distance: DistanceResult | None) -> None:
@@ -390,7 +652,17 @@ class VideoView(QWidget):
         prepared = self._prepared
         if prepared is not None:
             display_rect = self.rendered_rect()
-            painter.drawPixmap(display_rect, prepared.pixmap, QRectF(prepared.pixmap.rect()))
+            painter.drawPixmap(
+                display_rect,
+                prepared.pixmap,
+                QRectF(prepared.pixmap.rect()),
+            )
+            self._draw_tracking_overlays(painter, display_rect, prepared.result)
+            self._draw_control_prediction_overlay(
+                painter,
+                display_rect,
+                prepared.result,
+            )
             self._draw_objects(painter, display_rect, prepared.result)
             self._draw_reticle(painter, display_rect, prepared.result)
             if self._stale:
@@ -399,6 +671,129 @@ class VideoView(QWidget):
         else:
             self._draw_center_message(painter, QRectF(self.rect()), "ОЖИДАНИЕ КАДРА")
         self._draw_camera_and_status(painter)
+
+    def _draw_tracking_overlays(
+        self,
+        painter: QPainter,
+        display_rect: QRectF,
+        result: VisionResult,
+    ) -> None:
+        if self._preview:
+            return
+        diagnostics = self._tracking_diagnostics
+        if not self._diagnostics_match_result(diagnostics, result):
+            return
+        assert diagnostics is not None
+        height, width = result.frame.image.shape[:2]
+        source_size = QSize(width, height)
+
+        if self._show_search_region:
+            search_pen = QPen(
+                _SEARCH_REGION_COLOR,
+                _TRACKING_OVERLAY_PEN_WIDTH_PX,
+                Qt.PenStyle.DashLine,
+            )
+            painter.setPen(search_pen)
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            if diagnostics.full_frame_search:
+                inset = _TRACKING_OVERLAY_PEN_WIDTH_PX / 2.0
+                painter.drawRect(display_rect.adjusted(inset, inset, -inset, -inset))
+            else:
+                center = _map_source_to_widget_unbounded(
+                    diagnostics.predicted_xy,
+                    display_rect,
+                    source_size,
+                )
+                radius = map_source_radius_to_widget(
+                    diagnostics.search_radius_px,
+                    display_rect,
+                    source_size,
+                )
+                if center is not None and radius is not None:
+                    painter.drawEllipse(center, radius[0], radius[1])
+
+        if self._show_best_candidate and diagnostics.best_candidate_bbox is not None:
+            if self._best_candidate_is_accepted(result, diagnostics.best_candidate_bbox):
+                return
+            candidate_rect = map_bbox_to_widget(
+                diagnostics.best_candidate_bbox,
+                display_rect,
+                source_size,
+            )
+            if candidate_rect is not None:
+                painter.setPen(
+                    QPen(
+                        _BEST_CANDIDATE_COLOR,
+                        _TRACKING_OVERLAY_PEN_WIDTH_PX,
+                        Qt.PenStyle.DashLine,
+                    )
+                )
+                painter.setBrush(Qt.BrushStyle.NoBrush)
+                painter.drawRect(candidate_rect)
+
+    def _best_candidate_is_accepted(
+        self,
+        result: VisionResult,
+        candidate_bbox: BBox,
+    ) -> bool:
+        target = self._selected_target
+        if (
+            target is None
+            or target.camera is not result.frame.camera
+            or target.generation != result.frame.generation
+        ):
+            return False
+        for tracked in result.tracked_objects:
+            if tracked.track_id == target.track_id:
+                return tracked.bbox == candidate_bbox
+        return False
+
+    def _draw_control_prediction_overlay(
+        self,
+        painter: QPainter,
+        display_rect: QRectF,
+        result: VisionResult,
+    ) -> None:
+        if self._preview or not self._show_control_prediction:
+            return
+        visualization = self._tracking_control_visualization
+        overlay = self._control_prediction_overlay
+        if (
+            overlay is None
+            or visualization is None
+            or visualization.target != self._selected_target
+            or not self._control_visualization_matches_result(visualization, result)
+        ):
+            return
+        height, width = result.frame.image.shape[:2]
+        source_size = QSize(width, height)
+        start = _map_source_to_widget_unbounded(
+            overlay.observed_px,
+            display_rect,
+            source_size,
+        )
+        end = _map_source_to_widget_unbounded(
+            overlay.predicted_px,
+            display_rect,
+            source_size,
+        )
+        if start is None or end is None or start == end:
+            return
+        painter.setPen(
+            QPen(
+                _CONTROL_PREDICTION_COLOR,
+                _TRACKING_OVERLAY_PEN_WIDTH_PX,
+                Qt.PenStyle.SolidLine,
+                Qt.PenCapStyle.RoundCap,
+            )
+        )
+        painter.setBrush(QBrush(_CONTROL_PREDICTION_COLOR))
+        painter.drawLine(QLineF(start, end))
+        painter.drawEllipse(
+            end,
+            _CONTROL_PREDICTION_ENDPOINT_RADIUS_PX,
+            _CONTROL_PREDICTION_ENDPOINT_RADIUS_PX,
+        )
 
     def _draw_objects(
         self,

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import replace
 from pathlib import Path
 from threading import Event
@@ -401,6 +402,48 @@ def test_core_uses_platform_rate_at_observation_timestamp_not_latest_anchor() ->
     assert turret.platform_snapshot.anchors[-1].modeled_rate_x_deg_s == 30.0
 
 
+def test_tracking_debug_log_exposes_estimator_prediction_and_ff_fields(caplog) -> None:
+    mediator, _turret, _controls_value = _mediator(
+        mode=TurretControlMode.TRACKING
+    )
+    initial = _accept_main(mediator)
+    request = _request(mediator, initial)
+    assert mediator.accept_target_lifecycle_event(_acquired(request))
+    caplog.set_level(logging.DEBUG, logger="navmin.core.mediator")
+
+    for timestamp_ns in (50_000_000, 100_000_000, 150_000_000):
+        assert mediator.accept_vision_result(
+            _result(
+                CameraRole.OVERVIEW,
+                1,
+                timestamp_ns=timestamp_ns,
+            )
+        )
+
+    messages = [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == "navmin.core.mediator"
+        and record.getMessage().startswith("tracking-observation ")
+    ]
+    assert messages
+    message = messages[-1]
+    for field in (
+        "frame_id=",
+        "relative_rate_x_deg_s=",
+        "platform_rate_x_deg_s=",
+        "target_rate_x_deg_s=",
+        "rate_valid_x=",
+        "invalid_reason_x=",
+        "prediction_raw_x_deg=",
+        "prediction_applied_x_deg=",
+        "prediction_clamped_x=",
+        "ff_enabled=",
+        "ff_gain_x=",
+    ):
+        assert field in message
+
+
 def test_uncovered_platform_history_disables_contributions_but_submits_pid_error() -> (
     None
 ):
@@ -431,6 +474,37 @@ def test_uncovered_platform_history_disables_contributions_but_submits_pid_error
     assert not sample.rate_valid_x and not sample.rate_valid_y
     assert sample.prediction_offset_x_deg == 0.0
     assert sample.prediction_offset_y_deg == 0.0
+
+
+def test_control_visualization_is_exact_frame_bound_and_cleared_on_new_select() -> None:
+    mediator, _turret, _controls_value = _mediator(
+        mode=TurretControlMode.TRACKING
+    )
+    initial = _accept_main(mediator)
+    request = _request(mediator, initial)
+    assert mediator.accept_target_lifecycle_event(_acquired(request))
+
+    current = _result(
+        CameraRole.OVERVIEW,
+        1,
+        frame_id=9,
+        timestamp_ns=150_000_000,
+    )
+    assert mediator.accept_vision_result(current)
+
+    snapshot = mediator.tracking_control_visualization
+    assert snapshot is not None
+    assert snapshot.target == mediator.selected_target
+    assert snapshot.camera is current.frame.camera
+    assert snapshot.generation == current.frame.generation
+    assert snapshot.frame_id == current.frame.frame_id
+    assert snapshot.observation_timestamp_ns == current.frame.receive_timestamp_ns
+    assert snapshot.observed_center_px == (60.0, 40.0)
+    assert snapshot.applied_prediction_offset_x_deg == 0.0
+    assert snapshot.applied_prediction_offset_y_deg == 0.0
+
+    assert mediator.request_target_selection(current, 60.0, 40.0)
+    assert mediator.tracking_control_visualization is None
 
 
 def test_new_target_requires_estimator_history_to_be_collected_again() -> None:

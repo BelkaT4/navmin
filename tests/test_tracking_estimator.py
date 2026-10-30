@@ -242,6 +242,12 @@ def test_estimator_config_change_resets_history_but_control_only_change_does_not
     estimator.replace_config(control_only)
     assert estimator.sample_count == 4
 
+    diagnostics = _observe(estimator, 400, 4.0, 0.0)
+    assert diagnostics.x.valid
+    assert diagnostics.x.raw_prediction_offset_deg == pytest.approx(0.5)
+    assert diagnostics.x.applied_prediction_offset_deg == pytest.approx(0.5)
+    assert estimator.sample_count == 5
+
     estimator_changed = replace(
         control_only,
         velocity_estimator=replace(control_only.velocity_estimator, window_ms=250),
@@ -275,3 +281,86 @@ def test_new_target_starts_new_observation_history() -> None:
         diagnostics.x.invalid_reason
         is TrackingEstimateInvalidReason.INSUFFICIENT_SAMPLES
     )
+
+
+def test_default_prediction_safety_cap_is_five_degrees_per_axis() -> None:
+    config = _config(
+        window_ms=500,
+        max_samples=8,
+        max_target_rate_x_deg_s=100.0,
+        max_target_rate_y_deg_s=100.0,
+    )
+    estimator = TrackingEstimator(
+        replace(
+            config,
+            prediction=replace(
+                config.prediction,
+                enabled=True,
+                horizon_ms=200,
+            ),
+        )
+    )
+
+    diagnostics = None
+    for time_ms in (0, 100, 200, 300, 400):
+        time_s = time_ms / 1000.0
+        diagnostics = _observe(
+            estimator,
+            time_ms,
+            40.0 * time_s,
+            -40.0 * time_s,
+        )
+
+    assert diagnostics is not None
+    assert diagnostics.x.valid and diagnostics.y.valid
+    assert diagnostics.x.raw_prediction_offset_deg == pytest.approx(8.0)
+    assert diagnostics.y.raw_prediction_offset_deg == pytest.approx(-8.0)
+    assert diagnostics.x.applied_prediction_offset_deg == pytest.approx(5.0)
+    assert diagnostics.y.applied_prediction_offset_deg == pytest.approx(-5.0)
+
+
+def test_raw_prediction_is_available_while_control_prediction_is_disabled() -> None:
+    config = _config(
+        window_ms=500,
+        max_samples=8,
+        max_target_rate_x_deg_s=100.0,
+        max_target_rate_y_deg_s=100.0,
+    )
+    prediction = replace(
+        config.prediction,
+        enabled=False,
+        horizon_ms=200,
+        max_angle_x_deg=0.5,
+        max_angle_y_deg=0.5,
+    )
+    estimator = TrackingEstimator(replace(config, prediction=prediction))
+
+    diagnostics = None
+    for time_ms in (0, 100, 200, 300, 400):
+        time_s = time_ms / 1000.0
+        diagnostics = _observe(
+            estimator,
+            time_ms,
+            10.0 * time_s,
+            -5.0 * time_s,
+        )
+
+    assert diagnostics is not None
+    assert diagnostics.x.valid and diagnostics.y.valid
+    assert diagnostics.x.raw_prediction_offset_deg == pytest.approx(2.0)
+    assert diagnostics.y.raw_prediction_offset_deg == pytest.approx(-1.0)
+    assert diagnostics.x.applied_prediction_offset_deg == 0.0
+    assert diagnostics.y.applied_prediction_offset_deg == 0.0
+
+    estimator.replace_config(
+        replace(
+            estimator.config,
+            prediction=replace(estimator.config.prediction, enabled=True),
+        )
+    )
+    diagnostics = _observe(estimator, 500, 5.0, -2.5)
+
+    assert diagnostics.x.raw_prediction_offset_deg == pytest.approx(2.0)
+    assert diagnostics.y.raw_prediction_offset_deg == pytest.approx(-1.0)
+    assert diagnostics.x.applied_prediction_offset_deg == pytest.approx(0.5)
+    assert diagnostics.y.applied_prediction_offset_deg == pytest.approx(-0.5)

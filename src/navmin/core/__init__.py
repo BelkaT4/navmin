@@ -6,6 +6,7 @@ from .mediator import Mediator, TurretPort
 from .session_gate import CameraSessionGate
 from .tracking_estimator import (
     AxisTrackingEstimate,
+    TrackingControlVisualization,
     TrackingEstimateInvalidReason,
     TrackingEstimator,
     TrackingEstimatorDiagnostics,
@@ -17,6 +18,7 @@ __all__ = [
     "CameraSessionGate",
     "DistanceMeasurementMode",
     "Mediator",
+    "TrackingControlVisualization",
     "TrackingEstimateInvalidReason",
     "TrackingEstimator",
     "TrackingEstimatorDiagnostics",

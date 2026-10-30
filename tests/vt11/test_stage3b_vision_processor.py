@@ -10,6 +10,7 @@ import numpy as np
 import pytest
 
 from navmin.contracts import (
+    BBox,
     CameraRole,
     FramePacket,
     TargetAcquired,
@@ -573,6 +574,115 @@ def test_track_and_reacq_status_mapping_preserves_one_public_id() -> None:
     assert outputs[6].result.tracked_objects[0].track_id == 7
 
 
+def test_track_diagnostics_map_backend_result_without_exposing_vt11_types() -> None:
+    candidate = _candidate(31, 22)
+    track_result = TrackFrameResult(
+        frame_index=31,
+        predicted_xy=(44.5, 55.5),
+        selected=candidate,
+        selected_score=0.9,
+        confidence_gap=0.2,
+        candidate_count=3,
+        identity_similarity=0.8,
+        motion_score=0.7,
+        size_score=0.6,
+        status="LOW_CONFIDENCE",
+        miss_count=1,
+        search_radius_px=73,
+        prediction_error_px=4.25,
+        confidence=0.66,
+        diagnostic_reason="IDENTITY_GATE",
+        best_candidate_center=(36.5, 25.5),
+        best_candidate_bbox=(31, 22, 12, 8),
+        tracking_phase="MOTION_BREAK",
+    )
+    session = _FakeSession(
+        31,
+        (
+            TargetSessionStep(
+                phase="TRACK",
+                result=track_result,
+                phase_after="TRACK",
+                segment_ended=False,
+                terminal_status=None,
+            ),
+        ),
+    )
+    processor = Vt11VisionProcessor(profile_name="day")
+    _retain(processor, (30,))
+    _activate_target(processor, session, track_id=4)
+
+    output = processor.process(_packet(31))
+    diagnostics = output.tracking_diagnostics
+
+    assert diagnostics is not None
+    assert diagnostics.camera is CameraRole.OVERVIEW
+    assert diagnostics.generation == 1
+    assert diagnostics.frame_id == 31
+    assert diagnostics.phase == "TRACK"
+    assert diagnostics.status == "LOW_CONFIDENCE"
+    assert diagnostics.predicted_xy == (44.5, 55.5)
+    assert diagnostics.search_radius_px == 73
+    assert not diagnostics.full_frame_search
+    assert diagnostics.search_mode == "MOTION_BREAK"
+    assert diagnostics.candidate_count == 3
+    assert diagnostics.best_candidate_center == (36.5, 25.5)
+    assert diagnostics.best_candidate_bbox == BBox(31, 22, 12, 8)
+    assert diagnostics.confidence == pytest.approx(0.66)
+    assert diagnostics.prediction_error_px == pytest.approx(4.25)
+    assert diagnostics.diagnostic_reason == "IDENTITY_GATE"
+
+
+def test_reacq_global_diagnostics_preserve_real_search_mode_and_geometry() -> None:
+    candidate = _candidate(40, 30)
+    reacq_result = ReacqFrameResult(
+        frame_index=41,
+        predicted_xy=(61.0, 42.0),
+        search_radius_px=180,
+        selected=candidate,
+        selected_score=0.75,
+        identity_similarity=0.8,
+        motion_score=0.4,
+        size_score=0.9,
+        confidence_gap=0.1,
+        confidence=0.55,
+        candidate_count=5,
+        confirmation_streak=1,
+        confirmation_window_size=3,
+        status="TENTATIVE",
+        diagnostic_reason="GLOBAL_CANDIDATE",
+        prediction_error_px=12.0,
+        best_candidate_center=(45.5, 33.5),
+        best_candidate_bbox=(40, 30, 12, 8),
+        reacq_mode="GLOBAL_EMERGENCY_SCAN",
+    )
+    session = _FakeSession(
+        41,
+        (
+            TargetSessionStep(
+                phase="REACQ",
+                result=reacq_result,
+                phase_after="REACQ",
+                segment_ended=False,
+                terminal_status=None,
+            ),
+        ),
+    )
+    processor = Vt11VisionProcessor(profile_name="day")
+    _retain(processor, (40,))
+    _activate_target(processor, session, track_id=5)
+
+    diagnostics = processor.process(_packet(41)).tracking_diagnostics
+
+    assert diagnostics is not None
+    assert diagnostics.phase == "REACQ"
+    assert diagnostics.status == "TENTATIVE"
+    assert diagnostics.full_frame_search
+    assert diagnostics.search_mode == "GLOBAL_EMERGENCY_SCAN"
+    assert diagnostics.predicted_xy == (61.0, 42.0)
+    assert diagnostics.search_radius_px == 180
+    assert diagnostics.best_candidate_bbox == BBox(40, 30, 12, 8)
+
 def test_terminal_reacq_loss_emits_tracking_ended_and_returns_to_discovery() -> None:
     processor = Vt11VisionProcessor(profile_name="day")
     _retain(processor, (20,))
@@ -591,6 +701,7 @@ def test_terminal_reacq_loss_emits_tracking_ended_and_returns_to_discovery() -> 
     output = processor.process(_packet(21, timestamp_ns=2_345_000_000))
 
     assert output.result.tracked_objects == ()
+    assert output.tracking_diagnostics is None
     assert output.target_events == (
         TargetTrackingEnded(
             target=TargetRef(CameraRole.OVERVIEW, generation=1, track_id=4),

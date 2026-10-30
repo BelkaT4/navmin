@@ -234,6 +234,18 @@ def test_camera_model_returns_normalized_ray_using_working_frame_geometry(tmp_pa
     assert right.z == pytest.approx(1 / math.sqrt(2))
 
 
+def test_camera_model_projects_ray_back_to_working_frame_pixel(tmp_path) -> None:
+    path = tmp_path / "overview.json"
+    _write(path, _overview_calibration())
+    calibration = load_overview_calibration(path)
+    model = overview_camera_model(calibration)
+
+    for point in ((320.0, 240.0), (420.0, 240.0), (275.5, 190.25)):
+        ray = model.pixel_to_ray(*point)
+        projected = model.ray_to_pixel(ray)
+        assert projected == pytest.approx(point, abs=1e-9)
+
+
 def test_stereo_models_use_rectified_p1_p2_geometry(tmp_path) -> None:
     path = tmp_path / "stereo.json"
     _write(path, _stereo_calibration())

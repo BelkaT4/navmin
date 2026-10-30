@@ -1,4 +1,4 @@
-"""Typed configuration foundation for NavMin schema v4."""
+"""Typed configuration foundation for NavMin schema v6."""
 
 from .manager import ConfigManager, save_config
 from .models import (
@@ -19,6 +19,7 @@ from .models import (
     PlatformMotionConfig,
     PredictionConfig,
     ProcessingScope,
+    RecordingConfig,
     RtpJpegSourceConfig,
     RtspDecoderMode,
     RtspProtocol,
@@ -27,6 +28,7 @@ from .models import (
     StereoDistanceConfig,
     Stm32Config,
     TrackingControlConfig,
+    TrackingVisualizationConfig,
     TurretConfig,
     UiConfig,
     VelocityEstimatorConfig,
@@ -71,6 +73,7 @@ __all__ = [
     "PlatformMotionConfig",
     "PredictionConfig",
     "ProcessingScope",
+    "RecordingConfig",
     "RtpJpegSourceConfig",
     "RtspDecoderMode",
     "RtspProtocol",
@@ -79,6 +82,7 @@ __all__ = [
     "StereoDistanceConfig",
     "Stm32Config",
     "TrackingControlConfig",
+    "TrackingVisualizationConfig",
     "TurretConfig",
     "UiConfig",
     "UnsupportedConfigSchemaError",

@@ -21,6 +21,7 @@ from navmin.contracts import (
     VisionResult,
 )
 from navmin.core import Mediator
+from navmin.vision.processor import VisionTrackingDiagnostics
 
 
 @dataclass(frozen=True)
@@ -31,6 +32,7 @@ class CameraUiBinding:
     session_barriers: CameraSessionBarrierChannel
     target_events: TargetLifecycleEventChannel
     latest_result: LatestValue[VisionResult]
+    tracking_diagnostics: LatestValue[VisionTrackingDiagnostics]
     status: LatestValue[CameraStatus]
 
 

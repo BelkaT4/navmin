@@ -32,7 +32,7 @@ from navmin.contracts import (
     VisionResult,
     VisionTargetControlCommand,
 )
-from navmin.vision.processor import VisionProcessorOutput
+from navmin.vision.processor import VisionProcessorOutput, VisionTrackingDiagnostics
 from navmin.vision.tracking import PublicTrackIdAllocator
 
 from ..legacy_14 import Legacy14VisionProcessor
@@ -485,20 +485,84 @@ class Vt11VisionProcessor:
         self._discard_active_episode(reset_legacy=True)
         return (event,)
 
+    @staticmethod
+    def _tracking_diagnostics(
+        frame: FramePacket,
+        result: TrackFrameResult | ReacqFrameResult,
+        *,
+        phase: str,
+    ) -> VisionTrackingDiagnostics:
+        best_bbox = result.best_candidate_bbox
+        return VisionTrackingDiagnostics(
+            camera=frame.camera,
+            generation=frame.generation,
+            frame_id=frame.frame_id,
+            phase=phase,
+            status=result.status,
+            predicted_xy=(
+                float(result.predicted_xy[0]),
+                float(result.predicted_xy[1]),
+            ),
+            search_radius_px=int(result.search_radius_px),
+            full_frame_search=(
+                isinstance(result, ReacqFrameResult)
+                and result.reacq_mode == "GLOBAL_EMERGENCY_SCAN"
+            ),
+            search_mode=(
+                result.tracking_phase
+                if isinstance(result, TrackFrameResult)
+                else result.reacq_mode
+            ),
+            candidate_count=int(result.candidate_count),
+            best_candidate_center=(
+                None
+                if result.best_candidate_center is None
+                else (
+                    float(result.best_candidate_center[0]),
+                    float(result.best_candidate_center[1]),
+                )
+            ),
+            best_candidate_bbox=(
+                None
+                if best_bbox is None
+                else BBox(
+                    x=int(best_bbox[0]),
+                    y=int(best_bbox[1]),
+                    width=int(best_bbox[2]),
+                    height=int(best_bbox[3]),
+                )
+            ),
+            confidence=float(result.confidence),
+            prediction_error_px=(
+                None
+                if result.prediction_error_px is None
+                else float(result.prediction_error_px)
+            ),
+            diagnostic_reason=result.diagnostic_reason,
+        )
+
     def _process_target_frame(
         self,
         frame: FramePacket,
-    ) -> tuple[tuple[TrackedObject, ...], tuple[TargetLifecycleEvent, ...]]:
+    ) -> tuple[
+        tuple[TrackedObject, ...],
+        tuple[TargetLifecycleEvent, ...],
+        VisionTrackingDiagnostics | None,
+    ]:
         session = self._target_session
         if session is None:
             raise RuntimeError("TARGET state has no VT11 target session")
         step = session.step(frame.frame_id, frame.image)
         tracked_objects: tuple[TrackedObject, ...] = ()
+        tracking_diagnostics: VisionTrackingDiagnostics
 
         if step.phase == "TRACK":
             result = step.result
             if not isinstance(result, TrackFrameResult):
                 raise TypeError("TRACK phase emitted a non-TRACK result")
+            tracking_diagnostics = self._tracking_diagnostics(
+                frame, result, phase="TRACK"
+            )
             if result.status == "TRACK" and result.selected is not None:
                 tracked_objects = (
                     self._public_target_object(
@@ -511,6 +575,9 @@ class Vt11VisionProcessor:
             result = step.result
             if not isinstance(result, ReacqFrameResult):
                 raise TypeError("REACQ phase emitted a non-REACQ result")
+            tracking_diagnostics = self._tracking_diagnostics(
+                frame, result, phase="REACQ"
+            )
             if result.status == "CONFIRMED" and result.selected is not None:
                 tracked_objects = (
                     self._public_target_object(
@@ -523,12 +590,12 @@ class Vt11VisionProcessor:
             raise RuntimeError(f"unknown VT11 target phase: {step.phase}")
 
         if step.terminal_status in {"LOST_UNRECOVERED", "REACQ_LIMIT"}:
-            return (), self._finish_target_loss(frame)
+            return (), self._finish_target_loss(frame), None
         if step.terminal_status is not None:
             raise RuntimeError(
                 f"unexpected live VT11 terminal status: {step.terminal_status}"
             )
-        return tracked_objects, ()
+        return tracked_objects, (), tracking_diagnostics
 
     def apply_target_control(
         self,
@@ -600,10 +667,15 @@ class Vt11VisionProcessor:
 
         target_events: tuple[TargetLifecycleEvent, ...] = ()
         tracked_objects: tuple[TrackedObject, ...] = ()
+        tracking_diagnostics: VisionTrackingDiagnostics | None = None
         if self._state is Vt11ProcessorState.ACQUIRING:
             target_events = self._advance_acquisition((frame,))
         elif self._state is Vt11ProcessorState.TARGET:
-            tracked_objects, target_events = self._process_target_frame(frame)
+            (
+                tracked_objects,
+                target_events,
+                tracking_diagnostics,
+            ) = self._process_target_frame(frame)
 
         elapsed_ns = max(0, self._duration_clock_ns() - started_ns)
         return VisionProcessorOutput(
@@ -613,6 +685,7 @@ class Vt11VisionProcessor:
                 processing_time_ns=elapsed_ns,
             ),
             target_events=target_events,
+            tracking_diagnostics=tracking_diagnostics,
         )
 
 

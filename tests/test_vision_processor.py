@@ -161,6 +161,7 @@ def test_vision_processor_output_is_immutable_and_defaults_to_no_events() -> Non
     assert isinstance(result, VisionProcessorOutput)
     assert result.result.frame is frame
     assert result.target_events == ()
+    assert result.tracking_diagnostics is None
     with pytest.raises(FrozenInstanceError):
         result.target_events = ()
 

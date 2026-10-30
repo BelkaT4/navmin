@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 from collections.abc import Callable
 from dataclasses import replace
@@ -29,6 +30,7 @@ from navmin.config.models import (
     AimPointsConfig,
     PidControllerConfig,
     TrackingControlConfig,
+    TrackingVisualizationConfig,
     UiConfig,
 )
 from navmin.contracts import (
@@ -58,10 +60,12 @@ from navmin.core import (
     AxisTrackingEstimate,
     DistanceMeasurementMode,
     Mediator,
+    TrackingControlVisualization,
     TrackingEstimateInvalidReason,
     TrackingEstimatorDiagnostics,
 )
 from navmin.imu import GyroBiasState, ImuRuntimeState, ImuSourceIdentity
+from navmin.recording import RecordingRuntime, RecordingSessionInfo
 from navmin.ui import (
     CameraUiBinding,
     MainWindow,
@@ -73,9 +77,35 @@ from navmin.ui import (
     prepare_vision_frame,
     rendered_image_rect,
 )
-from navmin.ui.video_view import map_source_to_widget, reticle_segments
+from navmin.ui.video_view import (
+    map_bbox_to_widget,
+    map_source_radius_to_widget,
+    map_source_to_widget,
+    project_control_prediction,
+    reticle_segments,
+)
+from navmin.vision.processor import VisionTrackingDiagnostics
 from navmin.vision.stereo_distance_worker import StereoDistanceCandidate
 from navmin.vision.stereo_target_join import StereoPairingKind, StereoTargetJoiner
+
+
+class _FakeRecordingWriter:
+    codec = "TEST"
+    backend = "memory"
+
+    def __init__(self, path: Path, *, width: int, height: int, nominal_fps: float) -> None:
+        self.path = path
+        self.width = width
+        self.height = height
+        self.nominal_fps = nominal_fps
+        self.frames: list[np.ndarray] = []
+        path.touch()
+
+    def write(self, image: np.ndarray) -> None:
+        self.frames.append(image.copy())
+
+    def close(self) -> None:
+        return
 
 
 class _Clock:
@@ -97,6 +127,14 @@ class _WallClock:
 class _CameraModel:
     def pixel_to_ray(self, x_px: float, y_px: float) -> CameraRay:
         return CameraRay((x_px - 50.0) / 50.0, (y_px - 25.0) / 25.0, 1.0)
+
+    def ray_to_pixel(self, ray: CameraRay) -> tuple[float, float]:
+        if ray.z <= 0.0:
+            raise ValueError("ray is behind camera")
+        return (
+            50.0 + 50.0 * ray.x / ray.z,
+            25.0 + 25.0 * ray.y / ray.z,
+        )
 
 
 class _FakeTurret:
@@ -251,6 +289,78 @@ def _result(
     )
 
 
+_DEFAULT_TRACKING_DIAGNOSTIC_BBOX = BBox(10, 8, 20, 12)
+
+
+def _tracking_diagnostics(
+    camera: CameraRole,
+    generation: int,
+    frame_id: int,
+    *,
+    predicted_xy: tuple[float, float] = (50.0, 25.0),
+    search_radius_px: int = 10,
+    full_frame_search: bool = False,
+    best_candidate_bbox: BBox | None = _DEFAULT_TRACKING_DIAGNOSTIC_BBOX,
+) -> VisionTrackingDiagnostics:
+    return VisionTrackingDiagnostics(
+        camera=camera,
+        generation=generation,
+        frame_id=frame_id,
+        phase="REACQ" if full_frame_search else "TRACK",
+        status="SEARCHING" if full_frame_search else "TRACK",
+        predicted_xy=predicted_xy,
+        search_radius_px=search_radius_px,
+        full_frame_search=full_frame_search,
+        search_mode="GLOBAL_EMERGENCY_SCAN" if full_frame_search else "TRACK",
+        candidate_count=1 if best_candidate_bbox is not None else 0,
+        best_candidate_center=(20.0, 14.0) if best_candidate_bbox is not None else None,
+        best_candidate_bbox=best_candidate_bbox,
+        confidence=0.8,
+        prediction_error_px=2.0,
+        diagnostic_reason="test",
+    )
+
+
+def _control_visualization(
+    camera: CameraRole,
+    generation: int,
+    frame_id: int,
+    *,
+    rate_valid_x: bool = True,
+    rate_valid_y: bool = True,
+    raw_x_deg: float = 5.0,
+    raw_y_deg: float = 2.0,
+    applied_x_deg: float | None = None,
+    applied_y_deg: float | None = None,
+    observed_center_px: tuple[float, float] = (50.0, 25.0),
+) -> TrackingControlVisualization:
+    target = TargetRef(camera, generation, 7)
+    return TrackingControlVisualization(
+        target=target,
+        camera=camera,
+        generation=generation,
+        frame_id=frame_id,
+        observation_timestamp_ns=1_000_000_000,
+        observed_center_px=observed_center_px,
+        rate_valid_x=rate_valid_x,
+        rate_valid_y=rate_valid_y,
+        target_rate_x_deg_s=10.0 if rate_valid_x else None,
+        target_rate_y_deg_s=4.0 if rate_valid_y else None,
+        raw_prediction_offset_x_deg=raw_x_deg if rate_valid_x else 0.0,
+        raw_prediction_offset_y_deg=raw_y_deg if rate_valid_y else 0.0,
+        applied_prediction_offset_x_deg=(
+            raw_x_deg if applied_x_deg is None else applied_x_deg
+        )
+        if rate_valid_x
+        else 0.0,
+        applied_prediction_offset_y_deg=(
+            raw_y_deg if applied_y_deg is None else applied_y_deg
+        )
+        if rate_valid_y
+        else 0.0,
+    )
+
+
 def _status(
     camera: CameraRole,
     generation: int,
@@ -268,6 +378,7 @@ def _bindings() -> dict[CameraRole, CameraUiBinding]:
             camera,
             CameraSessionBarrierChannel(),
             TargetLifecycleEventChannel(),
+            LatestValue(),
             LatestValue(),
             LatestValue(),
         )
@@ -302,10 +413,18 @@ def _window(
     apply_tracking_control_tuning: (
         Callable[[TrackingControlConfig], None] | None
     ) = None,
+    tracking_visualization_config: TrackingVisualizationConfig | None = None,
+    persist_tracking_visualization: (
+        Callable[[TrackingVisualizationConfig], None] | None
+    ) = None,
     stereo_target_joiner: StereoTargetJoiner | None = None,
     stereo_distance_results: LatestValue[StereoDistanceCandidate] | None = None,
     imu_states: LatestValue[ImuRuntimeState] | None = None,
     imu_controls=None,
+    recording_runtime: RecordingRuntime | None = None,
+    start_recording: (
+        Callable[[CameraRole, int, int], RecordingSessionInfo] | None
+    ) = None,
 ) -> tuple[
     MainWindow,
     Mediator,
@@ -333,6 +452,13 @@ def _window(
         apply_tracking_control_tuning=(
             apply_tracking_control_tuning or (lambda _config: None)
         ),
+        tracking_visualization_config=(
+            tracking_visualization_config
+            or TrackingVisualizationConfig(False, False, False)
+        ),
+        persist_tracking_visualization=persist_tracking_visualization,
+        recording_runtime=recording_runtime,
+        start_recording=start_recording,
         imu_states=imu_states,
         imu_controls=imu_controls,
         clock_ns=clock or _Clock(),
@@ -466,6 +592,384 @@ def test_source_to_widget_and_reticle_geometry_keep_center_clear() -> None:
         (100.0, 86.0, 100.0, 96.0),
         (100.0, 104.0, 100.0, 114.0),
     ]
+
+
+def test_tracking_overlay_geometry_maps_radius_and_bbox_through_letterbox() -> None:
+    display_rect = rendered_image_rect(QSize(200, 200), QSize(100, 50))
+    radius = map_source_radius_to_widget(10, display_rect, QSize(100, 50))
+    assert radius == pytest.approx((20.0, 20.0))
+
+    bbox = map_bbox_to_widget(BBox(10, 5, 20, 10), display_rect, QSize(100, 50))
+    assert bbox is not None
+    assert (bbox.left(), bbox.top(), bbox.width(), bbox.height()) == pytest.approx(
+        (20.0, 60.0, 40.0, 20.0)
+    )
+
+
+def test_video_view_tracking_diagnostics_are_exact_frame_and_main_only(
+    qt_application: QApplication,
+) -> None:
+    result = _result(CameraRole.OVERVIEW, 3, frame_id=7)
+    prepared = prepare_vision_frame(result)
+    exact = _tracking_diagnostics(CameraRole.OVERVIEW, 3, 7)
+    stale = _tracking_diagnostics(CameraRole.OVERVIEW, 3, 6)
+
+    main = VideoView(
+        camera=CameraRole.OVERVIEW,
+        preview=False,
+        stale_timeout_ns=500_000_000,
+    )
+    main.set_prepared_frame(prepared)
+    main.set_tracking_diagnostics(exact)
+    assert main.tracking_diagnostics == exact
+    main.set_tracking_diagnostics(stale)
+    assert main.tracking_diagnostics is None
+
+    preview = VideoView(
+        camera=CameraRole.OVERVIEW,
+        preview=True,
+        stale_timeout_ns=500_000_000,
+    )
+    preview.set_prepared_frame(prepared)
+    preview.set_tracking_diagnostics(exact)
+    assert preview.tracking_diagnostics is None
+
+
+def test_main_window_binds_tracking_diagnostics_only_to_matching_displayed_frame(
+    qt_application: QApplication,
+) -> None:
+    window, _mediator_value, _turret, bindings, _states = _window(qt_application)
+    first = _result(CameraRole.OVERVIEW, 1, frame_id=1)
+    exact = _tracking_diagnostics(CameraRole.OVERVIEW, 1, 1)
+    bindings[CameraRole.OVERVIEW].tracking_diagnostics.publish(exact)
+    _publish_camera(window, bindings, first)
+
+    assert window.main_view.tracking_diagnostics == exact
+    assert window.preview_view.tracking_diagnostics is None
+
+    second = _result(CameraRole.OVERVIEW, 1, frame_id=2)
+    bindings[CameraRole.OVERVIEW].latest_result.publish(second)
+    bindings[CameraRole.OVERVIEW].status.publish(_status(CameraRole.OVERVIEW, 1))
+    window.state_pump.pump_once()
+
+    assert window.main_view.displayed_result == second
+    assert window.main_view.tracking_diagnostics is None
+    window.close()
+
+
+class _OverlayPainterSpy:
+    def __init__(self) -> None:
+        self.pen = None
+        self.brush = None
+        self.ellipses = []
+        self.rects = []
+        self.lines = []
+
+    def setPen(self, pen) -> None:
+        self.pen = pen
+
+    def setBrush(self, brush) -> None:
+        self.brush = brush
+
+    def drawEllipse(self, center, radius_x, radius_y) -> None:
+        self.ellipses.append((center, radius_x, radius_y, self.pen))
+
+    def drawRect(self, rect) -> None:
+        self.rects.append((rect, self.pen))
+
+    def drawLine(self, line) -> None:
+        self.lines.append((line, self.pen))
+
+
+def test_tracking_overlays_draw_local_search_and_unaccepted_best_candidate(
+    qt_application: QApplication,
+) -> None:
+    result = _result(CameraRole.OVERVIEW, 1, frame_id=1, objects=())
+    view = VideoView(
+        camera=CameraRole.OVERVIEW,
+        preview=False,
+        stale_timeout_ns=500_000_000,
+    )
+    view.resize(200, 200)
+    view.set_prepared_frame(prepare_vision_frame(result))
+    view.set_tracking_diagnostics(_tracking_diagnostics(CameraRole.OVERVIEW, 1, 1))
+    view.set_tracking_visualization(
+        show_search_region=True,
+        show_best_candidate=True,
+    )
+    painter = _OverlayPainterSpy()
+
+    view._draw_tracking_overlays(painter, view.rendered_rect(), result)
+
+    assert len(painter.ellipses) == 1
+    center, radius_x, radius_y, search_pen = painter.ellipses[0]
+    assert center == QPointF(101.0, 101.0)
+    assert (radius_x, radius_y) == pytest.approx((20.0, 20.0))
+    assert search_pen.color().getRgb()[:3] == (255, 80, 180)
+    assert search_pen.style() == Qt.PenStyle.DashLine
+
+    assert len(painter.rects) == 1
+    candidate_rect, candidate_pen = painter.rects[0]
+    assert (
+        candidate_rect.left(),
+        candidate_rect.top(),
+        candidate_rect.width(),
+        candidate_rect.height(),
+    ) == pytest.approx((20.0, 66.0, 40.0, 24.0))
+    assert candidate_pen.color().getRgb()[:3] == (255, 145, 40)
+    assert candidate_pen.style() == Qt.PenStyle.DashLine
+
+
+def test_tracking_overlay_uses_global_border_and_hides_accepted_candidate(
+    qt_application: QApplication,
+) -> None:
+    target = TargetRef(CameraRole.OVERVIEW, 1, 7)
+    accepted_bbox = BBox(40, 15, 20, 20)
+    result = _result(
+        CameraRole.OVERVIEW,
+        1,
+        frame_id=1,
+        objects=(TrackedObject(7, accepted_bbox, 0.0, 0.0, 3),),
+    )
+    view = VideoView(
+        camera=CameraRole.OVERVIEW,
+        preview=False,
+        stale_timeout_ns=500_000_000,
+    )
+    view.resize(200, 200)
+    view.set_prepared_frame(prepare_vision_frame(result))
+    view.set_selected_target(target)
+    view.set_tracking_diagnostics(
+        _tracking_diagnostics(
+            CameraRole.OVERVIEW,
+            1,
+            1,
+            full_frame_search=True,
+            best_candidate_bbox=accepted_bbox,
+        )
+    )
+    view.set_tracking_visualization(
+        show_search_region=True,
+        show_best_candidate=True,
+    )
+    painter = _OverlayPainterSpy()
+
+    view._draw_tracking_overlays(painter, view.rendered_rect(), result)
+
+    assert painter.ellipses == []
+    assert len(painter.rects) == 1
+    border_rect, border_pen = painter.rects[0]
+    assert (
+        border_rect.left(),
+        border_rect.top(),
+        border_rect.width(),
+        border_rect.height(),
+    ) == pytest.approx((1.0, 51.0, 198.0, 98.0))
+    assert border_pen.color().getRgb()[:3] == (255, 80, 180)
+    assert border_pen.style() == Qt.PenStyle.DashLine
+
+
+def test_tracking_overlays_are_not_drawn_on_preview(
+    qt_application: QApplication,
+) -> None:
+    result = _result(CameraRole.OVERVIEW, 1, frame_id=1, objects=())
+    view = VideoView(
+        camera=CameraRole.OVERVIEW,
+        preview=True,
+        stale_timeout_ns=500_000_000,
+    )
+    view.resize(200, 200)
+    view.set_prepared_frame(prepare_vision_frame(result))
+    view.set_tracking_visualization(
+        show_search_region=True,
+        show_best_candidate=True,
+    )
+    painter = _OverlayPainterSpy()
+
+    view._draw_tracking_overlays(painter, view.rendered_rect(), result)
+
+    assert painter.ellipses == []
+    assert painter.rects == []
+
+
+def test_control_prediction_projection_handles_zero_and_partial_axes() -> None:
+    model = _CameraModel()
+    zero = _control_visualization(
+        CameraRole.OVERVIEW,
+        1,
+        1,
+        raw_x_deg=0.0,
+        raw_y_deg=0.0,
+    )
+    assert project_control_prediction(zero, model) is None
+
+    x_only = _control_visualization(
+        CameraRole.OVERVIEW,
+        1,
+        1,
+        rate_valid_x=True,
+        rate_valid_y=False,
+        raw_x_deg=10.0,
+        observed_center_px=(60.0, 30.0),
+    )
+    x_overlay = project_control_prediction(x_only, model)
+    assert x_overlay is not None
+    assert x_overlay.predicted_px[0] != pytest.approx(60.0)
+    assert x_overlay.predicted_px[1] == pytest.approx(30.0)
+
+    y_only = _control_visualization(
+        CameraRole.OVERVIEW,
+        1,
+        1,
+        rate_valid_x=False,
+        rate_valid_y=True,
+        raw_y_deg=10.0,
+        observed_center_px=(60.0, 30.0),
+    )
+    y_overlay = project_control_prediction(y_only, model)
+    assert y_overlay is not None
+    assert y_overlay.predicted_px[0] == pytest.approx(60.0)
+    assert y_overlay.predicted_px[1] != pytest.approx(30.0)
+
+    invalid = _control_visualization(
+        CameraRole.OVERVIEW,
+        1,
+        1,
+        rate_valid_x=False,
+        rate_valid_y=False,
+    )
+    assert project_control_prediction(invalid, model) is None
+
+
+def test_control_prediction_uses_raw_forecast_when_control_is_disabled(
+    qt_application: QApplication,
+) -> None:
+    result = _result(CameraRole.OVERVIEW, 1, frame_id=1)
+    target = TargetRef(CameraRole.OVERVIEW, 1, 7)
+    visualization = _control_visualization(
+        CameraRole.OVERVIEW,
+        1,
+        1,
+        raw_x_deg=8.0,
+        raw_y_deg=0.0,
+        applied_x_deg=0.0,
+        applied_y_deg=0.0,
+    )
+    view = VideoView(
+        camera=CameraRole.OVERVIEW,
+        preview=False,
+        stale_timeout_ns=500_000_000,
+    )
+    view.resize(200, 200)
+    view.set_prepared_frame(prepare_vision_frame(result))
+    view.set_selected_target(target)
+    view.set_tracking_control_visualization(visualization, _CameraModel())
+    view.set_tracking_visualization(
+        show_search_region=False,
+        show_best_candidate=False,
+        show_control_prediction=True,
+    )
+    painter = _OverlayPainterSpy()
+
+    view._draw_control_prediction_overlay(painter, view.rendered_rect(), result)
+
+    assert visualization.applied_prediction_offset_x_deg == 0.0
+    assert len(painter.lines) == 1
+    assert len(painter.ellipses) == 1
+    _line, pen = painter.lines[0]
+    assert pen.color().getRgb()[:3] == (40, 185, 255)
+    endpoint, radius_x, radius_y, endpoint_pen = painter.ellipses[0]
+    assert radius_x == pytest.approx(4.0)
+    assert radius_y == pytest.approx(4.0)
+    assert endpoint_pen.color().getRgb()[:3] == (40, 185, 255)
+    assert endpoint != QPointF(101.0, 101.0)
+    view.close()
+
+
+def test_control_prediction_display_off_is_independent_of_control_on(
+    qt_application: QApplication,
+) -> None:
+    result = _result(CameraRole.OVERVIEW, 1, frame_id=1)
+    target = TargetRef(CameraRole.OVERVIEW, 1, 7)
+    visualization = _control_visualization(
+        CameraRole.OVERVIEW,
+        1,
+        1,
+        raw_x_deg=8.0,
+        applied_x_deg=5.0,
+    )
+    view = VideoView(
+        camera=CameraRole.OVERVIEW,
+        preview=False,
+        stale_timeout_ns=500_000_000,
+    )
+    view.resize(200, 200)
+    view.set_prepared_frame(prepare_vision_frame(result))
+    view.set_selected_target(target)
+    view.set_tracking_control_visualization(visualization, _CameraModel())
+    view.set_tracking_visualization(
+        show_search_region=False,
+        show_best_candidate=False,
+        show_control_prediction=False,
+    )
+    painter = _OverlayPainterSpy()
+
+    view._draw_control_prediction_overlay(painter, view.rendered_rect(), result)
+
+    assert visualization.applied_prediction_offset_x_deg == 5.0
+    assert painter.lines == []
+    assert painter.ellipses == []
+    view.close()
+
+
+def test_control_prediction_is_exact_frame_target_bound_and_preview_hidden(
+    qt_application: QApplication,
+) -> None:
+    result = _result(CameraRole.OVERVIEW, 2, frame_id=7)
+    target = TargetRef(CameraRole.OVERVIEW, 2, 7)
+    exact = _control_visualization(CameraRole.OVERVIEW, 2, 7)
+    stale = _control_visualization(CameraRole.OVERVIEW, 2, 6)
+    model = _CameraModel()
+
+    main = VideoView(
+        camera=CameraRole.OVERVIEW,
+        preview=False,
+        stale_timeout_ns=500_000_000,
+    )
+    main.set_prepared_frame(prepare_vision_frame(result))
+    main.set_selected_target(target)
+    main.set_tracking_control_visualization(exact, model)
+    assert main.tracking_control_visualization == exact
+    assert main.control_prediction_overlay is not None
+
+    main.set_tracking_control_visualization(stale, model)
+    assert main.tracking_control_visualization is None
+    assert main.control_prediction_overlay is None
+
+    main.set_tracking_control_visualization(exact, model)
+    main.set_selected_target(None)
+    assert main.tracking_control_visualization is None
+    assert main.control_prediction_overlay is None
+
+    main.set_selected_target(target)
+    main.set_tracking_control_visualization(exact, model)
+    next_frame = _result(CameraRole.OVERVIEW, 2, frame_id=8)
+    main.set_prepared_frame(prepare_vision_frame(next_frame))
+    assert main.tracking_control_visualization is None
+    assert main.control_prediction_overlay is None
+
+    preview = VideoView(
+        camera=CameraRole.OVERVIEW,
+        preview=True,
+        stale_timeout_ns=500_000_000,
+    )
+    preview.set_prepared_frame(prepare_vision_frame(result))
+    preview.set_selected_target(target)
+    preview.set_tracking_control_visualization(exact, model)
+    assert preview.tracking_control_visualization is None
+    assert preview.control_prediction_overlay is None
+    main.close()
+    preview.close()
 
 
 def test_main_reticle_draw_uses_red_three_pixel_pen_and_preview_draws_none(
@@ -1696,17 +2200,19 @@ def test_operator_tracking_panel_queues_only_exposed_typed_runtime_fields(
     initial = mediator.tracking_estimator.config
 
     assert not operator.ff_enabled_checkbox.isChecked()
-    assert operator.tracking_inputs["gain_x"].text() == "0"
-    assert operator.tracking_inputs["gain_y"].text() == "0"
+    assert operator.ff_gain_x.value() == 0.0
+    assert operator.ff_gain_y.value() == 0.0
+    assert operator.ff_gain_x.minimum() == 0.0
+    assert operator.ff_gain_x.maximum() == 1.5
+    assert operator.ff_gain_x.singleStep() == 0.05
     assert not operator.prediction_enabled_checkbox.isChecked()
-    assert operator.tracking_inputs["horizon_ms"].text() == "0"
+    assert "horizon_ms" not in operator.tracking_inputs
     assert operator.tracking_inputs["window_ms"].text() == "200"
 
     operator.ff_enabled_checkbox.setChecked(True)
-    operator.tracking_inputs["gain_x"].setText("0.4")
-    operator.tracking_inputs["gain_y"].setText("0.5")
+    operator.ff_gain_x.setValue(0.4)
+    operator.ff_gain_y.setValue(0.5)
     operator.prediction_enabled_checkbox.setChecked(True)
-    operator.tracking_inputs["horizon_ms"].setText("75")
     operator.tracking_inputs["window_ms"].setText("250")
     QTest.mouseClick(operator.tracking_apply_button, Qt.MouseButton.LeftButton)
 
@@ -1721,7 +2227,6 @@ def test_operator_tracking_panel_queues_only_exposed_typed_runtime_fields(
     assert update.prediction == replace(
         initial.prediction,
         enabled=True,
-        horizon_ms=75,
     )
     assert update.velocity_estimator == replace(
         initial.velocity_estimator,
@@ -1729,8 +2234,70 @@ def test_operator_tracking_panel_queues_only_exposed_typed_runtime_fields(
     )
     assert update.platform_motion == initial.platform_motion
     assert operator.tracking_status_label.text().startswith("Отправлено:")
-    assert "сохран" not in operator.tracking_status_label.text().lower()
     assert operator.tracking_error_label.text() == ""
+    window.close()
+
+
+def test_tracking_visualization_checkboxes_are_independent_display_settings(
+    qt_application: QApplication,
+) -> None:
+    persisted: list[TrackingVisualizationConfig] = []
+    window, _mediator_value, _turret, _bindings_value, _states = _window(
+        qt_application,
+        persist_tracking_visualization=persisted.append,
+    )
+    operator = window.operator_window
+
+    assert not operator.show_search_region_checkbox.isChecked()
+    assert not operator.show_best_candidate_checkbox.isChecked()
+    assert not operator.show_control_prediction_checkbox.isChecked()
+    assert not window.main_view._show_search_region
+    assert not window.main_view._show_best_candidate
+    assert not window.main_view._show_control_prediction
+
+    operator.show_search_region_checkbox.setChecked(True)
+    operator.show_best_candidate_checkbox.setChecked(True)
+    operator.show_control_prediction_checkbox.setChecked(True)
+
+    assert persisted[-1] == TrackingVisualizationConfig(True, True, True)
+    assert window.main_view._show_search_region
+    assert window.main_view._show_best_candidate
+    assert window.main_view._show_control_prediction
+    assert not window.preview_view._show_search_region
+    assert not window.preview_view._show_best_candidate
+    assert not window.preview_view._show_control_prediction
+    window.close()
+
+
+def test_prediction_horizon_slider_maps_seconds_to_authoritative_ms(
+    qt_application: QApplication,
+) -> None:
+    queued: list[TrackingControlConfig] = []
+    window, mediator, _turret, _bindings_value, _states = _window(
+        qt_application,
+        apply_tracking_control_tuning=queued.append,
+    )
+    initial = mediator.tracking_estimator.config
+
+    assert window.horizon_slider.minimum() == 0
+    assert window.horizon_slider.maximum() == 20
+    assert window.horizon_slider.singleStep() == 1
+    assert window.horizon_value_label.text() == "0.00 с"
+
+    window.horizon_slider.setValue(1)
+    assert queued[-1] == replace(
+        initial,
+        prediction=replace(initial.prediction, horizon_ms=50),
+    )
+    assert window.horizon_value_label.text() == "0.05 с"
+
+    window.horizon_slider.setValue(20)
+    assert queued[-1].prediction.horizon_ms == 1000
+    assert window.horizon_value_label.text() == "1.00 с"
+
+    window.horizon_slider.setValue(0)
+    assert queued[-1].prediction.horizon_ms == 0
+    assert window.horizon_value_label.text() == "0.00 с"
     window.close()
 
 
@@ -1850,4 +2417,72 @@ def test_main_window_can_request_fullscreen_at_startup(qt_application: QApplicat
     qt_application.processEvents()
     assert window.isFullScreen()
     assert window.state_pump.timer.interval() == 16
+    window.close()
+
+
+def test_recording_button_writes_exact_frame_jsonl_and_selection(
+    qt_application: QApplication,
+    tmp_path: Path,
+) -> None:
+    clock = _Clock()
+    wall_clock = _WallClock(datetime(2026, 10, 27, 15, 5, 12, tzinfo=UTC))
+    runtime = RecordingRuntime(
+        tmp_path,
+        monotonic_clock_ns=clock,
+        wall_clock=wall_clock,
+        video_writer_factory=_FakeRecordingWriter,
+    )
+
+    def start_recording(
+        camera: CameraRole, width: int, height: int
+    ) -> RecordingSessionInfo:
+        return runtime.start(
+            camera=camera,
+            width=width,
+            height=height,
+            nominal_fps=20.0,
+            vision_backend="Vt11VisionProcessor",
+        )
+
+    window, mediator, _turret, bindings, _turret_states = _window(
+        qt_application,
+        mode=TurretControlMode.TRACKING,
+        clock=clock,
+        wall_clock=wall_clock,
+        recording_runtime=runtime,
+        start_recording=start_recording,
+    )
+    mediator.accept_camera_session(_session(CameraRole.OVERVIEW, 1))
+    first = _result(CameraRole.OVERVIEW, 1, frame_id=1, timestamp_ns=1_000_000_000)
+    window._vision_result_accepted(first)
+
+    window.recording_button.click()
+    assert runtime.session is not None
+    session_dir = runtime.session.paths.session_dir
+    assert window.recording_button.text() == "STOP"
+
+    second = _result(CameraRole.OVERVIEW, 1, frame_id=2, timestamp_ns=1_050_000_000)
+    diagnostics = _tracking_diagnostics(CameraRole.OVERVIEW, 1, 2)
+    bindings[CameraRole.OVERVIEW].tracking_diagnostics.publish(diagnostics)
+    window._vision_result_accepted(second)
+    window._record_selection_for_pending(second, 51.0, 24.0)
+
+    third = _result(CameraRole.OVERVIEW, 1, frame_id=3, timestamp_ns=1_100_000_000)
+    window._vision_result_accepted(third)
+    window.recording_button.click()
+
+    lines = [
+        json.loads(line)
+        for line in (session_dir / "frames.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    assert [line["frame"]["frame_id"] for line in lines] == [2, 3]
+    assert lines[0]["selection"] == {"point": [51.0, 24.0]}
+    assert lines[0]["overlay"]["search_region"] == {
+        "kind": "circle",
+        "center": [50.0, 25.0],
+        "radius_px": 10.0,
+    }
+    assert lines[1]["selection"] is None
+    assert window.recording_button.text() == "REC"
+    assert window.recording_time_label.text() == "00:00:00"
     window.close()

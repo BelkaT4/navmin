@@ -7,6 +7,8 @@ from dataclasses import dataclass
 from typing import Protocol
 
 from navmin.contracts import (
+    BBox,
+    CameraRole,
     FramePacket,
     TargetLifecycleEvent,
     VisionResult,
@@ -18,12 +20,34 @@ DEFAULT_VISION_PROCESSOR_CLASS = "Legacy14VisionProcessor"
 LOGGER = logging.getLogger(__name__)
 
 
+@dataclass(frozen=True, slots=True)
+class VisionTrackingDiagnostics:
+    """Backend-neutral read-only tracking diagnostics for one exact frame."""
+
+    camera: CameraRole
+    generation: int
+    frame_id: int
+    phase: str
+    status: str
+    predicted_xy: tuple[float, float]
+    search_radius_px: int
+    full_frame_search: bool
+    search_mode: str
+    candidate_count: int
+    best_candidate_center: tuple[float, float] | None
+    best_candidate_bbox: BBox | None
+    confidence: float
+    prediction_error_px: float | None
+    diagnostic_reason: str
+
+
 @dataclass(frozen=True)
 class VisionProcessorOutput:
     """Explicit internal output from a vision backend to its pipeline."""
 
     result: VisionResult
     target_events: tuple[TargetLifecycleEvent, ...] = ()
+    tracking_diagnostics: VisionTrackingDiagnostics | None = None
 
 
 class VisionProcessor(Protocol):
@@ -80,5 +104,6 @@ __all__ = [
     "DEFAULT_VISION_PROCESSOR_CLASS",
     "VisionProcessor",
     "VisionProcessorOutput",
+    "VisionTrackingDiagnostics",
     "create_vision_processor",
 ]

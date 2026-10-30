@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import replace
 from pathlib import Path
 
@@ -557,7 +558,7 @@ def test_controller_tracking_pending_is_latest_and_revision_processed_once() -> 
     assert controller.last_processed_revision == 2
 
 
-def test_controller_applies_valid_prediction_and_velocity_feed_forward() -> None:
+def test_controller_applies_valid_prediction_and_velocity_feed_forward(caplog) -> None:
     tracking = _tracking_control_config()
     tracking = replace(
         tracking,
@@ -582,6 +583,7 @@ def test_controller_applies_valid_prediction_and_velocity_feed_forward() -> None
         tracking_control_config=tracking,
     )
     _enter_tracking_off(controller, transport)
+    caplog.set_level(logging.DEBUG, logger="navmin.turret.controller")
 
     controller.submit_tracking_control(
         1,
@@ -599,6 +601,20 @@ def test_controller_applies_valid_prediction_and_velocity_feed_forward() -> None
     )
 
     assert controller.pending_motion == AxisVelocitySetpoint(5.0, -4.5, 1)
+    assert controller.pid_x.last_step is not None
+    assert controller.pid_x.last_step.p_term == pytest.approx(3.0)
+    assert controller.pid_x.last_step.feed_forward == pytest.approx(2.0)
+    assert controller.pid_x.last_step.output == pytest.approx(5.0)
+    assert controller.pid_y.last_step is not None
+    assert controller.pid_y.last_step.feed_forward == pytest.approx(-2.0)
+    messages = [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == "navmin.turret.controller"
+    ]
+    assert any("ff_output_x_deg_s=2.000000" in message for message in messages)
+    assert any("p_x_deg_s=3.000000" in message for message in messages)
+    assert any("final_output_y_deg_s=-4.500000" in message for message in messages)
 
 
 def test_invalid_axis_suppresses_prediction_and_ff_but_keeps_pid() -> None:
@@ -629,6 +645,9 @@ def test_invalid_axis_suppresses_prediction_and_ff_but_keeps_pid() -> None:
     )
 
     assert controller.pending_motion == AxisVelocitySetpoint(2.0, 0.0, 1)
+    assert controller.pid_x.last_step is not None
+    assert controller.pid_x.last_step.proportional_offset == 0.0
+    assert controller.pid_x.last_step.feed_forward == 0.0
 
 
 def test_ff_config_replacement_does_not_reset_pid_state() -> None:
@@ -659,9 +678,33 @@ def test_ff_config_replacement_does_not_reset_pid_state() -> None:
     assert controller.pid_x.has_sample
     assert controller.pid_x.i_term == before
 
+    clock.now = 1.0
+    controller.submit_tracking_control(
+        3,
+        _tracking_error(
+            target,
+            1.0,
+            target_rate_x=4.0,
+            valid_x=True,
+        ),
+    )
+    assert controller.pid_x.last_step is not None
+    assert controller.pid_x.last_step.feed_forward == pytest.approx(2.0)
+
     controller.apply_tracking_control_config(tracking)
     assert controller.pid_x.has_sample
-    assert controller.pid_x.i_term == before
+    clock.now = 1.5
+    controller.submit_tracking_control(
+        4,
+        _tracking_error(
+            target,
+            1.0,
+            target_rate_x=4.0,
+            valid_x=True,
+        ),
+    )
+    assert controller.pid_x.last_step is not None
+    assert controller.pid_x.last_step.feed_forward == 0.0
 
 
 def test_target_change_resets_pid_before_new_tracking_sample() -> None:

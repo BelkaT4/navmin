@@ -1,5 +1,5 @@
 {
-  "schema-version": 4,
+  "schema-version": 6,
   "vision": {
     "processing-scope": "main-and-preview",
     "cameras": {
@@ -65,6 +65,46 @@
       }
     }
   },
+  "tracking-control": {
+    "velocity-estimator": {
+      "window-ms": 200,
+      "min-span-ms": 100,
+      "min-samples": 4,
+      "max-samples": 16,
+      "max-fit-rms-deg": 1.0,
+      "max-target-rate-x-deg-s": 90.0,
+      "max-target-rate-y-deg-s": 90.0
+    },
+    "feed-forward": {
+      "enabled": false,
+      "gain-x": 0.0,
+      "gain-y": 0.0
+    },
+    "prediction": {
+      "enabled": false,
+      "horizon-ms": 0,
+      "max-angle-x-deg": 5.0,
+      "max-angle-y-deg": 5.0
+    },
+    "platform-motion": {
+      "source": "command-model"
+    }
+  },
+  "tracking-visualization": {
+    "show-search-region": true,
+    "show-best-candidate": true,
+    "show-control-prediction": true
+  },
+  "recording": {
+    "directory": "recordings"
+  },
+  "imu": {
+    "enabled": false,
+    "bind-address": "0.0.0.0",
+    "port": 8891,
+    "expected-source": null,
+    "calibration-file": "calibration/imu.json"
+  },
   "turret": {
     "serial": {
       "port": "/dev/ttyUSB0",
@@ -108,37 +148,5 @@
     "default-camera": "overview",
     "show-fps": true,
     "show-stereo-right-diagnostics": false
-  },
-  "tracking-control": {
-    "velocity-estimator": {
-      "window-ms": 200,
-      "min-span-ms": 100,
-      "min-samples": 4,
-      "max-samples": 16,
-      "max-fit-rms-deg": 1.0,
-      "max-target-rate-x-deg-s": 90.0,
-      "max-target-rate-y-deg-s": 90.0
-    },
-    "feed-forward": {
-      "enabled": false,
-      "gain-x": 0.0,
-      "gain-y": 0.0
-    },
-    "prediction": {
-      "enabled": false,
-      "horizon-ms": 0,
-      "max-angle-x-deg": 1.0,
-      "max-angle-y-deg": 1.0
-    },
-    "platform-motion": {
-      "source": "command-model"
-    }
-  },
-  "imu": {
-    "enabled": false,
-    "bind-address": "0.0.0.0",
-    "port": 8891,
-    "expected-source": null,
-    "calibration-file": "calibration/imu.json"
   }
 }

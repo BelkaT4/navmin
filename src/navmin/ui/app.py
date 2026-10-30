@@ -7,10 +7,15 @@ from collections.abc import Callable, Mapping, Sequence
 from PyQt6.QtWidgets import QApplication
 
 from navmin.concurrency import LatestValue
-from navmin.config.models import PidControllerConfig, TrackingControlConfig
+from navmin.config.models import (
+    PidControllerConfig,
+    TrackingControlConfig,
+    TrackingVisualizationConfig,
+)
 from navmin.contracts import CameraRole, TurretState
 from navmin.core import Mediator
 from navmin.imu import ImuCalibrationControls, ImuRuntimeState
+from navmin.recording import RecordingRuntime, RecordingSessionInfo
 
 from .bridge import CameraUiBinding
 from .main_window import MainWindow
@@ -26,6 +31,12 @@ def run_ui(
     apply_pid_tuning: Callable[[PidControllerConfig], None],
     tracking_control_config: TrackingControlConfig,
     apply_tracking_control_tuning: Callable[[TrackingControlConfig], None],
+    tracking_visualization_config: TrackingVisualizationConfig,
+    recording_runtime: RecordingRuntime | None = None,
+    start_recording: Callable[[CameraRole, int, int], RecordingSessionInfo] | None = None,
+    persist_tracking_visualization: (
+        Callable[[TrackingVisualizationConfig], None] | None
+    ) = None,
     imu_states: LatestValue[ImuRuntimeState] | None = None,
     imu_controls: ImuCalibrationControls | None = None,
     show_diagnostic_clock: bool = False,
@@ -44,6 +55,10 @@ def run_ui(
         apply_pid_tuning=apply_pid_tuning,
         tracking_control_config=tracking_control_config,
         apply_tracking_control_tuning=apply_tracking_control_tuning,
+        tracking_visualization_config=tracking_visualization_config,
+        recording_runtime=recording_runtime,
+        start_recording=start_recording,
+        persist_tracking_visualization=persist_tracking_visualization,
         imu_states=imu_states,
         imu_controls=imu_controls,
         show_diagnostic_clock=show_diagnostic_clock,

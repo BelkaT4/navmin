@@ -1,5 +1,5 @@
 {
-  "schema-version": 4,
+  "schema-version": 6,
   "vision": {
     "processing-scope": "main-and-preview",
     "cameras": {
@@ -83,12 +83,20 @@
     "prediction": {
       "enabled": false,
       "horizon-ms": 0,
-      "max-angle-x-deg": 1.0,
-      "max-angle-y-deg": 1.0
+      "max-angle-x-deg": 5.0,
+      "max-angle-y-deg": 5.0
     },
     "platform-motion": {
       "source": "command-model"
     }
+  },
+  "tracking-visualization": {
+    "show-search-region": false,
+    "show-best-candidate": false,
+    "show-control-prediction": false
+  },
+  "recording": {
+    "directory": "recordings"
   },
   "imu": {
     "enabled": false,

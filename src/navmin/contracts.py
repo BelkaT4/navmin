@@ -40,6 +40,10 @@ class CameraModel(Protocol):
         """Return a normalized camera ray for a working-frame pixel."""
         ...
 
+    def ray_to_pixel(self, ray: CameraRay) -> tuple[float, float]:
+        """Project a forward camera ray into working-frame pixel coordinates."""
+        ...
+
 
 @dataclass(frozen=True)
 class CameraSessionStarted:

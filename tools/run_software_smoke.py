@@ -335,8 +335,14 @@ def _smoke_overview_config(port: int) -> OverviewCameraConfig:
 
 
 def _smoke_app_config() -> AppConfig:
+    default_config = load_config(
+        Path(__file__).resolve().parents[1]
+        / "config"
+        / "defaults"
+        / "navmin.json"
+    )
     return AppConfig(
-        schema_version=4,
+        schema_version=default_config.schema_version,
         vision=VisionConfig(
             processing_scope=ProcessingScope.MAIN_AND_PREVIEW,
             cameras=CamerasConfig(
@@ -363,12 +369,8 @@ def _smoke_app_config() -> AppConfig:
             simulation_mode=True,
         ),
         aiming=_smoke_aiming_config(),
-        tracking_control=load_config(
-            Path(__file__).resolve().parents[1]
-            / "config"
-            / "defaults"
-            / "navmin.json"
-        ).tracking_control,
+        tracking_control=default_config.tracking_control,
+        tracking_visualization=default_config.tracking_visualization,
         imu=ImuConfig(
             enabled=False,
             bind_address="0.0.0.0",
@@ -552,6 +554,7 @@ def _run_qt_smoke(runtime: SoftwareSmokeRuntime, auto_close_seconds: float | Non
         apply_pid_tuning=ui.apply_pid_tuning,
         tracking_control_config=ui.tracking_control_config,
         apply_tracking_control_tuning=ui.apply_tracking_control_tuning,
+        tracking_visualization_config=ui.tracking_visualization_config,
     )
 
 

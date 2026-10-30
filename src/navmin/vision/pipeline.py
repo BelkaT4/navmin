@@ -39,7 +39,11 @@ from navmin.contracts import (
     VisionResult,
 )
 
-from .processor import VisionProcessor, create_vision_processor
+from .processor import (
+    VisionProcessor,
+    VisionTrackingDiagnostics,
+    create_vision_processor,
+)
 
 LOGGER = logging.getLogger(__name__)
 
@@ -311,6 +315,9 @@ class VisionPipeline:
         target_events: TargetLifecycleEventChannel | None = None,
         corrected_frame_sink: CorrectedFrameSink | None = None,
         latest_result: InvalidatableLatest[VisionResult] | None = None,
+        latest_tracking_diagnostics: (
+            InvalidatableLatest[VisionTrackingDiagnostics] | None
+        ) = None,
         status: LatestValue[CameraStatus] | None = None,
         timestamp_clock_ns: Callable[[], int] = monotonic_ns,
         processing_enabled: bool = True,
@@ -331,6 +338,9 @@ class VisionPipeline:
         self.target_events = target_events or TargetLifecycleEventChannel()
         self._corrected_frame_sink = corrected_frame_sink
         self.latest_result = latest_result or InvalidatableLatest()
+        self.latest_tracking_diagnostics = (
+            latest_tracking_diagnostics or InvalidatableLatest()
+        )
         self.status = status or LatestValue()
         self._timestamp_clock_ns = timestamp_clock_ns
         self._processing_enabled = processing_enabled
@@ -393,6 +403,7 @@ class VisionPipeline:
             self.target_control.discard_pending()
             self._processor.reset()
             self.latest_result.invalidate()
+            self.latest_tracking_diagnostics.invalidate()
             self._reset_diagnostics_locked()
             timestamp_ns = self._timestamp_clock_ns()
             self.status.publish(
@@ -455,6 +466,34 @@ class VisionPipeline:
                     "processor returned a target event for another camera session"
                 )
             self.target_events.publish(event)
+
+    def _publish_tracking_diagnostics(
+        self,
+        diagnostics: VisionTrackingDiagnostics | None,
+        *,
+        frame: FramePacket,
+    ) -> None:
+        if diagnostics is None:
+            self.latest_tracking_diagnostics.invalidate()
+            return
+        if (
+            diagnostics.camera is not frame.camera
+            or diagnostics.generation != frame.generation
+            or diagnostics.frame_id != frame.frame_id
+        ):
+            self.latest_tracking_diagnostics.invalidate()
+            LOGGER.warning(
+                "Vision tracking diagnostics rejected camera=%s generation=%d "
+                "frame_id=%d diagnostics=(%s,%d,%d)",
+                frame.camera.value,
+                frame.generation,
+                frame.frame_id,
+                diagnostics.camera.value,
+                diagnostics.generation,
+                diagnostics.frame_id,
+            )
+            return
+        self.latest_tracking_diagnostics.publish(diagnostics)
 
     def stop(self) -> None:
         with self._state_lock:
@@ -657,6 +696,10 @@ class VisionPipeline:
             self._publish_target_events(
                 processor_output.target_events,
                 generation=pending.generation,
+            )
+            self._publish_tracking_diagnostics(
+                processor_output.tracking_diagnostics,
+                frame=result.frame,
             )
             self.latest_result.publish(result)
             self.status.publish(

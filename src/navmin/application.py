@@ -6,6 +6,7 @@ import logging
 import math
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
+from pathlib import Path
 from time import monotonic
 from types import MappingProxyType
 
@@ -15,6 +16,7 @@ from navmin.config.models import (
     AppConfig,
     PidControllerConfig,
     TrackingControlConfig,
+    TrackingVisualizationConfig,
     TurretConfig,
 )
 from navmin.contracts import (
@@ -34,6 +36,12 @@ from navmin.imu import (
     ImuCalibrationControls,
     ImuRuntime,
     ImuRuntimeState,
+)
+from navmin.recording import (
+    RecordingRuntime,
+    RecordingSessionInfo,
+    RecordingSessionStatus,
+    RecordingState,
 )
 from navmin.turret.worker import TransportFactory, TurretWorker
 from navmin.ui.bridge import CameraUiBinding
@@ -80,6 +88,7 @@ class ApplicationFactories:
     stereo_right_source_factory: SourceFactory = create_camera_source
     turret_transport_factory: TransportFactory | None = None
     imu_runtime_factory: Callable[..., ImuRuntime] = ImuRuntime
+    recording_runtime_factory: Callable[[Path], RecordingRuntime] = RecordingRuntime
 
 
 @dataclass(frozen=True)
@@ -96,6 +105,9 @@ class UiRuntimeDependencies:
     apply_pid_tuning: Callable[[PidControllerConfig], None]
     tracking_control_config: TrackingControlConfig
     apply_tracking_control_tuning: Callable[[TrackingControlConfig], None]
+    tracking_visualization_config: TrackingVisualizationConfig
+    recording_runtime: RecordingRuntime | None = None
+    start_recording: Callable[[CameraRole, int, int], RecordingSessionInfo] | None = None
 
 
 @dataclass(frozen=True)
@@ -137,11 +149,20 @@ class ApplicationRuntime:
         camera_stale_timeout_ms: int,
         turret_config: TurretConfig,
         tracking_control_config: TrackingControlConfig,
+        tracking_visualization_config: TrackingVisualizationConfig,
+        recording_runtime: RecordingRuntime | None = None,
+        vision_backends: Mapping[CameraRole, str] | None = None,
     ) -> None:
         if not isinstance(turret_config, TurretConfig):
             raise TypeError("turret_config must be TurretConfig")
         if not isinstance(tracking_control_config, TrackingControlConfig):
             raise TypeError("tracking_control_config must be TrackingControlConfig")
+        if not isinstance(tracking_visualization_config, TrackingVisualizationConfig):
+            raise TypeError(
+                "tracking_visualization_config must be TrackingVisualizationConfig"
+            )
+        if recording_runtime is not None and not isinstance(recording_runtime, RecordingRuntime):
+            raise TypeError("recording_runtime must be RecordingRuntime")
         self.overview_worker = overview_worker
         self.stereo_left_worker = stereo_left_worker
         self.stereo_right_worker = stereo_right_worker
@@ -153,6 +174,16 @@ class ApplicationRuntime:
         self.imu_runtime = imu_runtime
         self.turret_worker = turret_worker
         self.mediator = mediator
+        self.recording_runtime = recording_runtime or RecordingRuntime(Path("recordings"))
+        resolved_backends = (
+            {
+                CameraRole.OVERVIEW: "unknown",
+                CameraRole.STEREO_LEFT: "unknown",
+            }
+            if vision_backends is None
+            else dict(vision_backends)
+        )
+        self._vision_backends = MappingProxyType(resolved_backends)
         self.camera_stale_timeout_ms = camera_stale_timeout_ms
         self._runtime_turret_config = turret_config
         self._pid_tuning_revision = 0
@@ -183,6 +214,9 @@ class ApplicationRuntime:
             apply_pid_tuning=self.apply_pid_tuning,
             tracking_control_config=tracking_control_config,
             apply_tracking_control_tuning=self.apply_tracking_control_tuning,
+            tracking_visualization_config=tracking_visualization_config,
+            recording_runtime=self.recording_runtime,
+            start_recording=self.start_recording,
         )
         self._active_components: set[str] = set()
         self._start_attempted = False
@@ -207,6 +241,30 @@ class ApplicationRuntime:
     @property
     def ui_dependencies(self) -> UiRuntimeDependencies:
         return self._ui_dependencies
+
+    def start_recording(
+        self,
+        camera: CameraRole,
+        width: int,
+        height: int,
+    ) -> RecordingSessionInfo:
+        """Start one recording bound to the selected normal camera."""
+        if camera not in self._camera_bindings:
+            raise ValueError(f"camera is not recordable from the operator UI: {camera.value}")
+        if width <= 0 or height <= 0:
+            raise ValueError("recording dimensions must be positive")
+        diagnostics = self._camera_workers[camera].pipeline.diagnostics
+        nominal_fps = diagnostics.received_fps
+        if nominal_fps is None or not math.isfinite(nominal_fps) or nominal_fps <= 0.0:
+            nominal_fps = 20.0
+        vision_backend = self._vision_backends[camera]
+        return self.recording_runtime.start(
+            camera=camera,
+            width=width,
+            height=height,
+            nominal_fps=float(nominal_fps),
+            vision_backend=vision_backend,
+        )
 
     def apply_pid_tuning(self, config: PidControllerConfig) -> None:
         """Queue a temporary PID-only runtime config update for Turret."""
@@ -384,6 +442,18 @@ class ApplicationRuntime:
             self._start_attempted = True
 
         failures: list[ApplicationShutdownFailure] = []
+        if self.recording_runtime.state is not RecordingState.IDLE:
+            try:
+                recording_status = self.recording_runtime.stop()
+            except RuntimeError as error:
+                LOGGER.error("Recording cleanup failed during shutdown: %s", error)
+            else:
+                if recording_status is RecordingSessionStatus.FAILED:
+                    failure = self.recording_runtime.poll_failure()
+                    LOGGER.error(
+                        "Recording had failed before/during shutdown: %s",
+                        failure or "unknown failure",
+                    )
         self.mediator.invalidate_distance_computation()
         if _TURRET_COMPONENT in self._active_components:
             safety_failure = self._prepare_turret_for_shutdown(timeout)
@@ -508,6 +578,7 @@ class ApplicationRuntime:
             session_barriers=pipeline.session_barriers,
             target_events=pipeline.target_events,
             latest_result=pipeline.latest_result,
+            tracking_diagnostics=pipeline.latest_tracking_diagnostics,
             status=pipeline.status,
         )
 
@@ -651,6 +722,13 @@ def build_application_runtime(
                 mediator=mediator,
             )
         )
+    recording_runtime = selected_factories.recording_runtime_factory(
+        Path(config.recording.directory)
+    )
+    vision_backends = {
+        CameraRole.OVERVIEW: config.vision.cameras.overview.vision_processor_class,
+        CameraRole.STEREO_LEFT: config.vision.cameras.stereo_left.vision_processor_class,
+    }
     return ApplicationRuntime(
         overview_worker=overview_worker,
         stereo_left_worker=stereo_left_worker,
@@ -666,6 +744,9 @@ def build_application_runtime(
         camera_stale_timeout_ms=config.vision.camera_stale_timeout_ms,
         turret_config=config.turret,
         tracking_control_config=config.tracking_control,
+        tracking_visualization_config=config.tracking_visualization,
+        recording_runtime=recording_runtime,
+        vision_backends=vision_backends,
     )
 
 
