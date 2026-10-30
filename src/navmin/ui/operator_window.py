@@ -293,6 +293,15 @@ class OperatorWindow(QWidget):
     def set_tracking_control_config(self, config: TrackingControlConfig) -> None:
         self._sync_tracking_controls(config)
 
+    def set_tracking_control_horizon_ms(self, horizon_ms: int) -> None:
+        self._tracking_control_config = replace(
+            self._tracking_control_config,
+            prediction=replace(
+                self._tracking_control_config.prediction,
+                horizon_ms=horizon_ms,
+            ),
+        )
+
     def _sync_tracking_visualization_controls(
         self, config: TrackingVisualizationConfig
     ) -> None:

@@ -505,8 +505,14 @@ class MainWindow(QMainWindow):
             current,
             prediction=replace(current.prediction, horizon_ms=horizon_ms),
         )
+
         try:
-            self._apply_tracking_control_tuning(config)
+            self._on_apply_tracking_control_tuning(config)
+            self._tracking_control_config = config
+            self.operator_window.set_tracking_control_horizon_ms(horizon_ms)
+            self.horizon_value_label.setText(
+                self._format_horizon_seconds(horizon_ms)
+            )
         except (TypeError, ValueError):
             old_step = min(
                 20, max(0, round(current.prediction.horizon_ms / 50))
