@@ -80,6 +80,22 @@ verify_target() {
   printf '%s\n' "$ACTUAL_ADDRESSES" | grep -Fx "$EXPECTED_ADDRESS" >/dev/null 2>&1
 }
 
+wait_for_target() {
+  attempt=0
+  max_attempts=25
+
+  while [ "$attempt" -lt "$max_attempts" ]; do
+    if verify_target; then
+      return 0
+    fi
+
+    attempt=$((attempt + 1))
+    sleep 0.2
+  done
+
+  return 1
+}
+
 if [ -f "$STATE_FILE" ]; then
   # shellcheck disable=SC1090
   . "$STATE_FILE"
@@ -115,7 +131,7 @@ if ! nmcli connection up uuid "$TARGET_UUID" ifname "$INTERFACE" >/dev/null; the
   fail "failed to activate profile '$PROFILE' on $INTERFACE"
 fi
 
-if ! verify_target; then
+if ! wait_for_target; then
   rollback
   fail "profile '$PROFILE' activated but expected address $EXPECTED_ADDRESS is not active on $INTERFACE"
 fi
