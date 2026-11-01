@@ -1,4 +1,4 @@
-"""Strict parser and serializer for NavMin config schema v4."""
+"""Strict parser and serializer for NavMin config schema v6."""
 
 from __future__ import annotations
 
@@ -27,6 +27,7 @@ from .models import (
     PlatformMotionConfig,
     PredictionConfig,
     ProcessingScope,
+    RecordingConfig,
     RtpJpegSourceConfig,
     RtspDecoderMode,
     RtspProtocol,
@@ -35,6 +36,7 @@ from .models import (
     StereoDistanceConfig,
     Stm32Config,
     TrackingControlConfig,
+    TrackingVisualizationConfig,
     TurretConfig,
     UiConfig,
     VelocityEstimatorConfig,
@@ -42,7 +44,9 @@ from .models import (
     VisionDistanceConfig,
 )
 
-SUPPORTED_SCHEMA_VERSION = 4
+SUPPORTED_SCHEMA_VERSION = 6
+MIGRATABLE_SCHEMA_VERSION = 5
+LEGACY_MIGRATABLE_SCHEMA_VERSION = 4
 SUPPORTED_BAUDRATES = frozenset({9600, 19200, 38400, 57600, 115200})
 
 
@@ -570,6 +574,30 @@ def _parse_tracking_control(value: Any) -> TrackingControlConfig:
     )
 
 
+def _parse_tracking_visualization(value: Any) -> TrackingVisualizationConfig:
+    path = "tracking-visualization"
+    obj = _fields(
+        value,
+        path,
+        required={
+            "show-search-region",
+            "show-best-candidate",
+            "show-control-prediction",
+        },
+    )
+    return TrackingVisualizationConfig(
+        show_search_region=_bool(
+            obj["show-search-region"], f"{path}.show-search-region"
+        ),
+        show_best_candidate=_bool(
+            obj["show-best-candidate"], f"{path}.show-best-candidate"
+        ),
+        show_control_prediction=_bool(
+            obj["show-control-prediction"], f"{path}.show-control-prediction"
+        ),
+    )
+
+
 def _nullable_nonempty_string(value: Any, path: str) -> str | None:
     if value is None:
         return None
@@ -763,6 +791,14 @@ def _parse_turret(value: Any) -> TurretConfig:
     )
 
 
+
+def _parse_recording(value: Any) -> RecordingConfig:
+    path = "recording"
+    obj = _fields(value, path, required={"directory"})
+    return RecordingConfig(
+        directory=_nonempty_string(obj["directory"], f"{path}.directory")
+    )
+
 def _parse_ui(value: Any) -> UiConfig:
     path = "ui"
     obj = _fields(
@@ -789,29 +825,85 @@ def _parse_ui(value: Any) -> UiConfig:
 
 
 def parse_config(data: Any) -> AppConfig:
-    """Validate an already decoded JSON value and return schema-v4 snapshot."""
-    obj = _fields(
-        data,
-        "",
-        required={
-            "schema-version",
-            "vision",
-            "aiming",
-            "tracking-control",
-            "imu",
-            "turret",
-            "ui",
-        },
-    )
-    schema_version = _int(obj["schema-version"], "schema-version")
-    if schema_version != SUPPORTED_SCHEMA_VERSION:
+    """Validate JSON and return the current schema-v6 snapshot.
+
+    Schema v4 is migrated in memory by adding tracking-visualization and
+    recording defaults. Schema v5 is migrated by adding the recording default.
+    """
+    raw = _object(data, "")
+    if "schema-version" not in raw:
+        _validation("schema-version", "missing required field")
+    schema_version = _int(raw["schema-version"], "schema-version")
+
+    if schema_version == LEGACY_MIGRATABLE_SCHEMA_VERSION:
+        obj = _fields(
+            raw,
+            "",
+            required={
+                "schema-version",
+                "vision",
+                "aiming",
+                "tracking-control",
+                "imu",
+                "turret",
+                "ui",
+            },
+        )
+        tracking_visualization = TrackingVisualizationConfig(
+            show_search_region=False,
+            show_best_candidate=False,
+            show_control_prediction=False,
+        )
+        recording = RecordingConfig(directory="recordings")
+    elif schema_version == MIGRATABLE_SCHEMA_VERSION:
+        obj = _fields(
+            raw,
+            "",
+            required={
+                "schema-version",
+                "vision",
+                "aiming",
+                "tracking-control",
+                "tracking-visualization",
+                "imu",
+                "turret",
+                "ui",
+            },
+        )
+        tracking_visualization = _parse_tracking_visualization(
+            obj["tracking-visualization"]
+        )
+        recording = RecordingConfig(directory="recordings")
+    elif schema_version == SUPPORTED_SCHEMA_VERSION:
+        obj = _fields(
+            raw,
+            "",
+            required={
+                "schema-version",
+                "vision",
+                "aiming",
+                "tracking-control",
+                "tracking-visualization",
+                "recording",
+                "imu",
+                "turret",
+                "ui",
+            },
+        )
+        tracking_visualization = _parse_tracking_visualization(
+            obj["tracking-visualization"]
+        )
+        recording = _parse_recording(obj["recording"])
+    else:
         raise UnsupportedConfigSchemaError(schema_version)
 
     return AppConfig(
-        schema_version=schema_version,
+        schema_version=SUPPORTED_SCHEMA_VERSION,
         vision=_parse_vision(obj["vision"]),
         aiming=_parse_aiming(obj["aiming"]),
         tracking_control=_parse_tracking_control(obj["tracking-control"]),
+        tracking_visualization=tracking_visualization,
+        recording=recording,
         imu=_parse_imu(obj["imu"]),
         turret=_parse_turret(obj["turret"]),
         ui=_parse_ui(obj["ui"]),
@@ -880,9 +972,9 @@ def _aim_point_to_mapping(config: AimPointConfig) -> dict[str, Any]:
 
 
 def config_to_mapping(config: AppConfig) -> dict[str, Any]:
-    """Convert a typed schema-v4 snapshot to its persisted JSON structure."""
+    """Convert a typed schema-v6 snapshot to its persisted JSON structure."""
     return {
-        "schema-version": config.schema_version,
+        "schema-version": SUPPORTED_SCHEMA_VERSION,
         "vision": {
             "processing-scope": config.vision.processing_scope.value,
             "cameras": {
@@ -949,6 +1041,16 @@ def config_to_mapping(config: AppConfig) -> dict[str, Any]:
             "platform-motion": {
                 "source": config.tracking_control.platform_motion.source.value,
             },
+        },
+        "tracking-visualization": {
+            "show-search-region": config.tracking_visualization.show_search_region,
+            "show-best-candidate": config.tracking_visualization.show_best_candidate,
+            "show-control-prediction": (
+                config.tracking_visualization.show_control_prediction
+            ),
+        },
+        "recording": {
+            "directory": config.recording.directory,
         },
         "imu": {
             "enabled": config.imu.enabled,

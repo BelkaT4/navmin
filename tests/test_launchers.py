@@ -49,6 +49,7 @@ from navmin.config.models import (
     SerialConfig,
     StereoDistanceConfig,
     Stm32Config,
+    TrackingVisualizationConfig,
     TurretConfig,
     UiConfig,
     VisionConfig,
@@ -172,7 +173,7 @@ def _config(*, emulate_stm32: bool = False) -> AppConfig:
         max_relative_move_deg=45.0,
     )
     return AppConfig(
-        schema_version=4,
+        schema_version=6,
         vision=VisionConfig(
             processing_scope=ProcessingScope.MAIN_AND_PREVIEW,
             cameras=CamerasConfig(
@@ -199,6 +200,11 @@ def _config(*, emulate_stm32: bool = False) -> AppConfig:
             aim_points=AimPointsConfig(overview=center, stereo_left=center),
         ),
         tracking_control=_default_tracking_control_config(),
+        tracking_visualization=TrackingVisualizationConfig(
+            show_search_region=False,
+            show_best_candidate=False,
+            show_control_prediction=False,
+        ),
         imu=ImuConfig(
             enabled=False,
             bind_address="0.0.0.0",
@@ -841,6 +847,7 @@ def test_run_loaded_application_uses_shared_runtime_ui_surface_and_shutdown() ->
         apply_pid_tuning=apply_pid_tuning,
         tracking_control_config=inputs.config.tracking_control,
         apply_tracking_control_tuning=lambda _config: None,
+        tracking_visualization_config=inputs.config.tracking_visualization,
     )
 
     class FakeRuntime:
@@ -878,6 +885,11 @@ def test_run_loaded_application_uses_shared_runtime_ui_surface_and_shutdown() ->
             kwargs["apply_tracking_control_tuning"]
             is ui_dependencies.apply_tracking_control_tuning
         )
+        assert (
+            kwargs["tracking_visualization_config"]
+            is inputs.config.tracking_visualization
+        )
+        assert kwargs["persist_tracking_visualization"] is None
         assert kwargs["show_diagnostic_clock"] is False
         assert kwargs["argv"] == ("--qt-test",)
         return 7
@@ -892,6 +904,66 @@ def test_run_loaded_application_uses_shared_runtime_ui_surface_and_shutdown() ->
         == 7
     )
     assert events == ["start", "ui", "shutdown"]
+
+
+def test_run_loaded_application_persists_tracking_visualization_via_config_manager(
+    tmp_path: Path,
+) -> None:
+    config_path = tmp_path / "config" / "navmin.json"
+    config_path.parent.mkdir(parents=True)
+    config = _config()
+    save_config(config_path, config)
+    inputs = LoadedApplicationInputs(
+        config=config,
+        overview_calibration=_overview(),
+        stereo_calibration=_stereo(),
+        source_paths=SourceInputPaths(
+            config=config_path,
+            overview_calibration=tmp_path / "overview.json",
+            stereo_calibration=tmp_path / "stereo.json",
+        ),
+    )
+    ui_dependencies = SimpleNamespace(
+        mediator=object(),
+        camera_bindings={},
+        turret_states=object(),
+        imu_states=None,
+        imu_controls=None,
+        camera_stale_timeout_ms=500,
+        pid_controller_config=config.turret.controller,
+        apply_pid_tuning=lambda _config: None,
+        tracking_control_config=config.tracking_control,
+        apply_tracking_control_tuning=lambda _config: None,
+        tracking_visualization_config=config.tracking_visualization,
+    )
+
+    class FakeRuntime:
+        def __init__(self) -> None:
+            self.imu_runtime = None
+            self.ui_dependencies = ui_dependencies
+
+        def start(self) -> None:
+            pass
+
+        def shutdown(self) -> None:
+            pass
+
+    def ui_runner(**kwargs) -> int:
+        persist = kwargs["persist_tracking_visualization"]
+        assert persist is not None
+        persist(TrackingVisualizationConfig(True, True, True))
+        return 0
+
+    run_loaded_application(
+        inputs,
+        runtime_builder=lambda **_kwargs: FakeRuntime(),
+        ui_runner=ui_runner,
+    )
+
+    saved = load_config(config_path)
+    assert saved.tracking_visualization == TrackingVisualizationConfig(True, True, True)
+    assert saved.turret == config.turret
+    assert saved.tracking_control == config.tracking_control
 
 
 def test_run_loaded_application_installs_launcher_owned_imu_calibration_writer(
@@ -934,6 +1006,7 @@ def test_run_loaded_application_installs_launcher_owned_imu_calibration_writer(
                 apply_pid_tuning=lambda _config: None,
                 tracking_control_config=config.tracking_control,
                 apply_tracking_control_tuning=lambda _config: None,
+                tracking_visualization_config=config.tracking_visualization,
             )
 
         def start(self) -> None:
@@ -1558,7 +1631,7 @@ def test_input_recovery_creates_valid_safe_defaults_without_existing_files(
     stereo = load_stereo_calibration(paths.stereo_calibration)
     imu = ImuCalibration.load(imu_path)
     assert config.turret.serial.port == "/dev/navmin-configure-serial-port"
-    assert config.schema_version == 4
+    assert config.schema_version == 6
     assert config.vision.cameras.overview.calibration_file == "calibration/overview.json"
     assert config.vision.distance.stereo.calibration_file == "calibration/stereo.json"
     assert config.imu.calibration_file == "calibration/imu.json"
@@ -1599,7 +1672,7 @@ def test_input_recovery_replaces_malformed_root_and_invalid_canonical_calibratio
 
     assert len(result.backups) == 3
     recovered = load_config(paths.config)
-    assert recovered.schema_version == 4
+    assert recovered.schema_version == 6
     assert recovered.vision.cameras.overview.calibration_file == "calibration/overview.json"
     assert recovered.vision.distance.stereo.calibration_file == "calibration/stereo.json"
     assert load_overview_calibration(paths.overview_calibration).schema_version == 1

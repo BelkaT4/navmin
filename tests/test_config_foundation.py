@@ -25,7 +25,7 @@ from navmin.contracts import CameraRole, DistanceSource
 
 def _valid_config() -> dict:
     return {
-        "schema-version": 4,
+        "schema-version": 6,
         "vision": {
             "processing-scope": "main-only",
             "cameras": {
@@ -103,11 +103,17 @@ def _valid_config() -> dict:
             "prediction": {
                 "enabled": False,
                 "horizon-ms": 0,
-                "max-angle-x-deg": 1.0,
-                "max-angle-y-deg": 1.0,
+                "max-angle-x-deg": 5.0,
+                "max-angle-y-deg": 5.0,
             },
             "platform-motion": {"source": "command-model"},
         },
+        "tracking-visualization": {
+            "show-search-region": False,
+            "show-best-candidate": False,
+            "show-control-prediction": False,
+        },
+        "recording": {"directory": "recordings"},
         "imu": {
             "enabled": False,
             "bind-address": "0.0.0.0",
@@ -166,10 +172,10 @@ def _write_json(path, data) -> None:
     path.write_text(json.dumps(data), encoding="utf-8")
 
 
-def test_valid_schema_v4_builds_typed_immutable_snapshot() -> None:
+def test_valid_schema_v5_builds_typed_immutable_snapshot() -> None:
     config = parse_config(_valid_config())
 
-    assert config.schema_version == 4
+    assert config.schema_version == 6
     assert (
         config.vision.cameras.overview.calibration_file == "calibration/overview.json"
     )
@@ -194,7 +200,7 @@ def test_tracking_control_round_trips_through_mapping() -> None:
     assert parse_config(config_to_mapping(config)) == config
 
 
-def test_schema_v4_requires_tracking_control_and_rejects_old_pixel_lead() -> None:
+def test_schema_v5_requires_tracking_control_and_rejects_old_pixel_lead() -> None:
     missing = _valid_config()
     missing.pop("tracking-control")
     with pytest.raises(ConfigValidationError) as exc_info:
@@ -375,6 +381,97 @@ def test_legacy_flat_camera_schema_is_rejected_without_migration() -> None:
         parse_config(data)
 
 
+def test_schema_v4_migrates_tracking_visualization_defaults_in_memory() -> None:
+    data = _valid_config()
+    data["schema-version"] = 4
+    data.pop("tracking-visualization")
+    data.pop("recording")
+    data["tracking-control"]["prediction"]["max-angle-x-deg"] = 1.0
+    data["tracking-control"]["prediction"]["max-angle-y-deg"] = 1.0
+
+    config = parse_config(data)
+
+    assert config.schema_version == 6
+    assert not config.tracking_visualization.show_search_region
+    assert not config.tracking_visualization.show_best_candidate
+    assert not config.tracking_visualization.show_control_prediction
+    assert config.tracking_control.prediction.max_angle_x_deg == 1.0
+    assert config.tracking_control.prediction.max_angle_y_deg == 1.0
+
+
+def test_schema_v6_requires_tracking_visualization_section() -> None:
+    data = _valid_config()
+    data.pop("tracking-visualization")
+
+    with pytest.raises(ConfigValidationError) as exc_info:
+        parse_config(data)
+
+    assert exc_info.value.path == "tracking-visualization"
+
+
+def test_schema_v5_migrates_recording_default_in_memory() -> None:
+    data = _valid_config()
+    data["schema-version"] = 5
+    data.pop("recording")
+
+    config = parse_config(data)
+
+    assert config.schema_version == 6
+    assert config.recording.directory == "recordings"
+
+
+def test_schema_v6_requires_recording_section() -> None:
+    data = _valid_config()
+    data.pop("recording")
+
+    with pytest.raises(ConfigValidationError) as exc_info:
+        parse_config(data)
+
+    assert exc_info.value.path == "recording"
+
+
+def test_recording_directory_is_strict_and_round_trips(tmp_path) -> None:
+    data = _valid_config()
+    data["recording"] = {"directory": "captures"}
+    config = parse_config(data)
+    path = tmp_path / "config.json"
+
+    save_config(path, config)
+
+    saved = json.loads(path.read_text(encoding="utf-8"))
+    assert saved["recording"] == {"directory": "captures"}
+    assert load_config(path).recording == config.recording
+
+    invalid = copy.deepcopy(data)
+    invalid["recording"]["directory"] = ""
+    with pytest.raises(ConfigValidationError) as exc_info:
+        parse_config(invalid)
+    assert exc_info.value.path == "recording.directory"
+
+
+def test_tracking_visualization_is_strict_and_round_trips(tmp_path) -> None:
+    data = _valid_config()
+    data["tracking-visualization"] = {
+        "show-search-region": True,
+        "show-best-candidate": True,
+        "show-control-prediction": True,
+    }
+    config = parse_config(data)
+    path = tmp_path / "config.json"
+
+    save_config(path, config)
+
+    saved = json.loads(path.read_text(encoding="utf-8"))
+    assert saved["tracking-visualization"] == data["tracking-visualization"]
+    assert load_config(path).tracking_visualization == config.tracking_visualization
+
+    invalid = copy.deepcopy(data)
+    invalid["tracking-visualization"]["show-search-region"] = 1
+    with pytest.raises(ConfigValidationError) as exc_info:
+        parse_config(invalid)
+    assert exc_info.value.path == "tracking-visualization.show-search-region"
+
+
 @pytest.mark.parametrize(
     ("field", "value", "expected_path"),
     [
@@ -416,7 +513,7 @@ def test_missing_config_is_explicit_error(tmp_path) -> None:
 
 def test_malformed_json_is_preserved(tmp_path) -> None:
     path = tmp_path / "config.json"
-    original = b'{"schema-version": 4, broken}'
+    original = b'{"schema-version": 6, broken}'
     path.write_bytes(original)
 
     with pytest.raises(ConfigJsonError):
@@ -430,7 +527,7 @@ def test_malformed_json_is_preserved(tmp_path) -> None:
     [
         (lambda data: data.pop("schema-version"), "schema-version"),
         (lambda data: data.__setitem__("schema-version", True), "schema-version"),
-        (lambda data: data.__setitem__("schema-version", "4"), "schema-version"),
+        (lambda data: data.__setitem__("schema-version", "6"), "schema-version"),
     ],
 )
 def test_missing_or_invalid_schema_version_is_validation_error(mutation, path) -> None:
@@ -444,7 +541,7 @@ def test_missing_or_invalid_schema_version_is_validation_error(mutation, path) -
     assert not isinstance(exc_info.value, UnsupportedConfigSchemaError)
 
 
-@pytest.mark.parametrize("unsupported", [1, 2, 3, 5])
+@pytest.mark.parametrize("unsupported", [1, 2, 3, 7])
 def test_unsupported_schema_is_distinct_error(unsupported: int) -> None:
     data = _valid_config()
     data["schema-version"] = unsupported
@@ -454,7 +551,7 @@ def test_unsupported_schema_is_distinct_error(unsupported: int) -> None:
 
     assert exc_info.value.path == "schema-version"
     assert exc_info.value.actual == unsupported
-    assert "expected 4" in str(exc_info.value)
+    assert "expected 6" in str(exc_info.value)
 
 
 @pytest.mark.parametrize(
@@ -541,7 +638,7 @@ def test_missing_required_field_reports_exact_path() -> None:
         ),
     ],
 )
-def test_schema_v4_calibration_references_are_required_and_role_owned(
+def test_schema_v5_calibration_references_are_required_and_role_owned(
     mutate, expected_path
 ) -> None:
     data = _valid_config()
@@ -612,7 +709,7 @@ def test_repository_defaults_parse_with_production_loaders() -> None:
     stereo = load_stereo_calibration(defaults / "calibration" / "stereo.json")
     imu = ImuCalibration.load(defaults / "calibration" / "imu.json")
 
-    assert config.schema_version == 4
+    assert config.schema_version == 6
     assert (
         config.vision.cameras.overview.calibration_file == "calibration/overview.json"
     )
@@ -626,6 +723,11 @@ def test_repository_defaults_parse_with_production_loaders() -> None:
     assert config.tracking_control.feed_forward.gain_y == 0.0
     assert not config.tracking_control.prediction.enabled
     assert config.tracking_control.prediction.horizon_ms == 0
+    assert config.tracking_control.prediction.max_angle_x_deg == 5.0
+    assert config.tracking_control.prediction.max_angle_y_deg == 5.0
+    assert not config.tracking_visualization.show_search_region
+    assert not config.tracking_visualization.show_best_candidate
+    assert not config.tracking_visualization.show_control_prediction
     assert overview.schema_version == 1
     assert stereo.schema_version == 1
     assert not imu.gyro_ready
@@ -733,6 +835,26 @@ def test_watchdog_less_than_target_lost_is_not_an_undocumented_hard_rule() -> No
     assert config.turret.stm32.velocity_watchdog_timeout_ms == 900
 
 
+def test_tracking_visualization_runtime_update_is_dynamic_and_persisted(tmp_path) -> None:
+    path = tmp_path / "config.json"
+    data = _valid_config()
+    _write_json(path, data)
+    manager = ConfigManager.load(path)
+
+    changed = copy.deepcopy(data)
+    changed["tracking-visualization"]["show-control-prediction"] = True
+    assert manager.apply_runtime_update(changed, persist=True)
+
+    update = manager.tracking_visualization_updates.get()
+    assert update is not None
+    assert update.revision == 1
+    assert update.config.show_control_prediction
+    assert config_apply_policy(
+        "tracking-visualization.show-control-prediction"
+    ) is ConfigApplyPolicy.DYNAMIC
+    assert load_config(path).tracking_visualization.show_control_prediction
+
+
 def test_runtime_invalid_update_does_not_replace_snapshot_or_revision(tmp_path) -> None:
     path = tmp_path / "config.json"
     initial_data = _valid_config()
@@ -820,7 +942,7 @@ def test_rtsp_config_round_trip_preserves_source_specific_fields(tmp_path) -> No
     save_config(path, config)
 
     saved = json.loads(path.read_text(encoding="utf-8"))
-    assert saved["schema-version"] == 4
+    assert saved["schema-version"] == 6
     assert (
         saved["vision"]["cameras"]["overview"]["source"]
         == data["vision"]["cameras"]["overview"]["source"]
@@ -951,10 +1073,20 @@ def test_change_metadata_reports_only_fixed_architecture_classification() -> Non
         "tracking-control.prediction.horizon-ms",
         "tracking-control.prediction.max-angle-x-deg",
         "tracking-control.prediction.max-angle-y-deg",
+        "tracking-visualization.show-search-region",
+        "tracking-visualization.show-best-candidate",
+        "tracking-visualization.show-control-prediction",
     ],
 )
 def test_tracking_control_runtime_fields_are_dynamic(path: str) -> None:
     assert config_apply_policy(path) is ConfigApplyPolicy.DYNAMIC
+
+
+def test_recording_directory_requires_application_restart() -> None:
+    assert (
+        config_apply_policy("recording.directory")
+        is ConfigApplyPolicy.APPLICATION_RESTART
+    )
 
 
 def test_tracking_control_unknown_fields_have_no_implicit_apply_policy() -> None:

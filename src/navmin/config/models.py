@@ -156,6 +156,18 @@ class TrackingControlConfig:
 
 
 @dataclass(frozen=True)
+class TrackingVisualizationConfig:
+    show_search_region: bool
+    show_best_candidate: bool
+    show_control_prediction: bool
+
+
+@dataclass(frozen=True)
+class RecordingConfig:
+    directory: str
+
+
+@dataclass(frozen=True)
 class ImuConfig:
     enabled: bool
     bind_address: str
@@ -228,9 +240,11 @@ class AppConfig:
     vision: VisionConfig
     aiming: AimingConfig
     tracking_control: TrackingControlConfig
+    tracking_visualization: TrackingVisualizationConfig
     imu: ImuConfig
     turret: TurretConfig
     ui: UiConfig
+    recording: RecordingConfig = RecordingConfig(directory="recordings")
 
 
 _DYNAMIC_EXACT_PATHS = frozenset(
@@ -251,6 +265,9 @@ _DYNAMIC_EXACT_PATHS = frozenset(
         "tracking-control.prediction.horizon-ms",
         "tracking-control.prediction.max-angle-x-deg",
         "tracking-control.prediction.max-angle-y-deg",
+        "tracking-visualization.show-search-region",
+        "tracking-visualization.show-best-candidate",
+        "tracking-visualization.show-control-prediction",
         "ui.show-fps",
         "ui.show-stereo-right-diagnostics",
     }
@@ -268,6 +285,9 @@ def config_apply_policy(path: str) -> ConfigApplyPolicy | None:
 
     parts = path.split(".")
     if path == "tracking-control.platform-motion.source":
+        return ConfigApplyPolicy.APPLICATION_RESTART
+
+    if path == "recording.directory":
         return ConfigApplyPolicy.APPLICATION_RESTART
 
     if path.startswith("imu."):
@@ -371,6 +391,7 @@ __all__ = [
     "PlatformMotionConfig",
     "PredictionConfig",
     "ProcessingScope",
+    "RecordingConfig",
     "RtpJpegSourceConfig",
     "RtspDecoderMode",
     "RtspProtocol",
@@ -379,6 +400,7 @@ __all__ = [
     "StereoDistanceConfig",
     "Stm32Config",
     "TrackingControlConfig",
+    "TrackingVisualizationConfig",
     "TurretConfig",
     "UiConfig",
     "VelocityEstimatorConfig",

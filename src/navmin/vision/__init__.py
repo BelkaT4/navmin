@@ -29,6 +29,7 @@ from .processor import (
     DEFAULT_VISION_PROCESSOR_CLASS,
     VisionProcessor,
     VisionProcessorOutput,
+    VisionTrackingDiagnostics,
     create_vision_processor,
 )
 from .processors import Legacy14VisionProcessor
@@ -51,6 +52,7 @@ __all__ = [
     "VisionPipelineError",
     "VisionProcessor",
     "VisionProcessorOutput",
+    "VisionTrackingDiagnostics",
     "WorkingFrameError",
     "build_camera_worker",
     "build_rtp_jpeg_pipeline_description",

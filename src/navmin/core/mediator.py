@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from enum import Enum
@@ -33,6 +34,7 @@ from navmin.contracts import (
     TargetTrackingEnded,
     TrackedObject,
     TrackingControlSample,
+    TrackingError,
     TurretConnectionState,
     TurretControlMode,
     TurretState,
@@ -43,7 +45,11 @@ from navmin.vision.stereo_target_join import StereoPairingKind
 from .aiming import Aiming
 from .distance import DistanceMeasurementMode, quantize_constant_distance
 from .session_gate import CameraSessionGate
-from .tracking_estimator import TrackingEstimator, TrackingEstimatorDiagnostics
+from .tracking_estimator import (
+    TrackingControlVisualization,
+    TrackingEstimator,
+    TrackingEstimatorDiagnostics,
+)
 
 _NORMAL_CAMERAS = (CameraRole.OVERVIEW, CameraRole.STEREO_LEFT)
 _DISCONNECTED_CAMERA_STATES = (
@@ -51,6 +57,7 @@ _DISCONNECTED_CAMERA_STATES = (
     CameraState.ERROR,
     CameraState.STOPPED,
 )
+_LOGGER = logging.getLogger(__name__)
 
 
 class StereoDistanceRejectionReason(Enum):
@@ -197,6 +204,7 @@ class Mediator:
         self._stereo_distance_result_revision = 0
         self._aiming = Aiming(aiming_config)
         self._tracking_estimator = TrackingEstimator(tracking_control_config)
+        self._tracking_control_visualization: TrackingControlVisualization | None = None
         self._tracking_control_config_revision = 0
         self._tracking_gap_timeout_ns = tracking_gap_timeout_ms * 1_000_000
         self._main_camera = ui_config.default_camera
@@ -238,6 +246,10 @@ class Mediator:
     @property
     def tracking_diagnostics(self) -> TrackingEstimatorDiagnostics:
         return self._tracking_estimator.diagnostics
+
+    @property
+    def tracking_control_visualization(self) -> TrackingControlVisualization | None:
+        return self._tracking_control_visualization
 
     @property
     def main_camera(self) -> CameraRole:
@@ -536,6 +548,7 @@ class Mediator:
         self._invalidate_distance_intent()
         self._refresh_stereo_join_target()
         self._tracking_estimator.reset()
+        self._tracking_control_visualization = None
         self._turret.invalidate_tracking_control()
         if had_selected_target:
             self._turret.stop_motion()
@@ -633,6 +646,7 @@ class Mediator:
         self._refresh_stereo_join_target()
         self._refresh_manual_distance()
         self._tracking_estimator.reset()
+        self._tracking_control_visualization = None
         result = self._latest_results.get(target.camera)
         if result is not None:
             self._update_tracking_from_result(result)
@@ -657,6 +671,7 @@ class Mediator:
         self._invalidate_distance_intent()
         self._refresh_stereo_join_target()
         self._tracking_estimator.reset()
+        self._tracking_control_visualization = None
         self._turret.invalidate_tracking_control()
         return True
 
@@ -673,6 +688,7 @@ class Mediator:
         self._invalidate_distance_intent()
         self._refresh_stereo_join_target()
         self._tracking_estimator.reset()
+        self._tracking_control_visualization = None
         self._turret.invalidate_tracking_control()
         self._turret.stop_motion()
         return True
@@ -692,6 +708,7 @@ class Mediator:
         tracked = self._find_track(result, target.track_id)
         if tracked is None:
             self._tracking_estimator.reset_history()
+            self._tracking_control_visualization = None
             self._turret.invalidate_tracking_control()
             return
         self._submit_tracking_control(result, tracked, target)
@@ -705,6 +722,7 @@ class Mediator:
         model = self._session_gate.camera_model(target.camera, target.generation)
         if model is None:
             self._tracking_estimator.reset_history()
+            self._tracking_control_visualization = None
             self._turret.invalidate_tracking_control()
             return
         error = self._aiming.tracking_error(
@@ -725,6 +743,27 @@ class Mediator:
             error.timestamp_ns
         )
         diagnostics = self._tracking_estimator.observe(error, platform_rate)
+        self._log_tracking_observation(result, error, diagnostics)
+        self._tracking_control_visualization = TrackingControlVisualization(
+            target=target,
+            camera=result.frame.camera,
+            generation=result.frame.generation,
+            frame_id=result.frame.frame_id,
+            observation_timestamp_ns=error.timestamp_ns,
+            observed_center_px=self._aiming.tracked_center(tracked),
+            rate_valid_x=diagnostics.x.valid,
+            rate_valid_y=diagnostics.y.valid,
+            target_rate_x_deg_s=diagnostics.x.target_rate_deg_s,
+            target_rate_y_deg_s=diagnostics.y.target_rate_deg_s,
+            raw_prediction_offset_x_deg=diagnostics.x.raw_prediction_offset_deg,
+            raw_prediction_offset_y_deg=diagnostics.y.raw_prediction_offset_deg,
+            applied_prediction_offset_x_deg=(
+                diagnostics.x.applied_prediction_offset_deg
+            ),
+            applied_prediction_offset_y_deg=(
+                diagnostics.y.applied_prediction_offset_deg
+            ),
+        )
         self._turret.submit_tracking_control(
             TrackingControlSample(
                 target=error.target,
@@ -740,12 +779,81 @@ class Mediator:
             )
         )
 
+    def _log_tracking_observation(
+        self,
+        result: VisionResult,
+        error: TrackingError,
+        diagnostics: TrackingEstimatorDiagnostics,
+    ) -> None:
+        if not _LOGGER.isEnabledFor(logging.DEBUG):
+            return
+        config = self._tracking_estimator.config
+        prediction = config.prediction
+        feed_forward = config.feed_forward
+        x = diagnostics.x
+        y = diagnostics.y
+        prediction_clamped_x = (
+            prediction.enabled
+            and x.valid
+            and x.raw_prediction_offset_deg != x.applied_prediction_offset_deg
+        )
+        prediction_clamped_y = (
+            prediction.enabled
+            and y.valid
+            and y.raw_prediction_offset_deg != y.applied_prediction_offset_deg
+        )
+        _LOGGER.debug(
+            "tracking-observation "
+            "target=%s camera=%s generation=%d frame_id=%d "
+            "observation_timestamp_ns=%d "
+            "real_error_x_deg=%.6f real_error_y_deg=%.6f "
+            "relative_rate_x_deg_s=%s relative_rate_y_deg_s=%s "
+            "platform_rate_x_deg_s=%s platform_rate_y_deg_s=%s "
+            "target_rate_x_deg_s=%s target_rate_y_deg_s=%s "
+            "rate_valid_x=%s rate_valid_y=%s "
+            "invalid_reason_x=%s invalid_reason_y=%s "
+            "prediction_enabled=%s prediction_horizon_ms=%d "
+            "prediction_raw_x_deg=%.6f prediction_raw_y_deg=%.6f "
+            "prediction_applied_x_deg=%.6f prediction_applied_y_deg=%.6f "
+            "prediction_clamped_x=%s prediction_clamped_y=%s "
+            "ff_enabled=%s ff_gain_x=%.6f ff_gain_y=%.6f",
+            error.target,
+            result.frame.camera.value,
+            result.frame.generation,
+            result.frame.frame_id,
+            error.timestamp_ns,
+            error.error_x_deg,
+            error.error_y_deg,
+            x.relative_rate_deg_s,
+            y.relative_rate_deg_s,
+            x.platform_rate_deg_s,
+            y.platform_rate_deg_s,
+            x.target_rate_deg_s,
+            y.target_rate_deg_s,
+            x.valid,
+            y.valid,
+            None if x.invalid_reason is None else x.invalid_reason.value,
+            None if y.invalid_reason is None else y.invalid_reason.value,
+            prediction.enabled,
+            prediction.horizon_ms,
+            x.raw_prediction_offset_deg,
+            y.raw_prediction_offset_deg,
+            x.applied_prediction_offset_deg,
+            y.applied_prediction_offset_deg,
+            prediction_clamped_x,
+            prediction_clamped_y,
+            feed_forward.enabled,
+            feed_forward.gain_x,
+            feed_forward.gain_y,
+        )
+
     def _invalidate_target_intent(self, *, stop_motion: bool) -> None:
         self._pending_selection = None
         self._selected_target = None
         self._invalidate_distance_intent()
         self._refresh_stereo_join_target()
         self._tracking_estimator.reset()
+        self._tracking_control_visualization = None
         self._turret.invalidate_tracking_control()
         if stop_motion:
             self._turret.stop_motion()

@@ -288,9 +288,10 @@ class StereoCalibration:
 
 @dataclass(frozen=True)
 class WorkingFrameCameraModel:
-    """Immutable pinhole unprojection model for an already corrected frame."""
+    """Immutable pinhole projection model for an already corrected frame."""
 
     _inverse_projection: Matrix3x3
+    _projection: Matrix3x3 | None = None
 
     def pixel_to_ray(self, x_px: float, y_px: float) -> CameraRay:
         if type(x_px) not in (int, float) or type(y_px) not in (int, float):
@@ -308,6 +309,47 @@ class WorkingFrameCameraModel:
         if not math.isfinite(norm) or norm == 0.0:
             raise ValueError("pixel cannot be converted to a finite camera ray")
         return CameraRay(ray_x / norm, ray_y / norm, ray_z / norm)
+
+    def ray_to_pixel(self, ray: CameraRay) -> tuple[float, float]:
+        if not isinstance(ray, CameraRay):
+            raise TypeError("ray must be CameraRay")
+        if not all(math.isfinite(value) for value in (ray.x, ray.y, ray.z)):
+            raise ValueError("camera ray must be finite")
+        if ray.x == 0.0 and ray.y == 0.0 and ray.z == 0.0:
+            raise ValueError("camera ray must be non-zero")
+
+        projection = self._projection
+        if projection is None:
+            matrix = np.linalg.inv(
+                np.asarray(self._inverse_projection, dtype=np.float64)
+            )
+            if not np.isfinite(matrix).all():
+                raise ValueError("camera projection must be finite")
+            projection = tuple(
+                tuple(float(item) for item in row) for row in matrix.tolist()
+            )
+
+        projected_x = (
+            projection[0][0] * ray.x
+            + projection[0][1] * ray.y
+            + projection[0][2] * ray.z
+        )
+        projected_y = (
+            projection[1][0] * ray.x
+            + projection[1][1] * ray.y
+            + projection[1][2] * ray.z
+        )
+        projected_z = (
+            projection[2][0] * ray.x
+            + projection[2][1] * ray.y
+            + projection[2][2] * ray.z
+        )
+        if not all(
+            math.isfinite(value)
+            for value in (projected_x, projected_y, projected_z)
+        ) or projected_z <= 0.0:
+            raise ValueError("camera ray cannot be projected into the working frame")
+        return projected_x / projected_z, projected_y / projected_z
 
 
 def load_overview_calibration(
@@ -404,8 +446,16 @@ def _camera_model_from_matrix(
         raise CalibrationValidationError(
             path, "working-frame inverse projection must be finite"
         )
-    values = tuple(tuple(float(item) for item in row) for row in inverse.tolist())
-    return WorkingFrameCameraModel(values)  # type: ignore[arg-type]
+    inverse_values = tuple(
+        tuple(float(item) for item in row) for row in inverse.tolist()
+    )
+    projection_values = tuple(
+        tuple(float(item) for item in row) for row in matrix
+    )
+    return WorkingFrameCameraModel(
+        inverse_values,  # type: ignore[arg-type]
+        projection_values,  # type: ignore[arg-type]
+    )
 
 
 def overview_camera_model(calibration: OverviewCalibration) -> CameraModel:

@@ -24,6 +24,7 @@ EXCLUDED_DIR_NAMES = {
     ".venv",
     "venv",
     "logs",
+    "recordings",
     "_chat_exports",
     "__pycache__",
     ".pytest_cache",

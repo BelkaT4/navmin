@@ -17,7 +17,9 @@ site/
 .ruff_cache/
 
 logs/
+recordings/
 
 *.zip
+*.7z
 /calibration/*.json
 /calibration/*.json-*.bak

@@ -28,6 +28,7 @@ from navmin.config import (
     SerialConfig,
     StereoDistanceConfig,
     Stm32Config,
+    TrackingVisualizationConfig,
     TurretConfig,
     UiConfig,
     VisionConfig,
@@ -267,7 +268,7 @@ def _synthetic_diagnostic_inputs() -> LoadedApplicationInputs:
     stereo_left = replace(diagnostic_camera_config(8889), processing_enabled=True)
     stereo_right = diagnostic_camera_config(8890)
     config = AppConfig(
-        schema_version=4,
+        schema_version=6,
         vision=VisionConfig(
             processing_scope=ProcessingScope.MAIN_AND_PREVIEW,
             cameras=CamerasConfig(
@@ -294,6 +295,11 @@ def _synthetic_diagnostic_inputs() -> LoadedApplicationInputs:
             aim_points=AimPointsConfig(overview=center, stereo_left=center),
         ),
         tracking_control=_default_tracking_control_config(),
+        tracking_visualization=TrackingVisualizationConfig(
+            show_search_region=False,
+            show_best_candidate=False,
+            show_control_prediction=False,
+        ),
         imu=ImuConfig(
             enabled=False,
             bind_address="0.0.0.0",

@@ -13,7 +13,14 @@ from typing import Any
 from navmin.concurrency import LatestValue
 from navmin.contracts import ConfigUpdate
 
-from .models import AimingConfig, AppConfig, TurretConfig, UiConfig, VisionConfig
+from .models import (
+    AimingConfig,
+    AppConfig,
+    TrackingVisualizationConfig,
+    TurretConfig,
+    UiConfig,
+    VisionConfig,
+)
 from .parser import ConfigPersistenceError, config_to_mapping, load_config, parse_config
 
 
@@ -88,6 +95,9 @@ class ConfigManager:
         self._vision_updates: LatestValue[ConfigUpdate[VisionConfig]] = LatestValue()
         self._aiming_updates: LatestValue[ConfigUpdate[AimingConfig]] = LatestValue()
         self._turret_updates: LatestValue[ConfigUpdate[TurretConfig]] = LatestValue()
+        self._tracking_visualization_updates: LatestValue[
+            ConfigUpdate[TrackingVisualizationConfig]
+        ] = LatestValue()
         self._ui_updates: LatestValue[ConfigUpdate[UiConfig]] = LatestValue()
         self._publish_all(initial, revision=0)
 
@@ -120,6 +130,12 @@ class ConfigManager:
     @property
     def turret_updates(self) -> LatestValue[ConfigUpdate[TurretConfig]]:
         return self._turret_updates
+
+    @property
+    def tracking_visualization_updates(
+        self,
+    ) -> LatestValue[ConfigUpdate[TrackingVisualizationConfig]]:
+        return self._tracking_visualization_updates
 
     @property
     def ui_updates(self) -> LatestValue[ConfigUpdate[UiConfig]]:
@@ -161,6 +177,9 @@ class ConfigManager:
         self._vision_updates.publish(ConfigUpdate(revision, config.vision))
         self._aiming_updates.publish(ConfigUpdate(revision, config.aiming))
         self._turret_updates.publish(ConfigUpdate(revision, config.turret))
+        self._tracking_visualization_updates.publish(
+            ConfigUpdate(revision, config.tracking_visualization)
+        )
         self._ui_updates.publish(ConfigUpdate(revision, config.ui))
 
     def _publish_changed(
@@ -175,6 +194,10 @@ class ConfigManager:
             self._aiming_updates.publish(ConfigUpdate(revision, current.aiming))
         if current.turret != previous.turret:
             self._turret_updates.publish(ConfigUpdate(revision, current.turret))
+        if current.tracking_visualization != previous.tracking_visualization:
+            self._tracking_visualization_updates.publish(
+                ConfigUpdate(revision, current.tracking_visualization)
+            )
         if current.ui != previous.ui:
             self._ui_updates.publish(ConfigUpdate(revision, current.ui))
 

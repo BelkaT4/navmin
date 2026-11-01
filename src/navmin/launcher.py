@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -13,7 +13,7 @@ from navmin.calibration import (
     load_overview_calibration,
     load_stereo_calibration,
 )
-from navmin.config import AppConfig, load_config
+from navmin.config import AppConfig, ConfigManager, config_to_mapping, load_config
 from navmin.imu import ImuCalibration
 from navmin.logging_setup import session_file_logging
 from navmin.session_artifacts import SourceInputPaths
@@ -241,6 +241,21 @@ def run_loaded_application(
         imu_runtime.set_calibration_writer(
             lambda calibration, path=imu_calibration_path: calibration.save(path)
         )
+    persist_tracking_visualization = None
+    if inputs.source_paths is not None:
+        config_path = inputs.source_paths.config
+
+        def persist_tracking_visualization(config):
+            config_manager = ConfigManager.load(config_path)
+            candidate = replace(
+                config_manager.config,
+                tracking_visualization=config,
+            )
+            config_manager.apply_runtime_update(
+                config_to_mapping(candidate),
+                persist=True,
+            )
+
     runtime.start()
     try:
         ui = runtime.ui_dependencies
@@ -255,6 +270,10 @@ def run_loaded_application(
             apply_pid_tuning=ui.apply_pid_tuning,
             tracking_control_config=ui.tracking_control_config,
             apply_tracking_control_tuning=ui.apply_tracking_control_tuning,
+            tracking_visualization_config=ui.tracking_visualization_config,
+            recording_runtime=getattr(ui, "recording_runtime", None),
+            start_recording=getattr(ui, "start_recording", None),
+            persist_tracking_visualization=persist_tracking_visualization,
             show_diagnostic_clock=show_diagnostic_clock,
             argv=qt_argv,
         )

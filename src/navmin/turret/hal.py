@@ -5,7 +5,8 @@ from __future__ import annotations
 from collections.abc import Callable
 from contextlib import contextmanager
 from dataclasses import dataclass
-from math import isfinite
+from math import ceil, isfinite
+from threading import Lock
 from time import monotonic_ns
 from typing import Literal
 
@@ -34,6 +35,8 @@ from .session import SessionResult, TurretSession
 
 type AxisName = Literal["x", "y"]
 type NanosecondClock = Callable[[], int]
+
+_ZERO_SETTLE_MARGIN_NS = 250_000_000
 
 
 class HalError(RuntimeError):
@@ -82,6 +85,11 @@ class TurretHal:
             acceleration_x_deg_s2=config.stm32.acceleration_x_deg_s2,
             acceleration_y_deg_s2=config.stm32.acceleration_y_deg_s2,
         )
+        self._platform_zero_settle_lock = Lock()
+        self._platform_zero_settle_deadline_ns: int | None = None
+        self._platform_zero_recovery_required = False
+        self._platform_zero_speed_bound_x_deg_s = 0.0
+        self._platform_zero_speed_bound_y_deg_s = 0.0
 
     @property
     def motor_state(self) -> MotorState:
@@ -101,7 +109,15 @@ class TurretHal:
 
     @property
     def platform_motion_snapshot(self) -> PlatformMotionSnapshot:
-        return self._platform_motion.snapshot()
+        with self._platform_zero_settle_lock:
+            self._complete_platform_zero_settle_if_due_locked()
+            return self._platform_motion.snapshot()
+
+    @property
+    def platform_motion_zero_settling(self) -> bool:
+        with self._platform_zero_settle_lock:
+            self._complete_platform_zero_settle_if_due_locked()
+            return self._platform_zero_settle_deadline_ns is not None
 
     def rebind_session(self, session: TurretSession) -> None:
         """Bind a recovered session without changing restart-only mechanics."""
@@ -196,13 +212,23 @@ class TurretHal:
         result = self._ordinary(CommandCode.MOVE_RELATIVE, payload)
         if self._response_ok(result):
             # Relative target execution has no observable rate lifecycle.
-            self._platform_motion.invalidate()
+            with self._platform_zero_settle_lock:
+                self._clear_platform_zero_settle_locked()
+                self._platform_zero_recovery_required = True
+                self._platform_motion.invalidate()
             self._record_confirmed_emergency(result)
         return result
 
-    def set_velocity(self, setpoint: AxisVelocitySetpoint) -> SessionResult:
+    def set_velocity(
+        self,
+        setpoint: AxisVelocitySetpoint,
+        *,
+        recover_command_model_after_zero: bool = False,
+    ) -> SessionResult:
         if not isinstance(setpoint, AxisVelocitySetpoint):
             raise TypeError("setpoint must be AxisVelocitySetpoint")
+        if not isinstance(recover_command_model_after_zero, bool):
+            raise TypeError("recover_command_model_after_zero must be a boolean")
         payload = SetVelocityPayload(
             velocity_x_steps_s=self.velocity_to_steps_s(
                 "x", setpoint.velocity_x_deg_s
@@ -211,6 +237,12 @@ class TurretHal:
                 "y", setpoint.velocity_y_deg_s
             ),
         )
+        if recover_command_model_after_zero and (
+            payload.velocity_x_steps_s != 0 or payload.velocity_y_steps_s != 0
+        ):
+            raise HalError(
+                "command-model zero recovery requires an effective zero setpoint"
+            )
         command_timestamp_ns = self._read_command_timestamp()
         result = self._ordinary(
             CommandCode.SET_VELOCITY,
@@ -218,15 +250,31 @@ class TurretHal:
             drain_pending_config=False,
         )
         if self._response_ok(result):
-            self._platform_motion.record_velocity_command(
-                timestamp_ns=command_timestamp_ns,
-                commanded_rate_x_deg_s=self._logical_velocity_from_steps_s(
-                    "x", payload.velocity_x_steps_s
-                ),
-                commanded_rate_y_deg_s=self._logical_velocity_from_steps_s(
-                    "y", payload.velocity_y_steps_s
-                ),
-            )
+            with self._platform_zero_settle_lock:
+                self._complete_platform_zero_settle_if_due_locked()
+                if (
+                    recover_command_model_after_zero
+                    and self._platform_zero_recovery_required
+                    and not self._platform_motion.snapshot().valid
+                ):
+                    self._schedule_platform_zero_settle_locked(
+                        confirmed_zero_target_ns=self._read_command_timestamp()
+                    )
+                else:
+                    if (
+                        payload.velocity_x_steps_s != 0
+                        or payload.velocity_y_steps_s != 0
+                    ):
+                        self._clear_platform_zero_settle_locked()
+                    self._platform_motion.record_velocity_command(
+                        timestamp_ns=command_timestamp_ns,
+                        commanded_rate_x_deg_s=self._logical_velocity_from_steps_s(
+                            "x", payload.velocity_x_steps_s
+                        ),
+                        commanded_rate_y_deg_s=self._logical_velocity_from_steps_s(
+                            "y", payload.velocity_y_steps_s
+                        ),
+                    )
         self._record_confirmed_emergency(result)
         self._drain_pending_config_if_idle()
         return result
@@ -241,17 +289,23 @@ class TurretHal:
         result = self._ordinary(CommandCode.MOTOR_OFF)
         if self._response_ok(result):
             self._motor_state = MotorState.OFF
-            self._platform_motion.mark_known_zero(
-                timestamp_ns=self._read_command_timestamp()
-            )
+            with self._platform_zero_settle_lock:
+                self._clear_platform_zero_settle_locked()
+                self._platform_zero_recovery_required = False
+                self._platform_motion.mark_known_zero(
+                    timestamp_ns=self._read_command_timestamp()
+                )
         return result
 
     def emergency_stop(self) -> ProtocolResponse | None:
         response = self._session.request_emergency()
         if response is not None and response.result is ResultCode.OK:
-            self._platform_motion.mark_known_zero(
-                timestamp_ns=self._read_command_timestamp()
-            )
+            with self._platform_zero_settle_lock:
+                self._clear_platform_zero_settle_locked()
+                self._platform_zero_recovery_required = False
+                self._platform_motion.mark_known_zero(
+                    timestamp_ns=self._read_command_timestamp()
+                )
         self._drain_pending_config_if_idle()
         return response
 
@@ -324,15 +378,21 @@ class TurretHal:
 
             self._applied_stm32_config = pending.config
             self._applied_config_revision = pending.revision
-            self._platform_motion.record_acceleration_limits(
-                timestamp_ns=self._read_command_timestamp(),
-                acceleration_x_deg_s2=self._acceleration_from_steps_s2(
-                    "x", pending.payload.acceleration_x_steps_s2
-                ),
-                acceleration_y_deg_s2=self._acceleration_from_steps_s2(
-                    "y", pending.payload.acceleration_y_steps_s2
-                ),
-            )
+            config_timestamp_ns = self._read_command_timestamp()
+            with self._platform_zero_settle_lock:
+                self._platform_motion.record_acceleration_limits(
+                    timestamp_ns=config_timestamp_ns,
+                    acceleration_x_deg_s2=self._acceleration_from_steps_s2(
+                        "x", pending.payload.acceleration_x_steps_s2
+                    ),
+                    acceleration_y_deg_s2=self._acceleration_from_steps_s2(
+                        "y", pending.payload.acceleration_y_steps_s2
+                    ),
+                )
+                self._extend_platform_zero_settle_after_config_locked(
+                    timestamp_ns=config_timestamp_ns,
+                    payload=pending.payload,
+                )
             if (
                 self._pending_config is not None
                 and self._pending_config.revision == pending.revision
@@ -345,7 +405,10 @@ class TurretHal:
         self._motor_state = MotorState.UNKNOWN
         self._applied_stm32_config = None
         self._applied_config_revision = None
-        self._platform_motion.invalidate()
+        with self._platform_zero_settle_lock:
+            self._clear_platform_zero_settle_locked()
+            self._platform_zero_recovery_required = False
+            self._platform_motion.invalidate()
 
     def _ordinary(
         self,
@@ -368,9 +431,89 @@ class TurretHal:
     def _record_confirmed_emergency(self, result: SessionResult) -> None:
         emergency = result.emergency_response
         if emergency is not None and emergency.result is ResultCode.OK:
-            self._platform_motion.mark_known_zero(
-                timestamp_ns=self._read_command_timestamp()
-            )
+            with self._platform_zero_settle_lock:
+                self._clear_platform_zero_settle_locked()
+                self._platform_zero_recovery_required = False
+                self._platform_motion.mark_known_zero(
+                    timestamp_ns=self._read_command_timestamp()
+                )
+
+    def _schedule_platform_zero_settle_locked(
+        self, *, confirmed_zero_target_ns: int
+    ) -> None:
+        payload = self.make_set_config_payload(
+            self._applied_stm32_config or self._desired_stm32_config
+        )
+        self._platform_zero_speed_bound_x_deg_s = self._speed_from_steps_s(
+            "x", payload.max_speed_x_steps_s
+        )
+        self._platform_zero_speed_bound_y_deg_s = self._speed_from_steps_s(
+            "y", payload.max_speed_y_steps_s
+        )
+        settle_ns = self._zero_settle_duration_ns(
+            payload=payload,
+            speed_bound_x_deg_s=self._platform_zero_speed_bound_x_deg_s,
+            speed_bound_y_deg_s=self._platform_zero_speed_bound_y_deg_s,
+        )
+        self._platform_zero_settle_deadline_ns = (
+            confirmed_zero_target_ns + settle_ns
+        )
+
+    def _extend_platform_zero_settle_after_config_locked(
+        self, *, timestamp_ns: int, payload: SetConfigPayload
+    ) -> None:
+        if self._platform_zero_settle_deadline_ns is None:
+            return
+        self._platform_zero_speed_bound_x_deg_s = max(
+            self._platform_zero_speed_bound_x_deg_s,
+            self._speed_from_steps_s("x", payload.max_speed_x_steps_s),
+        )
+        self._platform_zero_speed_bound_y_deg_s = max(
+            self._platform_zero_speed_bound_y_deg_s,
+            self._speed_from_steps_s("y", payload.max_speed_y_steps_s),
+        )
+        candidate_deadline = timestamp_ns + self._zero_settle_duration_ns(
+            payload=payload,
+            speed_bound_x_deg_s=self._platform_zero_speed_bound_x_deg_s,
+            speed_bound_y_deg_s=self._platform_zero_speed_bound_y_deg_s,
+        )
+        self._platform_zero_settle_deadline_ns = max(
+            self._platform_zero_settle_deadline_ns, candidate_deadline
+        )
+
+    def _complete_platform_zero_settle_if_due_locked(self) -> None:
+        deadline_ns = self._platform_zero_settle_deadline_ns
+        if deadline_ns is None:
+            return
+        if self._read_command_timestamp() < deadline_ns:
+            return
+        self._platform_motion.mark_known_zero(timestamp_ns=deadline_ns)
+        self._platform_zero_recovery_required = False
+        self._clear_platform_zero_settle_locked()
+
+    def _clear_platform_zero_settle_locked(self) -> None:
+        self._platform_zero_settle_deadline_ns = None
+        self._platform_zero_speed_bound_x_deg_s = 0.0
+        self._platform_zero_speed_bound_y_deg_s = 0.0
+
+    def _zero_settle_duration_ns(
+        self,
+        *,
+        payload: SetConfigPayload,
+        speed_bound_x_deg_s: float,
+        speed_bound_y_deg_s: float,
+    ) -> int:
+        acceleration_x = self._acceleration_from_steps_s2(
+            "x", payload.acceleration_x_steps_s2
+        )
+        acceleration_y = self._acceleration_from_steps_s2(
+            "y", payload.acceleration_y_steps_s2
+        )
+        stop_seconds = max(
+            speed_bound_x_deg_s / acceleration_x,
+            speed_bound_y_deg_s / acceleration_y,
+        )
+        return ceil(stop_seconds * 1_000_000_000) + _ZERO_SETTLE_MARGIN_NS
 
     def _read_command_timestamp(self) -> int:
         value = self._command_clock_ns()
@@ -385,6 +528,9 @@ class TurretHal:
             return
         if self._pending_config is not None and not self._operation_active:
             self.flush_pending_config()
+
+    def _speed_from_steps_s(self, axis: AxisName, steps_s: int) -> float:
+        return abs(steps_s) * 360.0 / self.effective_steps_per_revolution(axis)
 
     def _logical_velocity_from_steps_s(self, axis: AxisName, steps_s: int) -> float:
         logical_steps_s = -steps_s if self._mechanics(axis).invert else steps_s

@@ -1269,3 +1269,15 @@ def test_emergency_preempted_set_config_is_confirmed_before_later_motion() -> No
         assert worker.current_state.max_speed_x_deg_s == 75.0
     finally:
         _shutdown(worker)
+
+def test_simulated_startup_log_does_not_claim_physical_connection(caplog) -> None:
+    worker = TurretWorker(_config(emulate_stm32=True))
+    with caplog.at_level("INFO", logger="navmin.turret.worker"):
+        worker.start()
+        try:
+            _wait_state(worker, TurretConnectionState.READY)
+        finally:
+            _shutdown(worker)
+
+    assert "Turret simulated connection ready at 9600 baud" in caplog.text
+    assert "Turret physical connection found" not in caplog.text

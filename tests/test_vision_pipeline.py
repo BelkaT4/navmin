@@ -15,6 +15,7 @@ from navmin.calibration import (
 )
 from navmin.concurrency import InvalidatableLatest, LatestValue
 from navmin.contracts import (
+    BBox,
     CameraRole,
     CameraState,
     CameraStatus,
@@ -31,7 +32,10 @@ from navmin.vision.pipeline import (
     stereo_left_corrector,
     stereo_right_corrector,
 )
-from navmin.vision.processor import VisionProcessorOutput
+from navmin.vision.processor import (
+    VisionProcessorOutput,
+    VisionTrackingDiagnostics,
+)
 from navmin.vision.stereo_pairing import StereoPairer, StereoPairIdentity
 
 WIDTH = 32
@@ -105,6 +109,41 @@ class _RecordingProcessor:
         self.processing_flags.append(processing_enabled)
         return VisionProcessorOutput(
             result=VisionResult(frame=frame, tracked_objects=(), processing_time_ns=0)
+        )
+
+
+class _DiagnosticsProcessor(_RecordingProcessor):
+    def __init__(self) -> None:
+        super().__init__()
+        self.frame_id_offset = 0
+
+    def process(
+        self,
+        frame: FramePacket,
+        *,
+        processing_enabled: bool = True,
+    ) -> VisionProcessorOutput:
+        self.frames.append(frame)
+        self.processing_flags.append(processing_enabled)
+        return VisionProcessorOutput(
+            result=VisionResult(frame=frame, tracked_objects=(), processing_time_ns=0),
+            tracking_diagnostics=VisionTrackingDiagnostics(
+                camera=frame.camera,
+                generation=frame.generation,
+                frame_id=frame.frame_id + self.frame_id_offset,
+                phase="TRACK",
+                status="TRACK",
+                predicted_xy=(10.0, 11.0),
+                search_radius_px=42,
+                full_frame_search=False,
+                search_mode="TRACK",
+                candidate_count=2,
+                best_candidate_center=(12.0, 13.0),
+                best_candidate_bbox=BBox(8, 9, 10, 11),
+                confidence=0.8,
+                prediction_error_px=1.5,
+                diagnostic_reason="OK",
+            ),
         )
 
 
@@ -382,6 +421,36 @@ def test_camera_session_barrier_precedes_generation_data_and_restart_clears_old_
     assert second_result.frame.frame_id == 0
     assert pipeline.latest_result.get() is second_result
     assert processor.reset_calls == 2
+
+
+def test_tracking_diagnostics_are_latest_only_exact_frame_bound_and_reset() -> None:
+    processor = _DiagnosticsProcessor()
+    pipeline = VisionPipeline(
+        camera=CameraRole.OVERVIEW,
+        corrector=overview_corrector(overview_calibration()),
+        processor=processor,
+        timestamp_clock_ns=_Clock(),
+    )
+
+    pipeline.start()
+    pipeline.submit_decoded_frame(source_frame(1))
+    first = pipeline.process_latest()
+    assert first is not None
+    diagnostics = pipeline.latest_tracking_diagnostics.get()
+    assert diagnostics is not None
+    assert diagnostics.camera is first.frame.camera
+    assert diagnostics.generation == first.frame.generation
+    assert diagnostics.frame_id == first.frame.frame_id
+
+    processor.frame_id_offset = -1
+    pipeline.submit_decoded_frame(source_frame(2))
+    second = pipeline.process_latest()
+    assert second is not None
+    assert second.frame.frame_id == 1
+    assert pipeline.latest_tracking_diagnostics.get() is None
+
+    pipeline.start()
+    assert pipeline.latest_tracking_diagnostics.get() is None
 
 
 def test_stereo_right_session_barrier_and_generation_are_role_correct() -> None:

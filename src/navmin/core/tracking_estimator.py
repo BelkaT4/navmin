@@ -8,6 +8,7 @@ from enum import Enum
 
 from navmin.config.models import TrackingControlConfig, VelocityEstimatorConfig
 from navmin.contracts import (
+    CameraRole,
     PlatformMotionRate,
     PlatformMotionSource,
     TargetRef,
@@ -36,6 +37,12 @@ class AxisTrackingEstimate:
     valid: bool
     invalid_reason: TrackingEstimateInvalidReason | None
     prediction_offset_deg: float
+    raw_prediction_offset_deg: float = 0.0
+
+    @property
+    def applied_prediction_offset_deg(self) -> float:
+        """Prediction contribution actually eligible for Turret control."""
+        return self.prediction_offset_deg
 
 
 @dataclass(frozen=True)
@@ -45,6 +52,26 @@ class TrackingEstimatorDiagnostics:
     platform_source: PlatformMotionSource
     x: AxisTrackingEstimate
     y: AxisTrackingEstimate
+
+
+@dataclass(frozen=True, slots=True)
+class TrackingControlVisualization:
+    """Read-only display snapshot bound to one authoritative observation frame."""
+
+    target: TargetRef
+    camera: CameraRole
+    generation: int
+    frame_id: int
+    observation_timestamp_ns: int
+    observed_center_px: tuple[float, float]
+    rate_valid_x: bool
+    rate_valid_y: bool
+    target_rate_x_deg_s: float | None
+    target_rate_y_deg_s: float | None
+    raw_prediction_offset_x_deg: float
+    raw_prediction_offset_y_deg: float
+    applied_prediction_offset_x_deg: float
+    applied_prediction_offset_y_deg: float
 
 
 @dataclass(frozen=True)
@@ -248,12 +275,17 @@ class TrackingEstimator:
             reason = TrackingEstimateInvalidReason.TARGET_RATE_LIMIT
 
         valid = reason is None
+        raw_prediction_offset = 0.0
         prediction_offset = 0.0
-        if valid and self._config.prediction.enabled and target_rate is not None:
-            raw_offset = target_rate * self._config.prediction.horizon_ms / 1000.0
-            prediction_offset = max(
-                -max_prediction_angle, min(max_prediction_angle, raw_offset)
+        if valid and target_rate is not None:
+            raw_prediction_offset = (
+                target_rate * self._config.prediction.horizon_ms / 1000.0
             )
+            if self._config.prediction.enabled:
+                prediction_offset = max(
+                    -max_prediction_angle,
+                    min(max_prediction_angle, raw_prediction_offset),
+                )
 
         return AxisTrackingEstimate(
             relative_rate_deg_s=relative_rate,
@@ -265,6 +297,7 @@ class TrackingEstimator:
             valid=valid,
             invalid_reason=reason,
             prediction_offset_deg=prediction_offset,
+            raw_prediction_offset_deg=raw_prediction_offset,
         )
 
     def _fit(self, axis: str) -> _Fit | None:
@@ -342,6 +375,7 @@ class TrackingEstimator:
             valid=False,
             invalid_reason=reason,
             prediction_offset_deg=0.0,
+            raw_prediction_offset_deg=0.0,
         )
         return TrackingEstimatorDiagnostics(
             target=self._target,
@@ -354,6 +388,7 @@ class TrackingEstimator:
 
 __all__ = [
     "AxisTrackingEstimate",
+    "TrackingControlVisualization",
     "TrackingEstimateInvalidReason",
     "TrackingEstimator",
     "TrackingEstimatorDiagnostics",

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from math import isfinite
 from time import monotonic
 from typing import Protocol
@@ -25,6 +26,8 @@ from .hal import TurretHal
 from .pid import AxisPid, PidGains
 from .protocol import ProtocolResponse, ResultCode
 from .session import SessionResult
+
+_LOGGER = logging.getLogger(__name__)
 
 
 class Clock(Protocol):
@@ -124,6 +127,9 @@ class TurretController:
             and revision <= self._last_processed_revision
         ):
             return False
+        if self._hal.platform_motion_zero_settling:
+            self._pending_motion = None
+            return False
 
         now = self._require_finite_time(self._clock())
         target_changed = self._target is not None and sample.target != self._target
@@ -167,6 +173,7 @@ class TurretController:
                 else 0.0
             ),
         )
+        self._log_tracking_control(sample, x_usable=x_usable, y_usable=y_usable)
         self._pending_motion = AxisVelocitySetpoint(
             velocity_x_deg_s=velocity_x,
             velocity_y_deg_s=velocity_y,
@@ -176,6 +183,71 @@ class TurretController:
         self._last_tracking_time_s = now
         self._last_processed_revision = revision
         return True
+
+    def _log_tracking_control(
+        self,
+        sample: TrackingControlSample,
+        *,
+        x_usable: bool,
+        y_usable: bool,
+    ) -> None:
+        if not _LOGGER.isEnabledFor(logging.DEBUG):
+            return
+        x_step = self._pid_x.last_step
+        y_step = self._pid_y.last_step
+        if x_step is None or y_step is None:
+            return
+        prediction = self._tracking_control_config.prediction
+        feed_forward = self._tracking_control_config.feed_forward
+        _LOGGER.debug(
+            "tracking-control "
+            "target=%s camera=%s generation=%d track_id=%d "
+            "observation_timestamp_ns=%d "
+            "real_error_x_deg=%.6f real_error_y_deg=%.6f "
+            "target_rate_x_deg_s=%s target_rate_y_deg_s=%s "
+            "rate_valid_x=%s rate_valid_y=%s "
+            "prediction_enabled=%s prediction_horizon_ms=%d "
+            "prediction_applied_x_deg=%.6f prediction_applied_y_deg=%.6f "
+            "ff_enabled=%s ff_gain_x=%.6f ff_gain_y=%.6f "
+            "ff_output_x_deg_s=%.6f ff_output_y_deg_s=%.6f "
+            "p_x_deg_s=%.6f i_x_deg_s=%.6f d_x_deg_s=%.6f "
+            "p_y_deg_s=%.6f i_y_deg_s=%.6f d_y_deg_s=%.6f "
+            "final_unclamped_x_deg_s=%.6f final_unclamped_y_deg_s=%.6f "
+            "final_output_x_deg_s=%.6f final_output_y_deg_s=%.6f "
+            "final_clamped_x=%s final_clamped_y=%s",
+            sample.target,
+            sample.target.camera.value,
+            sample.target.generation,
+            sample.target.track_id,
+            sample.observation_timestamp_ns,
+            sample.real_error_x_deg,
+            sample.real_error_y_deg,
+            sample.target_rate_x_deg_s,
+            sample.target_rate_y_deg_s,
+            sample.rate_valid_x,
+            sample.rate_valid_y,
+            prediction.enabled,
+            prediction.horizon_ms,
+            x_step.proportional_offset if x_usable else 0.0,
+            y_step.proportional_offset if y_usable else 0.0,
+            feed_forward.enabled,
+            feed_forward.gain_x,
+            feed_forward.gain_y,
+            x_step.feed_forward,
+            y_step.feed_forward,
+            x_step.p_term,
+            x_step.i_term,
+            x_step.d_term,
+            y_step.p_term,
+            y_step.i_term,
+            y_step.d_term,
+            x_step.unclamped_output,
+            y_step.unclamped_output,
+            x_step.output,
+            y_step.output,
+            x_step.clamped,
+            y_step.clamped,
+        )
 
     def apply_tracking_control_config(self, config: TrackingControlConfig) -> None:
         """Replace FF/prediction policy without disturbing PID state."""
@@ -224,7 +296,13 @@ class TurretController:
 
         result: SessionResult | None = None
         if self._hal.motor_state is MotorState.ON:
-            result = self._hal.set_velocity(self._zero_velocity())
+            result = self._hal.set_velocity(
+                self._zero_velocity(),
+                recover_command_model_after_zero=(
+                    old_mode is TurretControlMode.RELATIVE
+                    and mode is TurretControlMode.TRACKING
+                ),
+            )
             if not self._session_result_ok(result):
                 return result
 

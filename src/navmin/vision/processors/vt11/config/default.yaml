@@ -143,7 +143,7 @@ tracking:
   lost_after_misses: 3
   dynamic_search_enabled: true
   min_search_radius_px: 50
-  max_search_radius_px: 180
+  max_search_radius_px: 240
   speed_radius_gain: 0.5
   uncertainty_radius_gain: 2.0
   miss_radius_growth_px: 25.0

@@ -10,6 +10,7 @@ from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QKeyEvent
 from PyQt6.QtWidgets import (
     QCheckBox,
+    QDoubleSpinBox,
     QGridLayout,
     QGroupBox,
     QLabel,
@@ -19,7 +20,11 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from navmin.config.models import PidControllerConfig, TrackingControlConfig
+from navmin.config.models import (
+    PidControllerConfig,
+    TrackingControlConfig,
+    TrackingVisualizationConfig,
+)
 from navmin.contracts import CameraRole, CameraStatus, TurretControlMode, TurretState
 from navmin.core import AxisTrackingEstimate, TrackingEstimatorDiagnostics
 
@@ -43,6 +48,8 @@ class OperatorWindow(QWidget):
         on_apply_pid_tuning: Callable[[PidControllerConfig], None],
         tracking_control_config: TrackingControlConfig,
         on_apply_tracking_control_tuning: Callable[[TrackingControlConfig], None],
+        tracking_visualization_config: TrackingVisualizationConfig,
+        on_tracking_visualization_changed: Callable[[TrackingVisualizationConfig], None],
     ) -> None:
         super().__init__(owner, Qt.WindowType.Tool)
         self._on_toggle_fullscreen = on_toggle_fullscreen
@@ -51,6 +58,9 @@ class OperatorWindow(QWidget):
         self._on_apply_pid_tuning = on_apply_pid_tuning
         self._tracking_control_config = tracking_control_config
         self._on_apply_tracking_control_tuning = on_apply_tracking_control_tuning
+        self._tracking_visualization_config = tracking_visualization_config
+        self._on_tracking_visualization_changed = on_tracking_visualization_changed
+        self._syncing_tracking_visualization = False
         self.setWindowTitle("Operator Window")
         self.setWindowModality(Qt.WindowModality.NonModal)
         self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, False)
@@ -78,28 +88,36 @@ class OperatorWindow(QWidget):
         self.pid_status_label.setWordWrap(True)
         self.pid_error_label = QLabel("")
         self.pid_error_label.setWordWrap(True)
-        self.ff_enabled_checkbox = QCheckBox("Feed-forward enabled")
-        self.ff_enabled_checkbox.setChecked(tracking_control_config.feed_forward.enabled)
-        self.prediction_enabled_checkbox = QCheckBox("Prediction enabled")
-        self.prediction_enabled_checkbox.setChecked(
-            tracking_control_config.prediction.enabled
+        self.show_search_region_checkbox = QCheckBox("Показывать область поиска")
+        self.show_best_candidate_checkbox = QCheckBox("Показывать лучший кандидат")
+        self.show_control_prediction_checkbox = QCheckBox("Показывать прогноз")
+        self.ff_enabled_checkbox = QCheckBox("Использовать Feed Forward")
+        self.prediction_enabled_checkbox = QCheckBox(
+            "Использовать прогноз для управления"
+        )
+        self.ff_gain_x = self._tracking_gain_spinbox(
+            tracking_control_config.feed_forward.gain_x
+        )
+        self.ff_gain_y = self._tracking_gain_spinbox(
+            tracking_control_config.feed_forward.gain_y
         )
         self.tracking_inputs = {
-            "gain_x": QLineEdit(
-                self._format_gain(tracking_control_config.feed_forward.gain_x)
-            ),
-            "gain_y": QLineEdit(
-                self._format_gain(tracking_control_config.feed_forward.gain_y)
-            ),
-            "horizon_ms": QLineEdit(
-                str(tracking_control_config.prediction.horizon_ms)
-            ),
             "window_ms": QLineEdit(
                 str(tracking_control_config.velocity_estimator.window_ms)
             ),
         }
-        for editor in self.tracking_inputs.values():
-            editor.setMaximumWidth(110)
+        self.tracking_inputs["window_ms"].setMaximumWidth(110)
+        self._sync_tracking_controls(tracking_control_config)
+        self._sync_tracking_visualization_controls(tracking_visualization_config)
+        self.show_search_region_checkbox.stateChanged.connect(
+            self._apply_tracking_visualization
+        )
+        self.show_best_candidate_checkbox.stateChanged.connect(
+            self._apply_tracking_visualization
+        )
+        self.show_control_prediction_checkbox.stateChanged.connect(
+            self._apply_tracking_visualization
+        )
         self.tracking_apply_button = QPushButton("Применить tracking")
         self.tracking_apply_button.clicked.connect(self._apply_tracking_tuning)
         self.tracking_status_label = QLabel("Статус tracking: —")
@@ -161,21 +179,29 @@ class OperatorWindow(QWidget):
         pid_layout.addWidget(self.pid_status_label, 4, 0, 1, 4)
         pid_layout.addWidget(self.pid_error_label, 5, 0, 1, 4)
         layout.addWidget(pid_group)
-        tracking_group = QGroupBox("Predictive tracking — временная настройка")
+        tracking_group = QGroupBox("Сопровождение")
         tracking_layout = QGridLayout(tracking_group)
-        tracking_layout.addWidget(self.ff_enabled_checkbox, 0, 0, 1, 2)
-        tracking_layout.addWidget(QLabel("FF gain X"), 1, 0)
-        tracking_layout.addWidget(self.tracking_inputs["gain_x"], 1, 1)
-        tracking_layout.addWidget(QLabel("FF gain Y"), 2, 0)
-        tracking_layout.addWidget(self.tracking_inputs["gain_y"], 2, 1)
-        tracking_layout.addWidget(self.prediction_enabled_checkbox, 3, 0, 1, 2)
-        tracking_layout.addWidget(QLabel("Prediction horizon, ms"), 4, 0)
-        tracking_layout.addWidget(self.tracking_inputs["horizon_ms"], 4, 1)
-        tracking_layout.addWidget(QLabel("Estimator window, ms"), 5, 0)
-        tracking_layout.addWidget(self.tracking_inputs["window_ms"], 5, 1)
-        tracking_layout.addWidget(self.tracking_apply_button, 6, 0, 1, 2)
-        tracking_layout.addWidget(self.tracking_status_label, 7, 0, 1, 2)
-        tracking_layout.addWidget(self.tracking_error_label, 8, 0, 1, 2)
+        tracking_layout.addWidget(QLabel("Визуализация"), 0, 0, 1, 2)
+        tracking_layout.addWidget(self.show_search_region_checkbox, 1, 0, 1, 2)
+        tracking_layout.addWidget(self.show_best_candidate_checkbox, 2, 0, 1, 2)
+        tracking_layout.addWidget(
+            self.show_control_prediction_checkbox, 3, 0, 1, 2
+        )
+        tracking_layout.addWidget(QLabel("Управление"), 4, 0, 1, 2)
+        tracking_layout.addWidget(
+            self.prediction_enabled_checkbox, 5, 0, 1, 2
+        )
+        tracking_layout.addWidget(self.ff_enabled_checkbox, 6, 0, 1, 2)
+        tracking_layout.addWidget(QLabel("Feed Forward"), 7, 0, 1, 2)
+        tracking_layout.addWidget(QLabel("Gain X"), 8, 0)
+        tracking_layout.addWidget(self.ff_gain_x, 8, 1)
+        tracking_layout.addWidget(QLabel("Gain Y"), 9, 0)
+        tracking_layout.addWidget(self.ff_gain_y, 9, 1)
+        tracking_layout.addWidget(QLabel("Estimator window, ms"), 10, 0)
+        tracking_layout.addWidget(self.tracking_inputs["window_ms"], 10, 1)
+        tracking_layout.addWidget(self.tracking_apply_button, 11, 0, 1, 2)
+        tracking_layout.addWidget(self.tracking_status_label, 12, 0, 1, 2)
+        tracking_layout.addWidget(self.tracking_error_label, 13, 0, 1, 2)
         layout.addWidget(tracking_group)
 
         diagnostics_group = QGroupBox("Tracking estimator — диагностика")
@@ -244,6 +270,71 @@ class OperatorWindow(QWidget):
             raise ValueError(f"{label}: значение должно быть >= 0")
         return value
 
+    @staticmethod
+    def _tracking_gain_spinbox(value: float) -> QDoubleSpinBox:
+        editor = QDoubleSpinBox()
+        editor.setRange(0.0, 1.5)
+        editor.setSingleStep(0.05)
+        editor.setDecimals(2)
+        editor.setMaximumWidth(110)
+        editor.setValue(value)
+        return editor
+
+    def _sync_tracking_controls(self, config: TrackingControlConfig) -> None:
+        self._tracking_control_config = config
+        self.ff_enabled_checkbox.setChecked(config.feed_forward.enabled)
+        self.prediction_enabled_checkbox.setChecked(config.prediction.enabled)
+        self.ff_gain_x.setValue(config.feed_forward.gain_x)
+        self.ff_gain_y.setValue(config.feed_forward.gain_y)
+        self.tracking_inputs["window_ms"].setText(
+            str(config.velocity_estimator.window_ms)
+        )
+
+    def set_tracking_control_config(self, config: TrackingControlConfig) -> None:
+        self._sync_tracking_controls(config)
+
+    def set_tracking_control_horizon_ms(self, horizon_ms: int) -> None:
+        self._tracking_control_config = replace(
+            self._tracking_control_config,
+            prediction=replace(
+                self._tracking_control_config.prediction,
+                horizon_ms=horizon_ms,
+            ),
+        )
+
+    def _sync_tracking_visualization_controls(
+        self, config: TrackingVisualizationConfig
+    ) -> None:
+        self._syncing_tracking_visualization = True
+        try:
+            self._tracking_visualization_config = config
+            self.show_search_region_checkbox.setChecked(config.show_search_region)
+            self.show_best_candidate_checkbox.setChecked(config.show_best_candidate)
+            self.show_control_prediction_checkbox.setChecked(
+                config.show_control_prediction
+            )
+        finally:
+            self._syncing_tracking_visualization = False
+
+    def _apply_tracking_visualization(self, _state: int = 0) -> None:
+        if self._syncing_tracking_visualization:
+            return
+        config = TrackingVisualizationConfig(
+            show_search_region=self.show_search_region_checkbox.isChecked(),
+            show_best_candidate=self.show_best_candidate_checkbox.isChecked(),
+            show_control_prediction=self.show_control_prediction_checkbox.isChecked(),
+        )
+        try:
+            self._on_tracking_visualization_changed(config)
+        except (OSError, TypeError, ValueError) as exc:
+            self.tracking_error_label.setText(f"Ошибка визуализации: {exc}")
+            self._sync_tracking_visualization_controls(
+                self._tracking_visualization_config
+            )
+            return
+        self._tracking_visualization_config = config
+        self.tracking_error_label.clear()
+
     def _apply_tracking_tuning(self) -> None:
         try:
             config = replace(
@@ -251,15 +342,12 @@ class OperatorWindow(QWidget):
                 feed_forward=replace(
                     self._tracking_control_config.feed_forward,
                     enabled=self.ff_enabled_checkbox.isChecked(),
-                    gain_x=self._read_tracking_number("gain_x", "FF gain X"),
-                    gain_y=self._read_tracking_number("gain_y", "FF gain Y"),
+                    gain_x=self.ff_gain_x.value(),
+                    gain_y=self.ff_gain_y.value(),
                 ),
                 prediction=replace(
                     self._tracking_control_config.prediction,
                     enabled=self.prediction_enabled_checkbox.isChecked(),
-                    horizon_ms=self._read_tracking_integer(
-                        "horizon_ms", "Prediction horizon", minimum=0
-                    ),
                 ),
             )
             window_ms = self._read_tracking_integer(
@@ -288,18 +376,6 @@ class OperatorWindow(QWidget):
             f"horizon={config.prediction.horizon_ms} ms; "
             f"window={config.velocity_estimator.window_ms} ms"
         )
-
-    def _read_tracking_number(self, field: str, label: str) -> float:
-        text = self.tracking_inputs[field].text().strip()
-        try:
-            value = float(text)
-        except ValueError as exc:
-            raise ValueError(f"{label}: введите число >= 0") from exc
-        if not isfinite(value):
-            raise ValueError(f"{label}: значение должно быть конечным")
-        if value < 0:
-            raise ValueError(f"{label}: значение должно быть >= 0")
-        return value
 
     def _read_tracking_integer(
         self,

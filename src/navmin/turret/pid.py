@@ -27,6 +27,19 @@ def _clamp(value: float, limit: float) -> float:
 
 
 @dataclass(frozen=True)
+class PidStepDiagnostics:
+    real_error: float
+    proportional_offset: float
+    p_term: float
+    i_term: float
+    d_term: float
+    feed_forward: float
+    unclamped_output: float
+    output: float
+    clamped: bool
+
+
+@dataclass(frozen=True)
 class PidGains:
     kp: float
     ki: float
@@ -52,6 +65,7 @@ class AxisPid:
         self._previous_error = 0.0
         self._previous_time_s = 0.0
         self._has_sample = False
+        self._last_step: PidStepDiagnostics | None = None
 
     @property
     def gains(self) -> PidGains:
@@ -69,11 +83,16 @@ class AxisPid:
     def has_sample(self) -> bool:
         return self._has_sample
 
+    @property
+    def last_step(self) -> PidStepDiagnostics | None:
+        return self._last_step
+
     def reset(self) -> None:
         self._i_term = 0.0
         self._previous_error = 0.0
         self._previous_time_s = 0.0
         self._has_sample = False
+        self._last_step = None
 
     def set_gains(self, gains: PidGains) -> None:
         if not isinstance(gains, PidGains):
@@ -110,7 +129,20 @@ class AxisPid:
             self._previous_error = error_value
             self._previous_time_s = now
             self._has_sample = True
-            return _clamp(p_term + ff_term, self._output_limit)
+            unclamped_output = p_term + ff_term
+            output = _clamp(unclamped_output, self._output_limit)
+            self._last_step = PidStepDiagnostics(
+                real_error=error_value,
+                proportional_offset=offset,
+                p_term=p_term,
+                i_term=0.0,
+                d_term=0.0,
+                feed_forward=ff_term,
+                unclamped_output=unclamped_output,
+                output=output,
+                clamped=output != unclamped_output,
+            )
+            return output
 
         dt = now - self._previous_time_s
         if dt <= 0:
@@ -133,9 +165,18 @@ class AxisPid:
         if not drives_positive_saturation and not drives_negative_saturation:
             self._i_term = candidate_i
 
-        output = _clamp(
-            p_term + self._i_term + d_term + ff_term,
-            self._output_limit,
+        unclamped_output = p_term + self._i_term + d_term + ff_term
+        output = _clamp(unclamped_output, self._output_limit)
+        self._last_step = PidStepDiagnostics(
+            real_error=error_value,
+            proportional_offset=offset,
+            p_term=p_term,
+            i_term=self._i_term,
+            d_term=d_term,
+            feed_forward=ff_term,
+            unclamped_output=unclamped_output,
+            output=output,
+            clamped=output != unclamped_output,
         )
         self._previous_error = error_value
         self._previous_time_s = now
@@ -151,4 +192,4 @@ def _require_nonnegative_or_signed_finite(value: float, *, name: str) -> float:
     return result
 
 
-__all__ = ["AxisPid", "PidGains"]
+__all__ = ["AxisPid", "PidGains", "PidStepDiagnostics"]

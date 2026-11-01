@@ -36,6 +36,7 @@ from navmin.config.models import (
     SerialConfig,
     StereoDistanceConfig,
     Stm32Config,
+    TrackingVisualizationConfig,
     TurretConfig,
     UiConfig,
     VisionConfig,
@@ -137,7 +138,7 @@ def _config(
         max_relative_move_deg=45.0,
     )
     return AppConfig(
-        schema_version=4,
+        schema_version=6,
         vision=VisionConfig(
             processing_scope=ProcessingScope.MAIN_AND_PREVIEW,
             cameras=CamerasConfig(
@@ -164,6 +165,11 @@ def _config(
             aim_points=AimPointsConfig(overview=center, stereo_left=center),
         ),
         tracking_control=_default_tracking_control_config(),
+        tracking_visualization=TrackingVisualizationConfig(
+            show_search_region=False,
+            show_best_candidate=False,
+            show_control_prediction=False,
+        ),
         imu=ImuConfig(
             enabled=imu_enabled,
             bind_address="0.0.0.0",
@@ -999,6 +1005,10 @@ def test_shared_runtime_starts_and_exposes_complete_ui_dependency_surface() -> N
             is runtime.overview_worker.pipeline.latest_result
         )
         assert (
+            bindings[CameraRole.OVERVIEW].tracking_diagnostics
+            is runtime.overview_worker.pipeline.latest_tracking_diagnostics
+        )
+        assert (
             bindings[CameraRole.STEREO_LEFT].session_barriers
             is runtime.stereo_left_worker.pipeline.session_barriers
         )
@@ -1024,6 +1034,12 @@ def test_shared_runtime_starts_and_exposes_complete_ui_dependency_surface() -> N
         assert ui.imu_states is runtime.imu_states
         assert ui.imu_controls is runtime.imu_runtime
         assert ui.camera_stale_timeout_ms == 500
+        expected_config = _config(stereo_left_enabled=True)
+        assert ui.tracking_control_config == expected_config.tracking_control
+        assert (
+            ui.tracking_visualization_config
+            == expected_config.tracking_visualization
+        )
     finally:
         runtime.shutdown(timeout=1.0)
         runtime.shutdown(timeout=1.0)

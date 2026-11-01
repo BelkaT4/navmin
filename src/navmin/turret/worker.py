@@ -378,11 +378,17 @@ class TurretWorker:
                     return False
                 self._last_known_port = serial.port
                 self._last_known_baud = candidate
-                _LOGGER.info(
-                    "Turret physical connection found on %s at %d baud",
-                    serial.port,
-                    candidate,
-                )
+                if self._startup_emulate_stm32:
+                    _LOGGER.info(
+                        "Turret simulated connection ready at %d baud",
+                        candidate,
+                    )
+                else:
+                    _LOGGER.info(
+                        "Turret physical connection found on %s at %d baud",
+                        serial.port,
+                        candidate,
+                    )
                 self._publish_state(TurretConnectionState.CONNECTING)
 
                 while not self._stop_token.is_stop_requested():
