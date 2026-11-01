@@ -539,6 +539,83 @@ def test_successful_relative_motion_invalidates_command_rate_model() -> None:
     assert not hal.platform_motion_snapshot.valid
 
 
+def test_relative_to_tracking_without_relative_move_does_not_zero_settle() -> None:
+    controller, hal, _, _, clock = _stack()
+    controller.motor_on()
+
+    result = controller.set_control_mode(TurretControlMode.TRACKING)
+
+    assert result is not None and result.response is not None
+    assert result.response.result is ResultCode.OK
+    assert not hal.platform_motion_zero_settling
+    clock.now = 0.1
+    assert controller.submit_tracking_control(
+        1, _tracking_error(_target(), 2.0)
+    )
+    assert controller.pid_x.has_sample
+    assert controller.pending_motion is not None
+
+
+
+def test_relative_to_tracking_recovers_command_model_after_zero_settle() -> None:
+    config = _config(
+        max_speed_x=90.0,
+        max_speed_y=45.0,
+        acceleration_x=180.0,
+        acceleration_y=90.0,
+    )
+    clock = _Clock()
+    command_clock = _NsClock(1_000_000_000)
+    controller, hal, _, transport, _ = _stack(
+        config,
+        clock=clock,
+        command_clock=command_clock,
+    )
+    controller.motor_off()
+    controller.motor_on()
+    controller.submit_move_relative(MoveRelativeCommand(1.0, 0.0))
+    controller.flush_pending_motion()
+    assert not hal.platform_motion_snapshot.valid
+
+    transport.raw_write_history.clear()
+    command_clock.now = 2_000_000_000
+    result = controller.set_control_mode(TurretControlMode.TRACKING)
+
+    assert result is not None and result.response is not None
+    assert result.response.result is ResultCode.OK
+    assert controller.control_mode is TurretControlMode.TRACKING
+    assert hal.platform_motion_zero_settling
+    assert not hal.platform_motion_snapshot.valid
+    assert [decode_request(raw).payload for raw in transport.raw_write_history] == [
+        SetVelocityPayload(0, 0)
+    ]
+
+    clock.now = 0.1
+    assert not controller.submit_tracking_control(
+        1, _tracking_error(_target(), 2.0)
+    )
+    assert controller.pending_motion is None
+    assert len(transport.raw_write_history) == 1
+
+    command_clock.now = 2_749_999_999
+    assert hal.platform_motion_zero_settling
+    assert not hal.platform_motion_snapshot.valid
+
+    command_clock.now = 2_750_000_000
+    assert not hal.platform_motion_zero_settling
+    snapshot = hal.platform_motion_snapshot
+    assert snapshot.valid
+    assert snapshot.anchors[-1].timestamp_ns == 2_750_000_000
+    assert snapshot.anchors[-1].modeled_rate_x_deg_s == 0.0
+    assert snapshot.anchors[-1].modeled_rate_y_deg_s == 0.0
+
+    clock.now = 0.8
+    assert controller.submit_tracking_control(
+        1, _tracking_error(_target(), 2.0)
+    )
+    assert controller.pending_motion is not None
+
+
 def test_controller_tracking_pending_is_latest_and_revision_processed_once() -> None:
     controller, _, _, transport, clock = _stack()
     _enter_tracking_off(controller, transport)

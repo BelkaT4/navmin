@@ -127,6 +127,9 @@ class TurretController:
             and revision <= self._last_processed_revision
         ):
             return False
+        if self._hal.platform_motion_zero_settling:
+            self._pending_motion = None
+            return False
 
         now = self._require_finite_time(self._clock())
         target_changed = self._target is not None and sample.target != self._target
@@ -293,7 +296,13 @@ class TurretController:
 
         result: SessionResult | None = None
         if self._hal.motor_state is MotorState.ON:
-            result = self._hal.set_velocity(self._zero_velocity())
+            result = self._hal.set_velocity(
+                self._zero_velocity(),
+                recover_command_model_after_zero=(
+                    old_mode is TurretControlMode.RELATIVE
+                    and mode is TurretControlMode.TRACKING
+                ),
+            )
             if not self._session_result_ok(result):
                 return result
 
