@@ -239,6 +239,7 @@ def _mediator(
     stereo_distance_results: LatestValue[StereoDistanceCandidate] | None = None,
     distance_stale_timeout_ms: int = 300,
     clock_ns=monotonic_ns,
+    motion_calibration=None,
 ) -> tuple[Mediator, _FakeTurret, dict[CameraRole, TargetControlChannel]]:
     turret = _FakeTurret(_turret_state(mode=mode, motor=motor))
     controls = _controls()
@@ -254,6 +255,7 @@ def _mediator(
         stereo_distance_results=stereo_distance_results,
         distance_stale_timeout_ms=distance_stale_timeout_ms,
         clock_ns=clock_ns,
+        motion_calibration=motion_calibration,
     )
     return mediator, turret, controls
 
@@ -328,6 +330,56 @@ def test_relative_click_uses_accepted_main_session_only() -> None:
 
     assert mediator.accept_camera_session(_session(CameraRole.OVERVIEW, 2))
     assert not mediator.handle_relative_click(current, 60, 40)
+
+
+class _CameraCorrection:
+    def __init__(self) -> None:
+        self.cameras: list[CameraRole] = []
+
+    def correct(
+        self, camera: CameraRole, command: MoveRelativeCommand
+    ) -> MoveRelativeCommand:
+        self.cameras.append(camera)
+        return MoveRelativeCommand(command.delta_x_deg * 2.0, command.delta_y_deg)
+
+
+def test_relative_click_applies_camera_correction_at_mediator_boundary() -> None:
+    correction = _CameraCorrection()
+    baseline, baseline_turret, _ = _mediator()
+    corrected, corrected_turret, _ = _mediator(
+        motion_calibration=correction
+    )
+    baseline_result = _accept_main(baseline)
+    corrected_result = _accept_main(corrected)
+
+    assert baseline.handle_relative_click(baseline_result, 60, 40)
+    assert corrected.handle_relative_click(corrected_result, 60, 40)
+
+    assert correction.cameras == [CameraRole.OVERVIEW]
+    assert corrected_turret.relative_commands[-1].delta_x_deg == pytest.approx(
+        baseline_turret.relative_commands[-1].delta_x_deg * 2.0
+    )
+
+
+def test_calibration_move_bypasses_camera_correction_and_requires_safe_state() -> None:
+    correction = _CameraCorrection()
+    mediator, turret, _ = _mediator(motion_calibration=correction)
+    _accept_main(mediator)
+    command = MoveRelativeCommand(4.0, 0.0)
+
+    assert mediator.submit_calibration_move(CameraRole.OVERVIEW, 1, command)
+    assert turret.relative_commands == [command]
+    assert correction.cameras == []
+
+    mediator.accept_turret_state(
+        _turret_state(connection=TurretConnectionState.DISCONNECTED)
+    )
+    assert not mediator.submit_calibration_move(
+        CameraRole.OVERVIEW, 1, command
+    )
+    assert not mediator.submit_calibration_move(
+        CameraRole.STEREO_LEFT, 1, command
+    )
 
 
 def test_tracking_selection_rejected_in_relative_and_during_mode_transition() -> None:

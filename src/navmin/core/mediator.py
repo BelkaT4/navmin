@@ -114,6 +114,16 @@ class TurretPort(Protocol):
     def request_emergency(self) -> None: ...
 
 
+class MotionCalibrationCorrectionPort(Protocol):
+    """Camera-aware correction kept above the camera-agnostic Turret boundary."""
+
+    def correct(
+        self,
+        camera: CameraRole,
+        command: MoveRelativeCommand,
+    ) -> MoveRelativeCommand: ...
+
+
 class StereoDistanceCandidatePort(Protocol):
     """Narrow internal result shape produced by the stereo distance worker."""
 
@@ -160,6 +170,7 @@ class Mediator:
         initial_manual_distance_m: float = 100.0,
         distance_stale_timeout_ms: int = 300,
         clock_ns: Callable[[], int] = monotonic_ns,
+        motion_calibration: MotionCalibrationCorrectionPort | None = None,
     ) -> None:
         if ui_config.default_camera not in _NORMAL_CAMERAS:
             raise ValueError("ui.default_camera must be Overview or Stereo Left")
@@ -214,6 +225,7 @@ class Mediator:
         self._manual_distance_m = quantize_constant_distance(initial_manual_distance_m)
         self._distance_stale_timeout_ns = distance_stale_timeout_ms * 1_000_000
         self._clock_ns = clock_ns
+        self._motion_calibration = motion_calibration
         self._distance_intent_revision = 0
         self._current_distance: DistanceResult | None = None
         self._distance_shutdown = False
@@ -499,6 +511,30 @@ class Mediator:
             x_px=x_px,
             y_px=y_px,
         )
+        if self._motion_calibration is not None:
+            command = self._motion_calibration.correct(frame.camera, command)
+        self._turret.submit_move_relative(command)
+        return True
+
+    def submit_calibration_move(
+        self,
+        camera: CameraRole,
+        generation: int,
+        command: MoveRelativeCommand,
+    ) -> bool:
+        """Submit one wizard-owned baseline move without active click correction."""
+        if not isinstance(command, MoveRelativeCommand):
+            raise TypeError("command must be MoveRelativeCommand")
+        state = self._turret_state
+        if (
+            camera is not self._main_camera
+            or not self._session_gate.accepts(camera, generation)
+            or state.connection_state is not TurretConnectionState.READY
+            or state.motor_state is not MotorState.ON
+            or state.control_mode is not TurretControlMode.RELATIVE
+            or self._pending_control_mode is not None
+        ):
+            return False
         self._turret.submit_move_relative(command)
         return True
 
