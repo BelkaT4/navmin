@@ -201,6 +201,7 @@ def run_loaded_application(
     stereo_right_source_factory: SourceFactory | None = None,
 ) -> int:
     """Build/start one shared runtime, run Qt, then always perform safe shutdown."""
+    using_default_runtime_builder = runtime_builder is None
     if runtime_builder is None:
         from navmin.application import build_application_runtime
 
@@ -216,6 +217,10 @@ def run_loaded_application(
         "stereo_calibration": inputs.stereo_calibration,
         "imu_calibration": inputs.imu_calibration,
     }
+    if using_default_runtime_builder and inputs.source_paths is not None:
+        runtime_kwargs["motion_calibration_path"] = (
+            inputs.source_paths.config.parent / "calibration" / "motion.json"
+        )
     source_factories = (
         overview_source_factory,
         stereo_left_source_factory,
@@ -273,6 +278,15 @@ def run_loaded_application(
             tracking_visualization_config=ui.tracking_visualization_config,
             recording_runtime=getattr(ui, "recording_runtime", None),
             start_recording=getattr(ui, "start_recording", None),
+            motion_calibration_runtime=getattr(
+                ui, "motion_calibration_runtime", None
+            ),
+            begin_motion_calibration_profile=getattr(
+                ui, "begin_motion_calibration_profile", None
+            ),
+            restore_motion_calibration_profile=getattr(
+                ui, "restore_motion_calibration_profile", None
+            ),
             persist_tracking_visualization=persist_tracking_visualization,
             show_diagnostic_clock=show_diagnostic_clock,
             argv=qt_argv,

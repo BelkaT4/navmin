@@ -37,6 +37,11 @@ from navmin.imu import (
     ImuRuntime,
     ImuRuntimeState,
 )
+from navmin.motion_calibration import (
+    MotionCalibrationRuntime,
+    MotionProfile,
+    calibration_identity,
+)
 from navmin.recording import (
     RecordingRuntime,
     RecordingSessionInfo,
@@ -108,6 +113,9 @@ class UiRuntimeDependencies:
     tracking_visualization_config: TrackingVisualizationConfig
     recording_runtime: RecordingRuntime | None = None
     start_recording: Callable[[CameraRole, int, int], RecordingSessionInfo] | None = None
+    motion_calibration_runtime: MotionCalibrationRuntime | None = None
+    begin_motion_calibration_profile: Callable[[MotionProfile], None] | None = None
+    restore_motion_calibration_profile: Callable[[], None] | None = None
 
 
 @dataclass(frozen=True)
@@ -150,6 +158,7 @@ class ApplicationRuntime:
         turret_config: TurretConfig,
         tracking_control_config: TrackingControlConfig,
         tracking_visualization_config: TrackingVisualizationConfig,
+        motion_calibration_runtime: MotionCalibrationRuntime,
         recording_runtime: RecordingRuntime | None = None,
         vision_backends: Mapping[CameraRole, str] | None = None,
     ) -> None:
@@ -175,6 +184,7 @@ class ApplicationRuntime:
         self.turret_worker = turret_worker
         self.mediator = mediator
         self.recording_runtime = recording_runtime or RecordingRuntime(Path("recordings"))
+        self.motion_calibration_runtime = motion_calibration_runtime
         resolved_backends = (
             {
                 CameraRole.OVERVIEW: "unknown",
@@ -186,7 +196,8 @@ class ApplicationRuntime:
         self._vision_backends = MappingProxyType(resolved_backends)
         self.camera_stale_timeout_ms = camera_stale_timeout_ms
         self._runtime_turret_config = turret_config
-        self._pid_tuning_revision = 0
+        self._turret_config_revision = 0
+        self._pre_calibration_turret_config: TurretConfig | None = None
         self._runtime_tracking_control_config = tracking_control_config
         self._tracking_tuning_revision = 0
 
@@ -217,6 +228,9 @@ class ApplicationRuntime:
             tracking_visualization_config=tracking_visualization_config,
             recording_runtime=self.recording_runtime,
             start_recording=self.start_recording,
+            motion_calibration_runtime=self.motion_calibration_runtime,
+            begin_motion_calibration_profile=self.begin_motion_calibration_profile,
+            restore_motion_calibration_profile=self.restore_motion_calibration_profile,
         )
         self._active_components: set[str] = set()
         self._start_attempted = False
@@ -268,14 +282,16 @@ class ApplicationRuntime:
 
     def apply_pid_tuning(self, config: PidControllerConfig) -> None:
         """Queue a temporary PID-only runtime config update for Turret."""
+        if self._pre_calibration_turret_config is not None:
+            raise RuntimeError("PID tuning is unavailable during motion calibration")
         self._validate_pid_tuning(config)
-        next_revision = self._pid_tuning_revision + 1
+        next_revision = self._turret_config_revision + 1
         next_turret_config = replace(self._runtime_turret_config, controller=config)
         self.turret_worker.submit_config_update(
             ConfigUpdate(revision=next_revision, config=next_turret_config)
         )
         self._runtime_turret_config = next_turret_config
-        self._pid_tuning_revision = next_revision
+        self._turret_config_revision = next_revision
         LOGGER.info(
             "PID tuning update queued revision=%d "
             "x=(kp=%g, ki=%g, kd=%g) y=(kp=%g, ki=%g, kd=%g)",
@@ -287,6 +303,55 @@ class ApplicationRuntime:
             config.pid_ki_y,
             config.pid_kd_y,
         )
+
+    def begin_motion_calibration_profile(self, profile: MotionProfile) -> None:
+        """Queue a bounded temporary STM32 profile for one calibration session."""
+        if not isinstance(profile, MotionProfile):
+            raise TypeError("profile must be MotionProfile")
+        if self._pre_calibration_turret_config is not None:
+            raise RuntimeError("motion calibration profile is already active")
+        current = self._runtime_turret_config
+        stm32 = current.stm32
+        if profile.max_speed_deg_s > min(
+            stm32.max_speed_x_deg_s, stm32.max_speed_y_deg_s
+        ):
+            raise ValueError("calibration speed exceeds the current hardware limit")
+        if profile.acceleration_deg_s2 > min(
+            stm32.acceleration_x_deg_s2, stm32.acceleration_y_deg_s2
+        ):
+            raise ValueError(
+                "calibration acceleration exceeds the current hardware limit"
+            )
+        temporary = replace(
+            current,
+            stm32=replace(
+                stm32,
+                max_speed_x_deg_s=profile.max_speed_deg_s,
+                max_speed_y_deg_s=profile.max_speed_deg_s,
+                acceleration_x_deg_s2=profile.acceleration_deg_s2,
+                acceleration_y_deg_s2=profile.acceleration_deg_s2,
+            ),
+        )
+        next_revision = self._turret_config_revision + 1
+        self.turret_worker.submit_config_update(
+            ConfigUpdate(revision=next_revision, config=temporary)
+        )
+        self._pre_calibration_turret_config = current
+        self._runtime_turret_config = temporary
+        self._turret_config_revision = next_revision
+
+    def restore_motion_calibration_profile(self) -> None:
+        """Restore the exact pre-session runtime turret snapshot once."""
+        original = self._pre_calibration_turret_config
+        if original is None:
+            return
+        next_revision = self._turret_config_revision + 1
+        self.turret_worker.submit_config_update(
+            ConfigUpdate(revision=next_revision, config=original)
+        )
+        self._runtime_turret_config = original
+        self._pre_calibration_turret_config = None
+        self._turret_config_revision = next_revision
 
     def apply_tracking_control_tuning(
         self,
@@ -440,6 +505,8 @@ class ApplicationRuntime:
             return
         if not self._start_attempted:
             self._start_attempted = True
+
+        self.restore_motion_calibration_profile()
 
         failures: list[ApplicationShutdownFailure] = []
         if self.recording_runtime.state is not RecordingState.IDLE:
@@ -599,6 +666,7 @@ def build_application_runtime(
     stereo_calibration: StereoCalibration,
     imu_calibration: ImuCalibration | None = None,
     factories: ApplicationFactories | None = None,
+    motion_calibration_path: Path = Path("config/calibration/motion.json"),
 ) -> ApplicationRuntime:
     """Compose the production NavMin runtime from already-loaded typed inputs."""
     if not isinstance(config, AppConfig):
@@ -672,6 +740,14 @@ def build_application_runtime(
         config.tracking_control,
         transport_factory=selected_factories.turret_transport_factory,
     )
+    motion_calibration_runtime = MotionCalibrationRuntime.load(
+        path=motion_calibration_path,
+        axes=config.turret.axes,
+        camera_identities={
+            CameraRole.OVERVIEW: calibration_identity(overview_calibration),
+            CameraRole.STEREO_LEFT: calibration_identity(stereo_calibration),
+        },
+    )
     mediator = Mediator(
         aiming_config=config.aiming,
         tracking_control_config=config.tracking_control,
@@ -694,6 +770,7 @@ def build_application_runtime(
                 config.vision.cameras.stereo_left.processing_enabled
             ),
         },
+        motion_calibration=motion_calibration_runtime,
     )
     if stereo_frame_sink is not None:
         def active_pairing_kind() -> StereoPairingKind | None:
@@ -745,6 +822,7 @@ def build_application_runtime(
         turret_config=config.turret,
         tracking_control_config=config.tracking_control,
         tracking_visualization_config=config.tracking_visualization,
+        motion_calibration_runtime=motion_calibration_runtime,
         recording_runtime=recording_runtime,
         vision_backends=vision_backends,
     )

@@ -12,7 +12,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import numpy as np
 import pytest
-from PyQt6.QtCore import QPoint, QPointF, QSize, Qt
+from PyQt6.QtCore import QEvent, QPoint, QPointF, QSize, Qt
 from PyQt6.QtGui import QPixmap, QWheelEvent
 from PyQt6.QtTest import QTest
 from PyQt6.QtWidgets import QApplication, QMessageBox
@@ -28,6 +28,8 @@ from navmin.config.models import (
     AimingConfig,
     AimPointConfig,
     AimPointsConfig,
+    AxesConfig,
+    AxisMechanicsConfig,
     PidControllerConfig,
     TrackingControlConfig,
     TrackingVisualizationConfig,
@@ -65,6 +67,7 @@ from navmin.core import (
     TrackingEstimatorDiagnostics,
 )
 from navmin.imu import GyroBiasState, ImuRuntimeState, ImuSourceIdentity
+from navmin.motion_calibration import MotionCalibrationRuntime, MotionProfile
 from navmin.recording import RecordingRuntime, RecordingSessionInfo
 from navmin.ui import (
     CameraUiBinding,
@@ -221,8 +224,12 @@ def _turret_state(
     mode: TurretControlMode = TurretControlMode.RELATIVE,
     motor: MotorState = MotorState.ON,
     connection: TurretConnectionState = TurretConnectionState.READY,
+    speed: float = 40.0,
+    acceleration: float = 80.0,
 ) -> TurretState:
-    return TurretState(connection, motor, mode, 40.0, 40.0, 80.0, 80.0)
+    return TurretState(
+        connection, motor, mode, speed, speed, acceleration, acceleration
+    )
 
 
 def _mediator(
@@ -425,6 +432,9 @@ def _window(
     start_recording: (
         Callable[[CameraRole, int, int], RecordingSessionInfo] | None
     ) = None,
+    motion_calibration_runtime: MotionCalibrationRuntime | None = None,
+    begin_motion_calibration_profile: Callable[[MotionProfile], None] | None = None,
+    restore_motion_calibration_profile: Callable[[], None] | None = None,
 ) -> tuple[
     MainWindow,
     Mediator,
@@ -459,6 +469,9 @@ def _window(
         persist_tracking_visualization=persist_tracking_visualization,
         recording_runtime=recording_runtime,
         start_recording=start_recording,
+        motion_calibration_runtime=motion_calibration_runtime,
+        begin_motion_calibration_profile=begin_motion_calibration_profile,
+        restore_motion_calibration_profile=restore_motion_calibration_profile,
         imu_states=imu_states,
         imu_controls=imu_controls,
         clock_ns=clock or _Clock(),
@@ -474,6 +487,167 @@ def _window(
     qt_application.processEvents()
     return window, mediator, turret, bindings, turret_states
 
+
+@pytest.mark.parametrize(
+    "termination",
+    [
+        "emergency",
+        "motor_off",
+        "mode_change",
+        "disconnect",
+        "camera_loss",
+        "generation_change",
+        "calibration_close",
+        "main_close",
+    ],
+)
+def test_motion_calibration_lifecycle_always_restores_temporary_profile(
+    qt_application: QApplication,
+    tmp_path: Path,
+    termination: str,
+) -> None:
+    axis = AxisMechanicsConfig(False, 200, 16, 45.0)
+    runtime = MotionCalibrationRuntime(
+        path=tmp_path / "motion.json",
+        axes=AxesConfig(axis, axis),
+        camera_identities={
+            CameraRole.OVERVIEW: "sha256:overview",
+            CameraRole.STEREO_LEFT: "sha256:stereo",
+        },
+    )
+    begun: list[MotionProfile] = []
+    restored: list[bool] = []
+    window, mediator, turret, _bindings_value, _turret_states_value = _window(
+        qt_application,
+        motion_calibration_runtime=runtime,
+        begin_motion_calibration_profile=begun.append,
+        restore_motion_calibration_profile=lambda: restored.append(True),
+    )
+    assert mediator.accept_camera_session(_session(CameraRole.OVERVIEW, 1))
+    calibration = window.motion_calibration_window
+    assert calibration is not None
+
+    calibration._start()
+
+    assert calibration.calibration_active
+    assert len(begun) == 1
+    assert turret.relative_commands == []
+    calibration.accept_turret_state(
+        _turret_state(speed=5.0, acceleration=10.0)
+    )
+    assert turret.relative_commands == [MoveRelativeCommand(14.0, 0.0)]
+
+    if termination == "emergency":
+        window._emergency_stop()
+    elif termination == "motor_off":
+        window._toggle_motor()
+    elif termination == "mode_change":
+        window._request_other_mode()
+    elif termination == "disconnect":
+        calibration.accept_turret_state(
+            _turret_state(connection=TurretConnectionState.DISCONNECTED)
+        )
+    elif termination == "camera_loss":
+        calibration.accept_camera_status(
+            CameraStatus(
+                CameraRole.OVERVIEW,
+                CameraState.ERROR,
+                1,
+                None,
+                "lost",
+                "lost",
+            )
+        )
+    elif termination == "generation_change":
+        calibration.accept_camera_session(_session(CameraRole.OVERVIEW, 2))
+    elif termination == "calibration_close":
+        calibration.close()
+    else:
+        window.close()
+    qt_application.processEvents()
+
+    assert restored == [True]
+    assert not calibration.calibration_active
+    assert runtime.document.profiles == {}
+    window.close()
+    qt_application.processEvents()
+
+def test_motion_calibration_waits_for_confirmed_profile_before_first_move(
+    qt_application: QApplication,
+    tmp_path: Path,
+) -> None:
+    axis = AxisMechanicsConfig(False, 200, 16, 45.0)
+    runtime = MotionCalibrationRuntime(
+        path=tmp_path / "motion.json",
+        axes=AxesConfig(axis, axis),
+        camera_identities={
+            CameraRole.OVERVIEW: "sha256:overview",
+            CameraRole.STEREO_LEFT: "sha256:stereo",
+        },
+    )
+    begun: list[MotionProfile] = []
+    restored: list[bool] = []
+    clock = _Clock()
+    window, mediator, turret, _bindings_value, _turret_states_value = _window(
+        qt_application,
+        clock=clock,
+        motion_calibration_runtime=runtime,
+        begin_motion_calibration_profile=begun.append,
+        restore_motion_calibration_profile=lambda: restored.append(True),
+    )
+    assert mediator.accept_camera_session(_session(CameraRole.OVERVIEW, 1))
+    calibration = window.motion_calibration_window
+    assert calibration is not None
+
+    calibration._start()
+
+    assert len(begun) == 1
+    assert turret.relative_commands == []
+    calibration.accept_turret_state(_turret_state(speed=40.0, acceleration=80.0))
+    assert turret.relative_commands == []
+    calibration.accept_turret_state(_turret_state(speed=5.0, acceleration=10.0))
+    assert turret.relative_commands == [MoveRelativeCommand(14.0, 0.0)]
+    assert restored == []
+    calibration.close()
+    qt_application.processEvents()
+
+
+def test_motion_calibration_profile_confirmation_timeout_aborts_without_move(
+    qt_application: QApplication,
+    tmp_path: Path,
+) -> None:
+    axis = AxisMechanicsConfig(False, 200, 16, 45.0)
+    runtime = MotionCalibrationRuntime(
+        path=tmp_path / "motion.json",
+        axes=AxesConfig(axis, axis),
+        camera_identities={
+            CameraRole.OVERVIEW: "sha256:overview",
+            CameraRole.STEREO_LEFT: "sha256:stereo",
+        },
+    )
+    restored: list[bool] = []
+    clock = _Clock()
+    window, mediator, turret, _bindings_value, _turret_states_value = _window(
+        qt_application,
+        clock=clock,
+        motion_calibration_runtime=runtime,
+        begin_motion_calibration_profile=lambda _profile: None,
+        restore_motion_calibration_profile=lambda: restored.append(True),
+    )
+    assert mediator.accept_camera_session(_session(CameraRole.OVERVIEW, 1))
+    calibration = window.motion_calibration_window
+    assert calibration is not None
+
+    calibration._start()
+    assert turret.relative_commands == []
+    clock.now_ns += 5_000_000_000
+    calibration._tick()
+
+    assert turret.relative_commands == []
+    assert restored == [True]
+    assert not calibration.calibration_active
+    calibration.close()
+    qt_application.processEvents()
 
 
 def _imu_state(
@@ -1190,8 +1364,11 @@ def test_preview_click_and_action_swap_exactly_once_without_aiming(
     assert button.width() < 42
     assert button.height() < 34
 
+    QApplication.sendEvent(window.preview_view, QEvent(QEvent.Type.Leave))
+    qt_application.processEvents()
     inactive_style = button.styleSheet()
-    QTest.mouseMove(window.preview_view, QPoint(50, 50))
+
+    QApplication.sendEvent(window.preview_view, QEvent(QEvent.Type.Enter))
     qt_application.processEvents()
     active_style = button.styleSheet()
     assert active_style != inactive_style
@@ -1200,7 +1377,7 @@ def test_preview_click_and_action_swap_exactly_once_without_aiming(
     assert mediator.main_camera is CameraRole.OVERVIEW
     assert turret.relative_commands == []
 
-    QTest.mouseMove(window.main_view, QPoint(50, 50))
+    QApplication.sendEvent(window.preview_view, QEvent(QEvent.Type.Leave))
     qt_application.processEvents()
     assert button.styleSheet() == inactive_style
     window.close()
@@ -1337,8 +1514,6 @@ def test_timestamp_distance_is_shown_without_approximation_marker(
     assert window.main_view.distance_annotation_text == "12.4 м"
     assert window.preview_view.distance_annotation_text is None
     window.close()
-
-
 
 def test_distance_slider_standard_wheel_step_is_ten_metres(
     qt_application: QApplication,

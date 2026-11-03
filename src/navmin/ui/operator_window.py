@@ -50,6 +50,7 @@ class OperatorWindow(QWidget):
         on_apply_tracking_control_tuning: Callable[[TrackingControlConfig], None],
         tracking_visualization_config: TrackingVisualizationConfig,
         on_tracking_visualization_changed: Callable[[TrackingVisualizationConfig], None],
+        on_show_motion_calibration: Callable[[], None] | None = None,
     ) -> None:
         super().__init__(owner, Qt.WindowType.Tool)
         self._on_toggle_fullscreen = on_toggle_fullscreen
@@ -60,6 +61,7 @@ class OperatorWindow(QWidget):
         self._on_apply_tracking_control_tuning = on_apply_tracking_control_tuning
         self._tracking_visualization_config = tracking_visualization_config
         self._on_tracking_visualization_changed = on_tracking_visualization_changed
+        self._on_show_motion_calibration = on_show_motion_calibration
         self._syncing_tracking_visualization = False
         self.setWindowTitle("Operator Window")
         self.setWindowModality(Qt.WindowModality.NonModal)
@@ -145,6 +147,14 @@ class OperatorWindow(QWidget):
         }
         self.position_button = QPushButton("ПОЛОЖЕНИЕ")
         self.position_button.clicked.connect(self._on_show_imu)
+        self.motion_calibration_button = QPushButton("КАЛИБРОВКА ДВИЖЕНИЯ")
+        self.motion_calibration_button.setEnabled(
+            on_show_motion_calibration is not None
+        )
+        if on_show_motion_calibration is not None:
+            self.motion_calibration_button.clicked.connect(
+                on_show_motion_calibration
+            )
         self.fullscreen_button = QPushButton()
         self.fullscreen_button.clicked.connect(self._on_toggle_fullscreen)
         self.exit_button = QPushButton("Выход")
@@ -230,6 +240,7 @@ class OperatorWindow(QWidget):
             )
         layout.addWidget(diagnostics_group)
         layout.addSpacing(6)
+        layout.addWidget(self.motion_calibration_button)
         layout.addWidget(self.position_button)
         layout.addWidget(self.fullscreen_button)
         layout.addWidget(self.exit_button)

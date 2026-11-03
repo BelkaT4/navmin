@@ -54,6 +54,7 @@ from navmin.contracts import (
 )
 from navmin.core import DistanceMeasurementMode
 from navmin.imu import ImuCalibration, ImuRuntime
+from navmin.motion_calibration import MotionProfile
 from navmin.turret.protocol import CommandCode
 from navmin.turret.simulator import FakeStm32Endpoint, FakeTransport
 from navmin.turret.worker import TurretWorker
@@ -857,6 +858,61 @@ def test_runtime_pid_tuning_dependencies_use_loaded_config_and_monotonic_updates
         assert update.config.emulate_stm32 == config.turret.emulate_stm32
     assert queued[-1].config == replace(config.turret, controller=third)
     assert "PID tuning update queued revision=3" in caplog.text
+
+
+def test_motion_calibration_profile_is_temporary_bounded_and_restored_once(
+    monkeypatch,
+) -> None:
+    config = _config()
+    runtime = build_application_runtime(
+        config=config,
+        overview_calibration=_overview_calibration(),
+        stereo_calibration=_stereo_calibration(),
+    )
+    queued: list[ConfigUpdate[TurretConfig]] = []
+    monkeypatch.setattr(runtime.turret_worker, "submit_config_update", queued.append)
+    profile = MotionProfile(5.0, 10.0, 750)
+
+    runtime.begin_motion_calibration_profile(profile)
+
+    assert queued[-1].revision == 1
+    assert queued[-1].config.stm32 == replace(
+        config.turret.stm32,
+        max_speed_x_deg_s=5.0,
+        max_speed_y_deg_s=5.0,
+        acceleration_x_deg_s2=10.0,
+        acceleration_y_deg_s2=10.0,
+    )
+    with pytest.raises(RuntimeError, match="during motion calibration"):
+        runtime.apply_pid_tuning(config.turret.controller)
+
+    runtime.restore_motion_calibration_profile()
+    runtime.restore_motion_calibration_profile()
+
+    assert [update.revision for update in queued] == [1, 2]
+    assert queued[-1].config == config.turret
+
+
+@pytest.mark.parametrize(
+    "profile",
+    [MotionProfile(51.0, 10.0, 0), MotionProfile(5.0, 101.0, 0)],
+)
+def test_motion_calibration_profile_rejects_hardware_limit_excess(
+    monkeypatch,
+    profile: MotionProfile,
+) -> None:
+    runtime = build_application_runtime(
+        config=_config(),
+        overview_calibration=_overview_calibration(),
+        stereo_calibration=_stereo_calibration(),
+    )
+    queued: list[ConfigUpdate[TurretConfig]] = []
+    monkeypatch.setattr(runtime.turret_worker, "submit_config_update", queued.append)
+
+    with pytest.raises(ValueError):
+        runtime.begin_motion_calibration_profile(profile)
+
+    assert queued == []
 
 
 @pytest.mark.parametrize("invalid", [-0.1, float("nan"), float("inf")])

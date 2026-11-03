@@ -47,6 +47,7 @@ from navmin.core import (
     TrackingControlVisualization,
 )
 from navmin.imu import ImuCalibrationControls, ImuRuntimeState
+from navmin.motion_calibration import MotionCalibrationRuntime, MotionProfile
 from navmin.recording import (
     RecordingControlPrediction,
     RecordingControlState,
@@ -62,6 +63,7 @@ from navmin.vision.processor import VisionTrackingDiagnostics
 
 from .bridge import CameraUiBinding, UiStatePump
 from .imu_window import ImuWindow
+from .motion_calibration_window import MotionCalibrationWindow
 from .operator_window import OperatorWindow
 from .video_view import (
     PreparedVisionFrame,
@@ -148,6 +150,9 @@ class MainWindow(QMainWindow):
         tracking_visualization_config: TrackingVisualizationConfig | None = None,
         recording_runtime: RecordingRuntime | None = None,
         start_recording: Callable[[CameraRole, int, int], RecordingSessionInfo] | None = None,
+        motion_calibration_runtime: MotionCalibrationRuntime | None = None,
+        begin_motion_calibration_profile: Callable[[MotionProfile], None] | None = None,
+        restore_motion_calibration_profile: Callable[[], None] | None = None,
         persist_tracking_visualization: (
             Callable[[TrackingVisualizationConfig], None] | None
         ) = None,
@@ -318,7 +323,7 @@ class MainWindow(QMainWindow):
             "QPushButton { background: #a51616; color: white; font-size: 18px; font-weight: bold; }"
             "QPushButton:pressed { background: #710d0d; }"
         )
-        self.emergency_button.clicked.connect(self._mediator.emergency_stop)
+        self.emergency_button.clicked.connect(self._emergency_stop)
 
         self.operational_bar = QWidget()
         self.operational_bar.setFixedHeight(62)
@@ -351,6 +356,21 @@ class MainWindow(QMainWindow):
             controls=imu_controls,
             on_toggle_operator=self.toggle_operator_window,
         )
+        self.motion_calibration_window: MotionCalibrationWindow | None = None
+        if (
+            motion_calibration_runtime is not None
+            and begin_motion_calibration_profile is not None
+            and restore_motion_calibration_profile is not None
+        ):
+            self.motion_calibration_window = MotionCalibrationWindow(
+                owner=self,
+                mediator=mediator,
+                runtime=motion_calibration_runtime,
+                begin_motion_profile=begin_motion_calibration_profile,
+                restore_motion_profile=restore_motion_calibration_profile,
+                stale_timeout_ms=camera_stale_timeout_ms,
+                clock_ns=clock_ns,
+            )
         self.operator_window = OperatorWindow(
             owner=self,
             on_toggle_fullscreen=self.toggle_fullscreen,
@@ -362,6 +382,11 @@ class MainWindow(QMainWindow):
             on_apply_tracking_control_tuning=self._apply_tracking_control_tuning,
             tracking_visualization_config=tracking_visualization_config,
             on_tracking_visualization_changed=self._set_tracking_visualization,
+            on_show_motion_calibration=(
+                self.show_motion_calibration_window
+                if self.motion_calibration_window is not None
+                else None
+            ),
         )
 
         self.state_pump = UiStatePump(
@@ -402,6 +427,8 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event: QCloseEvent) -> None:
         self._stop_recording()
+        if self.motion_calibration_window is not None:
+            self.motion_calibration_window.close()
         self.imu_window.close()
         self.operator_window.close()
         super().closeEvent(event)
@@ -426,6 +453,14 @@ class MainWindow(QMainWindow):
         self.imu_window.raise_()
         self.imu_window.activateWindow()
 
+    def show_motion_calibration_window(self) -> None:
+        window = self.motion_calibration_window
+        if window is None:
+            return
+        window.show()
+        window.raise_()
+        window.activateWindow()
+
     def request_exit(self) -> None:
         if self._confirm_exit():
             self.close()
@@ -446,6 +481,7 @@ class MainWindow(QMainWindow):
         return dialog.exec() == QMessageBox.StandardButton.Yes
 
     def swap_main_preview(self) -> None:
+        self._abort_motion_calibration("основная камера изменена")
         self._mediator.swap_main_preview()
         self.refresh_presentation()
 
@@ -614,6 +650,8 @@ class MainWindow(QMainWindow):
         self.preview_view.set_aim_point(None)
 
     def _camera_session_accepted(self, session: CameraSessionStarted) -> None:
+        if self.motion_calibration_window is not None:
+            self.motion_calibration_window.accept_camera_session(session)
         self._prepared_frames.pop(session.camera, None)
         self._tracking_diagnostics.pop(session.camera, None)
         self._apply_camera_to_views(session.camera)
@@ -649,11 +687,15 @@ class MainWindow(QMainWindow):
         )
 
     def _camera_status_changed(self, status: CameraStatus) -> None:
+        if self.motion_calibration_window is not None:
+            self.motion_calibration_window.accept_camera_status(status)
         self._camera_statuses[status.camera] = status
         self._apply_camera_to_views(status.camera)
         self.operator_window.set_camera_status(status.camera, status)
 
     def _turret_state_changed(self, _state: TurretState) -> None:
+        if self.motion_calibration_window is not None:
+            self.motion_calibration_window.accept_turret_state(_state)
         self._refresh_turret_controls()
         self.refresh_presentation()
 
@@ -742,6 +784,14 @@ class MainWindow(QMainWindow):
             self._mediator.session_gate,
             self._clock_ns(),
         ):
+            return
+        if (
+            self.motion_calibration_window is not None
+            and self.motion_calibration_window.handle_click(
+                displayed_result, x_px, y_px
+            )
+        ):
+            self.refresh_presentation()
             return
         mode = self._mediator.turret_state.control_mode
         if mode is TurretControlMode.RELATIVE:
@@ -913,6 +963,7 @@ class MainWindow(QMainWindow):
             LOGGER.error("Recording packet rejected: %s", error)
 
     def _request_other_mode(self) -> None:
+        self._abort_motion_calibration("запрошена смена режима")
         current = self._mediator.turret_state.control_mode
         requested = (
             TurretControlMode.TRACKING
@@ -926,9 +977,19 @@ class MainWindow(QMainWindow):
     def _toggle_motor(self) -> None:
         motor = self._mediator.turret_state.motor_state
         if motor is MotorState.ON:
+            self._abort_motion_calibration("запрошен MOTOR OFF")
             self._mediator.motor_off()
         elif motor is MotorState.OFF:
             self._mediator.motor_on()
+
+    def _emergency_stop(self) -> None:
+        self._abort_motion_calibration("Emergency")
+        self._mediator.emergency_stop()
+
+    def _abort_motion_calibration(self, reason: str) -> None:
+        window = self.motion_calibration_window
+        if window is not None and window.calibration_active:
+            window.abort(reason)
 
     def _refresh_turret_controls(self) -> None:
         state = self._mediator.turret_state
