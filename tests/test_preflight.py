@@ -78,6 +78,7 @@ def _camera(
         ),
         processing_enabled=False,
         vision_processor_class="Legacy14VisionProcessor",
+        vision_processor_profile="default",
     )
 
 
@@ -88,6 +89,7 @@ def _overview_camera(port: int) -> OverviewCameraConfig:
         source=camera.source,
         processing_enabled=camera.processing_enabled,
         vision_processor_class=camera.vision_processor_class,
+        vision_processor_profile=camera.vision_processor_profile,
         calibration_file="calibration/overview.json",
     )
 
@@ -109,6 +111,7 @@ def _rtsp_camera(
         ),
         processing_enabled=False,
         vision_processor_class="Legacy14VisionProcessor",
+        vision_processor_profile="default",
     )
 
 
@@ -126,7 +129,7 @@ def _inputs(
         max_relative_move_deg=45.0,
     )
     config = AppConfig(
-        schema_version=6,
+        schema_version=7,
         vision=VisionConfig(
             processing_scope=ProcessingScope.MAIN_AND_PREVIEW,
             cameras=CamerasConfig(
@@ -150,7 +153,7 @@ def _inputs(
         ),
         aiming=AimingConfig(
             target_lost_timeout_ms=500,
-            aim_points=AimPointsConfig(overview=center, stereo_left=center),
+            aim_points=AimPointsConfig(overview=center, stereo_left=center, stereo_right=center),
         ),
         tracking_control=_default_tracking_control_config(),
         tracking_visualization=TrackingVisualizationConfig(
@@ -195,6 +198,7 @@ def _inputs(
             default_camera=CameraRole.OVERVIEW,
             show_fps=False,
             show_stereo_right_diagnostics=False,
+            show_stereo_right_camera=True,
         ),
     )
     overview = OverviewCalibration(

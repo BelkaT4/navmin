@@ -164,12 +164,13 @@ def _aiming_config() -> AimingConfig:
         aim_points=AimPointsConfig(
             overview=AimPointConfig(50, 40),
             stereo_left=AimPointConfig(50, 40),
+            stereo_right=AimPointConfig(50, 40),
         ),
     )
 
 
 def _ui_config(camera: CameraRole = CameraRole.OVERVIEW) -> UiConfig:
-    return UiConfig(camera, False, False)
+    return UiConfig(camera, False, False, True)
 
 
 def _tracking_control_config():
@@ -677,6 +678,19 @@ def test_vision_result_is_rejected_until_matching_barrier_is_accepted() -> None:
     assert mediator.accept_camera_session(_session(CameraRole.OVERVIEW, 1))
     assert mediator.accept_vision_result(result)
     assert mediator.latest_vision_result(CameraRole.OVERVIEW) is result
+
+
+def test_stereo_right_is_observable_without_becoming_a_control_camera() -> None:
+    mediator, turret, controls = _mediator(mode=TurretControlMode.TRACKING)
+    right_session = _session(CameraRole.STEREO_RIGHT, 1)
+    right_result = _result(CameraRole.STEREO_RIGHT, 1)
+
+    assert mediator.accept_camera_session(right_session)
+    assert mediator.accept_vision_result(right_result)
+    assert mediator.latest_vision_result(CameraRole.STEREO_RIGHT) is right_result
+    assert mediator.main_camera is CameraRole.OVERVIEW
+    assert CameraRole.STEREO_RIGHT not in controls
+    assert turret.stop_requests == 0
 
 
 def test_deselect_and_tracking_to_relative_publish_clear() -> None:

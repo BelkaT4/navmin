@@ -63,6 +63,7 @@ from navmin.vision.gstreamer_source import (
     GStreamerRtspSource,
 )
 from navmin.vision.pipeline import InMemoryFrameSource
+from navmin.vision.processor import VisionProcessorSelection
 
 WIDTH = 32
 HEIGHT = 24
@@ -84,6 +85,7 @@ def _camera(port: int, *, enabled: bool = True) -> CameraConfig:
         ),
         processing_enabled=False,
         vision_processor_class="Legacy14VisionProcessor",
+        vision_processor_profile="default",
     )
 
 
@@ -94,6 +96,7 @@ def _overview_camera(port: int) -> OverviewCameraConfig:
         source=camera.source,
         processing_enabled=camera.processing_enabled,
         vision_processor_class=camera.vision_processor_class,
+        vision_processor_profile=camera.vision_processor_profile,
         calibration_file="calibration/overview.json",
     )
 
@@ -111,6 +114,7 @@ def _rtsp_camera(uri: str) -> CameraConfig:
         ),
         processing_enabled=False,
         vision_processor_class="Legacy14VisionProcessor",
+        vision_processor_profile="default",
     )
 
 
@@ -139,7 +143,7 @@ def _config(
         max_relative_move_deg=45.0,
     )
     return AppConfig(
-        schema_version=6,
+        schema_version=7,
         vision=VisionConfig(
             processing_scope=ProcessingScope.MAIN_AND_PREVIEW,
             cameras=CamerasConfig(
@@ -163,7 +167,7 @@ def _config(
         ),
         aiming=AimingConfig(
             target_lost_timeout_ms=500,
-            aim_points=AimPointsConfig(overview=center, stereo_left=center),
+            aim_points=AimPointsConfig(overview=center, stereo_left=center, stereo_right=center),
         ),
         tracking_control=_default_tracking_control_config(),
         tracking_visualization=TrackingVisualizationConfig(
@@ -208,6 +212,7 @@ def _config(
             default_camera=CameraRole.OVERVIEW,
             show_fps=False,
             show_stereo_right_diagnostics=False,
+            show_stereo_right_camera=True,
         ),
     )
 
@@ -593,7 +598,7 @@ def test_stereo_right_disabled_does_not_call_source_factory() -> None:
     assert CameraRole.STEREO_RIGHT not in runtime.camera_bindings
 
 
-def test_stereo_right_enabled_is_owned_but_excluded_from_ui_and_targeting() -> None:
+def test_stereo_right_enabled_is_owned_and_observable_but_excluded_from_targeting() -> None:
     runtime, sources, _endpoint = _injected_runtime(stereo_right_enabled=True)
 
     assert runtime.stereo_right_worker is not None
@@ -606,6 +611,7 @@ def test_stereo_right_enabled_is_owned_but_excluded_from_ui_and_targeting() -> N
     assert set(runtime.camera_bindings) == {
         CameraRole.OVERVIEW,
         CameraRole.STEREO_LEFT,
+        CameraRole.STEREO_RIGHT,
     }
     assert set(runtime.mediator._target_controls) == {
         CameraRole.OVERVIEW,
@@ -679,6 +685,7 @@ def test_enabled_stereo_pairer_receives_both_corrected_frame_paths_and_resets() 
     assert set(runtime.camera_bindings) == {
         CameraRole.OVERVIEW,
         CameraRole.STEREO_LEFT,
+        CameraRole.STEREO_RIGHT,
     }
     assert CameraRole.STEREO_RIGHT not in runtime.mediator._target_controls
     assert CameraRole.STEREO_RIGHT not in runtime.mediator._vision_processing_enabled
@@ -841,7 +848,10 @@ def test_runtime_pid_tuning_dependencies_use_loaded_config_and_monotonic_updates
     caplog.set_level(logging.INFO, logger="navmin.application")
 
     ui = runtime.ui_dependencies
+    assert ui.aiming_config is config.aiming
     assert ui.pid_controller_config is config.turret.controller
+    assert ui.stm32_config is config.turret.stm32
+    assert ui.ui_config is config.ui
 
     first = PidControllerConfig(0.25, 0.01, 0.04, 0.30, 0.02, 0.05)
     second = PidControllerConfig(0.35, 0.03, 0.06, 0.40, 0.04, 0.07)
@@ -858,6 +868,56 @@ def test_runtime_pid_tuning_dependencies_use_loaded_config_and_monotonic_updates
         assert update.config.emulate_stm32 == config.turret.emulate_stm32
     assert queued[-1].config == replace(config.turret, controller=third)
     assert "PID tuning update queued revision=3" in caplog.text
+
+
+def test_ui_motion_limits_update_is_separate_from_pid_and_preserves_watchdog(
+    monkeypatch,
+) -> None:
+    config = _config()
+    runtime = build_application_runtime(
+        config=config,
+        overview_calibration=_overview_calibration(),
+        stereo_calibration=_stereo_calibration(),
+    )
+    queued: list[ConfigUpdate[TurretConfig]] = []
+    monkeypatch.setattr(runtime.turret_worker, "submit_config_update", queued.append)
+
+    updated = replace(
+        config.turret.stm32,
+        max_speed_x_deg_s=12.5,
+        max_speed_y_deg_s=13.5,
+        acceleration_x_deg_s2=20.0,
+        acceleration_y_deg_s2=21.0,
+    )
+    runtime.ui_dependencies.apply_motion_limits_tuning(updated)
+
+    assert len(queued) == 1
+    assert queued[0].config.stm32 == updated
+    assert queued[0].config.controller == config.turret.controller
+    assert (
+        queued[0].config.stm32.velocity_watchdog_timeout_ms
+        == config.turret.stm32.velocity_watchdog_timeout_ms
+    )
+
+
+def test_ui_vision_processor_selection_is_queued_to_camera_owner(
+    monkeypatch,
+) -> None:
+    runtime, _sources, _endpoint = _injected_runtime(stereo_right_enabled=True)
+    worker = runtime.camera_workers[CameraRole.OVERVIEW]
+    queued: list[VisionProcessorSelection] = []
+    monkeypatch.setattr(worker, "submit_processor_selection", queued.append)
+    selection = VisionProcessorSelection("Vt11VisionProcessor", "thermal")
+
+    runtime.ui_dependencies.apply_vision_processor_selection(
+        CameraRole.OVERVIEW, selection
+    )
+
+    assert queued == [selection]
+    assert (
+        runtime.ui_dependencies.vision_processor_selections[CameraRole.OVERVIEW]
+        == selection
+    )
 
 
 def test_motion_calibration_profile_is_temporary_bounded_and_restored_once(
@@ -1091,6 +1151,9 @@ def test_shared_runtime_starts_and_exposes_complete_ui_dependency_surface() -> N
         assert ui.imu_controls is runtime.imu_runtime
         assert ui.camera_stale_timeout_ms == 500
         expected_config = _config(stereo_left_enabled=True)
+        assert ui.aiming_config == expected_config.aiming
+        assert ui.stm32_config == expected_config.turret.stm32
+        assert ui.ui_config == expected_config.ui
         assert ui.tracking_control_config == expected_config.tracking_control
         assert (
             ui.tracking_visualization_config

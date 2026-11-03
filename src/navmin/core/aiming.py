@@ -115,7 +115,9 @@ class Aiming:
             return self._config.aim_points.overview
         if camera is CameraRole.STEREO_LEFT:
             return self._config.aim_points.stereo_left
-        raise ValueError("Stereo Right is not a normal aiming camera")
+        if camera is CameraRole.STEREO_RIGHT:
+            return self._config.aim_points.stereo_right
+        raise ValueError(f"unsupported aiming camera: {camera.value}")
 
     @staticmethod
     def _turret_angles(ray: CameraRay) -> TurretAngles:

@@ -7,6 +7,7 @@ from dataclasses import FrozenInstanceError
 import pytest
 
 from navmin.config import (
+    AimPointConfig,
     ConfigApplyPolicy,
     ConfigFileNotFoundError,
     ConfigJsonError,
@@ -25,7 +26,7 @@ from navmin.contracts import CameraRole, DistanceSource
 
 def _valid_config() -> dict:
     return {
-        "schema-version": 6,
+        "schema-version": 7,
         "vision": {
             "processing-scope": "main-only",
             "cameras": {
@@ -39,6 +40,7 @@ def _valid_config() -> dict:
                     },
                     "processing-enabled": True,
                     "vision-processor-class": "DefaultVisionProcessor",
+                    "vision-processor-profile": "default",
                     "calibration-file": "calibration/overview.json",
                 },
                 "stereo-left": {
@@ -51,6 +53,7 @@ def _valid_config() -> dict:
                     },
                     "processing-enabled": True,
                     "vision-processor-class": "DefaultVisionProcessor",
+                    "vision-processor-profile": "default",
                 },
                 "stereo-right": {
                     "enabled": True,
@@ -62,6 +65,7 @@ def _valid_config() -> dict:
                     },
                     "processing-enabled": False,
                     "vision-processor-class": "DefaultVisionProcessor",
+                    "vision-processor-profile": "default",
                 },
             },
             "distance": {
@@ -83,6 +87,7 @@ def _valid_config() -> dict:
             "aim-points": {
                 "overview": {"x-px": None, "y-px": None},
                 "stereo-left": {"x-px": None, "y-px": None},
+                "stereo-right": {"x-px": None, "y-px": None},
             },
         },
         "tracking-control": {
@@ -164,6 +169,7 @@ def _valid_config() -> dict:
             "default-camera": "overview",
             "show-fps": True,
             "show-stereo-right-diagnostics": False,
+            "show-stereo-right-camera": True,
         },
     }
 
@@ -172,10 +178,10 @@ def _write_json(path, data) -> None:
     path.write_text(json.dumps(data), encoding="utf-8")
 
 
-def test_valid_schema_v5_builds_typed_immutable_snapshot() -> None:
+def test_valid_schema_v7_builds_typed_immutable_snapshot() -> None:
     config = parse_config(_valid_config())
 
-    assert config.schema_version == 6
+    assert config.schema_version == 7
     assert (
         config.vision.cameras.overview.calibration_file == "calibration/overview.json"
     )
@@ -183,6 +189,9 @@ def test_valid_schema_v5_builds_typed_immutable_snapshot() -> None:
     assert not hasattr(config.vision.cameras.stereo_right, "calibration_file")
     assert config.vision.distance.source is DistanceSource.MANUAL
     assert config.ui.default_camera is CameraRole.OVERVIEW
+    assert config.ui.show_stereo_right_camera
+    assert config.aiming.aim_points.stereo_right.x_px is None
+    assert config.vision.cameras.overview.vision_processor_profile == "default"
     assert config.turret.serial.baudrate == 115200
     assert not config.imu.enabled
     assert config.imu.bind_address == "0.0.0.0"
@@ -200,7 +209,7 @@ def test_tracking_control_round_trips_through_mapping() -> None:
     assert parse_config(config_to_mapping(config)) == config
 
 
-def test_schema_v5_requires_tracking_control_and_rejects_old_pixel_lead() -> None:
+def test_schema_v7_requires_tracking_control_and_rejects_old_pixel_lead() -> None:
     missing = _valid_config()
     missing.pop("tracking-control")
     with pytest.raises(ConfigValidationError) as exc_info:
@@ -386,12 +395,16 @@ def test_schema_v4_migrates_tracking_visualization_defaults_in_memory() -> None:
     data["schema-version"] = 4
     data.pop("tracking-visualization")
     data.pop("recording")
+    for camera in data["vision"]["cameras"].values():
+        camera.pop("vision-processor-profile")
+    data["aiming"]["aim-points"].pop("stereo-right")
+    data["ui"].pop("show-stereo-right-camera")
     data["tracking-control"]["prediction"]["max-angle-x-deg"] = 1.0
     data["tracking-control"]["prediction"]["max-angle-y-deg"] = 1.0
 
     config = parse_config(data)
 
-    assert config.schema_version == 6
+    assert config.schema_version == 7
     assert not config.tracking_visualization.show_search_region
     assert not config.tracking_visualization.show_best_candidate
     assert not config.tracking_visualization.show_control_prediction
@@ -399,7 +412,23 @@ def test_schema_v4_migrates_tracking_visualization_defaults_in_memory() -> None:
     assert config.tracking_control.prediction.max_angle_y_deg == 1.0
 
 
-def test_schema_v6_requires_tracking_visualization_section() -> None:
+def test_schema_v6_migrates_ui_profiles_and_right_aim_point_in_memory() -> None:
+    data = _valid_config()
+    data["schema-version"] = 6
+    for camera in data["vision"]["cameras"].values():
+        camera.pop("vision-processor-profile")
+    data["aiming"]["aim-points"].pop("stereo-right")
+    data["ui"].pop("show-stereo-right-camera")
+
+    config = parse_config(data)
+
+    assert config.schema_version == 7
+    assert config.vision.cameras.overview.vision_processor_profile == "default"
+    assert config.aiming.aim_points.stereo_right == AimPointConfig(None, None)
+    assert config.ui.show_stereo_right_camera
+
+
+def test_schema_v7_requires_tracking_visualization_section() -> None:
     data = _valid_config()
     data.pop("tracking-visualization")
 
@@ -413,14 +442,18 @@ def test_schema_v5_migrates_recording_default_in_memory() -> None:
     data = _valid_config()
     data["schema-version"] = 5
     data.pop("recording")
+    for camera in data["vision"]["cameras"].values():
+        camera.pop("vision-processor-profile")
+    data["aiming"]["aim-points"].pop("stereo-right")
+    data["ui"].pop("show-stereo-right-camera")
 
     config = parse_config(data)
 
-    assert config.schema_version == 6
+    assert config.schema_version == 7
     assert config.recording.directory == "recordings"
 
 
-def test_schema_v6_requires_recording_section() -> None:
+def test_schema_v7_requires_recording_section() -> None:
     data = _valid_config()
     data.pop("recording")
 
@@ -541,7 +574,7 @@ def test_missing_or_invalid_schema_version_is_validation_error(mutation, path) -
     assert not isinstance(exc_info.value, UnsupportedConfigSchemaError)
 
 
-@pytest.mark.parametrize("unsupported", [1, 2, 3, 7])
+@pytest.mark.parametrize("unsupported", [1, 2, 3, 8])
 def test_unsupported_schema_is_distinct_error(unsupported: int) -> None:
     data = _valid_config()
     data["schema-version"] = unsupported
@@ -551,7 +584,7 @@ def test_unsupported_schema_is_distinct_error(unsupported: int) -> None:
 
     assert exc_info.value.path == "schema-version"
     assert exc_info.value.actual == unsupported
-    assert "expected 6" in str(exc_info.value)
+    assert "expected 7" in str(exc_info.value)
 
 
 @pytest.mark.parametrize(
@@ -709,7 +742,7 @@ def test_repository_defaults_parse_with_production_loaders() -> None:
     stereo = load_stereo_calibration(defaults / "calibration" / "stereo.json")
     imu = ImuCalibration.load(defaults / "calibration" / "imu.json")
 
-    assert config.schema_version == 6
+    assert config.schema_version == 7
     assert (
         config.vision.cameras.overview.calibration_file == "calibration/overview.json"
     )
@@ -942,7 +975,7 @@ def test_rtsp_config_round_trip_preserves_source_specific_fields(tmp_path) -> No
     save_config(path, config)
 
     saved = json.loads(path.read_text(encoding="utf-8"))
-    assert saved["schema-version"] == 6
+    assert saved["schema-version"] == 7
     assert (
         saved["vision"]["cameras"]["overview"]["source"]
         == data["vision"]["cameras"]["overview"]["source"]
@@ -1001,6 +1034,10 @@ def test_change_metadata_reports_only_fixed_architecture_classification() -> Non
     )
     assert (
         config_apply_policy("vision.cameras.overview.vision-processor-class")
+        is ConfigApplyPolicy.CAMERA_PIPELINE_RESTART
+    )
+    assert (
+        config_apply_policy("vision.cameras.overview.vision-processor-profile")
         is ConfigApplyPolicy.CAMERA_PIPELINE_RESTART
     )
     assert (
@@ -1076,6 +1113,9 @@ def test_change_metadata_reports_only_fixed_architecture_classification() -> Non
         "tracking-visualization.show-search-region",
         "tracking-visualization.show-best-candidate",
         "tracking-visualization.show-control-prediction",
+        "aiming.aim-points.stereo-right.x-px",
+        "aiming.aim-points.stereo-right.y-px",
+        "ui.show-stereo-right-camera",
     ],
 )
 def test_tracking_control_runtime_fields_are_dynamic(path: str) -> None:

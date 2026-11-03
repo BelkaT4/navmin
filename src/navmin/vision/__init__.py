@@ -27,15 +27,27 @@ from .pipeline import (
 )
 from .processor import (
     DEFAULT_VISION_PROCESSOR_CLASS,
+    LEGACY14_PROFILES,
+    VISION_PROCESSOR_PROFILES,
+    VT11_PROFILES,
+    VT11_VISION_PROCESSOR_CLASS,
     VisionProcessor,
     VisionProcessorOutput,
+    VisionProcessorSelection,
     VisionTrackingDiagnostics,
+    create_selected_vision_processor,
     create_vision_processor,
+    default_vision_processor_selection,
+    vision_processor_profiles,
 )
 from .processors import Legacy14VisionProcessor
 
 __all__ = [
     "DEFAULT_VISION_PROCESSOR_CLASS",
+    "LEGACY14_PROFILES",
+    "VISION_PROCESSOR_PROFILES",
+    "VT11_PROFILES",
+    "VT11_VISION_PROCESSOR_CLASS",
     "CameraSourceError",
     "CameraWorker",
     "CorrectedFrameSink",
@@ -52,6 +64,7 @@ __all__ = [
     "VisionPipelineError",
     "VisionProcessor",
     "VisionProcessorOutput",
+    "VisionProcessorSelection",
     "VisionTrackingDiagnostics",
     "WorkingFrameError",
     "build_camera_worker",
@@ -59,8 +72,11 @@ __all__ = [
     "build_rtsp_pipeline_description",
     "build_working_frame_corrector",
     "create_camera_source",
+    "create_selected_vision_processor",
     "create_vision_processor",
+    "default_vision_processor_selection",
     "overview_corrector",
     "stereo_left_corrector",
     "stereo_right_corrector",
+    "vision_processor_profiles",
 ]

@@ -49,8 +49,9 @@ _CONTROL_PREDICTION_COLOR = QColor(40, 185, 255)
 _CONTROL_PREDICTION_ENDPOINT_RADIUS_PX = 4.0
 
 _CAMERA_NAMES = {
-    CameraRole.OVERVIEW: "Overview",
-    CameraRole.STEREO_LEFT: "Stereo Left",
+    CameraRole.OVERVIEW: "Обзорная",
+    CameraRole.STEREO_LEFT: "Левая",
+    CameraRole.STEREO_RIGHT: "Правая",
 }
 
 
@@ -310,6 +311,7 @@ class VideoView(QWidget):
         self._selected_target: TargetRef | None = None
         self._target_distance: DistanceResult | None = None
         self._aim_point: tuple[float, float] | None = None
+        self._aim_point_configured = False
         self._tracking_diagnostics: VisionTrackingDiagnostics | None = None
         self._tracking_control_visualization: TrackingControlVisualization | None = None
         self._control_prediction_overlay: ControlPredictionOverlay | None = None
@@ -399,6 +401,7 @@ class VideoView(QWidget):
         self._camera = camera
         self._target_distance = None
         self._aim_point = None
+        self._aim_point_configured = False
         self._tracking_diagnostics = None
         self._tracking_control_visualization = None
         self._control_prediction_overlay = None
@@ -410,6 +413,7 @@ class VideoView(QWidget):
         self._prepared = prepared
         if prepared is None:
             self._aim_point = None
+            self._aim_point_configured = False
             self._tracking_diagnostics = None
             self._tracking_control_visualization = None
             self._control_prediction_overlay = None
@@ -541,10 +545,17 @@ class VideoView(QWidget):
         self._target_distance = distance
         self.update()
 
-    def set_aim_point(self, point: tuple[float, float] | None) -> None:
-        if point == self._aim_point:
+    def set_aim_point(
+        self,
+        point: tuple[float, float] | None,
+        *,
+        configured: bool = True,
+    ) -> None:
+        configured = bool(configured and point is not None)
+        if point == self._aim_point and configured == self._aim_point_configured:
             return
         self._aim_point = point
+        self._aim_point_configured = configured
         self.update()
 
     def refresh_freshness(self, now_ns: int) -> None:
@@ -779,21 +790,25 @@ class VideoView(QWidget):
         )
         if start is None or end is None or start == end:
             return
-        painter.setPen(
-            QPen(
-                _CONTROL_PREDICTION_COLOR,
-                _TRACKING_OVERLAY_PEN_WIDTH_PX,
-                Qt.PenStyle.SolidLine,
-                Qt.PenCapStyle.RoundCap,
+        painter.save()
+        try:
+            painter.setPen(
+                QPen(
+                    _CONTROL_PREDICTION_COLOR,
+                    _TRACKING_OVERLAY_PEN_WIDTH_PX,
+                    Qt.PenStyle.SolidLine,
+                    Qt.PenCapStyle.RoundCap,
+                )
             )
-        )
-        painter.setBrush(QBrush(_CONTROL_PREDICTION_COLOR))
-        painter.drawLine(QLineF(start, end))
-        painter.drawEllipse(
-            end,
-            _CONTROL_PREDICTION_ENDPOINT_RADIUS_PX,
-            _CONTROL_PREDICTION_ENDPOINT_RADIUS_PX,
-        )
+            painter.setBrush(QBrush(_CONTROL_PREDICTION_COLOR))
+            painter.drawLine(QLineF(start, end))
+            painter.drawEllipse(
+                end,
+                _CONTROL_PREDICTION_ENDPOINT_RADIUS_PX,
+                _CONTROL_PREDICTION_ENDPOINT_RADIUS_PX,
+            )
+        finally:
+            painter.restore()
 
     def _draw_objects(
         self,
@@ -813,8 +828,12 @@ class VideoView(QWidget):
                 and target.track_id == tracked.track_id
             )
             painter.setPen(
-                QPen(QColor(255, 210, 30) if selected else QColor(50, 230, 90), 4 if selected else 2)
+                QPen(
+                    QColor(255, 210, 30) if selected else QColor(50, 230, 90),
+                    4 if selected else 2,
+                )
             )
+            painter.setBrush(Qt.BrushStyle.NoBrush)
             bbox = tracked.bbox
             bbox_rect = QRectF(
                 display_rect.left() + bbox.x * scale_x,
@@ -876,11 +895,23 @@ class VideoView(QWidget):
         )
         if center is None:
             return
-        pen = QPen(QColor(255, 0, 0), _RETICLE_PEN_WIDTH_PX)
-        pen.setCapStyle(Qt.PenCapStyle.FlatCap)
-        painter.setPen(pen)
-        for segment in reticle_segments(center):
-            painter.drawLine(segment)
+        segments = reticle_segments(center)
+        painter.save()
+        try:
+            outline = QPen(QColor(0, 0, 0), _RETICLE_PEN_WIDTH_PX + 2)
+            outline.setCapStyle(Qt.PenCapStyle.FlatCap)
+            painter.setPen(outline)
+            for segment in segments:
+                painter.drawLine(segment)
+
+            color = QColor(255, 0, 0) if self._aim_point_configured else QColor(255, 255, 255)
+            pen = QPen(color, _RETICLE_PEN_WIDTH_PX)
+            pen.setCapStyle(Qt.PenCapStyle.FlatCap)
+            painter.setPen(pen)
+            for segment in segments:
+                painter.drawLine(segment)
+        finally:
+            painter.restore()
 
     def _draw_camera_and_status(self, painter: QPainter) -> None:
         name = _CAMERA_NAMES[self._camera]

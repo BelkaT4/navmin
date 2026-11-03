@@ -52,6 +52,7 @@ from .tracking_estimator import (
 )
 
 _NORMAL_CAMERAS = (CameraRole.OVERVIEW, CameraRole.STEREO_LEFT)
+_OBSERVABLE_CAMERAS = (*_NORMAL_CAMERAS, CameraRole.STEREO_RIGHT)
 _DISCONNECTED_CAMERA_STATES = (
     CameraState.RECONNECTING,
     CameraState.ERROR,
@@ -238,7 +239,7 @@ class Mediator:
         self._distance_stale_invalidations = 0
         self._next_selection_id = 1
         self._latest_results: dict[CameraRole, VisionResult | None] = {
-            camera: None for camera in _NORMAL_CAMERAS
+            camera: None for camera in _OBSERVABLE_CAMERAS
         }
         self._turret_state = turret.current_state
         self._pending_control_mode: TurretControlMode | None = None

@@ -16,8 +16,33 @@ from navmin.contracts import (
 )
 
 DEFAULT_VISION_PROCESSOR_CLASS = "Legacy14VisionProcessor"
+VT11_VISION_PROCESSOR_CLASS = "Vt11VisionProcessor"
+LEGACY14_PROFILES = ("default",)
+VT11_PROFILES = ("day", "thermal")
+VISION_PROCESSOR_PROFILES = {
+    DEFAULT_VISION_PROCESSOR_CLASS: LEGACY14_PROFILES,
+    VT11_VISION_PROCESSOR_CLASS: VT11_PROFILES,
+}
 
 LOGGER = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True, slots=True)
+class VisionProcessorSelection:
+    """Runtime-selectable Vision backend and one explicit backend profile."""
+
+    class_name: str
+    profile_name: str
+
+    def __post_init__(self) -> None:
+        profiles = VISION_PROCESSOR_PROFILES.get(self.class_name)
+        if profiles is None:
+            raise ValueError(f"unsupported VisionProcessor class: {self.class_name}")
+        if self.profile_name not in profiles:
+            expected = ", ".join(repr(profile) for profile in profiles)
+            raise ValueError(
+                f"{self.class_name} profile must be one of: {expected}"
+            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -74,36 +99,75 @@ class VisionProcessor(Protocol):
         ...
 
 
+def default_vision_processor_selection(class_name: str) -> VisionProcessorSelection:
+    """Return the production default profile for one configured backend."""
+    if class_name == DEFAULT_VISION_PROCESSOR_CLASS:
+        return VisionProcessorSelection(class_name, "default")
+    if class_name == VT11_VISION_PROCESSOR_CLASS:
+        from .processors.vt11.settings import VT11_PROFILE
+
+        if VT11_PROFILE not in VT11_PROFILES:
+            raise ValueError("VT11_PROFILE must be 'day' or 'thermal'")
+        return VisionProcessorSelection(class_name, VT11_PROFILE)
+    raise ValueError(f"unsupported VisionProcessor class in this checkpoint: {class_name}")
+
+
+def vision_processor_profiles(class_name: str) -> tuple[str, ...]:
+    profiles = VISION_PROCESSOR_PROFILES.get(class_name)
+    if profiles is None:
+        raise ValueError(f"unsupported VisionProcessor class: {class_name}")
+    return profiles
+
+
 def create_vision_processor(
     class_name: str = DEFAULT_VISION_PROCESSOR_CLASS,
+    *,
+    profile_name: str | None = None,
 ) -> VisionProcessor:
-    """Create a configured processor without exposing detector/tracker internals."""
-    if class_name == DEFAULT_VISION_PROCESSOR_CLASS:
+    """Create one processor from the same typed runtime selection used by UI."""
+    selection = (
+        default_vision_processor_selection(class_name)
+        if profile_name is None
+        else VisionProcessorSelection(class_name, profile_name)
+    )
+    if selection.class_name == DEFAULT_VISION_PROCESSOR_CLASS:
         from .processors import Legacy14VisionProcessor
 
         processor = Legacy14VisionProcessor()
         LOGGER.info("Vision processor: %s", DEFAULT_VISION_PROCESSOR_CLASS)
         return processor
-    if class_name == "Vt11VisionProcessor":
-        from .processors.vt11 import Vt11VisionProcessor
-        from .processors.vt11.settings import VT11_PROFILE
 
-        profile = VT11_PROFILE
-        if profile not in {"day", "thermal"}:
-            raise ValueError("VT11_PROFILE must be 'day' or 'thermal'")
-        processor = Vt11VisionProcessor(profile_name=profile)
-        LOGGER.info(
-            "Vision processor: Vt11VisionProcessor profile=%s",
-            processor.settings_snapshot.profile,
-        )
-        return processor
-    raise ValueError(f"unsupported VisionProcessor class in this checkpoint: {class_name}")
+    from .processors.vt11 import Vt11VisionProcessor
+
+    processor = Vt11VisionProcessor(profile_name=selection.profile_name)
+    LOGGER.info(
+        "Vision processor: Vt11VisionProcessor profile=%s",
+        processor.settings_snapshot.profile,
+    )
+    return processor
+
+
+def create_selected_vision_processor(selection: VisionProcessorSelection) -> VisionProcessor:
+    if not isinstance(selection, VisionProcessorSelection):
+        raise TypeError("selection must be VisionProcessorSelection")
+    return create_vision_processor(
+        selection.class_name,
+        profile_name=selection.profile_name,
+    )
 
 
 __all__ = [
     "DEFAULT_VISION_PROCESSOR_CLASS",
+    "LEGACY14_PROFILES",
+    "VISION_PROCESSOR_PROFILES",
+    "VT11_PROFILES",
+    "VT11_VISION_PROCESSOR_CLASS",
     "VisionProcessor",
     "VisionProcessorOutput",
+    "VisionProcessorSelection",
     "VisionTrackingDiagnostics",
+    "create_selected_vision_processor",
     "create_vision_processor",
+    "default_vision_processor_selection",
+    "vision_processor_profiles",
 ]

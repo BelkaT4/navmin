@@ -688,6 +688,7 @@ def diagnostic_camera_config(port: int) -> CameraConfig:
         ),
         processing_enabled=False,
         vision_processor_class="Legacy14VisionProcessor",
+        vision_processor_profile="default",
     )
 
 

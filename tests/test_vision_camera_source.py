@@ -35,8 +35,8 @@ from navmin.vision.pipeline import (
     VisionPipeline,
     overview_corrector,
 )
+from navmin.vision.processor import VisionProcessorSelection
 from navmin.vision.processors.vt11 import Vt11VisionProcessor
-from navmin.vision.processors.vt11 import settings as vt11_settings
 
 WIDTH = 32
 HEIGHT = 24
@@ -79,12 +79,18 @@ def camera_config(
     source: RtpJpegSourceConfig | RtspSourceConfig | None = None,
     processing_enabled: bool = True,
     vision_processor_class: str = "Legacy14VisionProcessor",
+    vision_processor_profile: str | None = None,
 ) -> CameraConfig:
     return CameraConfig(
         enabled=True,
         source=source or rtp_source_config(),
         processing_enabled=processing_enabled,
         vision_processor_class=vision_processor_class,
+        vision_processor_profile=(
+            vision_processor_profile
+            if vision_processor_profile is not None
+            else ("day" if vision_processor_class == "Vt11VisionProcessor" else "default")
+        ),
     )
 
 
@@ -534,6 +540,7 @@ def test_build_camera_worker_binds_existing_camera_config_without_parallel_schem
         source=rtp_source_config(bind_address="0.0.0.0", port=8889),
         processing_enabled=False,
         vision_processor_class="Legacy14VisionProcessor",
+        vision_processor_profile="default",
     )
     worker = build_camera_worker(
         camera=CameraRole.STEREO_LEFT,
@@ -546,14 +553,12 @@ def test_build_camera_worker_binds_existing_camera_config_without_parallel_schem
     assert worker.pipeline.camera is CameraRole.STEREO_LEFT
 
 
-def test_build_camera_worker_routes_configured_vt11_through_production_factory(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr(vt11_settings, "VT11_PROFILE", "thermal")
+def test_build_camera_worker_routes_configured_vt11_through_production_factory() -> None:
     config = camera_config(
         source=rtp_source_config(bind_address="0.0.0.0", port=8889),
         processing_enabled=False,
         vision_processor_class="Vt11VisionProcessor",
+        vision_processor_profile="thermal",
     )
 
     worker = build_camera_worker(
@@ -565,6 +570,32 @@ def test_build_camera_worker_routes_configured_vt11_through_production_factory(
     processor = worker.pipeline._processor
     assert isinstance(processor, Vt11VisionProcessor)
     assert processor.settings_snapshot.profile == "thermal"
+
+
+def test_camera_worker_runtime_processor_switch_starts_new_generation() -> None:
+    source = InMemoryFrameSource()
+    pipeline = VisionPipeline(
+        camera=CameraRole.OVERVIEW,
+        corrector=overview_corrector(overview_calibration()),
+        processing_enabled=False,
+    )
+    worker = CameraWorker(
+        source=source,
+        pipeline=pipeline,
+        idle_wait_s=0.005,
+        processor_selection=VisionProcessorSelection("Legacy14VisionProcessor", "default"),
+    )
+    worker.start()
+    _wait_until(lambda: pipeline.generation == 1)
+
+    selection = VisionProcessorSelection("Vt11VisionProcessor", "thermal")
+    worker.submit_processor_selection(selection)
+
+    _wait_until(lambda: pipeline.generation == 2)
+    assert worker.processor_selection == selection
+    assert isinstance(pipeline._processor, Vt11VisionProcessor)
+    assert pipeline._processor.settings_snapshot.profile == "thermal"
+    assert worker.stop(timeout=1.0)
 
 
 def test_camera_worker_uses_existing_source_to_pipeline_path_and_stops_bounded() -> None:

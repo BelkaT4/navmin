@@ -1,4 +1,4 @@
-"""Typed configuration foundation for NavMin schema v6."""
+"""Typed configuration foundation for NavMin schema v7."""
 
 from .manager import ConfigManager, save_config
 from .models import (

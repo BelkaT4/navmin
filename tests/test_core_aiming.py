@@ -39,12 +39,14 @@ def _config(
     *,
     overview: AimPointConfig | None = None,
     stereo_left: AimPointConfig | None = None,
+    stereo_right: AimPointConfig | None = None,
 ) -> AimingConfig:
     return AimingConfig(
         target_lost_timeout_ms=500,
         aim_points=AimPointsConfig(
             overview=overview or AimPointConfig(50, 40),
             stereo_left=stereo_left or AimPointConfig(50, 40),
+            stereo_right=stereo_right or AimPointConfig(50, 40),
         ),
     )
 
@@ -74,6 +76,13 @@ def test_aim_point_uses_configured_pixel_and_independent_center_fallback() -> No
         50.0,
         23.0,
     )
+
+
+def test_right_aim_point_uses_its_own_config_and_center_fallback() -> None:
+    aiming = Aiming(_config(stereo_right=AimPointConfig(None, None)))
+    frame = _frame(CameraRole.STEREO_RIGHT, width=121, height=91)
+
+    assert aiming.aim_point(CameraRole.STEREO_RIGHT, frame) == (60.0, 45.0)
 
 
 def test_click_on_aim_point_is_zero_delta() -> None:

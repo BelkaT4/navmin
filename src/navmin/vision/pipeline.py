@@ -357,6 +357,12 @@ class VisionPipeline:
         self._diagnostic_capture_id_present_count = 0
         self._diagnostic_capture_id_missing_count = 0
 
+    def replace_processor(self, processor: VisionProcessor) -> None:
+        """Replace the owner-thread processor before starting a new generation."""
+        if processor is None:
+            raise TypeError("processor must not be None")
+        self._processor = processor
+
     @property
     def generation(self) -> int:
         with self._state_lock:
