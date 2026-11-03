@@ -14,6 +14,7 @@ from navmin.concurrency import LatestValue, TargetControlChannel
 from navmin.config.models import (
     AimingConfig,
     AxesConfig,
+    StereoDistanceMethod,
     TrackingControlConfig,
     UiConfig,
 )
@@ -140,6 +141,8 @@ class StereoTargetJoinPort(Protocol):
     ) -> None: ...
 
     def offer_vision_result(self, result: VisionResult) -> object | None: ...
+
+    def set_require_right_result(self, required: bool) -> None: ...
 
 
 class Mediator:
@@ -346,6 +349,17 @@ class Mediator:
         if self._distance_mode is DistanceMeasurementMode.CONSTANT:
             self._refresh_manual_distance()
 
+    def reset_stereo_distance_method(self, method: StereoDistanceMethod) -> None:
+        """Reject in-flight results from the previous algorithm and rejoin fresh frames."""
+        if not isinstance(method, StereoDistanceMethod):
+            raise TypeError("method must be StereoDistanceMethod")
+        self._invalidate_distance_intent()
+        if self._stereo_target_joiner is not None:
+            self._stereo_target_joiner.set_require_right_result(method is StereoDistanceMethod.DETECTOR)
+        self._refresh_stereo_join_target()
+        if self._distance_mode is DistanceMeasurementMode.CONSTANT:
+            self._refresh_manual_distance()
+
     def _refresh_manual_distance(self) -> None:
         self._current_distance = None
         target = self._selected_target
@@ -447,7 +461,8 @@ class Mediator:
             return False
         if self._stereo_target_joiner is None:
             return False
-        self._stereo_target_joiner.offer_right_vision_result(result)
+        if self._stereo_target_joiner.requires_right_result:
+            self._stereo_target_joiner.offer_right_vision_result(result)
         return True
 
     def accept_camera_status(self, status: CameraStatus) -> bool:

@@ -341,6 +341,34 @@ def test_default_construction_uses_only_production_transport_boundaries() -> Non
     assert factories.turret_transport_factory is None
 
 
+def test_stereo_method_switch_rejoins_right_results_and_rejects_old_intent() -> None:
+    from types import SimpleNamespace
+
+    from navmin.config.models import StereoDistanceMethod
+
+    runtime, _, _ = _injected_runtime(stereo_right_enabled=True, stereo_enabled=True)
+    ui = runtime.ui_dependencies
+    assert ui.stereo_distance_method is StereoDistanceMethod.ROI
+    assert ui.stereo_right_binding.stereo_right_for_detector_distance
+    runtime.mediator.set_distance_mode(DistanceMeasurementMode.STEREO_TIMESTAMP)
+    old_intent = runtime.mediator._distance_intent_revision
+    runtime.mediator._current_distance = object()
+    ui.apply_stereo_distance_method(StereoDistanceMethod.DETECTOR)
+    assert runtime.stereo_distance_worker.method is StereoDistanceMethod.DETECTOR
+    assert runtime.stereo_target_joiner.requires_right_result
+    assert runtime.mediator._current_distance is None
+    assert not runtime.mediator._accept_stereo_distance_candidate(SimpleNamespace(intent_revision=old_intent))
+    ui.apply_stereo_distance_method(StereoDistanceMethod.ROI)
+    assert runtime.stereo_distance_worker.method is StereoDistanceMethod.ROI
+    assert not runtime.stereo_target_joiner.requires_right_result
+    assert not runtime.mediator._accept_stereo_distance_candidate(SimpleNamespace(intent_revision=old_intent))
+    old_intent = runtime.mediator._distance_intent_revision
+    tuning = replace(ui.get_stereo_distance_tuning(), aggregation_frame_count=9)
+    ui.apply_stereo_distance_tuning(tuning)
+    assert ui.get_stereo_distance_tuning() == tuning
+    assert not runtime.mediator._accept_stereo_distance_candidate(SimpleNamespace(intent_revision=old_intent))
+
+
 def test_stereo_right_disabled_does_not_call_source_factory() -> None:
     calls: list[CameraConfig] = []
 

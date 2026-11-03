@@ -29,6 +29,10 @@ def run_ui(
     show_diagnostic_clock: bool = False,
     argv: Sequence[str] = (),
     save_motion_calibration=None,
+    stereo_distance_method=None,
+    apply_stereo_distance_method=None,
+    get_stereo_distance_tuning=None,
+    apply_stereo_distance_tuning=None,
 ) -> int:
     """Run only the Qt UI; application composition owns all workers."""
     application = QApplication.instance()
@@ -46,6 +50,10 @@ def run_ui(
         apply_tracking_control_tuning=apply_tracking_control_tuning,
         show_diagnostic_clock=show_diagnostic_clock,
         save_motion_calibration=save_motion_calibration,
+        stereo_distance_method=stereo_distance_method,
+        apply_stereo_distance_method=apply_stereo_distance_method,
+        get_stereo_distance_tuning=get_stereo_distance_tuning,
+        apply_stereo_distance_tuning=apply_stereo_distance_tuning,
     )
     window.showFullScreen()
     return application.exec()

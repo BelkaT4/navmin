@@ -18,6 +18,7 @@ from navmin.contracts import TargetRef
 
 from .stereo_diagnostics import BoundedTimingSnapshot, BoundedTimingStats
 from .stereo_distance import (
+    StereoDetectorSettings,
     StereoDistanceEstimate,
     StereoDistanceEstimateOutcome,
     StereoDistanceFailure,
@@ -35,6 +36,47 @@ _DEFAULT_MIN_VALID_PIXEL_COUNT = 5
 
 
 @dataclass(frozen=True, slots=True)
+class StereoDistanceTuning:
+    aggregation_frame_count: int
+    min_valid_pixel_count: int
+    sgbm: StereoSgbmSettings
+    detector: StereoDetectorSettings
+
+    def __post_init__(self) -> None:
+        for value in (self.aggregation_frame_count, self.min_valid_pixel_count):
+            if type(value) is not int or value < 1:
+                raise ValueError(
+                    "Число кадров и минимум пикселей должны быть целыми и не меньше 1"
+                )
+        if not isinstance(self.sgbm, StereoSgbmSettings) or not isinstance(
+            self.detector, StereoDetectorSettings
+        ):
+            raise TypeError("Invalid stereo settings")
+        s = self.sgbm
+        if (
+            type(s.num_disparities) is not int
+            or not 16 <= s.num_disparities <= 4096
+            or s.num_disparities % 16
+        ):
+            raise ValueError("Диапазон disparity: 16–4096, кратно 16")
+        if (
+            type(s.block_size) is not int
+            or not 3 <= s.block_size <= 31
+            or s.block_size % 2 == 0
+        ):
+            raise ValueError("Размер блока должен быть нечётным: 3–31")
+        if not 0.25 <= s.processing_scale <= 1.0:
+            raise ValueError("Масштаб обработки: 0.25–1.0")
+        if type(s.uniqueness_ratio) is not int or not 0 <= s.uniqueness_ratio <= 100:
+            raise ValueError("Порог уникальности: 0–100")
+        if (
+            type(s.speckle_window_size) is not int
+            or not 0 <= s.speckle_window_size <= 10000
+        ):
+            raise ValueError("Размер фильтра мелких областей: 0–10000")
+
+
+@dataclass(frozen=True, slots=True)
 class StereoDistanceCandidate:
     """Internal worker output awaiting Core lifecycle revalidation."""
 
@@ -48,7 +90,9 @@ class StereoDistanceCandidate:
     sample_count: int = 1
 
 
-type StereoDistanceCompute = Callable[[StereoTargetObservation], StereoDistanceEstimateOutcome]
+type StereoDistanceCompute = Callable[
+    [StereoTargetObservation], StereoDistanceEstimateOutcome
+]
 
 
 class StereoDistanceFailureClass(Enum):
@@ -146,6 +190,7 @@ class StereoDistanceWorker:
 
         self._calibration = calibration
         self._settings = selected_settings
+        self._detector_settings = StereoDetectorSettings()
         self._method = method
         self._aggregation_frame_count = aggregation_frame_count
         self._max_sample_gap_ns = max_sample_gap_ms * 1_000_000
@@ -159,7 +204,9 @@ class StereoDistanceWorker:
         self._pending: StereoTargetObservation | None = None
         self._stop_requested = False
         self._thread: Thread | None = None
-        self.results: InvalidatableLatest[StereoDistanceCandidate] = InvalidatableLatest()
+        self.results: InvalidatableLatest[StereoDistanceCandidate] = (
+            InvalidatableLatest()
+        )
         self._jobs_submitted = 0
         self._pending_replacements = 0
         self._computations_started = 0
@@ -173,6 +220,44 @@ class StereoDistanceWorker:
         self._latest_failure_class: StereoDistanceFailureClass | None = None
         self._compute_duration = BoundedTimingStats()
         self._latest_success: StereoDistanceSuccessDiagnostics | None = None
+
+    @property
+    def tuning(self) -> StereoDistanceTuning:
+        with self._condition:
+            return StereoDistanceTuning(
+                self._aggregation_frame_count,
+                self._min_valid_pixel_count,
+                self._settings,
+                self._detector_settings,
+            )
+
+    def apply_tuning(self, tuning: StereoDistanceTuning) -> None:
+        if not isinstance(tuning, StereoDistanceTuning):
+            raise TypeError("tuning must be StereoDistanceTuning")
+        with self._condition:
+            self._settings = tuning.sgbm
+            self._detector_settings = tuning.detector
+            self._aggregation_frame_count = tuning.aggregation_frame_count
+            self._min_valid_pixel_count = tuning.min_valid_pixel_count
+            self._distance_samples = deque(maxlen=tuning.aggregation_frame_count)
+            self._clear_samples_locked()
+            self._pending = None
+            self.results.invalidate()
+
+    @property
+    def method(self) -> ConfigStereoDistanceMethod:
+        with self._condition:
+            return self._method
+
+    def set_method(self, method: ConfigStereoDistanceMethod) -> None:
+        """Switch future work; Core invalidates the existing distance intent."""
+        if not isinstance(method, ConfigStereoDistanceMethod):
+            raise TypeError("method must be StereoDistanceMethod")
+        with self._condition:
+            self._method = method
+            self._pending = None
+            self._clear_samples_locked()
+            self.results.invalidate()
 
     @property
     def diagnostics(self) -> StereoDistanceWorkerDiagnostics:
@@ -348,20 +433,28 @@ class StereoDistanceWorker:
         self,
         observation: StereoTargetObservation,
     ) -> StereoDistanceEstimateOutcome:
-        if self._method is ConfigStereoDistanceMethod.DETECTOR:
+        # One immutable settings snapshot per computation, even if the UI applies
+        # new tuning while OpenCV runs. Core rejects the previous intent's result.
+        with self._condition:
+            method = self._method
+            sgbm = self._settings
+            detector = self._detector_settings
+            min_pixels = self._min_valid_pixel_count
+        if method is ConfigStereoDistanceMethod.DETECTOR:
             return estimate_distance_from_detector_pair(
                 observation.pair,
                 self._calibration,
                 observation.roi,
                 observation.right_detections,
                 length_scale_to_m=self._calibration.length_scale_to_m,
+                settings=detector,
             )
         return estimate_distance_from_stereo_pair(
             observation.pair,
             self._calibration,
-            self._settings,
+            sgbm,
             length_scale_to_m=self._calibration.length_scale_to_m,
-            min_valid_pixel_count=self._min_valid_pixel_count,
+            min_valid_pixel_count=min_pixels,
             roi=observation.roi,
         )
 
@@ -379,13 +472,9 @@ class StereoDistanceWorker:
             pair.left.generation,
             pair.right.generation,
         )
-        if (
-            key != self._sample_key
-            or (
-                self._last_sample_timestamp_ns is not None
-                and timestamp_ns - self._last_sample_timestamp_ns
-                > self._max_sample_gap_ns
-            )
+        if key != self._sample_key or (
+            self._last_sample_timestamp_ns is not None
+            and timestamp_ns - self._last_sample_timestamp_ns > self._max_sample_gap_ns
         ):
             self._clear_samples_locked()
         self._sample_key = key

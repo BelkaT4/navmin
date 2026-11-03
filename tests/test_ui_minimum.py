@@ -28,6 +28,7 @@ from navmin.config.models import (
     AimPointConfig,
     AimPointsConfig,
     PidControllerConfig,
+    StereoDistanceMethod,
     TrackingControlConfig,
     UiConfig,
 )
@@ -298,6 +299,8 @@ def _window(
     camera_stale_timeout_ms: int = 500,
     aim_points: AimPointsConfig | None = None,
     pid_controller_config: PidControllerConfig | None = None,
+    stereo_distance_method: StereoDistanceMethod = StereoDistanceMethod.ROI,
+    apply_stereo_distance_method=None,
     apply_pid_tuning: Callable[[PidControllerConfig], None] | None = None,
     apply_tracking_control_tuning: (
         Callable[[TrackingControlConfig], None] | None
@@ -327,6 +330,8 @@ def _window(
         turret_states=turret_states,
         camera_stale_timeout_ms=camera_stale_timeout_ms,
         pid_controller_config=pid_controller_config or _pid_config(),
+        stereo_distance_method=stereo_distance_method,
+        apply_stereo_distance_method=apply_stereo_distance_method,
         apply_pid_tuning=apply_pid_tuning or (lambda _config: None),
         tracking_control_config=mediator.tracking_estimator.config,
         apply_tracking_control_tuning=(
@@ -344,6 +349,56 @@ def _window(
     window.show()
     qt_application.processEvents()
     return window, mediator, turret, bindings, turret_states
+
+
+def test_stereo_method_menu_switches_live_and_restores_selection_on_error(qt_application):
+    calls = []
+    def apply(method):
+        calls.append(method)
+        if method is StereoDistanceMethod.ROI:
+            raise ValueError("test unavailable")
+
+    window, *_ = _window(qt_application, apply_stereo_distance_method=apply)
+    try:
+        assert window.stereo_method_menu.isEnabled()
+        assert window.stereo_method_actions[StereoDistanceMethod.ROI].isChecked()
+        window.stereo_method_actions[StereoDistanceMethod.DETECTOR].trigger()
+        assert calls == [StereoDistanceMethod.DETECTOR]
+        assert window.stereo_method_actions[StereoDistanceMethod.DETECTOR].isChecked()
+        window.stereo_method_actions[StereoDistanceMethod.ROI].trigger()
+        assert window.stereo_method_actions[StereoDistanceMethod.DETECTOR].isChecked()
+        assert window.statusBar().currentMessage() == "test unavailable"
+    finally:
+        window.close()
+
+    window, *_ = _window(qt_application, stereo_distance_method=StereoDistanceMethod.DETECTOR)
+    assert not window.stereo_method_menu.isEnabled()
+    assert window.stereo_method_actions[StereoDistanceMethod.DETECTOR].isChecked()
+    window.close()
+
+
+def test_stereo_settings_apply_count_and_parameters_without_accepting_invalid_block(qt_application):
+    from navmin.ui.stereo_settings import StereoSettingsWindow
+    from navmin.vision.stereo_distance import StereoDetectorSettings, StereoSgbmSettings
+    from navmin.vision.stereo_distance_worker import StereoDistanceTuning
+
+    saved = [StereoDistanceTuning(5, 5, StereoSgbmSettings(), StereoDetectorSettings())]
+    dialog = StereoSettingsWindow(None, lambda: saved[-1], saved.append)
+    try:
+        dialog.editors["aggregation_frame_count"].setValue(12)
+        dialog.editors["block_size"].setValue(4)
+        dialog.apply_button.click()
+        assert len(saved) == 1
+        assert "нечётным" in dialog.status.text()
+        dialog.editors["block_size"].setValue(9)
+        dialog.editors["vertical_tolerance_px"].setValue(6)
+        dialog.apply_button.click()
+        assert saved[-1].aggregation_frame_count == 12
+        assert saved[-1].sgbm.block_size == 9
+        assert saved[-1].detector.vertical_tolerance_px == 6
+        assert "12" in dialog.status.text()
+    finally:
+        dialog.close()
 
 
 def _publish_camera(
@@ -1612,6 +1667,8 @@ def test_motion_calibration_ui_requires_confirmation_and_blocks_aborted_second_c
     window._handle_main_click(second, 50.25, 25)
     assert len(mediator.calibration_observations) == 1
     assert len(turret.relative_commands) == 1
+    assert dialog.error_map.sample_count == 1
+    assert dialog.error_map.maximum_abs_error_deg > 0
     window._handle_main_click(second, 50.5, 25)
     mediator.emergency_stop()
     window.refresh_presentation()

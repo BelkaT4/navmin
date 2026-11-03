@@ -206,7 +206,7 @@ class StereoTargetJoiner:
             if self._require_right_result == required:
                 return
             self._require_right_result = required
-            self._pending_right_result = None
+            self._clear_inputs_locked()
             self.observations.invalidate()
 
     def set_target(

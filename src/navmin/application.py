@@ -44,7 +44,10 @@ from navmin.vision.pipeline import (
     stereo_left_corrector,
     stereo_right_corrector,
 )
-from navmin.vision.stereo_distance_worker import StereoDistanceWorker
+from navmin.vision.stereo_distance_worker import (
+    StereoDistanceTuning,
+    StereoDistanceWorker,
+)
 from navmin.vision.stereo_pairing import StereoPairer
 from navmin.vision.stereo_target_join import (
     StereoPairingKind,
@@ -88,6 +91,10 @@ class UiRuntimeDependencies:
     tracking_control_config: TrackingControlConfig
     apply_tracking_control_tuning: Callable[[TrackingControlConfig], None]
     stereo_right_binding: CameraUiBinding | None = None
+    stereo_distance_method: ConfigStereoDistanceMethod = ConfigStereoDistanceMethod.ROI
+    apply_stereo_distance_method: Callable[[ConfigStereoDistanceMethod], None] | None = None
+    get_stereo_distance_tuning: Callable[[], StereoDistanceTuning] | None = None
+    apply_stereo_distance_tuning: Callable[[StereoDistanceTuning], None] | None = None
 
 
 @dataclass(frozen=True)
@@ -171,6 +178,10 @@ class ApplicationRuntime:
             apply_pid_tuning=self.apply_pid_tuning,
             tracking_control_config=tracking_control_config,
             apply_tracking_control_tuning=self.apply_tracking_control_tuning,
+            stereo_distance_method=(stereo_distance_worker.method if stereo_distance_worker is not None else ConfigStereoDistanceMethod.ROI),
+            apply_stereo_distance_method=(self.apply_stereo_distance_method if stereo_distance_worker is not None else None),
+            get_stereo_distance_tuning=(self.get_stereo_distance_tuning if stereo_distance_worker is not None else None),
+            apply_stereo_distance_tuning=(self.apply_stereo_distance_tuning if stereo_distance_worker is not None else None),
             stereo_right_binding=(
                 None
                 if stereo_right_worker is None
@@ -178,7 +189,6 @@ class ApplicationRuntime:
                     stereo_right_worker,
                     stereo_right_for_detector_distance=(
                         stereo_target_joiner is not None
-                        and stereo_target_joiner.requires_right_result
                     ),
                 )
             ),
@@ -225,6 +235,20 @@ class ApplicationRuntime:
             config.pid_kd_y,
         )
 
+    def apply_stereo_distance_method(self, method: ConfigStereoDistanceMethod) -> None:
+        if not isinstance(method, ConfigStereoDistanceMethod):
+            raise TypeError("method must be StereoDistanceMethod")
+        worker = self.stereo_distance_worker
+        if worker is None:
+            raise ValueError("Расчёт стереодальности отключён в конфигурации")
+        if method is worker.method:
+            return
+        if method is ConfigStereoDistanceMethod.DETECTOR:
+            self.stereo_right_worker.pipeline.set_processing_enabled(True)
+        worker.set_method(method)
+        self.mediator.reset_stereo_distance_method(method)
+        LOGGER.info("Stereo distance method changed to %s", method.value)
+
     def apply_motion_calibration(self, axes) -> None:
         """Queue saved curves through the same revision stream as PID updates."""
         next_config = replace(self._runtime_turret_config, axes=axes)
@@ -234,6 +258,19 @@ class ApplicationRuntime:
         self._pid_tuning_revision = revision
         self.mediator.calibration_axes = axes
         self.mediator.cancel_motion_calibration()
+
+    def get_stereo_distance_tuning(self) -> StereoDistanceTuning:
+        if self.stereo_distance_worker is None:
+            raise ValueError("Расчёт стереодальности отключён")
+        return self.stereo_distance_worker.tuning
+
+    def apply_stereo_distance_tuning(self, tuning: StereoDistanceTuning) -> None:
+        worker = self.stereo_distance_worker
+        if worker is None:
+            raise ValueError("Расчёт стереодальности отключён")
+        worker.apply_tuning(tuning)
+        self.mediator.reset_stereo_distance_method(worker.method)
+        LOGGER.info("Stereo tuning applied: %s", tuning)
 
     def apply_tracking_control_tuning(
         self,

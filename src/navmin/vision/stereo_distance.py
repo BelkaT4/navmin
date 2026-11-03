@@ -64,6 +64,40 @@ class StereoSgbmSettings:
 
 
 @dataclass(frozen=True, slots=True)
+class StereoDetectorSettings:
+    vertical_tolerance_px: float = 8.0
+    vertical_height_fraction: float = 0.3
+    min_height_ratio: float = 0.5
+    max_height_ratio: float = 2.0
+    ambiguity_margin: float = 0.05
+
+    def __post_init__(self) -> None:
+        values = (
+            self.vertical_tolerance_px,
+            self.vertical_height_fraction,
+            self.min_height_ratio,
+            self.max_height_ratio,
+            self.ambiguity_margin,
+        )
+        if any(
+            isinstance(v, bool) or not isinstance(v, (int, float)) or not isfinite(v)
+            for v in values
+        ):
+            raise ValueError("Пороги детекторов должны быть конечными числами")
+        if (
+            min(
+                self.vertical_tolerance_px,
+                self.vertical_height_fraction,
+                self.ambiguity_margin,
+            )
+            < 0
+        ):
+            raise ValueError("Пороги детекторов не могут быть отрицательными")
+        if not 0 < self.min_height_ratio <= 1 <= self.max_height_ratio:
+            raise ValueError("Допустимое отношение высот должно включать 1")
+
+
+@dataclass(frozen=True, slots=True)
 class StereoDistanceEstimate:
     """Successful robust distance estimate from one disparity-map ROI."""
 
@@ -139,8 +173,11 @@ def estimate_distance_from_detector_pair(
     right_detections: tuple[TrackedObject, ...],
     *,
     length_scale_to_m: float,
+    settings: StereoDetectorSettings | None = None,
 ) -> StereoDistanceEstimateOutcome:
     """Match independent detections by rectified epipolar geometry."""
+    if settings is None:
+        settings = StereoDetectorSettings()
     geometry_failure = validate_stereo_pair_geometry(pair, calibration)
     if geometry_failure is not None:
         return geometry_failure
@@ -167,10 +204,13 @@ def estimate_distance_from_detector_pair(
         vertical_error = abs(left_y - right_y)
         if disparity <= 0.0:
             continue
-        if vertical_error > max(8.0, 0.3 * max(left_roi.height, bbox.height)):
+        if vertical_error > max(
+            settings.vertical_tolerance_px,
+            settings.vertical_height_fraction * max(left_roi.height, bbox.height),
+        ):
             continue
         height_ratio = bbox.height / left_roi.height
-        if not 0.5 <= height_ratio <= 2.0:
+        if not settings.min_height_ratio <= height_ratio <= settings.max_height_ratio:
             continue
         score = vertical_error / max(left_roi.height, bbox.height) + abs(
             log(height_ratio)
@@ -179,7 +219,10 @@ def estimate_distance_from_detector_pair(
     if not candidates:
         return StereoDistanceFailure(StereoDistanceFailureReason.DETECTOR_NO_MATCH)
     candidates.sort(key=lambda item: item[0])
-    if len(candidates) > 1 and candidates[1][0] - candidates[0][0] < 0.05:
+    if (
+        len(candidates) > 1
+        and candidates[1][0] - candidates[0][0] <= settings.ambiguity_margin
+    ):
         return StereoDistanceFailure(StereoDistanceFailureReason.DETECTOR_AMBIGUOUS)
     best_disparity = candidates[0][1]
     point = reproject_disparity_point(
@@ -383,9 +426,7 @@ def estimate_distance_from_disparity_roi(
 
     scale = _finite_positive_float(length_scale_to_m)
     if scale is None:
-        return StereoDistanceFailure(
-            StereoDistanceFailureReason.INVALID_LENGTH_SCALE
-        )
+        return StereoDistanceFailure(StereoDistanceFailureReason.INVALID_LENGTH_SCALE)
 
     if (
         isinstance(min_valid_pixel_count, bool)
@@ -416,9 +457,7 @@ def estimate_distance_from_disparity_roi(
             or np.issubdtype(disparity_map_px.dtype, np.floating)
         )
     ):
-        return StereoDistanceFailure(
-            StereoDistanceFailureReason.INVALID_DISPARITY_MAP
-        )
+        return StereoDistanceFailure(StereoDistanceFailureReason.INVALID_DISPARITY_MAP)
 
     roi_disparity = disparity_map_px[
         roi.y : roi.y + roi.height,
@@ -455,16 +494,12 @@ def estimate_distance_from_disparity_roi(
 
     coordinates_m = (projected[:, :3] / w[:, None]) * scale
     distances_m = np.linalg.norm(coordinates_m, axis=1)
-    if not np.all(np.isfinite(coordinates_m)) or not np.all(
-        np.isfinite(distances_m)
-    ):
+    if not np.all(np.isfinite(coordinates_m)) or not np.all(np.isfinite(distances_m)):
         return StereoDistanceFailure(
             StereoDistanceFailureReason.NON_FINITE_REPROJECTION
         )
     if np.any(distances_m <= 0.0):
-        return StereoDistanceFailure(
-            StereoDistanceFailureReason.NON_POSITIVE_DISTANCE
-        )
+        return StereoDistanceFailure(StereoDistanceFailureReason.NON_POSITIVE_DISTANCE)
 
     return StereoDistanceEstimate(
         distance_m=float(np.median(distances_m)),
@@ -491,9 +526,7 @@ def reproject_disparity_point(
     """
     scale = _finite_positive_float(length_scale_to_m)
     if scale is None:
-        return StereoDistanceFailure(
-            StereoDistanceFailureReason.INVALID_LENGTH_SCALE
-        )
+        return StereoDistanceFailure(StereoDistanceFailureReason.INVALID_LENGTH_SCALE)
 
     x = _finite_float(x_px)
     y = _finite_float(y_px)
@@ -540,9 +573,7 @@ def reproject_disparity_point(
             StereoDistanceFailureReason.NON_FINITE_REPROJECTION
         )
     if distance_m <= 0.0:
-        return StereoDistanceFailure(
-            StereoDistanceFailureReason.NON_POSITIVE_DISTANCE
-        )
+        return StereoDistanceFailure(StereoDistanceFailureReason.NON_POSITIVE_DISTANCE)
 
     return StereoPoint3D(
         x_m=x_m,

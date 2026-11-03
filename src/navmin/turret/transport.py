@@ -150,8 +150,12 @@ class SerialTransport:
             raise ValueError("frame must not be empty")
         serial = self._require_open_serial()
         try:
+            # Prolific USB-UART adapters can lose the following response when
+            # timeout=0 was active while the request was submitted.
+            serial.timeout = timeout
             serial.write_timeout = timeout
             written = serial.write(raw)
+            serial.flush()
         except Exception as exc:
             raise self._translate_error(exc, "writing serial frame") from exc
         if written != len(raw):
@@ -164,26 +168,26 @@ class SerialTransport:
         serial = self._require_open_serial()
         deadline = monotonic() + timeout
 
-        start_prefix_length = 0
+        buffer = bytearray()
         while True:
-            byte = self._read_exact(serial, 1, deadline)[0]
+            start = buffer.find(START_BYTES)
+            if start < 0:
+                buffer[:] = buffer[-1:] if buffer.endswith(START_BYTES[:1]) else b""
+            elif start > 0:
+                del buffer[:start]
 
-            if start_prefix_length == 0:
-                if byte == START_BYTES[0]:
-                    start_prefix_length = 1
-                continue
-
-            if byte == START_BYTES[1]:
-                declared_length = self._read_exact(serial, 1, deadline)[0]
+            if len(buffer) >= 3:
+                declared_length = buffer[2]
                 if declared_length < MIN_RESPONSE_LENGTH:
-                    start_prefix_length = 0
+                    del buffer[0]
                     continue
+                if len(buffer) >= declared_length:
+                    return bytes(buffer[:declared_length])
+                needed = declared_length - len(buffer)
+            else:
+                needed = MIN_RESPONSE_LENGTH - len(buffer)
 
-                header = START_BYTES + bytes((declared_length,))
-                remainder = self._read_exact(serial, declared_length - 3, deadline)
-                return header + remainder
-
-            start_prefix_length = 1 if byte == START_BYTES[0] else 0
+            buffer.extend(self._read_exact(serial, needed, deadline))
 
     def _read_exact(self, serial: Any, size: int, deadline: float) -> bytes:
         data = bytearray()
@@ -194,7 +198,6 @@ class SerialTransport:
                     f"serial read timed out after {len(data)} of {size} bytes"
                 )
             try:
-                serial.timeout = remaining
                 chunk = serial.read(size - len(data))
             except Exception as exc:
                 raise self._translate_error(exc, "reading serial frame") from exc

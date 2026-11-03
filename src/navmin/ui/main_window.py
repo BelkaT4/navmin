@@ -7,7 +7,7 @@ from datetime import datetime
 from time import monotonic_ns
 
 from PyQt6.QtCore import QEvent, Qt
-from PyQt6.QtGui import QCloseEvent, QKeyEvent, QResizeEvent, QWheelEvent
+from PyQt6.QtGui import QActionGroup, QCloseEvent, QKeyEvent, QResizeEvent, QWheelEvent
 from PyQt6.QtWidgets import (
     QComboBox,
     QHBoxLayout,
@@ -22,7 +22,11 @@ from PyQt6.QtWidgets import (
 )
 
 from navmin.concurrency import LatestValue
-from navmin.config.models import PidControllerConfig, TrackingControlConfig
+from navmin.config.models import (
+    PidControllerConfig,
+    StereoDistanceMethod,
+    TrackingControlConfig,
+)
 from navmin.contracts import (
     CameraRole,
     CameraSessionStarted,
@@ -38,6 +42,7 @@ from navmin.core import DistanceMeasurementMode, Mediator
 from .bridge import CameraUiBinding, UiStatePump
 from .motion_calibration import MotionCalibrationWindow
 from .operator_window import OperatorWindow
+from .stereo_settings import StereoSettingsWindow
 from .video_view import PreparedVisionFrame, VideoView, prepare_vision_frame
 
 _NORMAL_CAMERAS = (CameraRole.OVERVIEW, CameraRole.STEREO_LEFT)
@@ -111,6 +116,10 @@ class MainWindow(QMainWindow):
         start_timer: bool = True,
         start_fullscreen: bool = True,
         save_motion_calibration=None,
+        stereo_distance_method: StereoDistanceMethod | None = None,
+        apply_stereo_distance_method: Callable[[StereoDistanceMethod], None] | None = None,
+        get_stereo_distance_tuning=None,
+        apply_stereo_distance_tuning=None,
     ) -> None:
         super().__init__()
         if set(camera_bindings) != set(_NORMAL_CAMERAS):
@@ -118,6 +127,11 @@ class MainWindow(QMainWindow):
         if any(camera is not binding.camera for camera, binding in camera_bindings.items()):
             raise ValueError("camera binding keys must match binding.camera")
         self._mediator = mediator
+        self._stereo_distance_method = stereo_distance_method or StereoDistanceMethod.ROI
+        self._apply_stereo_distance_method = apply_stereo_distance_method
+        self._get_stereo_distance_tuning = get_stereo_distance_tuning
+        self._apply_stereo_distance_tuning = apply_stereo_distance_tuning
+        self.stereo_settings_window = None
         self._camera_bindings = dict(camera_bindings)
         self._tracking_control_config = tracking_control_config
         self._apply_tracking_control_tuning_callback = apply_tracking_control_tuning
@@ -239,6 +253,21 @@ class MainWindow(QMainWindow):
         self.motion_calibration_window = MotionCalibrationWindow(self, mediator, save_motion_calibration)
         calibration_action = self.menuBar().addAction("Калибровка движения")
         calibration_action.triggered.connect(self.motion_calibration_window.show)
+        self.stereo_method_menu = self.menuBar().addMenu("Метод стерео")
+        self.stereo_method_group = QActionGroup(self)
+        self.stereo_method_actions = {}
+        for method, label in ((StereoDistanceMethod.ROI, "ROI"), (StereoDistanceMethod.DETECTOR, "Два детектора")):
+            action = self.stereo_method_menu.addAction(label)
+            action.setCheckable(True)
+            action.setChecked(method is self._stereo_distance_method)
+            action.setData(method)
+            self.stereo_method_group.addAction(action)
+            self.stereo_method_actions[method] = action
+        self.stereo_method_menu.setEnabled(apply_stereo_distance_method is not None)
+        self.stereo_method_group.triggered.connect(self._change_stereo_method)
+        self.stereo_settings_action = self.menuBar().addAction("Параметры стерео")
+        self.stereo_settings_action.setEnabled(get_stereo_distance_tuning is not None and apply_stereo_distance_tuning is not None)
+        self.stereo_settings_action.triggered.connect(self._show_stereo_settings)
 
         self.state_pump = UiStatePump(
             mediator=mediator,
@@ -279,6 +308,8 @@ class MainWindow(QMainWindow):
             self.operator_window.set_fullscreen_state(self.isFullScreen())
 
     def closeEvent(self, event: QCloseEvent) -> None:
+        if self.stereo_settings_window is not None:
+            self.stereo_settings_window.close()
         self.motion_calibration_window.close()
         self.operator_window.close()
         super().closeEvent(event)
@@ -359,6 +390,31 @@ class MainWindow(QMainWindow):
             return
         mode, _label = _DISTANCE_MODE_OPTIONS[index]
         self._mediator.set_distance_mode(mode)
+        self._refresh_distance_presentation()
+
+    def _change_stereo_method(self, action) -> None:
+        method = action.data()
+        try:
+            if self._apply_stereo_distance_method is None:
+                raise ValueError("Расчёт стереодальности недоступен")
+            self._apply_stereo_distance_method(method)
+        except (ValueError, RuntimeError) as exc:
+            self.stereo_method_actions[self._stereo_distance_method].setChecked(True)
+            self.statusBar().showMessage(str(exc), 5000)
+            return
+        self._stereo_distance_method = method
+        self._refresh_distance_presentation()
+        self.statusBar().showMessage(f"Метод стерео: {action.text()}. Применён без перезапуска.", 5000)
+
+    def _show_stereo_settings(self) -> None:
+        if self.stereo_settings_window is None:
+            self.stereo_settings_window = StereoSettingsWindow(self, self._get_stereo_distance_tuning, self._apply_stereo_tuning)
+        self.stereo_settings_window.show()
+        self.stereo_settings_window.raise_()
+        self.stereo_settings_window.activateWindow()
+
+    def _apply_stereo_tuning(self, tuning) -> None:
+        self._apply_stereo_distance_tuning(tuning)
         self._refresh_distance_presentation()
 
     def _manual_distance_changed(self, value_m: int) -> None:

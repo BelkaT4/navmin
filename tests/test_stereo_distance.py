@@ -110,6 +110,37 @@ def test_q_reprojection_at_principal_point_matches_known_depth() -> None:
     assert result.distance_m == pytest.approx(4.6)
 
 
+def test_detector_vertical_tuning_changes_accepted_match() -> None:
+    from navmin.contracts import TrackedObject
+    from navmin.vision.stereo_distance import (
+        StereoDetectorSettings,
+        estimate_distance_from_detector_pair,
+    )
+
+    left = BBox(310, 230, 20, 20)
+    right = (TrackedObject(1, BBox(290, 240, 20, 20), 0.0, 0.0, 1),)
+    rejected = estimate_distance_from_detector_pair(
+        pair(),
+        calibration(),
+        left,
+        right,
+        length_scale_to_m=1.0,
+    )
+    assert rejected == StereoDistanceFailure(
+        StereoDistanceFailureReason.DETECTOR_NO_MATCH
+    )
+    accepted = estimate_distance_from_detector_pair(
+        pair(),
+        calibration(),
+        left,
+        right,
+        length_scale_to_m=1.0,
+        settings=StereoDetectorSettings(vertical_tolerance_px=12.0),
+    )
+    assert isinstance(accepted, StereoDistanceEstimate)
+    assert accepted.distance_m == pytest.approx(4.6)
+
+
 def test_q_reprojection_returns_euclidean_3d_distance() -> None:
     result = reproject_disparity_point(
         calibration(),
@@ -336,9 +367,7 @@ def test_roi_meter_and_millimeter_geometry_produce_same_distance() -> None:
     assert isinstance(meters, StereoDistanceEstimate)
     assert isinstance(millimeters, StereoDistanceEstimate)
     assert millimeters.distance_m == pytest.approx(meters.distance_m)
-    assert millimeters.median_disparity_px == pytest.approx(
-        meters.median_disparity_px
-    )
+    assert millimeters.median_disparity_px == pytest.approx(meters.median_disparity_px)
 
 
 @pytest.mark.parametrize(
@@ -360,9 +389,7 @@ def test_roi_outside_frame_is_rejected_without_clipping(roi: BBox) -> None:
         min_valid_pixel_count=1,
     )
 
-    assert result == StereoDistanceFailure(
-        StereoDistanceFailureReason.ROI_OUT_OF_FRAME
-    )
+    assert result == StereoDistanceFailure(StereoDistanceFailureReason.ROI_OUT_OF_FRAME)
 
 
 @pytest.mark.parametrize(
@@ -667,7 +694,6 @@ def test_sgbm_rejects_mismatched_image_shapes() -> None:
         compute_sgbm_disparity(left, right, StereoSgbmSettings())
 
 
-
 def _pair_from_images(left: np.ndarray, right: np.ndarray) -> StereoFramePair:
     left_frame = left.copy()
     right_frame = right.copy()
@@ -946,6 +972,55 @@ def test_distance_worker_keeps_only_latest_not_started_job() -> None:
         worker.shutdown()
 
 
+@pytest.mark.parametrize("change_tuning", [False, True])
+def test_method_switch_drops_pending_work_and_does_not_mix_aggregation_intents(
+    change_tuning,
+) -> None:
+    from navmin.config.models import StereoDistanceMethod as Method
+
+    first_started, release_first, new_started = Event(), Event(), Event()
+    calls = []
+
+    def compute(observation):
+        frame_id = observation.pair.left.frame_id
+        calls.append(frame_id)
+        if frame_id == 1:
+            first_started.set()
+            assert release_first.wait(2.0)
+        if frame_id == 3:
+            new_started.set()
+        return _worker_estimate(1000 if frame_id == 1 else frame_id)
+
+    worker = StereoDistanceWorker(
+        calibration=calibration(width=8, height=6),
+        compute=compute,
+        aggregation_frame_count=3 if change_tuning else 2,
+    )
+    worker.start()
+    try:
+        worker.submit_observation(_worker_observation(1, intent_revision=1))
+        assert first_started.wait(1.0)
+        worker.submit_observation(_worker_observation(2, intent_revision=1))
+        if change_tuning:
+            worker.apply_tuning(replace(worker.tuning, aggregation_frame_count=2))
+        else:
+            worker.set_method(Method.DETECTOR)
+        assert worker.results.get() is None
+        revision = worker.results.snapshot().revision
+        worker.submit_observation(_worker_observation(3, intent_revision=2))
+        release_first.set()
+        assert new_started.wait(1.0)
+        worker.submit_observation(_worker_observation(4, intent_revision=2))
+        result = worker.results.wait_for_revision(revision, 1.0)
+        assert result is not None and result.value is not None
+        assert result.value.intent_revision == 2
+        assert result.value.distance_m == 3.5
+        assert calls == [1, 3, 4]
+    finally:
+        release_first.set()
+        worker.shutdown()
+
+
 def test_distance_worker_candidate_uses_exact_left_observation_identity() -> None:
     observation = _worker_observation(9, intent_revision=17, timestamp_ns=123_456)
     worker = StereoDistanceWorker(
@@ -971,14 +1046,21 @@ def test_distance_worker_candidate_uses_exact_left_observation_identity() -> Non
 
 def test_timestamp_distance_uses_single_s3_core_and_preserves_candidate_kind() -> None:
     base = pair(width=8, height=6)
-    left = replace(base.left, capture_id=None, frame_id=19, receive_timestamp_ns=555_000)
+    left = replace(
+        base.left, capture_id=None, frame_id=19, receive_timestamp_ns=555_000
+    )
     right = replace(base.right, capture_id=None, receive_timestamp_ns=556_000)
     timestamp_pair = TimestampStereoFramePair(
-        identity=TimestampStereoPairIdentity(1, 1, 19, right.frame_id, 555_000, 556_000, 1_000),
+        identity=TimestampStereoPairIdentity(
+            1, 1, 19, right.frame_id, 555_000, 556_000, 1_000
+        ),
         left=left,
         right=right,
     )
-    assert validate_stereo_pair_geometry(timestamp_pair, calibration(width=8, height=6)) is None
+    assert (
+        validate_stereo_pair_geometry(timestamp_pair, calibration(width=8, height=6))
+        is None
+    )
     observation = StereoTargetObservation(
         target=TargetRef(CameraRole.STEREO_LEFT, 1, 7),
         intent_revision=5,

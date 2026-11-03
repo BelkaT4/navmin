@@ -227,6 +227,10 @@ def run_loaded_application(
             show_diagnostic_clock=show_diagnostic_clock,
             argv=qt_argv,
             save_motion_calibration=save_motion_calibration,
+            stereo_distance_method=getattr(ui, "stereo_distance_method", None),
+            apply_stereo_distance_method=getattr(ui, "apply_stereo_distance_method", None),
+            get_stereo_distance_tuning=getattr(ui, "get_stereo_distance_tuning", None),
+            apply_stereo_distance_tuning=getattr(ui, "apply_stereo_distance_tuning", None),
         )
     finally:
         runtime.shutdown()

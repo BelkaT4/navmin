@@ -270,14 +270,14 @@ def config_apply_policy(path: str) -> ConfigApplyPolicy | None:
         return ConfigApplyPolicy.DYNAMIC
 
     parts = path.split(".")
+    if path in {"vision.distance.stereo.method", "vision.distance.stereo.aggregation-frame-count"}:
+        return ConfigApplyPolicy.DYNAMIC
     if path == "tracking-control.platform-motion.source":
         return ConfigApplyPolicy.APPLICATION_RESTART
 
     if path in {
         "vision.cameras.overview.calibration-file",
         "vision.distance.stereo.calibration-file",
-        "vision.distance.stereo.method",
-        "vision.distance.stereo.aggregation-frame-count",
     }:
         return ConfigApplyPolicy.APPLICATION_RESTART
 

@@ -443,6 +443,8 @@ class _FakeSerialBackend:
         self.timeout = kwargs["timeout"]
         self.write_timeout = kwargs["write_timeout"]
         self.writes: list[bytes] = []
+        self.flush_calls = 0
+        self.read_sizes: list[int] = []
         self.incoming = bytearray()
 
     def write(self, data: bytes) -> int:
@@ -450,7 +452,11 @@ class _FakeSerialBackend:
         self.writes.append(raw)
         return len(raw)
 
+    def flush(self) -> None:
+        self.flush_calls += 1
+
     def read(self, size: int) -> bytes:
+        self.read_sizes.append(size)
         if not self.incoming:
             return b""
         chunk = bytes(self.incoming[:size])
@@ -484,6 +490,8 @@ def test_serial_transport_uses_common_boundary_without_real_serial_device() -> N
     transport.set_baudrate(115200)
 
     assert backend.writes == [request]
+    assert backend.flush_calls == 1
+    assert backend.read_sizes == [9]
     assert response == ProtocolResponse(5, CommandCode.PING, ResultCode.OK)
     assert transport.baudrate == 115200
     assert backend.baudrate == 115200

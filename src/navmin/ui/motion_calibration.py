@@ -7,7 +7,7 @@ from dataclasses import asdict
 from pathlib import Path
 
 from PyQt6.QtCore import Qt
-from PyQt6.QtGui import QCloseEvent
+from PyQt6.QtGui import QCloseEvent, QColor, QPainter, QPen
 from PyQt6.QtWidgets import (
     QComboBox,
     QDialog,
@@ -21,7 +21,74 @@ from PyQt6.QtWidgets import (
 
 from navmin.contracts import VisionResult
 from navmin.core import Mediator
-from navmin.core.motion_calibration import estimate_motion
+from navmin.core.motion_calibration import MotionObservation, estimate_motion
+
+
+class MotionErrorMap(QWidget):
+    """Plot measured movement against the command with error-coloured points."""
+
+    def __init__(self, owner: QWidget) -> None:
+        super().__init__(owner)
+        self._samples: tuple[MotionObservation, ...] = ()
+        self.setMinimumHeight(210)
+
+    @property
+    def sample_count(self) -> int:
+        return len(self._samples)
+
+    @property
+    def maximum_abs_error_deg(self) -> float:
+        return max((abs(sample.error_deg) for sample in self._samples), default=0.0)
+
+    def set_observations(self, observations: list[MotionObservation], axis: str) -> None:
+        self._samples = tuple(sample for sample in observations if sample.axis == axis)
+        self.update()
+
+    def paintEvent(self, event) -> None:  # type: ignore[override]
+        del event
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        area = self.rect().adjusted(54, 24, -18, -42)
+        painter.fillRect(self.rect(), self.palette().base())
+        painter.setPen(QPen(self.palette().mid().color()))
+        painter.drawRect(area)
+        if not self._samples:
+            painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, "Нет замеров для выбранной оси")
+            return
+
+        extent = max(
+            1.0,
+            *(abs(value) for sample in self._samples for value in (sample.commanded_deg, sample.measured_deg)),
+        )
+
+        def x_pos(angle: float) -> float:
+            return area.left() + (angle + extent) * area.width() / (2 * extent)
+
+        def y_pos(angle: float) -> float:
+            return area.bottom() - (angle + extent) * area.height() / (2 * extent)
+
+        painter.setPen(QPen(self.palette().mid().color(), 1, Qt.PenStyle.DashLine))
+        painter.drawLine(area.left(), int(y_pos(0.0)), area.right(), int(y_pos(0.0)))
+        painter.drawLine(int(x_pos(0.0)), area.top(), int(x_pos(0.0)), area.bottom())
+        painter.setPen(QPen(QColor("#7f8c8d"), 1, Qt.PenStyle.DashLine))
+        painter.drawLine(int(x_pos(-extent)), int(y_pos(-extent)), int(x_pos(extent)), int(y_pos(extent)))
+
+        maximum_error = self.maximum_abs_error_deg
+        for sample in self._samples:
+            ratio = 0.0 if maximum_error == 0 else abs(sample.error_deg) / maximum_error
+            color = QColor.fromHsvF((1.0 - ratio) * 0.33, 0.85, 0.9)
+            painter.setPen(QPen(color.darker(130), 1))
+            painter.setBrush(color)
+            painter.drawEllipse(int(x_pos(sample.commanded_deg)) - 5, int(y_pos(sample.measured_deg)) - 5, 10, 10)
+
+        painter.setPen(self.palette().text().color())
+        painter.drawText(4, area.top() + 8, "измерено, °")
+        painter.drawText(area.left(), self.height() - 12, "команда, °")
+        painter.drawText(
+            area.right() - 245,
+            self.height() - 12,
+            f"зелёный — малая ошибка; красный — большая, max {maximum_error:.3f}°",
+        )
 
 
 class MotionCalibrationWindow(QDialog):
@@ -32,7 +99,7 @@ class MotionCalibrationWindow(QDialog):
         self._mark_after = False
         self._measuring = False
         self.setWindowTitle("Калибровка движения камер")
-        self.resize(530, 470)
+        self.resize(620, 700)
         layout = QVBoxLayout(self)
         instructions = QLabel(
             "Камеры вращаются вместе с платформой. Выберите ось и кликните на "
@@ -61,6 +128,9 @@ class MotionCalibrationWindow(QDialog):
         reset = QPushButton("Удалить замеры и начать новую серию")
         reset.clicked.connect(self._reset)
         layout.addWidget(reset)
+        layout.addWidget(QLabel("Карта ошибки: команда по горизонтали, измерение по вертикали"))
+        self.error_map = MotionErrorMap(self)
+        layout.addWidget(self.error_map)
         self.results = QTextEdit()
         self.results.setReadOnly(True)
         layout.addWidget(self.results)
@@ -70,7 +140,13 @@ class MotionCalibrationWindow(QDialog):
         config = QPushButton("Сохранить и применить калибровку выбранной оси")
         config.clicked.connect(self._save_config)
         layout.addWidget(config)
+        self.axis.currentTextChanged.connect(self._refresh_error_map)
         self.refresh()
+
+    def _refresh_error_map(self) -> None:
+        self.error_map.set_observations(
+            self._mediator.calibration_observations, self.axis.currentText()
+        )
 
     def refresh(self) -> None:
         pending = self._mediator.calibration_pending
@@ -111,6 +187,7 @@ class MotionCalibrationWindow(QDialog):
                 )
                 self.status.setText("Замер записан. Выберите следующую точку сцены.")
                 self._show_estimate()
+                self._refresh_error_map()
         except ValueError as exc:
             self.status.setText(str(exc))
         self.refresh()
@@ -144,6 +221,7 @@ class MotionCalibrationWindow(QDialog):
         self._cancel()
         self._mediator.calibration_observations.clear()
         self.results.clear()
+        self._refresh_error_map()
         self.status.setText("Новая серия. Кликните на неподвижную точку сцены.")
 
     def closeEvent(self, event: QCloseEvent) -> None:

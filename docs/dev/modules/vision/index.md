@@ -472,7 +472,7 @@ Distance вычисляется только в TRACKING, если текущи�
 - `capture_id`;
 - `measured_timestamp_ns`.
 
-`vision.distance.stereo.method` выбирает расчёт по ROI или по детекциям обеих камер. ROI-вариант агрегирует valid disparity в рамке выбранной Stereo Left цели. Detector-вариант использует независимые `VisionProcessor` результаты: выбранная рамка Stereo Left сопоставляется с Stereo Right рамками по вертикальной близости после rectification и отношению высот; при неоднозначном соответствии измерение отклоняется.
+`vision.distance.stereo.method` выбирает начальный расчёт по ROI или по детекциям обеих камер. Меню «Метод стерео» меняет runtime метод без перезапуска: worker сбрасывает ожидающий job и окно агрегации, joiner очищает входы и меняет требование правого результата, Core меняет distance intent. Поздний результат старого intent не публикуется в UI. ROI-вариант агрегирует valid disparity в рамке выбранной Stereo Left цели. Detector-вариант использует независимые `VisionProcessor` результаты: выбранная рамка Stereo Left сопоставляется с Stereo Right рамками по вертикальной близости после rectification и отношению высот; при неоднозначном соответствии измерение отклоняется.
 
 Каждый вариант собирает `aggregation-frame-count` успешных пар и публикует их медианную дистанцию. Окно ограничено числом кадров и очищается при смене target intent, pairing kind, camera generation, неуспешном измерении или паузе дольше `distance-stale-timeout-ms`. Пока окно не набрано, новый result не публикуется.
 
@@ -532,3 +532,5 @@ Diagnostics/errors идут в logging, runtime state — через typed contr
 - адаптация нагрузки после profiling.
 
 Полный список: [Открытые вопросы](../../architecture/problems.md).
+
+Runtime tuning передаётся в worker неизменяемым `StereoDistanceTuning`: число пар для медианы, минимум достоверных пикселей ROI, настройки SGBM и пороги сопоставления детекторов. Worker применяет их под своим lock, очищает pending job, окно агрегации и результат. Application затем обновляет существующий distance intent Core. Вычисление использует согласованный snapshot настроек; поздний результат прежнего intent отклоняется. Настройки не меняют геометрию или калибровку камер.
