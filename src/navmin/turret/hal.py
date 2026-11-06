@@ -47,6 +47,96 @@ class RelativeMoveLimitError(HalError):
     """A requested relative move exceeds the configured PC-side limit."""
 
 
+@dataclass(frozen=True, slots=True)
+class RelativeMovePreview:
+    """Exact restart-only mechanical conversion used by ``MOVE_RELATIVE``."""
+
+    command: MoveRelativeCommand
+    payload: MoveRelativePayload
+    effective_steps_per_revolution_x: int
+    effective_steps_per_revolution_y: int
+    quantized_delta_x_deg: float
+    quantized_delta_y_deg: float
+
+
+def preview_move_relative(
+    config: TurretConfig,
+    command: MoveRelativeCommand,
+) -> RelativeMovePreview:
+    """Preview the exact HAL payload without opening a transport or moving hardware."""
+    if not isinstance(config, TurretConfig):
+        raise TypeError("config must be TurretConfig")
+    return _preview_move_relative(
+        command,
+        mechanics_x=config.axes.x,
+        mechanics_y=config.axes.y,
+    )
+
+
+def _preview_move_relative(
+    command: MoveRelativeCommand,
+    *,
+    mechanics_x: AxisMechanicsConfig,
+    mechanics_y: AxisMechanicsConfig,
+) -> RelativeMovePreview:
+    if not isinstance(command, MoveRelativeCommand):
+        raise TypeError("command must be MoveRelativeCommand")
+    _validate_relative_limit("x", command.delta_x_deg, mechanics_x)
+    _validate_relative_limit("y", command.delta_y_deg, mechanics_y)
+    x_steps = _degrees_to_steps("x", command.delta_x_deg, mechanics_x)
+    y_steps = _degrees_to_steps("y", command.delta_y_deg, mechanics_y)
+    payload = MoveRelativePayload(delta_x_steps=x_steps, delta_y_steps=y_steps)
+    return RelativeMovePreview(
+        command=command,
+        payload=payload,
+        effective_steps_per_revolution_x=_effective_steps_per_revolution(mechanics_x),
+        effective_steps_per_revolution_y=_effective_steps_per_revolution(mechanics_y),
+        quantized_delta_x_deg=_logical_degrees_from_steps(x_steps, mechanics_x),
+        quantized_delta_y_deg=_logical_degrees_from_steps(y_steps, mechanics_y),
+    )
+
+
+def _effective_steps_per_revolution(mechanics: AxisMechanicsConfig) -> int:
+    return mechanics.full_steps_per_revolution * mechanics.microstep_divider
+
+
+def _degrees_to_steps(
+    axis: AxisName,
+    value_deg: float,
+    mechanics: AxisMechanicsConfig,
+) -> int:
+    value = TurretHal._require_finite(value_deg, name="value_deg")
+    try:
+        steps = round(value * _effective_steps_per_revolution(mechanics) / 360.0)
+    except OverflowError as exc:
+        raise ProtocolValueError(
+            f"{axis} step conversion exceeds protocol numeric range"
+        ) from exc
+    if mechanics.invert:
+        steps = -steps
+    return require_int32(steps, name=f"{axis}_steps")
+
+
+def _logical_degrees_from_steps(
+    physical_steps: int, mechanics: AxisMechanicsConfig
+) -> float:
+    logical_steps = -physical_steps if mechanics.invert else physical_steps
+    return logical_steps * 360.0 / _effective_steps_per_revolution(mechanics)
+
+
+def _validate_relative_limit(
+    axis: AxisName,
+    value_deg: float,
+    mechanics: AxisMechanicsConfig,
+) -> None:
+    value = TurretHal._require_finite(value_deg, name=f"delta_{axis}_deg")
+    limit = mechanics.max_relative_move_deg
+    if abs(value) > limit:
+        raise RelativeMoveLimitError(
+            f"delta_{axis}_deg {value} exceeds ±{limit} degree limit"
+        )
+
+
 @dataclass(frozen=True)
 class _PendingConfig:
     revision: int
@@ -137,15 +227,10 @@ class TurretHal:
             self._config_drain_defer_depth -= 1
 
     def effective_steps_per_revolution(self, axis: AxisName) -> int:
-        mechanics = self._mechanics(axis)
-        return mechanics.full_steps_per_revolution * mechanics.microstep_divider
+        return _effective_steps_per_revolution(self._mechanics(axis))
 
     def degrees_to_steps(self, axis: AxisName, value_deg: float) -> int:
-        value = self._require_finite(value_deg, name="value_deg")
-        steps = self._round_steps(axis, value)
-        if self._mechanics(axis).invert:
-            steps = -steps
-        return require_int32(steps, name=f"{axis}_steps")
+        return _degrees_to_steps(axis, value_deg, self._mechanics(axis))
 
     def velocity_to_steps_s(self, axis: AxisName, value_deg_s: float) -> int:
         value = self._require_finite(value_deg_s, name="value_deg_s")
@@ -201,15 +286,12 @@ class TurretHal:
         )
 
     def move_relative(self, command: MoveRelativeCommand) -> SessionResult:
-        if not isinstance(command, MoveRelativeCommand):
-            raise TypeError("command must be MoveRelativeCommand")
-        self._validate_relative_limit("x", command.delta_x_deg)
-        self._validate_relative_limit("y", command.delta_y_deg)
-        payload = MoveRelativePayload(
-            delta_x_steps=self.degrees_to_steps("x", command.delta_x_deg),
-            delta_y_steps=self.degrees_to_steps("y", command.delta_y_deg),
+        preview = _preview_move_relative(
+            command,
+            mechanics_x=self._mechanics_x,
+            mechanics_y=self._mechanics_y,
         )
-        result = self._ordinary(CommandCode.MOVE_RELATIVE, payload)
+        result = self._ordinary(CommandCode.MOVE_RELATIVE, preview.payload)
         if self._response_ok(result):
             # Relative target execution has no observable rate lifecycle.
             with self._platform_zero_settle_lock:
@@ -555,12 +637,7 @@ class TurretHal:
         raise ValueError("axis must be 'x' or 'y'")
 
     def _validate_relative_limit(self, axis: AxisName, value_deg: float) -> None:
-        value = self._require_finite(value_deg, name=f"delta_{axis}_deg")
-        limit = self._mechanics(axis).max_relative_move_deg
-        if abs(value) > limit:
-            raise RelativeMoveLimitError(
-                f"delta_{axis}_deg {value} exceeds ±{limit} degree limit"
-            )
+        _validate_relative_limit(axis, value_deg, self._mechanics(axis))
 
     @staticmethod
     def _response_ok(result: SessionResult) -> bool:
@@ -583,4 +660,11 @@ class TurretHal:
         return result
 
 
-__all__ = ["HalError", "NanosecondClock", "RelativeMoveLimitError", "TurretHal"]
+__all__ = [
+    "HalError",
+    "NanosecondClock",
+    "RelativeMoveLimitError",
+    "RelativeMovePreview",
+    "TurretHal",
+    "preview_move_relative",
+]

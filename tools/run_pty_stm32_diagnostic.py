@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from time import monotonic
 
+from navmin.config import load_config
 from navmin.config.models import (
     AxesConfig,
     AxisMechanicsConfig,
@@ -30,7 +31,11 @@ from navmin.diagnostics.pty_stm32 import (
     PtyStm32Emulator,
     check_pty_preflight,
 )
-from navmin.turret.protocol import CommandCode, ResultCode
+from navmin.turret.protocol import (
+    CommandCode,
+    MoveRelativePayload,
+    ResultCode,
+)
 from navmin.turret.session import TurretSession
 from navmin.turret.transport import SerialTransport, TransportError
 from navmin.turret.worker import TurretWorker, WorkerShutdownError
@@ -135,6 +140,16 @@ def _commands(records: tuple[PtyRequestRecord, ...]) -> tuple[CommandCode, ...]:
 
 def _command_summary(commands: tuple[CommandCode, ...]) -> str:
     return ", ".join(command.name for command in commands)
+
+
+def _tracking_control_config():
+    defaults = (
+        Path(__file__).resolve().parents[1]
+        / "config"
+        / "defaults"
+        / "navmin.json"
+    )
+    return load_config(defaults).tracking_control
 
 
 def _diagnostic_config(port: str) -> TurretConfig:
@@ -430,6 +445,17 @@ def _gate_f(
     request_count = emulator.stats().physical_request_count
     worker.submit_move_relative(MoveRelativeCommand(1.0, -0.5))
     _wait_request_count(emulator, request_count + 1, timeout_s=timeout_s)
+    move_requests = [
+        record.request
+        for record in emulator.requests_after(request_count)
+        if record.request is not None
+        and record.request.command is CommandCode.MOVE_RELATIVE
+    ]
+    _require(len(move_requests) == 1, "expected exactly one MOVE_RELATIVE request")
+    _require(
+        move_requests[0].payload == MoveRelativePayload(89, -44),
+        f"unexpected MOVE_RELATIVE payload: {move_requests[0].payload}",
+    )
 
     revision = worker.state_updates.snapshot().revision
     _require(worker.motor_off(), "MOTOR_OFF ingress was rejected")
@@ -458,6 +484,7 @@ def _gate_f(
             f"startup commands: {_command_summary(startup_commands[:3])}",
             f"ordinary commands: {_command_summary(ordinary_commands)}",
             "MOTOR_ON, TRACKING, STOP_MOTION, RELATIVE, MOVE_RELATIVE, MOTOR_OFF: confirmed",
+            "MOVE_RELATIVE payload for +1.0/-0.5 deg: +89/-44 STEP pulses",
         ),
     )
 
@@ -703,6 +730,7 @@ def run_diagnostic(*, timeout_seconds: float) -> bool:
         factory = _RecordingSerialFactory()
         worker = TurretWorker(
             _diagnostic_config(stable_path),
+            _tracking_control_config(),
             transport_factory=factory,
         )
         active_gate = "F"

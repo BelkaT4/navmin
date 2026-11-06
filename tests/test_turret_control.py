@@ -26,7 +26,11 @@ from navmin.contracts import (
     TurretControlMode,
 )
 from navmin.turret.controller import TurretController
-from navmin.turret.hal import RelativeMoveLimitError, TurretHal
+from navmin.turret.hal import (
+    RelativeMoveLimitError,
+    TurretHal,
+    preview_move_relative,
+)
 from navmin.turret.pid import AxisPid, PidGains
 from navmin.turret.protocol import (
     CommandCode,
@@ -200,6 +204,34 @@ def test_hal_signed_conversion_inverts_direction_but_not_unsigned_magnitudes() -
     assert hal.degrees_to_steps("y", -90.0) == -800
     assert hal.speed_magnitude_to_steps_s("x", 90.0) == 800
     assert hal.acceleration_magnitude_to_steps_s2("x", 180.0) == 1600
+
+
+def test_relative_move_preview_matches_hal_payload_for_4000_step_mechanics() -> None:
+    config = _config(
+        invert_x=False,
+        invert_y=False,
+        full_steps_x=4000,
+        full_steps_y=4000,
+        microstep_x=1,
+        microstep_y=1,
+        max_relative_x=45.0,
+        max_relative_y=45.0,
+    )
+    command = MoveRelativeCommand(4.0, 0.0)
+
+    preview = preview_move_relative(config, command)
+
+    assert preview.effective_steps_per_revolution_x == 4000
+    assert preview.payload == MoveRelativePayload(44, 0)
+    assert preview.quantized_delta_x_deg == pytest.approx(3.96)
+
+    _, hal, _, transport, _ = _stack(config)
+    result = hal.move_relative(command)
+
+    assert result.response is not None and result.response.result is ResultCode.OK
+    request = decode_request(transport.raw_write_history[-1])
+    assert request.command is CommandCode.MOVE_RELATIVE
+    assert request.payload == preview.payload
 
 
 def test_hal_relative_limit_is_checked_before_any_transmission() -> None:
