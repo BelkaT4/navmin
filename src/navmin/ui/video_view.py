@@ -35,6 +35,7 @@ from navmin.contracts import (
     VisionResult,
 )
 from navmin.core import CameraSessionGate, TrackingControlVisualization
+from navmin.motion_calibration import CalibrationClickGuide
 from navmin.vision.processor import VisionTrackingDiagnostics
 
 STALE_MESSAGE = "НЕТ НОВЫХ КАДРОВ"
@@ -47,6 +48,7 @@ _SEARCH_REGION_COLOR = QColor(255, 80, 180)
 _BEST_CANDIDATE_COLOR = QColor(255, 145, 40)
 _CONTROL_PREDICTION_COLOR = QColor(40, 185, 255)
 _CONTROL_PREDICTION_ENDPOINT_RADIUS_PX = 4.0
+_CALIBRATION_GUIDE_COLOR = QColor(60, 190, 255)
 
 _CAMERA_NAMES = {
     CameraRole.OVERVIEW: "Обзорная",
@@ -315,6 +317,7 @@ class VideoView(QWidget):
         self._tracking_diagnostics: VisionTrackingDiagnostics | None = None
         self._tracking_control_visualization: TrackingControlVisualization | None = None
         self._control_prediction_overlay: ControlPredictionOverlay | None = None
+        self._calibration_click_guide: CalibrationClickGuide | None = None
         self._show_search_region = False
         self._show_best_candidate = False
         self._show_control_prediction = False
@@ -370,6 +373,10 @@ class VideoView(QWidget):
         return self._control_prediction_overlay
 
     @property
+    def calibration_click_guide(self) -> CalibrationClickGuide | None:
+        return self._calibration_click_guide
+
+    @property
     def distance_annotation_text(self) -> str | None:
         result = self.displayed_result
         target = self._selected_target
@@ -405,6 +412,7 @@ class VideoView(QWidget):
         self._tracking_diagnostics = None
         self._tracking_control_visualization = None
         self._control_prediction_overlay = None
+        self._calibration_click_guide = None
         self.update()
 
     def set_prepared_frame(self, prepared: PreparedVisionFrame | None) -> None:
@@ -558,6 +566,16 @@ class VideoView(QWidget):
         self._aim_point_configured = configured
         self.update()
 
+    def set_calibration_click_guide(
+        self, guide: CalibrationClickGuide | None
+    ) -> None:
+        if self._preview:
+            guide = None
+        if guide == self._calibration_click_guide:
+            return
+        self._calibration_click_guide = guide
+        self.update()
+
     def refresh_freshness(self, now_ns: int) -> None:
         stale = self._prepared is not None and is_camera_stale(
             self._status,
@@ -668,6 +686,7 @@ class VideoView(QWidget):
                 prepared.pixmap,
                 QRectF(prepared.pixmap.rect()),
             )
+            self._draw_calibration_click_guide(painter, display_rect, prepared.result)
             self._draw_tracking_overlays(painter, display_rect, prepared.result)
             self._draw_control_prediction_overlay(
                 painter,
@@ -682,6 +701,66 @@ class VideoView(QWidget):
         else:
             self._draw_center_message(painter, QRectF(self.rect()), "ОЖИДАНИЕ КАДРА")
         self._draw_camera_and_status(painter)
+
+    def _draw_calibration_click_guide(
+        self,
+        painter: QPainter,
+        display_rect: QRectF,
+        result: VisionResult,
+    ) -> None:
+        guide = self._calibration_click_guide
+        if self._preview or guide is None:
+            return
+        height, width = result.frame.image.shape[:2]
+        if width != guide.frame_width or height != guide.frame_height:
+            return
+        if guide.axis == "x":
+            left = (
+                display_rect.left()
+                + guide.primary_min_px * display_rect.width() / width
+            )
+            right = (
+                display_rect.left()
+                + (guide.primary_max_px + 1) * display_rect.width() / width
+            )
+            band = QRectF(
+                left,
+                display_rect.top(),
+                max(0.0, right - left),
+                display_rect.height(),
+            )
+        else:
+            top = (
+                display_rect.top()
+                + guide.primary_min_px * display_rect.height() / height
+            )
+            bottom = (
+                display_rect.top()
+                + (guide.primary_max_px + 1) * display_rect.height() / height
+            )
+            band = QRectF(
+                display_rect.left(),
+                top,
+                display_rect.width(),
+                max(0.0, bottom - top),
+            )
+        if band.isEmpty():
+            return
+        painter.save()
+        try:
+            fill = QColor(_CALIBRATION_GUIDE_COLOR)
+            fill.setAlpha(45)
+            painter.setBrush(QBrush(fill))
+            painter.setPen(
+                QPen(
+                    _CALIBRATION_GUIDE_COLOR,
+                    2,
+                    Qt.PenStyle.DashLine,
+                )
+            )
+            painter.drawRect(band)
+        finally:
+            painter.restore()
 
     def _draw_tracking_overlays(
         self,

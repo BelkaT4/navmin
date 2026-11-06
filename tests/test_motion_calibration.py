@@ -7,6 +7,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
+from navmin.calibration import load_stereo_calibration, stereo_camera_models
 from navmin.config.models import AxesConfig, AxisMechanicsConfig
 from navmin.contracts import CameraRay, CameraRole, FramePacket, MoveRelativeCommand
 from navmin.motion_calibration import (
@@ -24,8 +25,10 @@ from navmin.motion_calibration import (
     ReversalLoss,
     WizardPhase,
     WizardSettings,
+    assess_calibration_plan,
     build_axis_calibration,
     build_calibration_sequence,
+    calibration_click_guide,
     motion_calibration_from_mapping,
     motion_calibration_to_mapping,
     validate_angles,
@@ -484,20 +487,48 @@ def test_failed_atomic_save_does_not_live_apply(
     assert runtime.document.profiles[CameraRole.OVERVIEW] is old
 
 
-def test_sequence_uses_clean_blocks_and_two_large_reversals_each_way() -> None:
+def test_sequence_is_bounded_and_preserves_clean_and_reversal_samples() -> None:
     sequence = build_calibration_sequence((4, 8, 14), (3, 6, 10))
 
-    for axis in ("x", "y"):
+    for axis, a1 in (("x", 4.0), ("y", 3.0)):
         axis_steps = [step for step in sequence if step.axis == axis]
-        clean = [step for step in axis_steps if not step.reversal and not step.conditioning]
+        clean = [step for step in axis_steps if not step.reversal]
         reversal = [step for step in axis_steps if step.reversal]
-        assert axis_steps[0].conditioning
-        assert [step.command_deg for step in clean].count(
-            4 if axis == "x" else 3
-        ) == 2
+
+        assert len(clean) == 12
+        assert len(reversal) == 4
+        assert [abs(step.command_deg) for step in clean].count(a1) == 4
         assert sum(step.command_deg < 0 for step in reversal) == 2
         assert sum(step.command_deg > 0 for step in reversal) == 2
-        assert all(abs(step.command_deg) in ({8, 14} if axis == "x" else {6, 10}) for step in reversal)
+
+        for step in axis_steps:
+            # Every measurement starts with only the smallest conditioning move
+            # and returns to the approximate origin afterwards.
+            assert abs(step.precondition_deg) == pytest.approx(a1)
+            assert step.precondition_deg + step.command_deg + step.return_deg == pytest.approx(0.0)
+            if step.reversal:
+                assert step.precondition_deg * step.command_deg < 0.0
+            else:
+                assert step.precondition_deg * step.command_deg > 0.0
+
+
+def test_plan_preflight_rejects_automatic_return_over_mechanical_limit() -> None:
+    model = _LinearCameraModel()
+    frame = _frame(frame_id=1, timestamp_ns=1_000_000_000)
+
+    assessment = assess_calibration_plan(
+        camera_model=model,
+        frame=frame,
+        x_angles=(4.0, 8.0, 14.0),
+        y_angles=(3.0, 6.0, 10.0),
+        mechanics=_axes(limit=15.0),
+    )
+
+    assert not assessment.valid
+    assert any(
+        "ось X" in issue and "возврат -18°" in issue and "15°" in issue
+        for issue in assessment.issues
+    )
 
 
 @pytest.mark.parametrize(
@@ -538,7 +569,59 @@ def _frame(*, frame_id: int, timestamp_ns: int, generation: int = 1) -> FramePac
     )
 
 
-def test_wizard_first_click_move_settle_gate_and_second_click() -> None:
+
+def test_real_stereo_left_plan_rejects_2_4_8_before_any_motion() -> None:
+    repo_root = Path(__file__).resolve().parents[1]
+    calibration = load_stereo_calibration(repo_root / "config/calibration/stereo.json")
+    left_model, _right_model = stereo_camera_models(calibration)
+    frame = FramePacket(
+        CameraRole.STEREO_LEFT,
+        1,
+        1,
+        None,
+        1_000_000_000,
+        np.zeros((calibration.image_height, calibration.image_width, 3), dtype=np.uint8),
+    )
+
+    assessment = assess_calibration_plan(
+        camera_model=left_model,
+        frame=frame,
+        x_angles=(2.0, 4.0, 8.0),
+        y_angles=(2.0, 4.0, 8.0),
+        mechanics=_axes(limit=45.0),
+    )
+
+    assert not assessment.valid
+    assert assessment.guide_for("x", 2.0) is not None
+    assert assessment.guide_for("x", 4.0) is not None
+    assert assessment.guide_for("x", 8.0) is None
+    assert assessment.guide_for("x", -8.0) is None
+    assert assessment.guide_for("y", 2.0) is not None
+    assert assessment.guide_for("y", 4.0) is not None
+    assert assessment.guide_for("y", 8.0) is None
+    assert assessment.guide_for("y", -8.0) is None
+    assert 4.0 < assessment.maximum_measurable_deg["x"] < 8.0
+    assert 4.0 < assessment.maximum_measurable_deg["y"] < 8.0
+    assert any("ось X, команда +8°" in issue for issue in assessment.issues)
+    assert any("ось Y, команда -8°" in issue for issue in assessment.issues)
+
+
+def test_click_guide_reports_narrower_band_for_larger_move() -> None:
+    model = _LinearCameraModel()
+    frame = _frame(frame_id=1, timestamp_ns=1_000_000_000)
+
+    small = calibration_click_guide(
+        camera_model=model, frame=frame, axis="x", command_deg=4.0
+    )
+    large = calibration_click_guide(
+        camera_model=model, frame=frame, axis="x", command_deg=14.0
+    )
+
+    assert small is not None
+    assert large is not None
+    assert large.fraction < small.fraction
+
+def test_wizard_first_click_move_return_and_next_precondition() -> None:
     now = [1_000_000_000]
     moves: list[MoveRelativeCommand] = []
 
@@ -563,8 +646,8 @@ def test_wizard_first_click_move_settle_gate_and_second_click() -> None:
     model = _LinearCameraModel()
 
     wizard.start(generation=1)
-    assert wizard.phase == WizardPhase.MOVING
-    assert moves[-1] == MoveRelativeCommand(14, 0)
+    assert wizard.phase == WizardPhase.CONDITIONING
+    assert moves[-1] == MoveRelativeCommand(4, 0)
     now[0] = wizard.settle_deadline_ns
     wizard.tick()
     assert wizard.phase == WizardPhase.WAIT_FIRST_CLICK
@@ -572,22 +655,36 @@ def test_wizard_first_click_move_settle_gate_and_second_click() -> None:
     before = _frame(frame_id=1, timestamp_ns=now[0])
     assert wizard.handle_click(frame=before, camera_model=model, x_px=100, y_px=50)
     assert moves[-1] == MoveRelativeCommand(4, 0)
+    assert wizard.phase == WizardPhase.MOVING
     assert not wizard.handle_click(
         frame=_frame(frame_id=2, timestamp_ns=now[0]),
         camera_model=model,
         x_px=80,
         y_px=50,
     )
+
     now[0] = wizard.settle_deadline_ns
     wizard.tick()
     assert wizard.phase == WizardPhase.WAIT_SECOND_CLICK
     after = _frame(frame_id=2, timestamp_ns=now[0])
     assert wizard.handle_click(frame=after, camera_model=model, x_px=80, y_px=50)
     assert wizard.observations[-1].measured_movement_deg == pytest.approx(4)
-    assert wizard.step_index == 2
+    assert wizard.phase == WizardPhase.RETURNING
+    assert moves[-1] == MoveRelativeCommand(-8, 0)
+    assert wizard.step_index == 0
+
+    now[0] = wizard.settle_deadline_ns
+    wizard.tick()
+    assert wizard.step_index == 1
+    assert wizard.phase == WizardPhase.CONDITIONING
+    assert moves[-1] == MoveRelativeCommand(4, 0)
+
+    now[0] = wizard.settle_deadline_ns
+    wizard.tick()
+    assert wizard.phase == WizardPhase.WAIT_FIRST_CLICK
 
 
-def test_wizard_dispatches_next_axis_conditioning_automatically() -> None:
+def test_return_completion_dispatches_next_axis_precondition_automatically() -> None:
     moves: list[MoveRelativeCommand] = []
     wizard = MotionCalibrationWizard(
         settings=WizardSettings(
@@ -604,19 +701,18 @@ def test_wizard_dispatches_next_axis_conditioning_automatically() -> None:
         clock_ns=lambda: 0,
     )
     wizard.start(generation=1)
-    y_conditioning_index = next(
-        index
-        for index, step in enumerate(wizard.steps)
-        if step.axis == "y" and step.conditioning
+    first_y_index = next(
+        index for index, step in enumerate(wizard.steps) if step.axis == "y"
     )
-    wizard.step_index = y_conditioning_index - 1
-    wizard.phase = WizardPhase.WAIT_SECOND_CLICK
+    wizard.step_index = first_y_index - 1
+    wizard.phase = WizardPhase.RETURNING
+    wizard.settle_deadline_ns = 0
 
-    wizard._advance_after_measurement()
+    wizard.tick()
 
-    assert wizard.step_index == y_conditioning_index
-    assert wizard.phase == WizardPhase.MOVING
-    assert moves[-1] == MoveRelativeCommand(0.0, 10.0)
+    assert wizard.step_index == first_y_index
+    assert wizard.phase == WizardPhase.CONDITIONING
+    assert moves[-1] == MoveRelativeCommand(0.0, 3.0)
 
 
 def test_repeat_problematic_step_keeps_evidence_and_third_sample_resolves_pair() -> None:
@@ -641,7 +737,6 @@ def test_repeat_problematic_step_keeps_evidence_and_third_sample_resolves_pair()
         for index, step in enumerate(wizard.steps)
         if step.axis == "x"
         and not step.reversal
-        and not step.conditioning
         and step.command_deg == 4
     ][1]
     wizard.step_index = target_index
@@ -659,11 +754,18 @@ def test_repeat_problematic_step_keeps_evidence_and_third_sample_resolves_pair()
         x_px=70,
         y_px=50,
     )
-    assert wizard.phase == WizardPhase.REVIEW_REPEAT
+    assert wizard.phase == WizardPhase.RETURNING
     assert len(wizard.observations) == 2
+    now[0] = wizard.settle_deadline_ns
+    wizard.tick()
+    assert wizard.phase == WizardPhase.REVIEW_REPEAT
 
     wizard.repeat_problematic_step()
+    assert wizard.phase == WizardPhase.CONDITIONING
     assert len(wizard.observations) == 2
+    now[0] = wizard.settle_deadline_ns
+    wizard.tick()
+    assert wizard.phase == WizardPhase.WAIT_FIRST_CLICK
     wizard.handle_click(
         frame=_frame(frame_id=12, timestamp_ns=now[0]),
         camera_model=model,
@@ -679,12 +781,153 @@ def test_repeat_problematic_step_keeps_evidence_and_third_sample_resolves_pair()
         y_px=50,
     )
 
-    assert wizard.phase == WizardPhase.WAIT_FIRST_CLICK
+    assert wizard.phase == WizardPhase.RETURNING
+    now[0] = wizard.settle_deadline_ns
+    wizard.tick()
+    assert wizard.phase == WizardPhase.CONDITIONING
     assert wizard.step_index == target_index + 1
+    now[0] = wizard.settle_deadline_ns
+    wizard.tick()
+    assert wizard.phase == WizardPhase.WAIT_FIRST_CLICK
     assert len(wizard.observations) == 3
     assert any("resolved by additional sample" in warning for warning in wizard.warnings)
 
-def test_wizard_rejects_stale_out_of_bounds_edge_and_generation_change() -> None:
+def test_wizard_full_synthetic_sequence_returns_to_origin_and_builds_profile() -> None:
+    now = [1_000_000_000]
+    moves: list[MoveRelativeCommand] = []
+    wizard = MotionCalibrationWizard(
+        settings=WizardSettings(
+            CameraRole.OVERVIEW,
+            (4, 8, 14),
+            (3, 6, 10),
+            20,
+            MotionProfile(5, 10, 0),
+        ),
+        mechanics=_axes(),
+        camera_calibration_identity="sha256:camera",
+        stale_timeout_ms=500,
+        submit_move=lambda _camera, _generation, command: (moves.append(command) or True),
+        clock_ns=lambda: now[0],
+    )
+    model = _LinearCameraModel()
+    frame_id = 0
+
+    wizard.start(generation=1)
+    while wizard.phase != WizardPhase.COMPLETE:
+        if wizard.phase in (
+            WizardPhase.CONDITIONING,
+            WizardPhase.MOVING,
+            WizardPhase.RETURNING,
+        ):
+            assert wizard.settle_deadline_ns is not None
+            now[0] = wizard.settle_deadline_ns
+            wizard.tick()
+            continue
+        step = wizard.current_step
+        assert step is not None
+        if wizard.phase == WizardPhase.WAIT_FIRST_CLICK:
+            frame_id += 1
+            if step.axis == "x":
+                x_px, y_px = 100.0, 50.0
+            else:
+                x_px = 100.0
+                y_px = 30.0 if step.command_deg > 0.0 else 70.0
+            assert wizard.handle_click(
+                frame=_frame(frame_id=frame_id, timestamp_ns=now[0]),
+                camera_model=model,
+                x_px=x_px,
+                y_px=y_px,
+            )
+            continue
+        if wizard.phase == WizardPhase.WAIT_SECOND_CLICK:
+            first = wizard.first_click
+            assert first is not None
+            frame_id += 1
+            if step.axis == "x":
+                x_px = first.x_px - step.command_deg / 0.2
+                y_px = first.y_px
+            else:
+                x_px = first.x_px
+                y_px = first.y_px + step.command_deg / 0.2
+            assert wizard.handle_click(
+                frame=_frame(frame_id=frame_id, timestamp_ns=now[0]),
+                camera_model=model,
+                x_px=x_px,
+                y_px=y_px,
+            )
+            continue
+        pytest.fail(f"unexpected wizard phase: {wizard.phase}")
+
+    assert len(wizard.observations) == len(wizard.steps) == 32
+    assert wizard.first_click is None
+    assert sum(command.delta_x_deg for command in moves) == pytest.approx(0.0)
+    assert sum(command.delta_y_deg for command in moves) == pytest.approx(0.0)
+    assert all(
+        observation.measured_movement_deg
+        == pytest.approx(observation.commanded_angle_deg)
+        for observation in wizard.observations
+    )
+    profile = wizard.build_profile()
+    assert profile.camera is CameraRole.OVERVIEW
+    assert set(profile.axes) == {"x", "y"}
+
+
+def test_return_rejection_cancels_wizard_after_recording_measurement() -> None:
+    now = [1_000_000_000]
+    calls: list[MoveRelativeCommand] = []
+
+    def submit(_camera, _generation, command):
+        calls.append(command)
+        return len(calls) < 3
+
+    wizard = MotionCalibrationWizard(
+        settings=WizardSettings(
+            CameraRole.OVERVIEW,
+            (4, 8, 14),
+            (3, 6, 10),
+            20,
+            MotionProfile(5, 10, 0),
+        ),
+        mechanics=_axes(),
+        camera_calibration_identity="sha256:camera",
+        stale_timeout_ms=500,
+        submit_move=submit,
+        clock_ns=lambda: now[0],
+    )
+    model = _LinearCameraModel()
+
+    wizard.start(generation=1)
+    now[0] = wizard.settle_deadline_ns
+    wizard.tick()
+    assert wizard.handle_click(
+        frame=_frame(frame_id=1, timestamp_ns=now[0]),
+        camera_model=model,
+        x_px=100,
+        y_px=50,
+    )
+    now[0] = wizard.settle_deadline_ns
+    wizard.tick()
+    with pytest.raises(MotionCalibrationError, match="return MOVE_RELATIVE"):
+        wizard.handle_click(
+            frame=_frame(frame_id=2, timestamp_ns=now[0]),
+            camera_model=model,
+            x_px=80,
+            y_px=50,
+        )
+
+    assert calls == [
+        MoveRelativeCommand(4, 0),
+        MoveRelativeCommand(4, 0),
+        MoveRelativeCommand(-8, 0),
+    ]
+    assert wizard.phase == WizardPhase.CANCELLED
+    assert wizard.cancel_reason == "return MOVE_RELATIVE was rejected"
+    assert len(wizard.observations) == 1
+
+
+def test_wizard_rejects_stale_out_of_bounds_edge_and_generation_change(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     now = [2_000_000_000]
     wizard = MotionCalibrationWizard(
         settings=WizardSettings(
@@ -719,13 +962,18 @@ def test_wizard_rejects_stale_out_of_bounds_edge_and_generation_change() -> None
             x_px=300,
             y_px=50,
         )
-    with pytest.raises(MotionCalibrationError, match="edge"):
+    with (
+        caplog.at_level("INFO", logger="navmin.motion_calibration"),
+        pytest.raises(MotionCalibrationError, match="edge"),
+    ):
         wizard.handle_click(
             frame=_frame(frame_id=1, timestamp_ns=now[0]),
             camera_model=model,
             x_px=10,
             y_px=50,
         )
+    assert "first click rejected visibility" in caplog.text
+    assert "command_deg=+4" in caplog.text
 
     wizard.handle_click(
         frame=_frame(frame_id=1, timestamp_ns=now[0]),

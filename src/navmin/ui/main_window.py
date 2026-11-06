@@ -648,6 +648,7 @@ class MainWindow(QMainWindow):
                 )
         self._refresh_distance_presentation()
         self._refresh_aim_point()
+        self._refresh_motion_calibration_guide()
         now_ns = self._clock_ns()
         for view in self._all_video_views():
             if view.isVisible():
@@ -657,6 +658,18 @@ class MainWindow(QMainWindow):
             now = self._wall_clock()
             milliseconds = now.microsecond // 1000
             self.now_label.setText(f"NOW {now:%H:%M:%S}.{milliseconds:03d}")
+
+    def _refresh_motion_calibration_guide(self) -> None:
+        calibration = self.motion_calibration_window
+        guide = None
+        if (
+            calibration is not None
+            and calibration.calibration_camera is self.main_view.camera
+        ):
+            guide = calibration.current_click_guide
+        self.main_view.set_calibration_click_guide(guide)
+        self.preview_view.set_calibration_click_guide(None)
+        self.preview_view_2.set_calibration_click_guide(None)
 
     @staticmethod
     def _format_horizon_seconds(horizon_ms: int) -> str:
@@ -837,6 +850,8 @@ class MainWindow(QMainWindow):
         self.refresh_presentation()
 
     def _vision_result_accepted(self, result: VisionResult) -> None:
+        if self.motion_calibration_window is not None:
+            self.motion_calibration_window.accept_vision_result(result)
         prepared = self._frame_preparer(result)
         camera = result.frame.camera
         self._prepared_frames[camera] = prepared

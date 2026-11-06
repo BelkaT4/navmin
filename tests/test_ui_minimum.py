@@ -17,6 +17,7 @@ from PyQt6.QtGui import QPixmap, QWheelEvent
 from PyQt6.QtTest import QTest
 from PyQt6.QtWidgets import QApplication, QDoubleSpinBox, QMessageBox, QScrollArea
 
+from navmin.calibration import load_stereo_calibration, stereo_camera_models
 from navmin.concurrency import (
     CameraSessionBarrierChannel,
     LatestValue,
@@ -576,6 +577,7 @@ def test_motion_calibration_lifecycle_always_restores_temporary_profile(
     assert mediator.accept_camera_session(_session(CameraRole.OVERVIEW, 1))
     calibration = window.motion_calibration_window
     assert calibration is not None
+    calibration.accept_vision_result(_result(CameraRole.OVERVIEW, 1))
 
     calibration._start()
 
@@ -585,7 +587,7 @@ def test_motion_calibration_lifecycle_always_restores_temporary_profile(
     calibration.accept_turret_state(
         _turret_state(speed=5.0, acceleration=10.0)
     )
-    assert turret.relative_commands == [MoveRelativeCommand(14.0, 0.0)]
+    assert turret.relative_commands == [MoveRelativeCommand(4.0, 0.0)]
 
     if termination == "emergency":
         window._emergency_stop()
@@ -622,6 +624,74 @@ def test_motion_calibration_lifecycle_always_restores_temporary_profile(
     window.close()
     qt_application.processEvents()
 
+def test_motion_calibration_preflight_blocks_unmeasurable_real_stereo_plan_before_profile(
+    qt_application: QApplication,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    axis = AxisMechanicsConfig(False, 200, 16, 45.0)
+    runtime = MotionCalibrationRuntime(
+        path=tmp_path / "motion.json",
+        axes=AxesConfig(axis, axis),
+        camera_identities={
+            CameraRole.OVERVIEW: "sha256:overview",
+            CameraRole.STEREO_LEFT: "sha256:stereo",
+        },
+    )
+    begun: list[MotionProfile] = []
+    window, mediator, turret, _bindings_value, _turret_states_value = _window(
+        qt_application,
+        motion_calibration_runtime=runtime,
+        begin_motion_calibration_profile=begun.append,
+        restore_motion_calibration_profile=lambda: None,
+    )
+    repo_root = Path(__file__).resolve().parents[1]
+    stereo = load_stereo_calibration(repo_root / "config/calibration/stereo.json")
+    left_model, _right_model = stereo_camera_models(stereo)
+    session = CameraSessionStarted(CameraRole.STEREO_LEFT, 1, left_model, 1_000_000_000)
+    assert mediator.accept_camera_session(session)
+    mediator.swap_main_preview()
+    calibration = window.motion_calibration_window
+    assert calibration is not None
+    calibration.camera_combo.setCurrentIndex(1)
+    for axis_name in ("x", "y"):
+        for index, value in enumerate((2.0, 4.0, 8.0), start=1):
+            calibration.angle_inputs[f"{axis_name}{index}"].setValue(value)
+    image = np.zeros((stereo.image_height, stereo.image_width, 3), dtype=np.uint8)
+    result = VisionResult(
+        FramePacket(
+            CameraRole.STEREO_LEFT,
+            1,
+            1,
+            None,
+            1_000_000_000,
+            image,
+        ),
+        (),
+        0,
+    )
+    calibration.accept_vision_result(result)
+    messages: list[str] = []
+    monkeypatch.setattr(
+        QMessageBox,
+        "warning",
+        lambda _owner, _title, message: messages.append(str(message)),
+    )
+
+    calibration._start()
+
+    assert begun == []
+    assert turret.relative_commands == []
+    assert not calibration.calibration_active
+    assert messages
+    assert "Набор углов нельзя измерить" in messages[-1]
+    assert "+8°" in messages[-1]
+    assert "X ≈" in messages[-1]
+    assert "Y ≈" in messages[-1]
+    window.close()
+    qt_application.processEvents()
+
+
 def test_motion_calibration_waits_for_confirmed_profile_before_first_move(
     qt_application: QApplication,
     tmp_path: Path,
@@ -648,6 +718,7 @@ def test_motion_calibration_waits_for_confirmed_profile_before_first_move(
     assert mediator.accept_camera_session(_session(CameraRole.OVERVIEW, 1))
     calibration = window.motion_calibration_window
     assert calibration is not None
+    calibration.accept_vision_result(_result(CameraRole.OVERVIEW, 1))
 
     calibration._start()
 
@@ -656,7 +727,27 @@ def test_motion_calibration_waits_for_confirmed_profile_before_first_move(
     calibration.accept_turret_state(_turret_state(speed=40.0, acceleration=80.0))
     assert turret.relative_commands == []
     calibration.accept_turret_state(_turret_state(speed=5.0, acceleration=10.0))
-    assert turret.relative_commands == [MoveRelativeCommand(14.0, 0.0)]
+    assert turret.relative_commands == [MoveRelativeCommand(4.0, 0.0)]
+    wizard = calibration._wizard
+    assert wizard is not None
+    assert wizard.settle_deadline_ns is not None
+    clock.now_ns = wizard.settle_deadline_ns
+    calibration._tick()
+    assert "Допустимая зона:" in calibration.progress_label.text()
+    window.refresh_presentation()
+    guide = window.main_view.calibration_click_guide
+    assert guide is not None
+    assert guide.axis == "x"
+    assert guide.command_deg == pytest.approx(4.0)
+
+    calibration.handle_click(
+        _result(CameraRole.OVERVIEW, 1, frame_id=2, timestamp_ns=clock.now_ns),
+        0.0,
+        25.0,
+    )
+    assert turret.relative_commands == [MoveRelativeCommand(4.0, 0.0)]
+    assert "Измерение отклонено:" in calibration.progress_label.text()
+    assert "Допустимая зона для этого шага:" in calibration.progress_label.text()
     assert restored == []
     calibration.close()
     qt_application.processEvents()
@@ -687,6 +778,7 @@ def test_motion_calibration_profile_confirmation_timeout_aborts_without_move(
     assert mediator.accept_camera_session(_session(CameraRole.OVERVIEW, 1))
     calibration = window.motion_calibration_window
     assert calibration is not None
+    calibration.accept_vision_result(_result(CameraRole.OVERVIEW, 1))
 
     calibration._start()
     assert turret.relative_commands == []
