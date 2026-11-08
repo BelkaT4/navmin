@@ -14,6 +14,7 @@ from urllib.parse import urlsplit
 
 from navmin.config.models import (
     RtpJpegSourceConfig,
+    RtpJpegTimestampMode,
     RtspDecoderMode,
     RtspProtocol,
     RtspSourceConfig,
@@ -26,6 +27,7 @@ from navmin.diagnostics.pty_stm32 import PtyPreflightResult, check_pty_preflight
 from navmin.launcher import LoadedApplicationInputs
 from navmin.vision.gstreamer_source import (
     RTP_JPEG_GSTREAMER_ELEMENTS,
+    RTP_JPEG_SENSOR_TIMESTAMP_GSTREAMER_ELEMENTS,
     RTSP_H264_GSTREAMER_ELEMENTS,
     GStreamerUnavailableError,
     find_missing_gstreamer_elements,
@@ -197,6 +199,8 @@ def run_startup_preflight(
         source = camera.source
         if isinstance(source, RtpJpegSourceConfig):
             receiver_elements.extend(RTP_JPEG_GSTREAMER_ELEMENTS)
+            if source.timestamp_mode is RtpJpegTimestampMode.SENSOR_RTP_PTS:
+                receiver_elements.extend(RTP_JPEG_SENSOR_TIMESTAMP_GSTREAMER_ELEMENTS)
             source_error = _rtp_jpeg_config_error(source)
             checks.append(
                 _result_check(
@@ -204,7 +208,8 @@ def run_startup_preflight(
                     source_error,
                     success_detail=(
                         f"bind={source.bind_address}:{source.port}; "
-                        f"buffer-size={source.buffer_size}"
+                        f"buffer-size={source.buffer_size}; "
+                        f"timestamp-mode={source.timestamp_mode.value}"
                     ),
                 )
             )
@@ -404,6 +409,11 @@ def _rtp_jpeg_config_error(source: RtpJpegSourceConfig) -> str | None:
         return "port must be an integer in range 1..65535"
     if type(source.buffer_size) is not int or source.buffer_size < 1:
         return "buffer-size must be an integer >= 1"
+    if source.timestamp_mode not in (
+        RtpJpegTimestampMode.RECEIVE_TIME,
+        RtpJpegTimestampMode.SENSOR_RTP_PTS,
+    ):
+        return "timestamp-mode must be receive-time or sensor-rtp-pts"
     return None
 
 

@@ -24,6 +24,7 @@ from navmin.config.models import (
     PidControllerConfig,
     ProcessingScope,
     RtpJpegSourceConfig,
+    RtpJpegTimestampMode,
     RtspDecoderMode,
     RtspProtocol,
     RtspSourceConfig,
@@ -560,6 +561,55 @@ def test_stereo_right_enabled_rtp_uses_stereo_calibration_and_udp_checks(
         for check in report.checks
     )
     assert ("127.0.0.1", 18_901) in udp_calls
+
+
+def test_sensor_rtp_pts_mode_requires_jitterbuffer_dependency_only_when_enabled(
+    tmp_path,
+) -> None:
+    inputs = _inputs(18_899, 18_900)
+    legacy_element_calls: list[tuple[str, ...]] = []
+    legacy_report = _run(
+        tmp_path,
+        inputs,
+        StartupBackendSelection("real", "real", "pty", stereo_right="real"),
+        receiver_check=lambda elements: legacy_element_calls.append(elements) or None,
+    )
+    assert legacy_report.ok
+    assert len(legacy_element_calls) == 1
+    assert "rtpjitterbuffer" not in legacy_element_calls[0]
+
+    overview = inputs.config.vision.cameras.overview
+    assert isinstance(overview.source, RtpJpegSourceConfig)
+    sensor_overview = replace(
+        overview,
+        source=replace(
+            overview.source,
+            timestamp_mode=RtpJpegTimestampMode.SENSOR_RTP_PTS,
+        ),
+    )
+    cameras = replace(inputs.config.vision.cameras, overview=sensor_overview)
+    config = replace(
+        inputs.config,
+        vision=replace(inputs.config.vision, cameras=cameras),
+    )
+    sensor_element_calls: list[tuple[str, ...]] = []
+
+    sensor_report = _run(
+        tmp_path,
+        replace(inputs, config=config),
+        StartupBackendSelection("real", "real", "pty", stereo_right="real"),
+        receiver_check=lambda elements: sensor_element_calls.append(elements) or None,
+    )
+
+    assert sensor_report.ok
+    assert len(sensor_element_calls) == 1
+    assert "rtpjitterbuffer" in sensor_element_calls[0]
+    detail = next(
+        check.detail
+        for check in sensor_report.checks
+        if check.name == "Overview RTP/JPEG configuration"
+    )
+    assert "timestamp-mode=sensor-rtp-pts" in detail
 
 
 def test_stereo_right_enabled_rtsp_checks_rtsp_dependencies_without_udp(

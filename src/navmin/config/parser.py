@@ -29,6 +29,7 @@ from .models import (
     ProcessingScope,
     RecordingConfig,
     RtpJpegSourceConfig,
+    RtpJpegTimestampMode,
     RtspDecoderMode,
     RtspProtocol,
     RtspSourceConfig,
@@ -183,14 +184,21 @@ def _parse_camera_source(
             obj,
             path,
             required={"type", "bind-address", "port", "buffer-size"},
+            optional={"timestamp-mode"},
         )
         port = _int(obj["port"], f"{path}.port", minimum=1)
         if port > 65535:
             _validation(f"{path}.port", "must be <= 65535")
+        timestamp_mode = _enum_string(
+            obj.get("timestamp-mode", RtpJpegTimestampMode.RECEIVE_TIME.value),
+            f"{path}.timestamp-mode",
+            {item.value for item in RtpJpegTimestampMode},
+        )
         return RtpJpegSourceConfig(
             bind_address=_nonempty_string(obj["bind-address"], f"{path}.bind-address"),
             port=port,
             buffer_size=_int(obj["buffer-size"], f"{path}.buffer-size", minimum=1),
+            timestamp_mode=RtpJpegTimestampMode(timestamp_mode),
         )
 
     obj = _fields(
@@ -1009,12 +1017,15 @@ def _camera_source_to_mapping(
     source: RtpJpegSourceConfig | RtspSourceConfig,
 ) -> dict[str, Any]:
     if isinstance(source, RtpJpegSourceConfig):
-        return {
+        result: dict[str, Any] = {
             "type": "rtp-jpeg",
             "bind-address": source.bind_address,
             "port": source.port,
             "buffer-size": source.buffer_size,
         }
+        if source.timestamp_mode is not RtpJpegTimestampMode.RECEIVE_TIME:
+            result["timestamp-mode"] = source.timestamp_mode.value
+        return result
     if isinstance(source, RtspSourceConfig):
         return {
             "type": "rtsp",

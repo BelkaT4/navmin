@@ -13,6 +13,7 @@ from navmin.config import (
     ConfigJsonError,
     ConfigManager,
     ConfigValidationError,
+    RtpJpegTimestampMode,
     UnsupportedConfigSchemaError,
     changed_config_paths,
     config_apply_policy,
@@ -946,6 +947,61 @@ def test_config_manager_publishes_but_does_not_own_restart_reconnect_actions(
     assert not hasattr(manager, "requires_restart")
     assert not hasattr(manager, "restart")
     assert not hasattr(manager, "reconnect")
+
+
+def test_rtp_timestamp_mode_defaults_to_receive_time_for_existing_schema_v7() -> None:
+    config = parse_config(_valid_config())
+
+    assert (
+        config.vision.cameras.overview.source.timestamp_mode
+        is RtpJpegTimestampMode.RECEIVE_TIME
+    )
+    assert (
+        "timestamp-mode"
+        not in config_to_mapping(config)["vision"]["cameras"]["overview"]["source"]
+    )
+
+
+def test_rtp_sensor_timestamp_mode_round_trips_explicitly() -> None:
+    data = _valid_config()
+    data["vision"]["cameras"]["overview"]["source"]["timestamp-mode"] = (
+        "sensor-rtp-pts"
+    )
+
+    config = parse_config(data)
+    mapped = config_to_mapping(config)
+
+    assert (
+        config.vision.cameras.overview.source.timestamp_mode
+        is RtpJpegTimestampMode.SENSOR_RTP_PTS
+    )
+    assert (
+        mapped["vision"]["cameras"]["overview"]["source"]["timestamp-mode"]
+        == "sensor-rtp-pts"
+    )
+
+
+def test_rtp_timestamp_mode_change_requires_camera_pipeline_restart() -> None:
+    old = parse_config(_valid_config())
+    data = _valid_config()
+    data["vision"]["cameras"]["overview"]["source"]["timestamp-mode"] = (
+        "sensor-rtp-pts"
+    )
+    new = parse_config(data)
+    path = "vision.cameras.overview.source.timestamp-mode"
+
+    assert path in changed_config_paths(old, new)
+    assert config_apply_policy(path) is ConfigApplyPolicy.CAMERA_PIPELINE_RESTART
+
+
+def test_rtp_timestamp_mode_rejects_unknown_value() -> None:
+    data = _valid_config()
+    data["vision"]["cameras"]["overview"]["source"]["timestamp-mode"] = "guess"
+
+    with pytest.raises(ConfigValidationError) as exc_info:
+        parse_config(data)
+
+    assert exc_info.value.path == "vision.cameras.overview.source.timestamp-mode"
 
 
 def test_atomic_save_round_trips_in_temp_directory(tmp_path) -> None:

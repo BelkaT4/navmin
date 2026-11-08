@@ -457,6 +457,10 @@ class MainWindow(QMainWindow):
             on_apply_tracking_control_tuning=self._apply_tracking_control_tuning,
             tracking_visualization_config=tracking_visualization_config,
             on_tracking_visualization_changed=self._set_tracking_visualization,
+            use_camera_time_for_tracking=mediator.use_camera_time_for_tracking,
+            on_use_camera_time_for_tracking_changed=(
+                mediator.set_use_camera_time_for_tracking
+            ),
             vision_processor_selections=vision_processor_selections,
             on_apply_vision_processor_selection=apply_vision_processor_selection,
             available_cameras=self._available_cameras,

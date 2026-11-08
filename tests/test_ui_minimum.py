@@ -2561,6 +2561,28 @@ def test_operator_pid_panel_uses_numeric_spinboxes_with_non_negative_range(
     window.close()
 
 
+def test_operator_additional_camera_time_checkbox_is_opt_in_runtime_setting(
+    qt_application: QApplication,
+) -> None:
+    window, mediator, _turret, _bindings_value, _states = _window(qt_application)
+    operator = window.operator_window
+
+    assert not mediator.use_camera_time_for_tracking
+    assert not operator.use_camera_time_for_tracking_checkbox.isChecked()
+    assert "диагностики" in operator.camera_time_status_label.text()
+
+    operator.use_camera_time_for_tracking_checkbox.setChecked(True)
+    qt_application.processEvents()
+    assert mediator.use_camera_time_for_tracking
+    assert "включено" in operator.camera_time_status_label.text()
+
+    operator.use_camera_time_for_tracking_checkbox.setChecked(False)
+    qt_application.processEvents()
+    assert not mediator.use_camera_time_for_tracking
+    assert "диагностики" in operator.camera_time_status_label.text()
+    window.close()
+
+
 def test_operator_tracking_panel_queues_only_exposed_typed_runtime_fields(
     qt_application: QApplication,
 ) -> None:

@@ -78,6 +78,7 @@ class Aiming:
         frame: FramePacket,
         tracked: TrackedObject,
         target: TargetRef,
+        observation_timestamp_ns: int | None = None,
     ) -> TrackingError:
         center = self.tracked_center(tracked)
         error_x, error_y = self.angular_delta(
@@ -86,11 +87,18 @@ class Aiming:
             frame=frame,
             target=center,
         )
+        timestamp_ns = (
+            frame.receive_timestamp_ns
+            if observation_timestamp_ns is None
+            else observation_timestamp_ns
+        )
+        if type(timestamp_ns) is not int or timestamp_ns < 0:
+            raise ValueError("observation_timestamp_ns must be an integer >= 0")
         return TrackingError(
             target=target,
             error_x_deg=error_x,
             error_y_deg=error_y,
-            timestamp_ns=frame.receive_timestamp_ns,
+            timestamp_ns=timestamp_ns,
         )
 
     def angular_delta(

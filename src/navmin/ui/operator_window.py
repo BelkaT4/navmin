@@ -77,6 +77,8 @@ class OperatorWindow(QWidget):
         on_apply_tracking_control_tuning: Callable[[TrackingControlConfig], None],
         tracking_visualization_config: TrackingVisualizationConfig,
         on_tracking_visualization_changed: Callable[[TrackingVisualizationConfig], None],
+        use_camera_time_for_tracking: bool,
+        on_use_camera_time_for_tracking_changed: Callable[[bool], None],
         vision_processor_selections: Mapping[CameraRole, VisionProcessorSelection] | None = None,
         on_apply_vision_processor_selection: (
             Callable[[CameraRole, VisionProcessorSelection], None] | None
@@ -102,6 +104,9 @@ class OperatorWindow(QWidget):
         self._on_apply_tracking_control_tuning = on_apply_tracking_control_tuning
         self._tracking_visualization_config = tracking_visualization_config
         self._on_tracking_visualization_changed = on_tracking_visualization_changed
+        self._on_use_camera_time_for_tracking_changed = (
+            on_use_camera_time_for_tracking_changed
+        )
         self._vision_processor_selections = dict(vision_processor_selections or {})
         self._on_apply_vision_processor_selection = on_apply_vision_processor_selection
         self._available_cameras = set(available_cameras)
@@ -132,6 +137,25 @@ class OperatorWindow(QWidget):
         )
         self.camera_error_label = QLabel("")
         self.camera_error_label.setWordWrap(True)
+        self.use_camera_time_for_tracking_checkbox = QCheckBox(
+            "Использовать время камеры в управлении сопровождением"
+        )
+        self.use_camera_time_for_tracking_checkbox.setChecked(
+            use_camera_time_for_tracking
+        )
+        self.use_camera_time_for_tracking_checkbox.setToolTip(
+            "OFF: управление использует прежнее PC receive time. "
+            "ON: после прогрева ClockMapper управление использует временную шкалу "
+            "камеры, привязанную к receive time; абсолютная задержка камеры пока "
+            "не компенсируется."
+        )
+        self.use_camera_time_for_tracking_checkbox.stateChanged.connect(
+            self._apply_camera_time_for_tracking
+        )
+        self.camera_time_status_label = QLabel(
+            "Время камеры: используется только для диагностики"
+        )
+        self.camera_time_status_label.setWordWrap(True)
 
         self._build_pid_controls(pid_controller_config)
         self._build_feed_forward_controls(tracking_control_config)
@@ -570,6 +594,11 @@ class OperatorWindow(QWidget):
                 self.tracking_diagnostic_labels[f"{key}_y"], row, 2
             )
         layout.addWidget(diagnostics_group)
+        camera_time_group = QGroupBox("Временные метки камеры")
+        camera_time_layout = QVBoxLayout(camera_time_group)
+        camera_time_layout.addWidget(self.use_camera_time_for_tracking_checkbox)
+        camera_time_layout.addWidget(self.camera_time_status_label)
+        layout.addWidget(camera_time_group)
         layout.addWidget(self.fullscreen_button)
         layout.addWidget(self.exit_button)
         layout.addStretch(1)
@@ -790,6 +819,26 @@ class OperatorWindow(QWidget):
         status.setText(
             "Отправлено: "
             f"{_PROCESSOR_LABELS[selection.class_name]} / {selection.profile_name}"
+        )
+
+    def _apply_camera_time_for_tracking(self, _state: int = 0) -> None:
+        enabled = self.use_camera_time_for_tracking_checkbox.isChecked()
+        try:
+            self._on_use_camera_time_for_tracking_changed(enabled)
+        except (OSError, RuntimeError, TypeError, ValueError) as exc:
+            self.use_camera_time_for_tracking_checkbox.blockSignals(True)
+            try:
+                self.use_camera_time_for_tracking_checkbox.setChecked(not enabled)
+            finally:
+                self.use_camera_time_for_tracking_checkbox.blockSignals(False)
+            self.camera_time_status_label.setText(
+                f"Ошибка переключения временной шкалы: {exc}"
+            )
+            return
+        self.camera_time_status_label.setText(
+            "Время камеры: включено для управления после готовности ClockMapper"
+            if enabled
+            else "Время камеры: используется только для диагностики"
         )
 
     def _apply_show_right_camera(self, _state: int = 0) -> None:

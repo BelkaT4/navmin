@@ -10,6 +10,8 @@ from navmin.contracts import (
     CameraRay,
     CameraRole,
     FramePacket,
+    FrameSourceTimestamp,
+    FrameTimestampSource,
     TargetRef,
     TrackedObject,
 )
@@ -161,15 +163,38 @@ def test_tracking_error_contains_target_frame_timestamp_and_finite_angles() -> N
     tracked = TrackedObject(3, BBox(50, 40, 10, 8), 4.0, -2.0, 8)
     model = _RayModel()
     frame = _frame(timestamp_ns=987654321)
+    frame = FramePacket(
+        camera=frame.camera,
+        generation=frame.generation,
+        frame_id=frame.frame_id,
+        capture_id=frame.capture_id,
+        receive_timestamp_ns=frame.receive_timestamp_ns,
+        image=frame.image,
+        source_timestamp=FrameSourceTimestamp(
+            source=FrameTimestampSource.SENSOR_RTP_PTS,
+            timestamp_ns=123_456_789,
+        ),
+    )
 
-    error = Aiming(_config()).tracking_error(
+    aiming = Aiming(_config())
+    error = aiming.tracking_error(
         camera_model=model,
         frame=frame,
         tracked=tracked,
         target=target,
     )
+    mapped_error = aiming.tracking_error(
+        camera_model=model,
+        frame=frame,
+        tracked=tracked,
+        target=target,
+        observation_timestamp_ns=123_456_789,
+    )
 
     assert error.target == target
+    assert frame.source_timestamp is not None
+    assert frame.source_timestamp.timestamp_ns != frame.receive_timestamp_ns
     assert error.timestamp_ns == frame.receive_timestamp_ns
+    assert mapped_error.timestamp_ns == 123_456_789
     assert math.isfinite(error.error_x_deg)
     assert math.isfinite(error.error_y_deg)

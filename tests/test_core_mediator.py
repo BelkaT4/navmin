@@ -23,6 +23,8 @@ from navmin.contracts import (
     ClearTargetSelection,
     DistanceSource,
     FramePacket,
+    FrameSourceTimestamp,
+    FrameTimestampSource,
     MotorState,
     MoveRelativeCommand,
     PlatformMotionAnchor,
@@ -195,10 +197,25 @@ def _result(
     track_ids: tuple[int, ...] = (7,),
     timestamp_ns: int = 1000,
     velocity_x: float = 0.0,
+    source_timestamp_ns: int | None = None,
 ) -> VisionResult:
     image = np.zeros((81, 101, 3), dtype=np.uint8)
     image.flags.writeable = False
-    frame = FramePacket(camera, generation, frame_id, None, timestamp_ns, image)
+    frame = FramePacket(
+        camera,
+        generation,
+        frame_id,
+        None,
+        timestamp_ns,
+        image,
+        (
+            None
+            if source_timestamp_ns is None
+            else FrameSourceTimestamp(
+                FrameTimestampSource.SENSOR_RTP_PTS, source_timestamp_ns
+            )
+        ),
+    )
     tracked = tuple(
         TrackedObject(
             track_id,
@@ -416,6 +433,258 @@ def test_point_request_allocates_pending_and_acquired_accepts_target() -> None:
     )
 
 
+def test_camera_time_is_observed_while_tracking_control_stays_legacy_by_default() -> None:
+    mediator, turret, _controls_value = _mediator(
+        mode=TurretControlMode.TRACKING
+    )
+    assert not mediator.use_camera_time_for_tracking
+    assert mediator.accept_camera_session(_session(CameraRole.OVERVIEW, 1))
+
+    latest = None
+    receives = (
+        10_000_000_000,
+        10_401_000_000,
+        10_799_000_000,
+        11_202_000_000,
+    )
+    for frame_id, (source_ns, receive_ns) in enumerate(
+        zip((0, 400_000_000, 800_000_000, 1_200_000_000), receives, strict=True),
+        start=1,
+    ):
+        latest = _result(
+            CameraRole.OVERVIEW,
+            1,
+            frame_id=frame_id,
+            timestamp_ns=receive_ns,
+            source_timestamp_ns=source_ns,
+        )
+        assert mediator.accept_vision_result(latest)
+
+    assert latest is not None
+    observation = mediator.camera_clock_observation(CameraRole.OVERVIEW)
+    assert observation is not None
+    assert observation.receive_anchored_timestamp is not None
+
+    request = _request(mediator, latest)
+    assert mediator.accept_target_lifecycle_event(_acquired(request))
+    assert turret.tracking_controls[-1].observation_timestamp_ns == (
+        latest.frame.receive_timestamp_ns
+    )
+
+
+def test_camera_time_checkbox_mode_uses_mapped_time_after_mapper_is_ready() -> None:
+    mediator, turret, _controls_value = _mediator(
+        mode=TurretControlMode.TRACKING
+    )
+    assert mediator.accept_camera_session(_session(CameraRole.OVERVIEW, 1))
+
+    latest = None
+    for frame_id, source_ns, receive_ns in (
+        (1, 0, 10_000_000_000),
+        (2, 400_000_000, 10_401_000_000),
+        (3, 800_000_000, 10_799_000_000),
+        (4, 1_200_000_000, 11_202_000_000),
+    ):
+        latest = _result(
+            CameraRole.OVERVIEW,
+            1,
+            frame_id=frame_id,
+            timestamp_ns=receive_ns,
+            source_timestamp_ns=source_ns,
+        )
+        assert mediator.accept_vision_result(latest)
+
+    assert latest is not None
+    request = _request(mediator, latest)
+    assert mediator.accept_target_lifecycle_event(_acquired(request))
+    assert mediator.tracking_estimator.sample_count == 1
+
+    invalidations_before = turret.invalidations
+    mediator.set_use_camera_time_for_tracking(True)
+    assert mediator.use_camera_time_for_tracking
+    assert mediator.tracking_estimator.sample_count == 0
+    assert turret.invalidations == invalidations_before + 1
+
+    current = _result(
+        CameraRole.OVERVIEW,
+        1,
+        frame_id=5,
+        timestamp_ns=11_602_000_000,
+        source_timestamp_ns=1_600_000_000,
+    )
+    assert mediator.accept_vision_result(current)
+    observation = mediator.camera_clock_observation(CameraRole.OVERVIEW)
+    assert observation is not None
+    mapped = observation.receive_anchored_timestamp
+    assert mapped is not None
+    assert mapped.pc_timestamp_ns != current.frame.receive_timestamp_ns
+    assert turret.tracking_controls[-1].observation_timestamp_ns == (
+        mapped.pc_timestamp_ns
+    )
+
+    mediator.set_use_camera_time_for_tracking(False)
+    assert not mediator.use_camera_time_for_tracking
+    assert mediator.tracking_estimator.sample_count == 0
+
+    legacy = _result(
+        CameraRole.OVERVIEW,
+        1,
+        frame_id=6,
+        timestamp_ns=12_001_000_000,
+        source_timestamp_ns=2_000_000_000,
+    )
+    assert mediator.accept_vision_result(legacy)
+    assert turret.tracking_controls[-1].observation_timestamp_ns == (
+        legacy.frame.receive_timestamp_ns
+    )
+
+
+def test_enabled_camera_time_falls_back_to_receive_time_while_mapper_warms() -> None:
+    mediator, turret, _controls_value = _mediator(
+        mode=TurretControlMode.TRACKING
+    )
+    assert mediator.accept_camera_session(_session(CameraRole.OVERVIEW, 1))
+    initial = _result(
+        CameraRole.OVERVIEW,
+        1,
+        frame_id=1,
+        timestamp_ns=10_000_000_000,
+        source_timestamp_ns=0,
+    )
+    assert mediator.accept_vision_result(initial)
+    request = _request(mediator, initial)
+    assert mediator.accept_target_lifecycle_event(_acquired(request))
+
+    mediator.set_use_camera_time_for_tracking(True)
+    current = _result(
+        CameraRole.OVERVIEW,
+        1,
+        frame_id=2,
+        timestamp_ns=10_400_000_000,
+        source_timestamp_ns=400_000_000,
+    )
+    assert mediator.accept_vision_result(current)
+    observation = mediator.camera_clock_observation(CameraRole.OVERVIEW)
+    assert observation is not None
+    assert observation.receive_anchored_timestamp is None
+    assert turret.tracking_controls[-1].observation_timestamp_ns == (
+        current.frame.receive_timestamp_ns
+    )
+
+
+def test_camera_clock_observability_logs_session_state_and_snapshots(caplog) -> None:
+    mediator, _turret, _controls_value = _mediator(
+        mode=TurretControlMode.TRACKING
+    )
+    caplog.set_level(logging.DEBUG, logger="navmin.core.mediator")
+    assert mediator.accept_camera_session(_session(CameraRole.OVERVIEW, 1))
+
+    for frame_id, source_ns, receive_ns in (
+        (1, 0, 10_000_000_000),
+        (2, 400_000_000, 10_401_000_000),
+        (3, 800_000_000, 10_799_000_000),
+        (4, 1_200_000_000, 11_202_000_000),
+    ):
+        assert mediator.accept_vision_result(
+            _result(
+                CameraRole.OVERVIEW,
+                1,
+                frame_id=frame_id,
+                timestamp_ns=receive_ns,
+                source_timestamp_ns=source_ns,
+            )
+        )
+
+    messages = [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == "navmin.core.mediator"
+    ]
+    assert any(
+        message.startswith(
+            "camera-clock-session camera=overview generation=1 "
+            "source=sensor-rtp-pts"
+        )
+        for message in messages
+    )
+    state_messages = [
+        message for message in messages if message.startswith("camera-clock-state ")
+    ]
+    assert any("current=warming" in message for message in state_messages)
+    assert any("current=valid" in message for message in state_messages)
+    snapshots = [
+        message
+        for message in messages
+        if message.startswith("camera-clock-snapshot ")
+    ]
+    assert len(snapshots) >= 2
+    for field in (
+        "source_timestamp_ns=",
+        "receive_timestamp_ns=",
+        "mapped_timestamp_ns=",
+        "mapped_minus_receive_ns=",
+        "estimated_error_ns=",
+        "samples=",
+        "drift_ppm=",
+        "rms_ns=",
+    ):
+        assert field in snapshots[-1]
+
+
+def test_enabled_camera_time_logs_fallback_then_mapped_basis(caplog) -> None:
+    mediator, _turret, _controls_value = _mediator(
+        mode=TurretControlMode.TRACKING
+    )
+    assert mediator.accept_camera_session(_session(CameraRole.OVERVIEW, 1))
+    initial = _result(
+        CameraRole.OVERVIEW,
+        1,
+        frame_id=1,
+        timestamp_ns=10_000_000_000,
+        source_timestamp_ns=0,
+    )
+    assert mediator.accept_vision_result(initial)
+    request = _request(mediator, initial)
+    assert mediator.accept_target_lifecycle_event(_acquired(request))
+
+    caplog.set_level(logging.INFO, logger="navmin.core.mediator")
+    mediator.set_use_camera_time_for_tracking(True)
+    for frame_id, source_ns, receive_ns in (
+        (2, 400_000_000, 10_401_000_000),
+        (3, 800_000_000, 10_799_000_000),
+        (4, 1_200_000_000, 11_202_000_000),
+    ):
+        assert mediator.accept_vision_result(
+            _result(
+                CameraRole.OVERVIEW,
+                1,
+                frame_id=frame_id,
+                timestamp_ns=receive_ns,
+                source_timestamp_ns=source_ns,
+            )
+        )
+
+    messages = [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == "navmin.core.mediator"
+    ]
+    assert any(
+        message.startswith("tracking-time-fallback ")
+        and "reason=mapper-warming:insufficient_samples" in message
+        for message in messages
+    )
+    assert any(
+        message.startswith("tracking-time-basis ")
+        and "current=receive-anchored-source-clock" in message
+        for message in messages
+    )
+    assert any(
+        message.startswith("tracking-time-fallback-cleared ")
+        for message in messages
+    )
+
+
 def test_core_uses_platform_rate_at_observation_timestamp_not_latest_anchor() -> None:
     mediator, turret, _controls_value = _mediator(
         mode=TurretControlMode.TRACKING
@@ -483,6 +752,16 @@ def test_tracking_debug_log_exposes_estimator_prediction_and_ff_fields(caplog) -
     message = messages[-1]
     for field in (
         "frame_id=",
+        "camera_time_enabled=",
+        "time_basis=",
+        "fallback_reason=",
+        "source_timestamp_type=",
+        "source_timestamp_ns=",
+        "receive_timestamp_ns=",
+        "mapped_timestamp_ns=",
+        "mapped_minus_receive_ns=",
+        "mapped_estimated_error_ns=",
+        "mapper_state=",
         "relative_rate_x_deg_s=",
         "platform_rate_x_deg_s=",
         "target_rate_x_deg_s=",

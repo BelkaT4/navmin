@@ -33,11 +33,17 @@ class RtspDecoderMode(Enum):
     SOFTWARE = "software"
 
 
+class RtpJpegTimestampMode(Enum):
+    RECEIVE_TIME = "receive-time"
+    SENSOR_RTP_PTS = "sensor-rtp-pts"
+
+
 @dataclass(frozen=True)
 class RtpJpegSourceConfig:
     bind_address: str
     port: int
     buffer_size: int
+    timestamp_mode: RtpJpegTimestampMode = RtpJpegTimestampMode.RECEIVE_TIME
 
 
 @dataclass(frozen=True)
@@ -397,6 +403,7 @@ __all__ = [
     "ProcessingScope",
     "RecordingConfig",
     "RtpJpegSourceConfig",
+    "RtpJpegTimestampMode",
     "RtspDecoderMode",
     "RtspProtocol",
     "RtspSourceConfig",

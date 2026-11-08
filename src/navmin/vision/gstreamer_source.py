@@ -14,10 +14,12 @@ import numpy as np
 from navmin.concurrency import LatestValue
 from navmin.config.models import (
     RtpJpegSourceConfig,
+    RtpJpegTimestampMode,
     RtspDecoderMode,
     RtspProtocol,
     RtspSourceConfig,
 )
+from navmin.contracts import FrameSourceTimestamp, FrameTimestampSource
 
 from .pipeline import DecodedFrame
 
@@ -33,6 +35,7 @@ RTP_JPEG_GSTREAMER_ELEMENTS = (
     "videoconvert",
     "appsink",
 )
+RTP_JPEG_SENSOR_TIMESTAMP_GSTREAMER_ELEMENTS = ("rtpjitterbuffer",)
 RTSP_H264_GSTREAMER_ELEMENTS = (
     "rtspsrc",
     "rtph264depay",
@@ -56,6 +59,10 @@ class UnsupportedCameraTransportError(CameraSourceError):
 
 class GStreamerUnavailableError(CameraSourceError):
     """PyGObject/GStreamer runtime is unavailable or incomplete."""
+
+
+class CameraTimestampDiscontinuityError(CameraSourceError):
+    """Configured source timestamp stream is missing or not strictly increasing."""
 
 
 def _import_gstreamer_modules() -> tuple[object, object]:
@@ -107,7 +114,11 @@ class _SourceBackend(Protocol):
 
 
 BackendFactory = Callable[
-    [str, Callable[[np.ndarray], None], Callable[[BaseException], None]],
+    [
+        str,
+        Callable[[np.ndarray, int | None], None],
+        Callable[[BaseException], None],
+    ],
     _SourceBackend,
 ]
 
@@ -156,6 +167,11 @@ def _appsink_description(buffer_size: int) -> str:
     )
 
 
+def _transport_timestamp_ns(gst: object, buffer: object) -> int | None:
+    pts = int(buffer.pts)
+    return None if pts == int(gst.CLOCK_TIME_NONE) else pts
+
+
 def _is_h264_video_stream_caps(caps: object) -> bool:
     """Return whether pre-transport rtspsrc caps identify H.264 video.
 
@@ -186,9 +202,15 @@ def _is_h264_video_stream_caps(caps: object) -> bool:
 
 def build_rtp_jpeg_pipeline_description(config: RtpJpegSourceConfig) -> str:
     """Build the production RTP/JPEG receiver pipeline."""
+    timestamp_stage = (
+        "! rtpjitterbuffer latency=0 mode=0 "
+        if config.timestamp_mode is RtpJpegTimestampMode.SENSOR_RTP_PTS
+        else ""
+    )
     return (
         f"udpsrc address={_gst_quote(config.bind_address)} port={config.port} "
         f"caps={_gst_quote(RTP_JPEG_CAPS)} "
+        f"{timestamp_stage}"
         "! rtpjpegdepay "
         "! jpegdec "
         "! videoconvert "
@@ -232,6 +254,8 @@ class _GStreamerDecodedFrameSource:
         *,
         source_description: str,
         supports_reconnect: bool,
+        require_strict_transport_timestamp: bool = False,
+        frame_timestamp_source: FrameTimestampSource = FrameTimestampSource.RECEIVE_TIME,
         error_sanitizer: Callable[[BaseException], BaseException] | None = None,
         timestamp_clock_ns: Callable[[], int] = monotonic_ns,
         backend_factory: BackendFactory | None = None,
@@ -241,6 +265,9 @@ class _GStreamerDecodedFrameSource:
         self._timestamp_clock_ns = timestamp_clock_ns
         self._backend_factory = backend_factory or _default_backend_factory
         self._supports_reconnect = supports_reconnect
+        self._require_strict_transport_timestamp = require_strict_transport_timestamp
+        self._frame_timestamp_source = frame_timestamp_source
+        self._last_transport_timestamp_ns: int | None = None
         self._error_sanitizer = error_sanitizer or (lambda error: error)
         self._latest: LatestValue[DecodedFrame] = LatestValue()
         self._last_read_revision = 0
@@ -273,11 +300,16 @@ class _GStreamerDecodedFrameSource:
             session_id = self._next_session_id
             self._next_session_id += 1
             self._failure = None
+            self._last_transport_timestamp_ns = None
             self._last_read_revision = self._latest.snapshot().revision
             try:
                 backend = self._backend_factory(
                     self.pipeline_description,
-                    lambda frame: self._publish_frame(session_id, frame),
+                    lambda frame, transport_timestamp_ns: self._publish_frame(
+                        session_id,
+                        frame,
+                        transport_timestamp_ns,
+                    ),
                     lambda error: self._record_failure(session_id, error),
                 )
             except CameraSourceError as exc:
@@ -310,6 +342,7 @@ class _GStreamerDecodedFrameSource:
             self._started = False
             self._backend = None
             self._active_session_id = None
+            self._last_transport_timestamp_ns = None
         if backend is not None:
             backend.stop()
         if was_started:
@@ -323,7 +356,12 @@ class _GStreamerDecodedFrameSource:
         self._last_read_revision = snapshot.revision
         return snapshot.value
 
-    def _publish_frame(self, session_id: int, frame: np.ndarray) -> None:
+    def _publish_frame(
+        self,
+        session_id: int,
+        frame: np.ndarray,
+        transport_timestamp_ns: int | None,
+    ) -> None:
         if not isinstance(frame, np.ndarray):
             self._record_failure(
                 session_id, CameraSourceError("decoded frame must be numpy.ndarray")
@@ -340,15 +378,54 @@ class _GStreamerDecodedFrameSource:
             return
         owned = np.array(frame, copy=True, order="C")
         with self._state_lock:
-            if session_id != self._active_session_id:
+            if session_id != self._active_session_id or self._failure is not None:
+                return
+            if self._require_strict_transport_timestamp:
+                timestamp_error = self._transport_timestamp_error_locked(
+                    transport_timestamp_ns
+                )
+                if timestamp_error is not None:
+                    if self._failure is None:
+                        self._failure = timestamp_error
+                    return
+            receive_timestamp_ns = self._timestamp_clock_ns()
+            source_timestamp_ns = (
+                transport_timestamp_ns
+                if self._frame_timestamp_source is FrameTimestampSource.SENSOR_RTP_PTS
+                else receive_timestamp_ns
+            )
+            if source_timestamp_ns is None:
+                # Strict sensor mode rejects missing PTS above; keep this guard local
+                # so the normalized frame contract never publishes an absent timestamp.
                 return
             self._latest.publish(
                 DecodedFrame(
                     image=owned,
                     capture_id=None,
-                    receive_timestamp_ns=self._timestamp_clock_ns(),
+                    receive_timestamp_ns=receive_timestamp_ns,
+                    transport_timestamp_ns=transport_timestamp_ns,
+                    source_timestamp=FrameSourceTimestamp(
+                        source=self._frame_timestamp_source,
+                        timestamp_ns=source_timestamp_ns,
+                    ),
                 )
             )
+
+    def _transport_timestamp_error_locked(
+        self, transport_timestamp_ns: int | None
+    ) -> CameraTimestampDiscontinuityError | None:
+        if transport_timestamp_ns is None:
+            return CameraTimestampDiscontinuityError(
+                "timestamp-capable RTP/JPEG source produced a frame without PTS"
+            )
+        previous = self._last_transport_timestamp_ns
+        if previous is not None and transport_timestamp_ns <= previous:
+            return CameraTimestampDiscontinuityError(
+                "timestamp-capable RTP/JPEG source PTS is not strictly increasing: "
+                f"previous={previous} current={transport_timestamp_ns}"
+            )
+        self._last_transport_timestamp_ns = transport_timestamp_ns
+        return None
 
     def _record_failure(self, session_id: int, error: BaseException) -> None:
         safe_error = self._sanitize_error(error)
@@ -380,10 +457,22 @@ class GStreamerRtpJpegSource(_GStreamerDecodedFrameSource):
         timestamp_clock_ns: Callable[[], int] = monotonic_ns,
         backend_factory: BackendFactory | None = None,
     ) -> None:
+        sensor_timestamp_mode = (
+            config.timestamp_mode is RtpJpegTimestampMode.SENSOR_RTP_PTS
+        )
         super().__init__(
             build_rtp_jpeg_pipeline_description(config),
-            source_description=f"bind={config.bind_address} port={config.port}",
-            supports_reconnect=False,
+            source_description=(
+                f"bind={config.bind_address} port={config.port} "
+                f"timestamp_mode={config.timestamp_mode.value}"
+            ),
+            supports_reconnect=sensor_timestamp_mode,
+            require_strict_transport_timestamp=sensor_timestamp_mode,
+            frame_timestamp_source=(
+                FrameTimestampSource.SENSOR_RTP_PTS
+                if sensor_timestamp_mode
+                else FrameTimestampSource.RECEIVE_TIME
+            ),
             timestamp_clock_ns=timestamp_clock_ns,
             backend_factory=backend_factory,
         )
@@ -419,7 +508,7 @@ class _PyGObjectGstBackend:
     def __init__(
         self,
         pipeline_description: str,
-        on_frame: Callable[[np.ndarray], None],
+        on_frame: Callable[[np.ndarray, int | None], None],
         on_failure: Callable[[BaseException], None],
     ) -> None:
         GLib, Gst = _load_gstreamer_modules()
@@ -488,14 +577,14 @@ class _PyGObjectGstBackend:
     def _on_new_sample(self, sink):
         Gst = self._Gst
         try:
-            frame = self._copy_sample_frame(sink)
+            frame, transport_timestamp_ns = self._copy_sample_frame(sink)
         except CameraSourceError as exc:
             self._on_failure(exc)
             return Gst.FlowReturn.ERROR
-        self._on_frame(frame)
+        self._on_frame(frame, transport_timestamp_ns)
         return Gst.FlowReturn.OK
 
-    def _copy_sample_frame(self, sink) -> np.ndarray:
+    def _copy_sample_frame(self, sink) -> tuple[np.ndarray, int | None]:
         Gst = self._Gst
         try:
             sample = sink.emit("pull-sample")
@@ -514,6 +603,7 @@ class _PyGObjectGstBackend:
             buffer = sample.get_buffer()
             if buffer is None:
                 raise CameraSourceError("decoded GStreamer sample has no buffer")
+            transport_timestamp_ns = _transport_timestamp_ns(Gst, buffer)
             success, map_info = buffer.map(Gst.MapFlags.READ)
             if not success:
                 raise CameraSourceError("cannot map decoded GStreamer buffer")
@@ -526,7 +616,7 @@ class _PyGObjectGstBackend:
                         f"{raw.size} bytes for {width}x{height}"
                     )
                 # Gst owns map_info.data. The independent copy must happen before unmap.
-                return raw.reshape((height, width, 3)).copy()
+                return raw.reshape((height, width, 3)).copy(), transport_timestamp_ns
             finally:
                 buffer.unmap(map_info)
         except CameraSourceError:
@@ -543,7 +633,7 @@ class _PyGObjectGstBackend:
 
 def _default_backend_factory(
     pipeline_description: str,
-    on_frame: Callable[[np.ndarray], None],
+    on_frame: Callable[[np.ndarray, int | None], None],
     on_failure: Callable[[BaseException], None],
 ) -> _SourceBackend:
     return _PyGObjectGstBackend(pipeline_description, on_frame, on_failure)
@@ -552,8 +642,10 @@ def _default_backend_factory(
 __all__ = [
     "RTP_JPEG_CAPS",
     "RTP_JPEG_GSTREAMER_ELEMENTS",
+    "RTP_JPEG_SENSOR_TIMESTAMP_GSTREAMER_ELEMENTS",
     "RTSP_H264_GSTREAMER_ELEMENTS",
     "CameraSourceError",
+    "CameraTimestampDiscontinuityError",
     "GStreamerRtpJpegSource",
     "GStreamerRtspSource",
     "GStreamerUnavailableError",
