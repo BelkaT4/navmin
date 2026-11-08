@@ -508,27 +508,103 @@ class CalibrationPlanStep:
     axis: AxisName
     command_deg: float
     reversal: bool
-    conditioning: bool = False
+    precondition_deg: float
+    return_deg: float
+
+
+@dataclass(frozen=True, slots=True)
+class CalibrationClickGuide:
+    """Pixel band where a landmark is expected to remain visible after a move."""
+
+    axis: AxisName
+    command_deg: float
+    primary_min_px: int
+    primary_max_px: int
+    frame_width: int
+    frame_height: int
+
+    @property
+    def fraction(self) -> float:
+        extent = self.frame_width if self.axis == "x" else self.frame_height
+        return (self.primary_max_px - self.primary_min_px + 1) / extent
+
+    def describe(self) -> str:
+        coordinate = "X" if self.axis == "x" else "Y"
+        return (
+            f"{coordinate}={self.primary_min_px}…{self.primary_max_px} px "
+            f"({self.fraction * 100.0:.0f}% кадра по этой оси)"
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class CalibrationPlanAssessment:
+    """Camera-geometry validation performed before any calibration motion."""
+
+    guides: dict[tuple[AxisName, float], CalibrationClickGuide | None]
+    maximum_measurable_deg: dict[AxisName, float]
+    issues: tuple[str, ...]
+
+    @property
+    def valid(self) -> bool:
+        return not self.issues
+
+    def guide_for(
+        self, axis: AxisName, command_deg: float
+    ) -> CalibrationClickGuide | None:
+        return self.guides.get((axis, float(command_deg)))
 
 
 def build_calibration_sequence(
     x_angles: tuple[float, float, float],
     y_angles: tuple[float, float, float],
 ) -> tuple[CalibrationPlanStep, ...]:
+    """Build bounded calibration measurements around an approximate origin.
+
+    Every measured move is preceded by a small same-direction conditioning move
+    and followed by an automatic return that approximately restores the starting
+    position.  This keeps the clean-response/reversal semantics while avoiding
+    the large cumulative drift of the original sequential relative-move plan.
+    """
+
     steps: list[CalibrationPlanStep] = []
+
+    def clean(axis: AxisName, command_deg: float, conditioning_deg: float) -> None:
+        steps.append(
+            CalibrationPlanStep(
+                axis=axis,
+                command_deg=command_deg,
+                reversal=False,
+                precondition_deg=conditioning_deg,
+                return_deg=-(conditioning_deg + command_deg),
+            )
+        )
+
+    def reversal(axis: AxisName, command_deg: float, conditioning_deg: float) -> None:
+        steps.append(
+            CalibrationPlanStep(
+                axis=axis,
+                command_deg=command_deg,
+                reversal=True,
+                precondition_deg=conditioning_deg,
+                return_deg=-(conditioning_deg + command_deg),
+            )
+        )
+
     for axis, angles in (("x", x_angles), ("y", y_angles)):
         a1, a2, a3 = angles
-        steps.append(CalibrationPlanStep(axis, a3, reversal=False, conditioning=True))
-        steps.extend(CalibrationPlanStep(axis, angle, False) for angle in (a1, a2, a3))
-        steps.append(CalibrationPlanStep(axis, -a2, True))
-        steps.extend(CalibrationPlanStep(axis, -angle, False) for angle in (a1, a2, a3))
-        steps.append(CalibrationPlanStep(axis, a2, True))
-        steps.extend(CalibrationPlanStep(axis, angle, False) for angle in (a1, a2, a3))
-        steps.append(CalibrationPlanStep(axis, -a3, True))
-        steps.extend(CalibrationPlanStep(axis, -angle, False) for angle in (a1, a2, a3))
-        steps.append(CalibrationPlanStep(axis, a3, True))
+        for angle in (a1, a2, a3):
+            clean(axis, +angle, +a1)
+        reversal(axis, -a2, +a1)
+        for angle in (a1, a2, a3):
+            clean(axis, -angle, -a1)
+        reversal(axis, +a2, -a1)
+        for angle in (a1, a2, a3):
+            clean(axis, +angle, +a1)
+        reversal(axis, -a3, +a1)
+        for angle in (a1, a2, a3):
+            clean(axis, -angle, -a1)
+        reversal(axis, +a3, -a1)
     return tuple(steps)
-
 
 class CalibrationMovePort(Protocol):
     def __call__(
@@ -550,7 +626,9 @@ class WizardSettings:
 
 class WizardPhase:
     IDLE = "idle"
+    CONDITIONING = "conditioning"
     MOVING = "moving"
+    RETURNING = "returning"
     WAIT_FIRST_CLICK = "wait-first-click"
     WAIT_SECOND_CLICK = "wait-second-click"
     REVIEW_REPEAT = "review-repeat"
@@ -600,6 +678,19 @@ class MotionCalibrationWizard:
         self._submit_move = submit_move
         self._clock_ns = clock_ns
         self.steps = build_calibration_sequence(settings.x_angles, settings.y_angles)
+        for step in self.steps:
+            mechanics_axis = mechanics.x if step.axis == "x" else mechanics.y
+            limit = mechanics_axis.max_relative_move_deg
+            for label, value in (
+                ("conditioning", step.precondition_deg),
+                ("measurement", step.command_deg),
+                ("return", step.return_deg),
+            ):
+                if abs(value) > limit:
+                    raise MotionCalibrationError(
+                        f"{step.axis.upper()} {label} move {value:+g}° exceeds "
+                        f"mechanical relative limit {limit:g}°"
+                    )
         self.step_index = 0
         self.phase = WizardPhase.IDLE
         self.settle_deadline_ns: int | None = None
@@ -609,6 +700,7 @@ class MotionCalibrationWizard:
         self.warnings: list[str] = []
         self._generation: int | None = None
         self._repeat_resolution_key: tuple[AxisName, DirectionName, float] | None = None
+        self._review_after_return = False
 
     @property
     def current_step(self) -> CalibrationPlanStep | None:
@@ -620,23 +712,69 @@ class MotionCalibrationWizard:
         if self.phase != WizardPhase.IDLE:
             raise MotionCalibrationError("wizard already started")
         self._generation = generation
-        self._dispatch_current(generation)
+        LOGGER.info(
+            "Motion calibration start camera=%s generation=%d x_angles=%s y_angles=%s "
+            "speed_deg_s=%g acceleration_deg_s2=%g settle_margin_ms=%d",
+            self.settings.camera.value,
+            generation,
+            self.settings.x_angles,
+            self.settings.y_angles,
+            self.settings.motion_profile.max_speed_deg_s,
+            self.settings.motion_profile.acceleration_deg_s2,
+            self.settings.motion_profile.settle_margin_ms,
+        )
+        self._dispatch_precondition_current(generation)
 
     def tick(self) -> None:
-        if self.phase != WizardPhase.MOVING or self.settle_deadline_ns is None:
+        if (
+            self.phase
+            not in (WizardPhase.CONDITIONING, WizardPhase.MOVING, WizardPhase.RETURNING)
+            or self.settle_deadline_ns is None
+        ):
             return
         if self._clock_ns() < self.settle_deadline_ns:
             return
         step = self.current_step
         if step is None:
-            self.phase = WizardPhase.COMPLETE
-        elif step.conditioning:
-            self.step_index += 1
+            self._complete()
+            return
+        phase = self.phase
+        self.settle_deadline_ns = None
+        if phase == WizardPhase.CONDITIONING:
+            LOGGER.info(
+                "Motion calibration conditioning settled camera=%s step=%d axis=%s "
+                "command_deg=%+g",
+                self.settings.camera.value,
+                self.step_index + 1,
+                step.axis,
+                step.precondition_deg,
+            )
             self.phase = WizardPhase.WAIT_FIRST_CLICK
-            self.settle_deadline_ns = None
-        else:
+            return
+        if phase == WizardPhase.MOVING:
+            LOGGER.info(
+                "Motion calibration measurement move settled camera=%s step=%d axis=%s "
+                "command_deg=%+g; waiting for second click",
+                self.settings.camera.value,
+                self.step_index + 1,
+                step.axis,
+                step.command_deg,
+            )
             self.phase = WizardPhase.WAIT_SECOND_CLICK
-            self.settle_deadline_ns = None
+            return
+
+        LOGGER.info(
+            "Motion calibration return settled camera=%s step=%d axis=%s command_deg=%+g",
+            self.settings.camera.value,
+            self.step_index + 1,
+            step.axis,
+            step.return_deg,
+        )
+        if self._review_after_return:
+            self._review_after_return = False
+            self.phase = WizardPhase.REVIEW_REPEAT
+            return
+        self._advance_to_next_step()
 
     def handle_click(
         self,
@@ -652,6 +790,18 @@ class MotionCalibrationWizard:
             return False
         if self.phase == WizardPhase.WAIT_FIRST_CLICK:
             coordinate = _axis_coordinate(camera_model, step.axis, x_px, y_px)
+            LOGGER.info(
+                "Motion calibration first click camera=%s step=%d axis=%s command_deg=%+g "
+                "frame_id=%d x_px=%.2f y_px=%.2f angular_coordinate_deg=%.6f",
+                frame.camera.value,
+                self.step_index + 1,
+                step.axis,
+                step.command_deg,
+                frame.frame_id,
+                x_px,
+                y_px,
+                coordinate,
+            )
             if not landmark_remains_visible(
                 camera_model=camera_model,
                 frame=frame,
@@ -660,13 +810,40 @@ class MotionCalibrationWizard:
                 axis=step.axis,
                 command_deg=step.command_deg,
             ):
+                LOGGER.warning(
+                    "Motion calibration first click rejected visibility camera=%s step=%d "
+                    "axis=%s command_deg=%+g frame_id=%d x_px=%.2f y_px=%.2f",
+                    frame.camera.value,
+                    self.step_index + 1,
+                    step.axis,
+                    step.command_deg,
+                    frame.frame_id,
+                    x_px,
+                    y_px,
+                )
                 raise MotionCalibrationError(
                     "selected landmark is too close to the image edge for this move"
                 )
             first = _FirstClick(frame, float(x_px), float(y_px), coordinate)
             command = _axis_command(step.axis, step.command_deg)
             if not self._submit_move(frame.camera, frame.generation, command):
+                LOGGER.error(
+                    "Motion calibration MOVE_RELATIVE rejected camera=%s step=%d axis=%s "
+                    "command_deg=%+g",
+                    frame.camera.value,
+                    self.step_index + 1,
+                    step.axis,
+                    step.command_deg,
+                )
                 raise MotionCalibrationError("calibration MOVE_RELATIVE was rejected")
+            LOGGER.info(
+                "Motion calibration MOVE_RELATIVE accepted camera=%s step=%d axis=%s "
+                "command_deg=%+g",
+                frame.camera.value,
+                self.step_index + 1,
+                step.axis,
+                step.command_deg,
+            )
             self.first_click = first
             self.phase = WizardPhase.MOVING
             self.settle_deadline_ns = self._clock_ns() + minimum_move_time_ns(
@@ -679,12 +856,51 @@ class MotionCalibrationWizard:
         if first is None:
             raise MotionCalibrationError("missing first click")
         if frame.generation != first.frame.generation:
+            LOGGER.warning(
+                "Motion calibration second click rejected generation camera=%s step=%d "
+                "expected_generation=%d actual_generation=%d",
+                frame.camera.value,
+                self.step_index + 1,
+                first.frame.generation,
+                frame.generation,
+            )
             raise MotionCalibrationError("camera generation changed during measurement")
         if frame.frame_id <= first.frame.frame_id:
+            LOGGER.warning(
+                "Motion calibration second click rejected frame order camera=%s step=%d "
+                "before_frame_id=%d after_frame_id=%d",
+                frame.camera.value,
+                self.step_index + 1,
+                first.frame.frame_id,
+                frame.frame_id,
+            )
             raise MotionCalibrationError("second frame must be newer than first frame")
         coordinate = _axis_coordinate(camera_model, step.axis, x_px, y_px)
         measured = first.angular_coordinate_deg - coordinate
+        LOGGER.info(
+            "Motion calibration second click camera=%s step=%d axis=%s command_deg=%+g "
+            "frame_id=%d x_px=%.2f y_px=%.2f angular_coordinate_deg=%.6f "
+            "measured_deg=%+.6f",
+            frame.camera.value,
+            self.step_index + 1,
+            step.axis,
+            step.command_deg,
+            frame.frame_id,
+            x_px,
+            y_px,
+            coordinate,
+            measured,
+        )
         if not math.isfinite(measured) or measured * step.command_deg <= 0.0:
+            LOGGER.warning(
+                "Motion calibration second click rejected direction camera=%s step=%d "
+                "axis=%s command_deg=%+g measured_deg=%+.6f",
+                frame.camera.value,
+                self.step_index + 1,
+                step.axis,
+                step.command_deg,
+                measured,
+            )
             raise MotionCalibrationError(
                 "measured movement has the wrong direction; repeat the measurement"
             )
@@ -710,7 +926,25 @@ class MotionCalibrationWizard:
             motion_profile=self.settings.motion_profile,
         )
         self.observations.append(observation)
+        LOGGER.info(
+            "Motion calibration observation accepted camera=%s step=%d axis=%s "
+            "command_deg=%+g measured_deg=%+.6f before_frame_id=%d after_frame_id=%d "
+            "before_px=(%.2f,%.2f) after_px=(%.2f,%.2f) reversal=%s",
+            frame.camera.value,
+            self.step_index + 1,
+            step.axis,
+            step.command_deg,
+            measured,
+            first.frame.frame_id,
+            frame.frame_id,
+            first.x_px,
+            first.y_px,
+            x_px,
+            y_px,
+            step.reversal,
+        )
         self.first_click = None
+        review_after_return = False
         if not step.reversal:
             if self._repeat_resolution_key is not None:
                 if self._repeat_group_has_agreeing_pair(observation):
@@ -719,13 +953,12 @@ class MotionCalibrationWizard:
                     )
                     self._repeat_resolution_key = None
                 else:
-                    self.phase = WizardPhase.REVIEW_REPEAT
-                    return True
+                    review_after_return = True
             elif self._repeat_disagrees(observation):
                 self._repeat_resolution_key = self._observation_key(observation)
-                self.phase = WizardPhase.REVIEW_REPEAT
-                return True
-        self._advance_after_measurement()
+                review_after_return = True
+        self._review_after_return = review_after_return
+        self._dispatch_return_current()
         return True
 
     def accept_disagreement(self) -> None:
@@ -735,20 +968,31 @@ class MotionCalibrationWizard:
             f"operator accepted repeat disagreement at step {self.step_index + 1}"
         )
         self._repeat_resolution_key = None
-        self._advance_after_measurement()
+        self._advance_to_next_step()
 
     def repeat_problematic_step(self) -> None:
         if self.phase != WizardPhase.REVIEW_REPEAT:
             raise MotionCalibrationError("there is no problematic step to repeat")
         self.first_click = None
-        self.phase = WizardPhase.WAIT_FIRST_CLICK
+        generation = self._generation
+        if generation is None:
+            raise MotionCalibrationError("calibration generation is unavailable")
+        self._dispatch_precondition_current(generation)
 
     def cancel(self, reason: str) -> None:
         if self.phase in (WizardPhase.COMPLETE, WizardPhase.CANCELLED):
             return
+        LOGGER.warning(
+            "Motion calibration cancelled camera=%s step=%d phase=%s reason=%s",
+            self.settings.camera.value,
+            self.step_index + 1,
+            self.phase,
+            reason,
+        )
         self.first_click = None
         self.settle_deadline_ns = None
         self._repeat_resolution_key = None
+        self._review_after_return = False
         self.phase = WizardPhase.CANCELLED
         self.cancel_reason = reason
 
@@ -780,42 +1024,88 @@ class MotionCalibrationWizard:
             warnings=tuple(warnings),
         )
 
-    def _dispatch_current(self, generation: int) -> None:
+    def _dispatch_precondition_current(self, generation: int) -> None:
         step = self.current_step
         if step is None:
-            self.phase = WizardPhase.COMPLETE
+            self._complete()
             return
-        if not step.conditioning:
-            self.phase = WizardPhase.WAIT_FIRST_CLICK
-            return
+        LOGGER.info(
+            "Motion calibration conditioning command camera=%s step=%d axis=%s command_deg=%+g",
+            self.settings.camera.value,
+            self.step_index + 1,
+            step.axis,
+            step.precondition_deg,
+        )
         if not self._submit_move(
             self.settings.camera,
             generation,
-            _axis_command(step.axis, step.command_deg),
+            _axis_command(step.axis, step.precondition_deg),
         ):
+            LOGGER.error(
+                "Motion calibration conditioning MOVE_RELATIVE rejected camera=%s step=%d "
+                "axis=%s command_deg=%+g",
+                self.settings.camera.value,
+                self.step_index + 1,
+                step.axis,
+                step.precondition_deg,
+            )
+            self.cancel("conditioning MOVE_RELATIVE was rejected")
             raise MotionCalibrationError("conditioning MOVE_RELATIVE was rejected")
-        self.phase = WizardPhase.MOVING
+        self.phase = WizardPhase.CONDITIONING
         self.settle_deadline_ns = self._clock_ns() + minimum_move_time_ns(
-            abs(step.command_deg), self.settings.motion_profile
+            abs(step.precondition_deg), self.settings.motion_profile
         )
 
-    def _advance_after_measurement(self) -> None:
+    def _dispatch_return_current(self) -> None:
+        step = self.current_step
+        generation = self._generation
+        if step is None or generation is None:
+            raise MotionCalibrationError("calibration return state is unavailable")
+        LOGGER.info(
+            "Motion calibration return command camera=%s step=%d axis=%s command_deg=%+g",
+            self.settings.camera.value,
+            self.step_index + 1,
+            step.axis,
+            step.return_deg,
+        )
+        if not self._submit_move(
+            self.settings.camera,
+            generation,
+            _axis_command(step.axis, step.return_deg),
+        ):
+            LOGGER.error(
+                "Motion calibration return MOVE_RELATIVE rejected camera=%s step=%d "
+                "axis=%s command_deg=%+g",
+                self.settings.camera.value,
+                self.step_index + 1,
+                step.axis,
+                step.return_deg,
+            )
+            self.cancel("return MOVE_RELATIVE was rejected")
+            raise MotionCalibrationError("return MOVE_RELATIVE was rejected")
+        self.phase = WizardPhase.RETURNING
+        self.settle_deadline_ns = self._clock_ns() + minimum_move_time_ns(
+            abs(step.return_deg), self.settings.motion_profile
+        )
+
+    def _advance_to_next_step(self) -> None:
         self.step_index += 1
         if self.step_index >= len(self.steps):
-            self.phase = WizardPhase.COMPLETE
+            self._complete()
             return
-        step = self.current_step
-        if step is not None and step.conditioning:
-            generation = self._generation
-            if generation is None:
-                raise MotionCalibrationError("calibration generation is unavailable")
-            try:
-                self._dispatch_current(generation)
-            except MotionCalibrationError:
-                self.cancel("automatic conditioning MOVE_RELATIVE was rejected")
-                raise
-            return
-        self.phase = WizardPhase.WAIT_FIRST_CLICK
+        generation = self._generation
+        if generation is None:
+            raise MotionCalibrationError("calibration generation is unavailable")
+        self._dispatch_precondition_current(generation)
+
+    def _complete(self) -> None:
+        self.phase = WizardPhase.COMPLETE
+        self.settle_deadline_ns = None
+        LOGGER.info(
+            "Motion calibration complete camera=%s observations=%d",
+            self.settings.camera.value,
+            len(self.observations),
+        )
 
     @staticmethod
     def _observation_key(
@@ -863,11 +1153,35 @@ class MotionCalibrationWizard:
 
     def _validate_frame(self, frame: FramePacket, x_px: float, y_px: float) -> None:
         if frame.camera is not self.settings.camera:
+            LOGGER.warning(
+                "Motion calibration click rejected wrong camera expected=%s actual=%s",
+                self.settings.camera.value,
+                frame.camera.value,
+            )
             raise MotionCalibrationError("click came from the wrong camera")
-        if self._clock_ns() - frame.receive_timestamp_ns > self.stale_timeout_ns:
+        age_ns = self._clock_ns() - frame.receive_timestamp_ns
+        if age_ns > self.stale_timeout_ns:
+            LOGGER.warning(
+                "Motion calibration click rejected stale camera=%s frame_id=%d age_ms=%.3f "
+                "limit_ms=%.3f",
+                frame.camera.value,
+                frame.frame_id,
+                age_ns / 1_000_000.0,
+                self.stale_timeout_ns / 1_000_000.0,
+            )
             raise MotionCalibrationError("camera frame is stale")
         height, width = frame.image.shape[:2]
         if not (0.0 <= x_px < width and 0.0 <= y_px < height):
+            LOGGER.warning(
+                "Motion calibration click rejected outside frame camera=%s frame_id=%d "
+                "x_px=%.2f y_px=%.2f frame=%dx%d",
+                frame.camera.value,
+                frame.frame_id,
+                x_px,
+                y_px,
+                width,
+                height,
+            )
             raise MotionCalibrationError("click is outside the frame")
 
 
@@ -953,6 +1267,206 @@ def landmark_remains_visible(
         and math.isfinite(projected_y)
         and margin_x <= projected_x < width - margin_x
         and margin_y <= projected_y < height - margin_y
+    )
+
+
+def calibration_click_guide(
+    *,
+    camera_model: CameraModel,
+    frame: FramePacket,
+    axis: AxisName,
+    command_deg: float,
+) -> CalibrationClickGuide | None:
+    """Return a practical first-click guide band for one calibration move.
+
+    The final click is always validated with ``landmark_remains_visible``.  The
+    guide samples several positions on the orthogonal axis and intentionally
+    returns the union of primary-axis pixels that are valid for at least one
+    sampled row/column.  It is therefore an operator guide, not a replacement
+    for the exact per-click check.
+    """
+
+    height, width = frame.image.shape[:2]
+    if width <= 0 or height <= 0:
+        return None
+    primary_extent = width if axis == "x" else height
+    orth_extent = height if axis == "x" else width
+    if primary_extent <= 0 or orth_extent <= 0:
+        return None
+
+    margin = max(8, math.ceil(orth_extent * 0.05))
+    low = min(max(margin, 0), orth_extent - 1)
+    high = max(low, min(orth_extent - margin - 1, orth_extent - 1))
+    if high == low:
+        orth_positions = (float(low),)
+    else:
+        span = high - low
+        orth_positions = tuple(float(round(low + span * index / 4)) for index in range(5))
+
+    valid_primary: list[int] = []
+    for primary in range(primary_extent):
+        for orth in orth_positions:
+            x_px = float(primary) if axis == "x" else orth
+            y_px = orth if axis == "x" else float(primary)
+            if landmark_remains_visible(
+                camera_model=camera_model,
+                frame=frame,
+                x_px=x_px,
+                y_px=y_px,
+                axis=axis,
+                command_deg=command_deg,
+            ):
+                valid_primary.append(primary)
+                break
+    if not valid_primary:
+        return None
+    return CalibrationClickGuide(
+        axis=axis,
+        command_deg=float(command_deg),
+        primary_min_px=min(valid_primary),
+        primary_max_px=max(valid_primary),
+        frame_width=width,
+        frame_height=height,
+    )
+
+
+def _maximum_measurable_abs_angle(
+    *,
+    camera_model: CameraModel,
+    frame: FramePacket,
+    axis: AxisName,
+    mechanical_limit_deg: float,
+) -> float:
+    """Approximate the largest symmetric measurable move for operator guidance."""
+
+    lower = 0.0
+    upper = float(mechanical_limit_deg)
+    for _ in range(12):
+        midpoint = (lower + upper) / 2.0
+        if _has_measurable_landmark(
+            camera_model=camera_model,
+            frame=frame,
+            axis=axis,
+            command_deg=midpoint,
+        ) and _has_measurable_landmark(
+            camera_model=camera_model,
+            frame=frame,
+            axis=axis,
+            command_deg=-midpoint,
+        ):
+            lower = midpoint
+        else:
+            upper = midpoint
+    return lower
+
+
+def _has_measurable_landmark(
+    *,
+    camera_model: CameraModel,
+    frame: FramePacket,
+    axis: AxisName,
+    command_deg: float,
+) -> bool:
+    """Cheap sampled predicate used only for the approximate maximum hint."""
+
+    height, width = frame.image.shape[:2]
+    primary_extent = width if axis == "x" else height
+    orth_extent = height if axis == "x" else width
+    if primary_extent <= 0 or orth_extent <= 0:
+        return False
+
+    def positions(extent: int, count: int) -> tuple[float, ...]:
+        if extent <= 1:
+            return (0.0,)
+        samples = min(count, extent)
+        return tuple(
+            float(round((extent - 1) * index / (samples - 1)))
+            for index in range(samples)
+        )
+
+    primary_positions = positions(primary_extent, 257)
+    orth_positions = positions(orth_extent, 9)
+    for primary in primary_positions:
+        for orth in orth_positions:
+            x_px = primary if axis == "x" else orth
+            y_px = orth if axis == "x" else primary
+            if landmark_remains_visible(
+                camera_model=camera_model,
+                frame=frame,
+                x_px=x_px,
+                y_px=y_px,
+                axis=axis,
+                command_deg=command_deg,
+            ):
+                return True
+    return False
+
+
+def assess_calibration_plan(
+    *,
+    camera_model: CameraModel,
+    frame: FramePacket,
+    x_angles: tuple[float, float, float],
+    y_angles: tuple[float, float, float],
+    mechanics: AxesConfig,
+) -> CalibrationPlanAssessment:
+    """Validate camera measurability and bounded automatic calibration motion."""
+
+    x_values = validate_angles(
+        x_angles, mechanical_limit_deg=mechanics.x.max_relative_move_deg
+    )
+    y_values = validate_angles(
+        y_angles, mechanical_limit_deg=mechanics.y.max_relative_move_deg
+    )
+    guides: dict[tuple[AxisName, float], CalibrationClickGuide | None] = {}
+    issues: list[str] = []
+    for axis, values in (("x", x_values), ("y", y_values)):
+        for amplitude in values:
+            for command in (float(amplitude), -float(amplitude)):
+                guide = calibration_click_guide(
+                    camera_model=camera_model,
+                    frame=frame,
+                    axis=axis,
+                    command_deg=command,
+                )
+                guides[(axis, command)] = guide
+                if guide is None:
+                    issues.append(
+                        f"ось {axis.upper()}, команда {command:+g}°: "
+                        "нет точки, которая останется в рабочей области кадра"
+                    )
+    sequence = build_calibration_sequence(x_values, y_values)
+    for step in sequence:
+        mechanics_axis = mechanics.x if step.axis == "x" else mechanics.y
+        for label, value in (
+            ("служебное предварительное движение", step.precondition_deg),
+            ("измерительное движение", step.command_deg),
+            ("возврат", step.return_deg),
+        ):
+            if abs(value) > mechanics_axis.max_relative_move_deg:
+                issues.append(
+                    f"ось {step.axis.upper()}, {label} {value:+g}°: "
+                    f"превышает допустимое относительное движение "
+                    f"{mechanics_axis.max_relative_move_deg:g}°"
+                )
+    maximum_measurable = {
+        "x": _maximum_measurable_abs_angle(
+            camera_model=camera_model,
+            frame=frame,
+            axis="x",
+            mechanical_limit_deg=mechanics.x.max_relative_move_deg,
+        ),
+        "y": _maximum_measurable_abs_angle(
+            camera_model=camera_model,
+            frame=frame,
+            axis="y",
+            mechanical_limit_deg=mechanics.y.max_relative_move_deg,
+        ),
+    }
+    return CalibrationPlanAssessment(
+        guides=guides,
+        maximum_measurable_deg=maximum_measurable,
+        issues=tuple(issues),
     )
 
 
@@ -1409,6 +1923,8 @@ def _optional_nonnegative(value: Any, path: str) -> float | None:
 
 __all__ = [
     "AxisMotionCalibration",
+    "CalibrationClickGuide",
+    "CalibrationPlanAssessment",
     "CalibrationPlanStep",
     "CameraMotionCalibration",
     "CurvePoint",
@@ -1423,8 +1939,10 @@ __all__ = [
     "ReversalLoss",
     "WizardPhase",
     "WizardSettings",
+    "assess_calibration_plan",
     "build_axis_calibration",
     "build_calibration_sequence",
+    "calibration_click_guide",
     "calibration_identity",
     "landmark_remains_visible",
     "minimum_move_time_ns",

@@ -1,4 +1,4 @@
-"""Strict parser and serializer for NavMin config schema v6."""
+"""Strict parser and serializer for NavMin config schema v7."""
 
 from __future__ import annotations
 
@@ -29,6 +29,7 @@ from .models import (
     ProcessingScope,
     RecordingConfig,
     RtpJpegSourceConfig,
+    RtpJpegTimestampMode,
     RtspDecoderMode,
     RtspProtocol,
     RtspSourceConfig,
@@ -44,7 +45,8 @@ from .models import (
     VisionDistanceConfig,
 )
 
-SUPPORTED_SCHEMA_VERSION = 6
+SUPPORTED_SCHEMA_VERSION = 7
+PREVIOUS_MIGRATABLE_SCHEMA_VERSION = 6
 MIGRATABLE_SCHEMA_VERSION = 5
 LEGACY_MIGRATABLE_SCHEMA_VERSION = 4
 SUPPORTED_BAUDRATES = frozenset({9600, 19200, 38400, 57600, 115200})
@@ -182,14 +184,21 @@ def _parse_camera_source(
             obj,
             path,
             required={"type", "bind-address", "port", "buffer-size"},
+            optional={"timestamp-mode"},
         )
         port = _int(obj["port"], f"{path}.port", minimum=1)
         if port > 65535:
             _validation(f"{path}.port", "must be <= 65535")
+        timestamp_mode = _enum_string(
+            obj.get("timestamp-mode", RtpJpegTimestampMode.RECEIVE_TIME.value),
+            f"{path}.timestamp-mode",
+            {item.value for item in RtpJpegTimestampMode},
+        )
         return RtpJpegSourceConfig(
             bind_address=_nonempty_string(obj["bind-address"], f"{path}.bind-address"),
             port=port,
             buffer_size=_int(obj["buffer-size"], f"{path}.buffer-size", minimum=1),
+            timestamp_mode=RtpJpegTimestampMode(timestamp_mode),
         )
 
     obj = _fields(
@@ -235,16 +244,37 @@ def _parse_camera_source(
     )
 
 
-def _parse_camera(value: Any, path: str) -> CameraConfig:
-    obj = _fields(
-        value,
-        path,
-        required={
-            "enabled",
-            "source",
-            "processing-enabled",
-            "vision-processor-class",
-        },
+def _legacy_processor_profile(class_name: str) -> str:
+    return "day" if class_name == "Vt11VisionProcessor" else "default"
+
+
+def _parse_camera(
+    value: Any,
+    path: str,
+    *,
+    allow_missing_profile: bool = False,
+) -> CameraConfig:
+    required = {
+        "enabled",
+        "source",
+        "processing-enabled",
+        "vision-processor-class",
+    }
+    optional: set[str] = set()
+    if allow_missing_profile:
+        optional.add("vision-processor-profile")
+    else:
+        required.add("vision-processor-profile")
+    obj = _fields(value, path, required=required, optional=optional)
+    class_name = _nonempty_string(
+        obj["vision-processor-class"], f"{path}.vision-processor-class"
+    )
+    profile = (
+        _legacy_processor_profile(class_name)
+        if "vision-processor-profile" not in obj
+        else _nonempty_string(
+            obj["vision-processor-profile"], f"{path}.vision-processor-profile"
+        )
     )
     return CameraConfig(
         enabled=_bool(obj["enabled"], f"{path}.enabled"),
@@ -252,23 +282,39 @@ def _parse_camera(value: Any, path: str) -> CameraConfig:
         processing_enabled=_bool(
             obj["processing-enabled"], f"{path}.processing-enabled"
         ),
-        vision_processor_class=_nonempty_string(
-            obj["vision-processor-class"], f"{path}.vision-processor-class"
-        ),
+        vision_processor_class=class_name,
+        vision_processor_profile=profile,
     )
 
 
-def _parse_overview_camera(value: Any, path: str) -> OverviewCameraConfig:
-    obj = _fields(
-        value,
-        path,
-        required={
-            "enabled",
-            "source",
-            "processing-enabled",
-            "vision-processor-class",
-            "calibration-file",
-        },
+def _parse_overview_camera(
+    value: Any,
+    path: str,
+    *,
+    allow_missing_profile: bool = False,
+) -> OverviewCameraConfig:
+    required = {
+        "enabled",
+        "source",
+        "processing-enabled",
+        "vision-processor-class",
+        "calibration-file",
+    }
+    optional: set[str] = set()
+    if allow_missing_profile:
+        optional.add("vision-processor-profile")
+    else:
+        required.add("vision-processor-profile")
+    obj = _fields(value, path, required=required, optional=optional)
+    class_name = _nonempty_string(
+        obj["vision-processor-class"], f"{path}.vision-processor-class"
+    )
+    profile = (
+        _legacy_processor_profile(class_name)
+        if "vision-processor-profile" not in obj
+        else _nonempty_string(
+            obj["vision-processor-profile"], f"{path}.vision-processor-profile"
+        )
     )
     return OverviewCameraConfig(
         enabled=_bool(obj["enabled"], f"{path}.enabled"),
@@ -276,16 +322,15 @@ def _parse_overview_camera(value: Any, path: str) -> OverviewCameraConfig:
         processing_enabled=_bool(
             obj["processing-enabled"], f"{path}.processing-enabled"
         ),
-        vision_processor_class=_nonempty_string(
-            obj["vision-processor-class"], f"{path}.vision-processor-class"
-        ),
+        vision_processor_class=class_name,
+        vision_processor_profile=profile,
         calibration_file=_nonempty_string(
             obj["calibration-file"], f"{path}.calibration-file"
         ),
     )
 
 
-def _parse_vision(value: Any) -> VisionConfig:
+def _parse_vision(value: Any, *, allow_missing_profile: bool = False) -> VisionConfig:
     path = "vision"
     obj = _fields(
         value,
@@ -311,13 +356,19 @@ def _parse_vision(value: Any) -> VisionConfig:
     )
     cameras = CamerasConfig(
         overview=_parse_overview_camera(
-            cameras_obj["overview"], f"{path}.cameras.overview"
+            cameras_obj["overview"],
+            f"{path}.cameras.overview",
+            allow_missing_profile=allow_missing_profile,
         ),
         stereo_left=_parse_camera(
-            cameras_obj["stereo-left"], f"{path}.cameras.stereo-left"
+            cameras_obj["stereo-left"],
+            f"{path}.cameras.stereo-left",
+            allow_missing_profile=allow_missing_profile,
         ),
         stereo_right=_parse_camera(
-            cameras_obj["stereo-right"], f"{path}.cameras.stereo-right"
+            cameras_obj["stereo-right"],
+            f"{path}.cameras.stereo-right",
+            allow_missing_profile=allow_missing_profile,
         ),
     )
 
@@ -404,17 +455,31 @@ def _parse_aim_point(value: Any, path: str) -> AimPointConfig:
     return AimPointConfig(x_px=coordinate("x-px"), y_px=coordinate("y-px"))
 
 
-def _parse_aiming(value: Any) -> AimingConfig:
+def _parse_aiming(value: Any, *, allow_missing_right: bool = False) -> AimingConfig:
     path = "aiming"
     obj = _fields(
         value,
         path,
         required={"target-lost-timeout-ms", "aim-points"},
     )
+    required = {"overview", "stereo-left"}
+    optional: set[str] = set()
+    if allow_missing_right:
+        optional.add("stereo-right")
+    else:
+        required.add("stereo-right")
     aim_points_obj = _fields(
         obj["aim-points"],
         f"{path}.aim-points",
-        required={"overview", "stereo-left"},
+        required=required,
+        optional=optional,
+    )
+    right = (
+        AimPointConfig(x_px=None, y_px=None)
+        if "stereo-right" not in aim_points_obj
+        else _parse_aim_point(
+            aim_points_obj["stereo-right"], f"{path}.aim-points.stereo-right"
+        )
     )
     return AimingConfig(
         target_lost_timeout_ms=_int(
@@ -429,6 +494,7 @@ def _parse_aiming(value: Any) -> AimingConfig:
             stereo_left=_parse_aim_point(
                 aim_points_obj["stereo-left"], f"{path}.aim-points.stereo-left"
             ),
+            stereo_right=right,
         ),
     )
 
@@ -799,13 +865,15 @@ def _parse_recording(value: Any) -> RecordingConfig:
         directory=_nonempty_string(obj["directory"], f"{path}.directory")
     )
 
-def _parse_ui(value: Any) -> UiConfig:
+def _parse_ui(value: Any, *, allow_missing_show_right: bool = False) -> UiConfig:
     path = "ui"
-    obj = _fields(
-        value,
-        path,
-        required={"default-camera", "show-fps", "show-stereo-right-diagnostics"},
-    )
+    required = {"default-camera", "show-fps", "show-stereo-right-diagnostics"}
+    optional: set[str] = set()
+    if allow_missing_show_right:
+        optional.add("show-stereo-right-camera")
+    else:
+        required.add("show-stereo-right-camera")
+    obj = _fields(value, path, required=required, optional=optional)
     default_camera = _enum_string(
         obj["default-camera"],
         f"{path}.default-camera",
@@ -821,14 +889,23 @@ def _parse_ui(value: Any) -> UiConfig:
             obj["show-stereo-right-diagnostics"],
             f"{path}.show-stereo-right-diagnostics",
         ),
+        show_stereo_right_camera=(
+            True
+            if "show-stereo-right-camera" not in obj
+            else _bool(
+                obj["show-stereo-right-camera"],
+                f"{path}.show-stereo-right-camera",
+            )
+        ),
     )
 
 
 def parse_config(data: Any) -> AppConfig:
-    """Validate JSON and return the current schema-v6 snapshot.
+    """Validate JSON and return the current schema-v7 snapshot.
 
-    Schema v4 is migrated in memory by adding tracking-visualization and
-    recording defaults. Schema v5 is migrated by adding the recording default.
+    Schemas v4-v6 are migrated in memory. Schema v7 adds explicit Vision
+    processor profiles, a Right-camera aim point, and the Right-camera display
+    preference while keeping existing files loadable.
     """
     raw = _object(data, "")
     if "schema-version" not in raw:
@@ -874,7 +951,7 @@ def parse_config(data: Any) -> AppConfig:
             obj["tracking-visualization"]
         )
         recording = RecordingConfig(directory="recordings")
-    elif schema_version == SUPPORTED_SCHEMA_VERSION:
+    elif schema_version in {PREVIOUS_MIGRATABLE_SCHEMA_VERSION, SUPPORTED_SCHEMA_VERSION}:
         obj = _fields(
             raw,
             "",
@@ -897,16 +974,23 @@ def parse_config(data: Any) -> AppConfig:
     else:
         raise UnsupportedConfigSchemaError(schema_version)
 
+    legacy_v7_fields = schema_version < SUPPORTED_SCHEMA_VERSION
     return AppConfig(
         schema_version=SUPPORTED_SCHEMA_VERSION,
-        vision=_parse_vision(obj["vision"]),
-        aiming=_parse_aiming(obj["aiming"]),
+        vision=_parse_vision(
+            obj["vision"], allow_missing_profile=legacy_v7_fields
+        ),
+        aiming=_parse_aiming(
+            obj["aiming"], allow_missing_right=legacy_v7_fields
+        ),
         tracking_control=_parse_tracking_control(obj["tracking-control"]),
         tracking_visualization=tracking_visualization,
         recording=recording,
         imu=_parse_imu(obj["imu"]),
         turret=_parse_turret(obj["turret"]),
-        ui=_parse_ui(obj["ui"]),
+        ui=_parse_ui(
+            obj["ui"], allow_missing_show_right=legacy_v7_fields
+        ),
     )
 
 
@@ -933,12 +1017,15 @@ def _camera_source_to_mapping(
     source: RtpJpegSourceConfig | RtspSourceConfig,
 ) -> dict[str, Any]:
     if isinstance(source, RtpJpegSourceConfig):
-        return {
+        result: dict[str, Any] = {
             "type": "rtp-jpeg",
             "bind-address": source.bind_address,
             "port": source.port,
             "buffer-size": source.buffer_size,
         }
+        if source.timestamp_mode is not RtpJpegTimestampMode.RECEIVE_TIME:
+            result["timestamp-mode"] = source.timestamp_mode.value
+        return result
     if isinstance(source, RtspSourceConfig):
         return {
             "type": "rtsp",
@@ -958,6 +1045,7 @@ def _camera_to_mapping(config: CameraConfig) -> dict[str, Any]:
         "source": _camera_source_to_mapping(config.source),
         "processing-enabled": config.processing_enabled,
         "vision-processor-class": config.vision_processor_class,
+        "vision-processor-profile": config.vision_processor_profile,
     }
 
 
@@ -972,7 +1060,7 @@ def _aim_point_to_mapping(config: AimPointConfig) -> dict[str, Any]:
 
 
 def config_to_mapping(config: AppConfig) -> dict[str, Any]:
-    """Convert a typed schema-v6 snapshot to its persisted JSON structure."""
+    """Convert a typed schema-v7 snapshot to its persisted JSON structure."""
     return {
         "schema-version": SUPPORTED_SCHEMA_VERSION,
         "vision": {
@@ -1008,6 +1096,9 @@ def config_to_mapping(config: AppConfig) -> dict[str, Any]:
                 "overview": _aim_point_to_mapping(config.aiming.aim_points.overview),
                 "stereo-left": _aim_point_to_mapping(
                     config.aiming.aim_points.stereo_left
+                ),
+                "stereo-right": _aim_point_to_mapping(
+                    config.aiming.aim_points.stereo_right
                 ),
             },
         },
@@ -1112,6 +1203,7 @@ def config_to_mapping(config: AppConfig) -> dict[str, Any]:
             ),
             "show-fps": config.ui.show_fps,
             "show-stereo-right-diagnostics": config.ui.show_stereo_right_diagnostics,
+            "show-stereo-right-camera": config.ui.show_stereo_right_camera,
         },
     }
 

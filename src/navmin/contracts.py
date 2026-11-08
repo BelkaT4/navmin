@@ -16,6 +16,17 @@ class CameraRole(Enum):
     STEREO_RIGHT = "stereo_right"
 
 
+class FrameTimestampSource(Enum):
+    RECEIVE_TIME = "receive-time"
+    SENSOR_RTP_PTS = "sensor-rtp-pts"
+
+
+@dataclass(frozen=True, slots=True)
+class FrameSourceTimestamp:
+    source: FrameTimestampSource
+    timestamp_ns: int
+
+
 @dataclass(frozen=True)
 class FramePacket:
     camera: CameraRole
@@ -24,6 +35,7 @@ class FramePacket:
     capture_id: int | None
     receive_timestamp_ns: int
     image: np.ndarray
+    source_timestamp: FrameSourceTimestamp | None = None
 
 
 @dataclass(frozen=True)

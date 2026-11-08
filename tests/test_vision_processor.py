@@ -21,7 +21,13 @@ from navmin.contracts import (
     TargetTrackingEndReason,
     VisionTargetControlCommand,
 )
-from navmin.vision import VisionProcessorOutput, create_vision_processor
+from navmin.vision import (
+    VT11_VISION_PROCESSOR_CLASS,
+    VisionProcessorOutput,
+    VisionProcessorSelection,
+    create_selected_vision_processor,
+    create_vision_processor,
+)
 from navmin.vision.processors.legacy_14.detector import Legacy14Detector
 from navmin.vision.processors.legacy_14.processor import Legacy14VisionProcessor
 from navmin.vision.processors.vt11 import Vt11VisionProcessor
@@ -101,6 +107,28 @@ def test_factory_rejects_invalid_vt11_internal_profile(
 def test_factory_rejects_unknown_processor_class() -> None:
     with pytest.raises(ValueError, match="unsupported VisionProcessor class"):
         create_vision_processor("UnknownVisionProcessor")
+
+
+def test_runtime_processor_selection_uses_explicit_vt11_profile() -> None:
+    selection = VisionProcessorSelection(VT11_VISION_PROCESSOR_CLASS, "thermal")
+
+    processor = create_selected_vision_processor(selection)
+
+    assert isinstance(processor, Vt11VisionProcessor)
+    assert processor.settings_snapshot.profile == "thermal"
+
+
+def test_runtime_processor_selection_uses_default_legacy_profile() -> None:
+    selection = VisionProcessorSelection("Legacy14VisionProcessor", "default")
+
+    processor = create_selected_vision_processor(selection)
+
+    assert isinstance(processor, Legacy14VisionProcessor)
+
+
+def test_runtime_processor_selection_rejects_unknown_legacy_profile() -> None:
+    with pytest.raises(ValueError, match="profile must be one of"):
+        VisionProcessorSelection("Legacy14VisionProcessor", "day")
 
 
 def test_target_control_and_lifecycle_contracts_are_immutable_unions() -> None:

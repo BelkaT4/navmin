@@ -33,11 +33,17 @@ class RtspDecoderMode(Enum):
     SOFTWARE = "software"
 
 
+class RtpJpegTimestampMode(Enum):
+    RECEIVE_TIME = "receive-time"
+    SENSOR_RTP_PTS = "sensor-rtp-pts"
+
+
 @dataclass(frozen=True)
 class RtpJpegSourceConfig:
     bind_address: str
     port: int
     buffer_size: int
+    timestamp_mode: RtpJpegTimestampMode = RtpJpegTimestampMode.RECEIVE_TIME
 
 
 @dataclass(frozen=True)
@@ -59,6 +65,7 @@ class CameraConfig:
     source: CameraSourceConfig
     processing_enabled: bool
     vision_processor_class: str
+    vision_processor_profile: str
 
 
 @dataclass(frozen=True)
@@ -108,6 +115,7 @@ class AimPointConfig:
 class AimPointsConfig:
     overview: AimPointConfig
     stereo_left: AimPointConfig
+    stereo_right: AimPointConfig
 
 
 @dataclass(frozen=True)
@@ -232,6 +240,7 @@ class UiConfig:
     default_camera: CameraRole
     show_fps: bool
     show_stereo_right_diagnostics: bool
+    show_stereo_right_camera: bool
 
 
 @dataclass(frozen=True)
@@ -270,6 +279,7 @@ _DYNAMIC_EXACT_PATHS = frozenset(
         "tracking-visualization.show-control-prediction",
         "ui.show-fps",
         "ui.show-stereo-right-diagnostics",
+        "ui.show-stereo-right-camera",
     }
 )
 
@@ -312,7 +322,7 @@ def config_apply_policy(path: str) -> ConfigApplyPolicy | None:
     if len(parts) >= 4 and parts[:2] == ["vision", "cameras"]:
         if parts[3] == "processing-enabled" and len(parts) == 4:
             return ConfigApplyPolicy.DYNAMIC
-        if parts[3] == "vision-processor-class" and len(parts) == 4:
+        if parts[3] in {"vision-processor-class", "vision-processor-profile"} and len(parts) == 4:
             return ConfigApplyPolicy.CAMERA_PIPELINE_RESTART
         if parts[3] == "source" and len(parts) == 5:
             return ConfigApplyPolicy.CAMERA_PIPELINE_RESTART
@@ -393,6 +403,7 @@ __all__ = [
     "ProcessingScope",
     "RecordingConfig",
     "RtpJpegSourceConfig",
+    "RtpJpegTimestampMode",
     "RtspDecoderMode",
     "RtspProtocol",
     "RtspSourceConfig",

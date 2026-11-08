@@ -102,6 +102,7 @@ from navmin.preflight import (
 )
 from navmin.session_artifacts import SessionArtifacts, SourceInputPaths
 from navmin.vision.gstreamer_source import GStreamerRtpJpegSource
+from navmin.vision.processor import VisionProcessorSelection
 
 WIDTH = 64
 HEIGHT = 48
@@ -140,6 +141,7 @@ def _camera(port: int) -> CameraConfig:
         ),
         processing_enabled=False,
         vision_processor_class="Legacy14VisionProcessor",
+        vision_processor_profile="default",
     )
 
 
@@ -150,6 +152,7 @@ def _overview_camera(port: int) -> OverviewCameraConfig:
         source=camera.source,
         processing_enabled=camera.processing_enabled,
         vision_processor_class=camera.vision_processor_class,
+        vision_processor_profile=camera.vision_processor_profile,
         calibration_file="calibration/overview.json",
     )
 
@@ -173,7 +176,7 @@ def _config(*, emulate_stm32: bool = False) -> AppConfig:
         max_relative_move_deg=45.0,
     )
     return AppConfig(
-        schema_version=6,
+        schema_version=7,
         vision=VisionConfig(
             processing_scope=ProcessingScope.MAIN_AND_PREVIEW,
             cameras=CamerasConfig(
@@ -197,7 +200,7 @@ def _config(*, emulate_stm32: bool = False) -> AppConfig:
         ),
         aiming=AimingConfig(
             target_lost_timeout_ms=500,
-            aim_points=AimPointsConfig(overview=center, stereo_left=center),
+            aim_points=AimPointsConfig(overview=center, stereo_left=center, stereo_right=center),
         ),
         tracking_control=_default_tracking_control_config(),
         tracking_visualization=TrackingVisualizationConfig(
@@ -242,6 +245,7 @@ def _config(*, emulate_stm32: bool = False) -> AppConfig:
             default_camera=CameraRole.OVERVIEW,
             show_fps=False,
             show_stereo_right_diagnostics=False,
+            show_stereo_right_camera=True,
         ),
     )
 
@@ -843,11 +847,18 @@ def test_run_loaded_application_uses_shared_runtime_ui_surface_and_shutdown() ->
         imu_states=object(),
         imu_controls=object(),
         camera_stale_timeout_ms=321,
+        aiming_config=inputs.config.aiming,
+        apply_aiming_tuning=lambda _config: None,
         pid_controller_config=pid_config,
         apply_pid_tuning=apply_pid_tuning,
+        stm32_config=inputs.config.turret.stm32,
+        apply_motion_limits_tuning=lambda _config: None,
         tracking_control_config=inputs.config.tracking_control,
         apply_tracking_control_tuning=lambda _config: None,
         tracking_visualization_config=inputs.config.tracking_visualization,
+        ui_config=inputs.config.ui,
+        vision_processor_selections={},
+        apply_vision_processor_selection=lambda _camera, _selection: None,
     )
 
     class FakeRuntime:
@@ -878,7 +889,9 @@ def test_run_loaded_application_uses_shared_runtime_ui_surface_and_shutdown() ->
         assert kwargs["imu_states"] is ui_dependencies.imu_states
         assert kwargs["imu_controls"] is ui_dependencies.imu_controls
         assert kwargs["camera_stale_timeout_ms"] == 321
+        assert kwargs["aiming_config"] is inputs.config.aiming
         assert kwargs["pid_controller_config"] is pid_config
+        assert kwargs["stm32_config"] is inputs.config.turret.stm32
         assert kwargs["apply_pid_tuning"] is apply_pid_tuning
         assert kwargs["tracking_control_config"] is inputs.config.tracking_control
         assert (
@@ -889,6 +902,8 @@ def test_run_loaded_application_uses_shared_runtime_ui_surface_and_shutdown() ->
             kwargs["tracking_visualization_config"]
             is inputs.config.tracking_visualization
         )
+        assert kwargs["ui_config"] is inputs.config.ui
+        assert kwargs["persist_ui_config"] is None
         assert kwargs["persist_tracking_visualization"] is None
         assert kwargs["show_diagnostic_clock"] is False
         assert kwargs["argv"] == ("--qt-test",)
@@ -930,11 +945,18 @@ def test_run_loaded_application_persists_tracking_visualization_via_config_manag
         imu_states=None,
         imu_controls=None,
         camera_stale_timeout_ms=500,
+        aiming_config=config.aiming,
+        apply_aiming_tuning=lambda _config: None,
         pid_controller_config=config.turret.controller,
         apply_pid_tuning=lambda _config: None,
+        stm32_config=config.turret.stm32,
+        apply_motion_limits_tuning=lambda _config: None,
         tracking_control_config=config.tracking_control,
         apply_tracking_control_tuning=lambda _config: None,
         tracking_visualization_config=config.tracking_visualization,
+        ui_config=config.ui,
+        vision_processor_selections={},
+        apply_vision_processor_selection=lambda _camera, _selection: None,
     )
 
     class FakeRuntime:
@@ -964,6 +986,203 @@ def test_run_loaded_application_persists_tracking_visualization_via_config_manag
     assert saved.tracking_visualization == TrackingVisualizationConfig(True, True, True)
     assert saved.turret == config.turret
     assert saved.tracking_control == config.tracking_control
+
+
+def test_run_loaded_application_persists_aim_point_before_runtime_apply(
+    tmp_path: Path,
+) -> None:
+    config = _config()
+    config_path = tmp_path / "navmin.json"
+    save_config(config_path, config)
+    inputs = LoadedApplicationInputs(
+        config=config,
+        overview_calibration=_overview(),
+        stereo_calibration=_stereo(),
+        source_paths=SourceInputPaths(
+            config=config_path,
+            overview_calibration=tmp_path / "overview.json",
+            stereo_calibration=tmp_path / "stereo.json",
+        ),
+    )
+    applied: list[AimingConfig] = []
+    ui_dependencies = SimpleNamespace(
+        mediator=object(),
+        camera_bindings={},
+        turret_states=object(),
+        imu_states=None,
+        imu_controls=None,
+        camera_stale_timeout_ms=500,
+        aiming_config=config.aiming,
+        apply_aiming_tuning=applied.append,
+        pid_controller_config=config.turret.controller,
+        apply_pid_tuning=lambda _config: None,
+        stm32_config=config.turret.stm32,
+        apply_motion_limits_tuning=lambda _config: None,
+        tracking_control_config=config.tracking_control,
+        apply_tracking_control_tuning=lambda _config: None,
+        tracking_visualization_config=config.tracking_visualization,
+        ui_config=config.ui,
+        vision_processor_selections={},
+        apply_vision_processor_selection=lambda _camera, _selection: None,
+    )
+
+    class FakeRuntime:
+        def __init__(self) -> None:
+            self.imu_runtime = None
+            self.ui_dependencies = ui_dependencies
+
+        def start(self) -> None:
+            pass
+
+        def shutdown(self) -> None:
+            pass
+
+
+    updated = replace(
+        config.aiming,
+        aim_points=replace(
+            config.aiming.aim_points,
+            overview=AimPointConfig(123, 456),
+        ),
+    )
+
+    def ui_runner(**kwargs) -> int:
+        kwargs["apply_aiming_tuning"](updated)
+        return 0
+
+    run_loaded_application(
+        inputs,
+        runtime_builder=lambda **_kwargs: FakeRuntime(),
+        ui_runner=ui_runner,
+    )
+
+    assert applied == [updated]
+    saved = load_config(config_path)
+    assert saved.aiming == updated
+    assert saved.turret == config.turret
+    assert saved.tracking_control == config.tracking_control
+
+
+def test_run_loaded_application_persists_all_operator_config_backed_updates_before_apply(
+    tmp_path: Path,
+) -> None:
+    config = _config()
+    config_path = tmp_path / "navmin.json"
+    save_config(config_path, config)
+    inputs = LoadedApplicationInputs(
+        config=config,
+        overview_calibration=_overview(),
+        stereo_calibration=_stereo(),
+        source_paths=SourceInputPaths(
+            config=config_path,
+            overview_calibration=tmp_path / "overview.json",
+            stereo_calibration=tmp_path / "stereo.json",
+        ),
+    )
+    applied: list[str] = []
+
+    pid = replace(config.turret.controller, pid_kp_x=2.5)
+    limits = replace(
+        config.turret.stm32,
+        max_speed_x_deg_s=55.0,
+        max_speed_y_deg_s=60.0,
+        acceleration_x_deg_s2=105.0,
+        acceleration_y_deg_s2=110.0,
+    )
+    tracking = replace(
+        config.tracking_control,
+        feed_forward=replace(
+            config.tracking_control.feed_forward,
+            enabled=True,
+            gain_x=0.25,
+            gain_y=0.30,
+        ),
+        prediction=replace(config.tracking_control.prediction, enabled=True),
+        velocity_estimator=replace(
+            config.tracking_control.velocity_estimator,
+            window_ms=250,
+        ),
+    )
+    selection = VisionProcessorSelection("Vt11VisionProcessor", "thermal")
+    ui_config = replace(config.ui, show_stereo_right_camera=False)
+
+    def apply_pid(value) -> None:
+        assert load_config(config_path).turret.controller == value
+        applied.append("pid")
+
+    def apply_limits(value) -> None:
+        assert load_config(config_path).turret.stm32 == value
+        applied.append("limits")
+
+    def apply_tracking(value) -> None:
+        assert load_config(config_path).tracking_control == value
+        applied.append("tracking")
+
+    def apply_processor(camera, value) -> None:
+        saved_camera = load_config(config_path).vision.cameras.overview
+        assert camera is CameraRole.OVERVIEW
+        assert saved_camera.vision_processor_class == value.class_name
+        assert saved_camera.vision_processor_profile == value.profile_name
+        applied.append("processor")
+
+    ui_dependencies = SimpleNamespace(
+        mediator=object(),
+        camera_bindings={},
+        turret_states=object(),
+        imu_states=None,
+        imu_controls=None,
+        camera_stale_timeout_ms=500,
+        aiming_config=config.aiming,
+        apply_aiming_tuning=lambda _config: None,
+        pid_controller_config=config.turret.controller,
+        apply_pid_tuning=apply_pid,
+        stm32_config=config.turret.stm32,
+        apply_motion_limits_tuning=apply_limits,
+        tracking_control_config=config.tracking_control,
+        apply_tracking_control_tuning=apply_tracking,
+        tracking_visualization_config=config.tracking_visualization,
+        ui_config=config.ui,
+        vision_processor_selections={
+            CameraRole.OVERVIEW: VisionProcessorSelection(
+                "Legacy14VisionProcessor", "default"
+            )
+        },
+        apply_vision_processor_selection=apply_processor,
+    )
+
+    class FakeRuntime:
+        def __init__(self) -> None:
+            self.imu_runtime = None
+            self.ui_dependencies = ui_dependencies
+
+        def start(self) -> None:
+            pass
+
+        def shutdown(self) -> None:
+            pass
+
+    def ui_runner(**kwargs) -> int:
+        kwargs["apply_pid_tuning"](pid)
+        kwargs["apply_motion_limits_tuning"](limits)
+        kwargs["apply_tracking_control_tuning"](tracking)
+        kwargs["apply_vision_processor_selection"](CameraRole.OVERVIEW, selection)
+        kwargs["persist_ui_config"](ui_config)
+        return 0
+
+    run_loaded_application(
+        inputs,
+        runtime_builder=lambda **_kwargs: FakeRuntime(),
+        ui_runner=ui_runner,
+    )
+
+    assert applied == ["pid", "limits", "tracking", "processor"]
+    saved = load_config(config_path)
+    assert saved.turret.controller == pid
+    assert saved.turret.stm32 == limits
+    assert saved.tracking_control == tracking
+    assert saved.vision.cameras.overview.vision_processor_class == selection.class_name
+    assert saved.vision.cameras.overview.vision_processor_profile == selection.profile_name
+    assert saved.ui == ui_config
 
 
 def test_run_loaded_application_installs_launcher_owned_imu_calibration_writer(
@@ -1002,11 +1221,18 @@ def test_run_loaded_application_installs_launcher_owned_imu_calibration_writer(
                 imu_states=object(),
                 imu_controls=object(),
                 camera_stale_timeout_ms=500,
+                aiming_config=config.aiming,
+                apply_aiming_tuning=lambda _config: None,
                 pid_controller_config=config.turret.controller,
                 apply_pid_tuning=lambda _config: None,
+                stm32_config=config.turret.stm32,
+                apply_motion_limits_tuning=lambda _config: None,
                 tracking_control_config=config.tracking_control,
                 apply_tracking_control_tuning=lambda _config: None,
                 tracking_visualization_config=config.tracking_visualization,
+                ui_config=config.ui,
+                vision_processor_selections={},
+                apply_vision_processor_selection=lambda _camera, _selection: None,
             )
 
         def start(self) -> None:
@@ -1631,7 +1857,7 @@ def test_input_recovery_creates_valid_safe_defaults_without_existing_files(
     stereo = load_stereo_calibration(paths.stereo_calibration)
     imu = ImuCalibration.load(imu_path)
     assert config.turret.serial.port == "/dev/navmin-configure-serial-port"
-    assert config.schema_version == 6
+    assert config.schema_version == 7
     assert config.vision.cameras.overview.calibration_file == "calibration/overview.json"
     assert config.vision.distance.stereo.calibration_file == "calibration/stereo.json"
     assert config.imu.calibration_file == "calibration/imu.json"
@@ -1672,7 +1898,7 @@ def test_input_recovery_replaces_malformed_root_and_invalid_canonical_calibratio
 
     assert len(result.backups) == 3
     recovered = load_config(paths.config)
-    assert recovered.schema_version == 6
+    assert recovered.schema_version == 7
     assert recovered.vision.cameras.overview.calibration_file == "calibration/overview.json"
     assert recovered.vision.distance.stereo.calibration_file == "calibration/stereo.json"
     assert load_overview_calibration(paths.overview_calibration).schema_version == 1

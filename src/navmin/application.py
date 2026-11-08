@@ -13,11 +13,14 @@ from types import MappingProxyType
 from navmin.calibration import OverviewCalibration, StereoCalibration
 from navmin.concurrency import LatestValue
 from navmin.config.models import (
+    AimingConfig,
     AppConfig,
     PidControllerConfig,
+    Stm32Config,
     TrackingControlConfig,
     TrackingVisualizationConfig,
     TurretConfig,
+    UiConfig,
 )
 from navmin.contracts import (
     CameraRole,
@@ -62,6 +65,7 @@ from navmin.vision.pipeline import (
     stereo_left_corrector,
     stereo_right_corrector,
 )
+from navmin.vision.processor import VisionProcessorSelection
 from navmin.vision.stereo_distance_worker import StereoDistanceWorker
 from navmin.vision.stereo_pairing import StereoPairer
 from navmin.vision.stereo_target_join import (
@@ -106,11 +110,20 @@ class UiRuntimeDependencies:
     imu_states: LatestValue[ImuRuntimeState] | None
     imu_controls: ImuCalibrationControls | None
     camera_stale_timeout_ms: int
+    aiming_config: AimingConfig
+    apply_aiming_tuning: Callable[[AimingConfig], None]
     pid_controller_config: PidControllerConfig
     apply_pid_tuning: Callable[[PidControllerConfig], None]
+    stm32_config: Stm32Config
+    apply_motion_limits_tuning: Callable[[Stm32Config], None]
     tracking_control_config: TrackingControlConfig
     apply_tracking_control_tuning: Callable[[TrackingControlConfig], None]
     tracking_visualization_config: TrackingVisualizationConfig
+    ui_config: UiConfig
+    vision_processor_selections: Mapping[CameraRole, VisionProcessorSelection] | None = None
+    apply_vision_processor_selection: (
+        Callable[[CameraRole, VisionProcessorSelection], None] | None
+    ) = None
     recording_runtime: RecordingRuntime | None = None
     start_recording: Callable[[CameraRole, int, int], RecordingSessionInfo] | None = None
     motion_calibration_runtime: MotionCalibrationRuntime | None = None
@@ -158,9 +171,10 @@ class ApplicationRuntime:
         turret_config: TurretConfig,
         tracking_control_config: TrackingControlConfig,
         tracking_visualization_config: TrackingVisualizationConfig,
+        ui_config: UiConfig,
         motion_calibration_runtime: MotionCalibrationRuntime,
         recording_runtime: RecordingRuntime | None = None,
-        vision_backends: Mapping[CameraRole, str] | None = None,
+        vision_processor_selections: Mapping[CameraRole, VisionProcessorSelection] | None = None,
     ) -> None:
         if not isinstance(turret_config, TurretConfig):
             raise TypeError("turret_config must be TurretConfig")
@@ -170,6 +184,8 @@ class ApplicationRuntime:
             raise TypeError(
                 "tracking_visualization_config must be TrackingVisualizationConfig"
             )
+        if not isinstance(ui_config, UiConfig):
+            raise TypeError("ui_config must be UiConfig")
         if recording_runtime is not None and not isinstance(recording_runtime, RecordingRuntime):
             raise TypeError("recording_runtime must be RecordingRuntime")
         self.overview_worker = overview_worker
@@ -185,15 +201,14 @@ class ApplicationRuntime:
         self.mediator = mediator
         self.recording_runtime = recording_runtime or RecordingRuntime(Path("recordings"))
         self.motion_calibration_runtime = motion_calibration_runtime
-        resolved_backends = (
-            {
-                CameraRole.OVERVIEW: "unknown",
-                CameraRole.STEREO_LEFT: "unknown",
-            }
-            if vision_backends is None
-            else dict(vision_backends)
+        self._runtime_vision_processor_selections = (
+            {}
+            if vision_processor_selections is None
+            else dict(vision_processor_selections)
         )
-        self._vision_backends = MappingProxyType(resolved_backends)
+        self._vision_processor_selections = MappingProxyType(
+            self._runtime_vision_processor_selections
+        )
         self.camera_stale_timeout_ms = camera_stale_timeout_ms
         self._runtime_turret_config = turret_config
         self._turret_config_revision = 0
@@ -208,12 +223,13 @@ class ApplicationRuntime:
         if stereo_right_worker is not None:
             camera_workers[CameraRole.STEREO_RIGHT] = stereo_right_worker
         self._camera_workers = MappingProxyType(camera_workers)
-        self._camera_bindings = MappingProxyType(
-            {
-                CameraRole.OVERVIEW: self._binding(overview_worker),
-                CameraRole.STEREO_LEFT: self._binding(stereo_left_worker),
-            }
-        )
+        camera_bindings = {
+            CameraRole.OVERVIEW: self._binding(overview_worker),
+            CameraRole.STEREO_LEFT: self._binding(stereo_left_worker),
+        }
+        if stereo_right_worker is not None:
+            camera_bindings[CameraRole.STEREO_RIGHT] = self._binding(stereo_right_worker)
+        self._camera_bindings = MappingProxyType(camera_bindings)
         self._ui_dependencies = UiRuntimeDependencies(
             mediator=mediator,
             camera_bindings=self._camera_bindings,
@@ -221,11 +237,18 @@ class ApplicationRuntime:
             imu_states=self.imu_states,
             imu_controls=self.imu_runtime,
             camera_stale_timeout_ms=camera_stale_timeout_ms,
+            aiming_config=mediator.aiming.config,
+            apply_aiming_tuning=self.apply_aiming_tuning,
             pid_controller_config=turret_config.controller,
             apply_pid_tuning=self.apply_pid_tuning,
+            stm32_config=turret_config.stm32,
+            apply_motion_limits_tuning=self.apply_motion_limits_tuning,
             tracking_control_config=tracking_control_config,
             apply_tracking_control_tuning=self.apply_tracking_control_tuning,
             tracking_visualization_config=tracking_visualization_config,
+            ui_config=ui_config,
+            vision_processor_selections=self._vision_processor_selections,
+            apply_vision_processor_selection=self.apply_vision_processor_selection,
             recording_runtime=self.recording_runtime,
             start_recording=self.start_recording,
             motion_calibration_runtime=self.motion_calibration_runtime,
@@ -262,7 +285,7 @@ class ApplicationRuntime:
         width: int,
         height: int,
     ) -> RecordingSessionInfo:
-        """Start one recording bound to the selected normal camera."""
+        """Start one recording bound to the selected displayed camera."""
         if camera not in self._camera_bindings:
             raise ValueError(f"camera is not recordable from the operator UI: {camera.value}")
         if width <= 0 or height <= 0:
@@ -271,13 +294,80 @@ class ApplicationRuntime:
         nominal_fps = diagnostics.received_fps
         if nominal_fps is None or not math.isfinite(nominal_fps) or nominal_fps <= 0.0:
             nominal_fps = 20.0
-        vision_backend = self._vision_backends[camera]
+        selection = self._runtime_vision_processor_selections.get(camera)
+        vision_backend = "unknown" if selection is None else selection.class_name
         return self.recording_runtime.start(
             camera=camera,
             width=width,
             height=height,
             nominal_fps=float(nominal_fps),
             vision_backend=vision_backend,
+        )
+
+    def apply_aiming_tuning(self, config: AimingConfig) -> None:
+        """Apply one dynamic aiming snapshot without restarting camera workers."""
+        if not isinstance(config, AimingConfig):
+            raise TypeError("config must be AimingConfig")
+        self.mediator.aiming.replace_config(config)
+        LOGGER.info("Aiming runtime update applied")
+
+    def apply_motion_limits_tuning(self, config: Stm32Config) -> None:
+        """Queue a temporary speed/acceleration-only Turret config update."""
+        if self._pre_calibration_turret_config is not None:
+            raise RuntimeError("motion limits are unavailable during motion calibration")
+        if not isinstance(config, Stm32Config):
+            raise TypeError("config must be Stm32Config")
+        current = self._runtime_turret_config.stm32
+        if config.velocity_watchdog_timeout_ms != current.velocity_watchdog_timeout_ms:
+            raise ValueError("velocity watchdog is not editable from the operator UI")
+        for name in (
+            "max_speed_x_deg_s",
+            "max_speed_y_deg_s",
+            "acceleration_x_deg_s2",
+            "acceleration_y_deg_s2",
+        ):
+            value = getattr(config, name)
+            if isinstance(value, bool) or not isinstance(value, int | float):
+                raise TypeError(f"{name} must be a number")
+            numeric = float(value)
+            if not math.isfinite(numeric) or numeric <= 0.0:
+                raise ValueError(f"{name} must be finite and > 0")
+        next_revision = self._turret_config_revision + 1
+        next_turret_config = replace(self._runtime_turret_config, stm32=config)
+        self.turret_worker.submit_config_update(
+            ConfigUpdate(revision=next_revision, config=next_turret_config)
+        )
+        self._runtime_turret_config = next_turret_config
+        self._turret_config_revision = next_revision
+        LOGGER.info(
+            "Motion limits update queued revision=%d speed=(%g,%g) acceleration=(%g,%g)",
+            next_revision,
+            config.max_speed_x_deg_s,
+            config.max_speed_y_deg_s,
+            config.acceleration_x_deg_s2,
+            config.acceleration_y_deg_s2,
+        )
+
+    def apply_vision_processor_selection(
+        self,
+        camera: CameraRole,
+        selection: VisionProcessorSelection,
+    ) -> None:
+        """Queue one camera-owner processor/profile switch for a new generation."""
+        if not isinstance(camera, CameraRole):
+            raise TypeError("camera must be CameraRole")
+        if not isinstance(selection, VisionProcessorSelection):
+            raise TypeError("selection must be VisionProcessorSelection")
+        worker = self._camera_workers.get(camera)
+        if worker is None:
+            raise ValueError(f"camera is not enabled: {camera.value}")
+        worker.submit_processor_selection(selection)
+        self._runtime_vision_processor_selections[camera] = selection
+        LOGGER.info(
+            "Vision processor update queued camera=%s class=%s profile=%s",
+            camera.value,
+            selection.class_name,
+            selection.profile_name,
         )
 
     def apply_pid_tuning(self, config: PidControllerConfig) -> None:
@@ -802,10 +892,21 @@ def build_application_runtime(
     recording_runtime = selected_factories.recording_runtime_factory(
         Path(config.recording.directory)
     )
-    vision_backends = {
-        CameraRole.OVERVIEW: config.vision.cameras.overview.vision_processor_class,
-        CameraRole.STEREO_LEFT: config.vision.cameras.stereo_left.vision_processor_class,
+    vision_processor_selections = {
+        CameraRole.OVERVIEW: VisionProcessorSelection(
+            config.vision.cameras.overview.vision_processor_class,
+            config.vision.cameras.overview.vision_processor_profile,
+        ),
+        CameraRole.STEREO_LEFT: VisionProcessorSelection(
+            config.vision.cameras.stereo_left.vision_processor_class,
+            config.vision.cameras.stereo_left.vision_processor_profile,
+        ),
     }
+    if stereo_right_worker is not None:
+        vision_processor_selections[CameraRole.STEREO_RIGHT] = VisionProcessorSelection(
+            config.vision.cameras.stereo_right.vision_processor_class,
+            config.vision.cameras.stereo_right.vision_processor_profile,
+        )
     return ApplicationRuntime(
         overview_worker=overview_worker,
         stereo_left_worker=stereo_left_worker,
@@ -822,9 +923,10 @@ def build_application_runtime(
         turret_config=config.turret,
         tracking_control_config=config.tracking_control,
         tracking_visualization_config=config.tracking_visualization,
+        ui_config=config.ui,
         motion_calibration_runtime=motion_calibration_runtime,
         recording_runtime=recording_runtime,
-        vision_backends=vision_backends,
+        vision_processor_selections=vision_processor_selections,
     )
 
 

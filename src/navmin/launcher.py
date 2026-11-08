@@ -14,6 +14,7 @@ from navmin.calibration import (
     load_stereo_calibration,
 )
 from navmin.config import AppConfig, ConfigManager, config_to_mapping, load_config
+from navmin.contracts import CameraRole
 from navmin.imu import ImuCalibration
 from navmin.logging_setup import session_file_logging
 from navmin.session_artifacts import SourceInputPaths
@@ -247,23 +248,112 @@ def run_loaded_application(
             lambda calibration, path=imu_calibration_path: calibration.save(path)
         )
     persist_tracking_visualization = None
-    if inputs.source_paths is not None:
-        config_path = inputs.source_paths.config
-
-        def persist_tracking_visualization(config):
-            config_manager = ConfigManager.load(config_path)
-            candidate = replace(
-                config_manager.config,
-                tracking_visualization=config,
-            )
-            config_manager.apply_runtime_update(
-                config_to_mapping(candidate),
-                persist=True,
-            )
-
+    persist_ui_config = None
     runtime.start()
     try:
         ui = runtime.ui_dependencies
+        apply_aiming_tuning = ui.apply_aiming_tuning
+        apply_pid_tuning = ui.apply_pid_tuning
+        apply_motion_limits_tuning = ui.apply_motion_limits_tuning
+        apply_tracking_control_tuning = ui.apply_tracking_control_tuning
+        apply_vision_processor_selection = ui.apply_vision_processor_selection
+        if inputs.source_paths is not None:
+            config_path = inputs.source_paths.config
+
+            def persist_candidate(transform):
+                config_manager = ConfigManager.load(config_path)
+                candidate = transform(config_manager.config)
+                config_manager.apply_runtime_update(
+                    config_to_mapping(candidate),
+                    persist=True,
+                )
+
+            def persist_tracking_visualization(config):
+                persist_candidate(
+                    lambda current: replace(
+                        current, tracking_visualization=config
+                    )
+                )
+
+            def persist_ui_config(config):
+                persist_candidate(lambda current: replace(current, ui=config))
+
+            def persist_and_apply_aiming(config):
+                persist_candidate(lambda current: replace(current, aiming=config))
+                ui.apply_aiming_tuning(config)
+
+            def persist_and_apply_pid(config):
+                persist_candidate(
+                    lambda current: replace(
+                        current,
+                        turret=replace(current.turret, controller=config),
+                    )
+                )
+                ui.apply_pid_tuning(config)
+
+            def persist_and_apply_motion_limits(config):
+                persist_candidate(
+                    lambda current: replace(
+                        current,
+                        turret=replace(current.turret, stm32=config),
+                    )
+                )
+                ui.apply_motion_limits_tuning(config)
+
+            def persist_and_apply_tracking_control(config):
+                persist_candidate(
+                    lambda current: replace(current, tracking_control=config)
+                )
+                ui.apply_tracking_control_tuning(config)
+
+            def persist_and_apply_vision_processor(camera, selection):
+                def transform(current):
+                    cameras = current.vision.cameras
+                    if camera is CameraRole.OVERVIEW:
+                        cameras = replace(
+                            cameras,
+                            overview=replace(
+                                cameras.overview,
+                                vision_processor_class=selection.class_name,
+                                vision_processor_profile=selection.profile_name,
+                            ),
+                        )
+                    elif camera is CameraRole.STEREO_LEFT:
+                        cameras = replace(
+                            cameras,
+                            stereo_left=replace(
+                                cameras.stereo_left,
+                                vision_processor_class=selection.class_name,
+                                vision_processor_profile=selection.profile_name,
+                            ),
+                        )
+                    elif camera is CameraRole.STEREO_RIGHT:
+                        cameras = replace(
+                            cameras,
+                            stereo_right=replace(
+                                cameras.stereo_right,
+                                vision_processor_class=selection.class_name,
+                                vision_processor_profile=selection.profile_name,
+                            ),
+                        )
+                    else:
+                        raise ValueError(f"unsupported camera role: {camera}")
+                    return replace(
+                        current,
+                        vision=replace(current.vision, cameras=cameras),
+                    )
+
+                persist_candidate(transform)
+                if ui.apply_vision_processor_selection is None:
+                    raise RuntimeError("Vision processor selection is unavailable")
+                ui.apply_vision_processor_selection(camera, selection)
+
+            apply_aiming_tuning = persist_and_apply_aiming
+            apply_pid_tuning = persist_and_apply_pid
+            apply_motion_limits_tuning = persist_and_apply_motion_limits
+            apply_tracking_control_tuning = persist_and_apply_tracking_control
+            apply_vision_processor_selection = persist_and_apply_vision_processor
+
         return ui_runner(
             mediator=ui.mediator,
             camera_bindings=ui.camera_bindings,
@@ -271,11 +361,19 @@ def run_loaded_application(
             imu_states=ui.imu_states,
             imu_controls=ui.imu_controls,
             camera_stale_timeout_ms=ui.camera_stale_timeout_ms,
+            aiming_config=ui.aiming_config,
+            apply_aiming_tuning=apply_aiming_tuning,
             pid_controller_config=ui.pid_controller_config,
-            apply_pid_tuning=ui.apply_pid_tuning,
+            apply_pid_tuning=apply_pid_tuning,
+            stm32_config=ui.stm32_config,
+            apply_motion_limits_tuning=apply_motion_limits_tuning,
             tracking_control_config=ui.tracking_control_config,
-            apply_tracking_control_tuning=ui.apply_tracking_control_tuning,
+            apply_tracking_control_tuning=apply_tracking_control_tuning,
             tracking_visualization_config=ui.tracking_visualization_config,
+            ui_config=ui.ui_config,
+            persist_ui_config=persist_ui_config,
+            vision_processor_selections=ui.vision_processor_selections,
+            apply_vision_processor_selection=apply_vision_processor_selection,
             recording_runtime=getattr(ui, "recording_runtime", None),
             start_recording=getattr(ui, "start_recording", None),
             motion_calibration_runtime=getattr(

@@ -268,10 +268,22 @@ def test_relative_ui_click_reaches_observable_fake_stm32_for_both_cameras() -> N
             camera_bindings=runtime.camera_bindings(),
             turret_states=runtime.turret_worker.state_updates,
             camera_stale_timeout_ms=500,
+            aiming_config=runtime.application.ui_dependencies.aiming_config,
+            apply_aiming_tuning=runtime.application.ui_dependencies.apply_aiming_tuning,
             pid_controller_config=(
                 runtime.application.ui_dependencies.pid_controller_config
             ),
             apply_pid_tuning=runtime.application.ui_dependencies.apply_pid_tuning,
+            stm32_config=runtime.application.ui_dependencies.stm32_config,
+            apply_motion_limits_tuning=(
+                runtime.application.ui_dependencies.apply_motion_limits_tuning
+            ),
+            vision_processor_selections=(
+                runtime.application.ui_dependencies.vision_processor_selections
+            ),
+            apply_vision_processor_selection=(
+                runtime.application.ui_dependencies.apply_vision_processor_selection
+            ),
             tracking_control_config=(
                 runtime.application.ui_dependencies.tracking_control_config
             ),
@@ -454,10 +466,22 @@ def test_tracking_ui_selection_drives_real_velocity_loop_to_fake_stm32() -> None
             camera_bindings=runtime.camera_bindings(),
             turret_states=runtime.turret_worker.state_updates,
             camera_stale_timeout_ms=500,
+            aiming_config=runtime.application.ui_dependencies.aiming_config,
+            apply_aiming_tuning=runtime.application.ui_dependencies.apply_aiming_tuning,
             pid_controller_config=(
                 runtime.application.ui_dependencies.pid_controller_config
             ),
             apply_pid_tuning=runtime.application.ui_dependencies.apply_pid_tuning,
+            stm32_config=runtime.application.ui_dependencies.stm32_config,
+            apply_motion_limits_tuning=(
+                runtime.application.ui_dependencies.apply_motion_limits_tuning
+            ),
+            vision_processor_selections=(
+                runtime.application.ui_dependencies.vision_processor_selections
+            ),
+            apply_vision_processor_selection=(
+                runtime.application.ui_dependencies.apply_vision_processor_selection
+            ),
             tracking_control_config=(
                 runtime.application.ui_dependencies.tracking_control_config
             ),
@@ -869,10 +893,22 @@ def test_camera_stale_resume_keeps_generation_and_recovers_interaction() -> None
             camera_bindings=runtime.camera_bindings(),
             turret_states=runtime.turret_worker.state_updates,
             camera_stale_timeout_ms=500,
+            aiming_config=runtime.application.ui_dependencies.aiming_config,
+            apply_aiming_tuning=runtime.application.ui_dependencies.apply_aiming_tuning,
             pid_controller_config=(
                 runtime.application.ui_dependencies.pid_controller_config
             ),
             apply_pid_tuning=runtime.application.ui_dependencies.apply_pid_tuning,
+            stm32_config=runtime.application.ui_dependencies.stm32_config,
+            apply_motion_limits_tuning=(
+                runtime.application.ui_dependencies.apply_motion_limits_tuning
+            ),
+            vision_processor_selections=(
+                runtime.application.ui_dependencies.vision_processor_selections
+            ),
+            apply_vision_processor_selection=(
+                runtime.application.ui_dependencies.apply_vision_processor_selection
+            ),
             tracking_control_config=(
                 runtime.application.ui_dependencies.tracking_control_config
             ),
@@ -987,10 +1023,22 @@ def test_generation_restart_and_preview_swap_clear_active_tracking() -> None:
             camera_bindings=runtime.camera_bindings(),
             turret_states=runtime.turret_worker.state_updates,
             camera_stale_timeout_ms=500,
+            aiming_config=runtime.application.ui_dependencies.aiming_config,
+            apply_aiming_tuning=runtime.application.ui_dependencies.apply_aiming_tuning,
             pid_controller_config=(
                 runtime.application.ui_dependencies.pid_controller_config
             ),
             apply_pid_tuning=runtime.application.ui_dependencies.apply_pid_tuning,
+            stm32_config=runtime.application.ui_dependencies.stm32_config,
+            apply_motion_limits_tuning=(
+                runtime.application.ui_dependencies.apply_motion_limits_tuning
+            ),
+            vision_processor_selections=(
+                runtime.application.ui_dependencies.vision_processor_selections
+            ),
+            apply_vision_processor_selection=(
+                runtime.application.ui_dependencies.apply_vision_processor_selection
+            ),
             tracking_control_config=(
                 runtime.application.ui_dependencies.tracking_control_config
             ),
@@ -1115,10 +1163,22 @@ def test_turret_disconnect_clears_tracking_recovers_off_and_remains_usable() -> 
             camera_bindings=runtime.camera_bindings(),
             turret_states=runtime.turret_worker.state_updates,
             camera_stale_timeout_ms=500,
+            aiming_config=runtime.application.ui_dependencies.aiming_config,
+            apply_aiming_tuning=runtime.application.ui_dependencies.apply_aiming_tuning,
             pid_controller_config=(
                 runtime.application.ui_dependencies.pid_controller_config
             ),
             apply_pid_tuning=runtime.application.ui_dependencies.apply_pid_tuning,
+            stm32_config=runtime.application.ui_dependencies.stm32_config,
+            apply_motion_limits_tuning=(
+                runtime.application.ui_dependencies.apply_motion_limits_tuning
+            ),
+            vision_processor_selections=(
+                runtime.application.ui_dependencies.vision_processor_selections
+            ),
+            apply_vision_processor_selection=(
+                runtime.application.ui_dependencies.apply_vision_processor_selection
+            ),
             tracking_control_config=(
                 runtime.application.ui_dependencies.tracking_control_config
             ),
@@ -1224,10 +1284,22 @@ def test_emergency_click_during_tracking_crosses_full_stack_and_preserves_motor_
             camera_bindings=runtime.camera_bindings(),
             turret_states=runtime.turret_worker.state_updates,
             camera_stale_timeout_ms=500,
+            aiming_config=runtime.application.ui_dependencies.aiming_config,
+            apply_aiming_tuning=runtime.application.ui_dependencies.apply_aiming_tuning,
             pid_controller_config=(
                 runtime.application.ui_dependencies.pid_controller_config
             ),
             apply_pid_tuning=runtime.application.ui_dependencies.apply_pid_tuning,
+            stm32_config=runtime.application.ui_dependencies.stm32_config,
+            apply_motion_limits_tuning=(
+                runtime.application.ui_dependencies.apply_motion_limits_tuning
+            ),
+            vision_processor_selections=(
+                runtime.application.ui_dependencies.vision_processor_selections
+            ),
+            apply_vision_processor_selection=(
+                runtime.application.ui_dependencies.apply_vision_processor_selection
+            ),
             tracking_control_config=(
                 runtime.application.ui_dependencies.tracking_control_config
             ),

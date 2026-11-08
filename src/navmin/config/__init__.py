@@ -1,4 +1,4 @@
-"""Typed configuration foundation for NavMin schema v6."""
+"""Typed configuration foundation for NavMin schema v7."""
 
 from .manager import ConfigManager, save_config
 from .models import (
@@ -21,6 +21,7 @@ from .models import (
     ProcessingScope,
     RecordingConfig,
     RtpJpegSourceConfig,
+    RtpJpegTimestampMode,
     RtspDecoderMode,
     RtspProtocol,
     RtspSourceConfig,
@@ -75,6 +76,7 @@ __all__ = [
     "ProcessingScope",
     "RecordingConfig",
     "RtpJpegSourceConfig",
+    "RtpJpegTimestampMode",
     "RtspDecoderMode",
     "RtspProtocol",
     "RtspSourceConfig",

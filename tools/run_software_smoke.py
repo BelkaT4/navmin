@@ -258,7 +258,7 @@ def _smoke_aiming_config() -> AimingConfig:
     center = AimPointConfig(x_px=None, y_px=None)
     return AimingConfig(
         target_lost_timeout_ms=500,
-        aim_points=AimPointsConfig(overview=center, stereo_left=center),
+        aim_points=AimPointsConfig(overview=center, stereo_left=center, stereo_right=center),
     )
 
 
@@ -267,6 +267,7 @@ def _smoke_ui_config() -> UiConfig:
         default_camera=CameraRole.OVERVIEW,
         show_fps=False,
         show_stereo_right_diagnostics=False,
+        show_stereo_right_camera=True,
     )
 
 
@@ -320,6 +321,7 @@ def _smoke_camera_config(
         ),
         processing_enabled=processing_enabled,
         vision_processor_class="Legacy14VisionProcessor",
+        vision_processor_profile="default",
     )
 
 
@@ -330,6 +332,7 @@ def _smoke_overview_config(port: int) -> OverviewCameraConfig:
         source=camera.source,
         processing_enabled=camera.processing_enabled,
         vision_processor_class=camera.vision_processor_class,
+        vision_processor_profile=camera.vision_processor_profile,
         calibration_file="calibration/overview.json",
     )
 
@@ -550,11 +553,16 @@ def _run_qt_smoke(runtime: SoftwareSmokeRuntime, auto_close_seconds: float | Non
         camera_bindings=ui.camera_bindings,
         turret_states=ui.turret_states,
         camera_stale_timeout_ms=ui.camera_stale_timeout_ms,
+        aiming_config=ui.aiming_config,
+        apply_aiming_tuning=ui.apply_aiming_tuning,
         pid_controller_config=ui.pid_controller_config,
         apply_pid_tuning=ui.apply_pid_tuning,
+        stm32_config=ui.stm32_config,
+        apply_motion_limits_tuning=ui.apply_motion_limits_tuning,
         tracking_control_config=ui.tracking_control_config,
         apply_tracking_control_tuning=ui.apply_tracking_control_tuning,
         tracking_visualization_config=ui.tracking_visualization_config,
+        ui_config=ui.ui_config,
     )
 
 

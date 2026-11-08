@@ -32,6 +32,8 @@ from navmin.contracts import (
     CameraState,
     CameraStatus,
     FramePacket,
+    FrameSourceTimestamp,
+    FrameTimestampSource,
     TargetAcquired,
     TargetAcquisitionFailed,
     TargetLifecycleEvent,
@@ -209,6 +211,8 @@ class DecodedFrame:
     image: np.ndarray
     capture_id: int | None = None
     receive_timestamp_ns: int | None = None
+    transport_timestamp_ns: int | None = None
+    source_timestamp: FrameSourceTimestamp | None = None
 
 
 class DecodedFrameSource(Protocol):
@@ -266,6 +270,10 @@ class InMemoryFrameSource:
                 image=image,
                 capture_id=capture_id,
                 receive_timestamp_ns=timestamp_ns,
+                source_timestamp=FrameSourceTimestamp(
+                    source=FrameTimestampSource.RECEIVE_TIME,
+                    timestamp_ns=timestamp_ns,
+                ),
             )
         )
 
@@ -283,6 +291,7 @@ class _PendingFrame:
     image: np.ndarray
     capture_id: int | None
     receive_timestamp_ns: int
+    source_timestamp: FrameSourceTimestamp
 
 
 @dataclass(frozen=True, slots=True)
@@ -356,6 +365,12 @@ class VisionPipeline:
         self._diagnostic_decoded_height: int | None = None
         self._diagnostic_capture_id_present_count = 0
         self._diagnostic_capture_id_missing_count = 0
+
+    def replace_processor(self, processor: VisionProcessor) -> None:
+        """Replace the owner-thread processor before starting a new generation."""
+        if processor is None:
+            raise TypeError("processor must not be None")
+        self._processor = processor
 
     @property
     def generation(self) -> int:
@@ -567,6 +582,7 @@ class VisionPipeline:
         *,
         capture_id: int | None = None,
         receive_timestamp_ns: int | None = None,
+        source_timestamp: FrameSourceTimestamp | None = None,
     ) -> None:
         with self._state_lock:
             generation = self._generation
@@ -579,6 +595,10 @@ class VisionPipeline:
             self._timestamp_clock_ns()
             if receive_timestamp_ns is None
             else receive_timestamp_ns
+        )
+        normalized_source_timestamp = source_timestamp or FrameSourceTimestamp(
+            source=FrameTimestampSource.RECEIVE_TIME,
+            timestamp_ns=received_ns,
         )
         first_frame_evidence: tuple[int, int, int] | None = None
         with self._state_lock:
@@ -616,6 +636,7 @@ class VisionPipeline:
                 image=stable_image,
                 capture_id=capture_id,
                 receive_timestamp_ns=received_ns,
+                source_timestamp=normalized_source_timestamp,
             )
         )
 
@@ -627,6 +648,7 @@ class VisionPipeline:
             decoded.image,
             capture_id=decoded.capture_id,
             receive_timestamp_ns=decoded.receive_timestamp_ns,
+            source_timestamp=decoded.source_timestamp,
         )
         return True
 
@@ -655,6 +677,7 @@ class VisionPipeline:
                 ),
                 receive_timestamp_ns=pending.receive_timestamp_ns,
                 image=image,
+                source_timestamp=pending.source_timestamp,
             )
             if self._corrected_frame_sink is not None:
                 with self._state_lock:

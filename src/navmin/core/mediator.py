@@ -11,6 +11,12 @@ from threading import Lock
 from time import monotonic_ns
 from typing import Protocol
 
+from navmin.camera_time_sync import (
+    CameraClockObservation,
+    CameraClockSessionError,
+    CameraClockTracker,
+    CameraPcTimeBasis,
+)
 from navmin.concurrency import LatestValue, TargetControlChannel
 from navmin.config.models import AimingConfig, TrackingControlConfig, UiConfig
 from navmin.contracts import (
@@ -23,6 +29,7 @@ from navmin.contracts import (
     DistanceResult,
     DistanceSource,
     FramePacket,
+    FrameTimestampSource,
     MotorState,
     MoveRelativeCommand,
     PlatformMotionSnapshot,
@@ -40,6 +47,7 @@ from navmin.contracts import (
     TurretState,
     VisionResult,
 )
+from navmin.time_sync import ClockMappingState, ClockSampleOutcome
 from navmin.vision.stereo_target_join import StereoPairingKind
 
 from .aiming import Aiming
@@ -52,12 +60,14 @@ from .tracking_estimator import (
 )
 
 _NORMAL_CAMERAS = (CameraRole.OVERVIEW, CameraRole.STEREO_LEFT)
+_OBSERVABLE_CAMERAS = (*_NORMAL_CAMERAS, CameraRole.STEREO_RIGHT)
 _DISCONNECTED_CAMERA_STATES = (
     CameraState.RECONNECTING,
     CameraState.ERROR,
     CameraState.STOPPED,
 )
 _LOGGER = logging.getLogger(__name__)
+_CAMERA_CLOCK_DEBUG_INTERVAL_NS = 1_000_000_000
 
 
 class StereoDistanceRejectionReason(Enum):
@@ -215,6 +225,24 @@ class Mediator:
         self._stereo_distance_result_revision = 0
         self._aiming = Aiming(aiming_config)
         self._tracking_estimator = TrackingEstimator(tracking_control_config)
+        self._camera_clock_trackers = {
+            camera: CameraClockTracker(camera) for camera in _OBSERVABLE_CAMERAS
+        }
+        self._camera_clock_observations: dict[
+            CameraRole, CameraClockObservation | None
+        ] = {camera: None for camera in _OBSERVABLE_CAMERAS}
+        self._camera_clock_log_session: dict[
+            CameraRole, tuple[int, FrameTimestampSource] | None
+        ] = {camera: None for camera in _OBSERVABLE_CAMERAS}
+        self._camera_clock_log_state: dict[
+            CameraRole, tuple[ClockMappingState, str | None] | None
+        ] = {camera: None for camera in _OBSERVABLE_CAMERAS}
+        self._camera_clock_log_last_snapshot_receive_ns: dict[
+            CameraRole, int | None
+        ] = {camera: None for camera in _OBSERVABLE_CAMERAS}
+        self._use_camera_time_for_tracking = False
+        self._tracking_time_basis: CameraPcTimeBasis | None = None
+        self._tracking_time_fallback_reason: str | None = None
         self._tracking_control_visualization: TrackingControlVisualization | None = None
         self._tracking_control_config_revision = 0
         self._tracking_gap_timeout_ns = tracking_gap_timeout_ms * 1_000_000
@@ -238,7 +266,7 @@ class Mediator:
         self._distance_stale_invalidations = 0
         self._next_selection_id = 1
         self._latest_results: dict[CameraRole, VisionResult | None] = {
-            camera: None for camera in _NORMAL_CAMERAS
+            camera: None for camera in _OBSERVABLE_CAMERAS
         }
         self._turret_state = turret.current_state
         self._pending_control_mode: TurretControlMode | None = None
@@ -254,6 +282,33 @@ class Mediator:
     @property
     def tracking_estimator(self) -> TrackingEstimator:
         return self._tracking_estimator
+
+    @property
+    def use_camera_time_for_tracking(self) -> bool:
+        return self._use_camera_time_for_tracking
+
+    def set_use_camera_time_for_tracking(self, enabled: bool) -> None:
+        if type(enabled) is not bool:
+            raise TypeError("enabled must be bool")
+        if enabled is self._use_camera_time_for_tracking:
+            return
+        self._use_camera_time_for_tracking = enabled
+        self._tracking_time_basis = None
+        self._tracking_time_fallback_reason = None
+        self._tracking_estimator.reset_history()
+        self._tracking_control_visualization = None
+        self._turret.invalidate_tracking_control()
+        _LOGGER.info(
+            "Camera source time for tracking control %s",
+            "enabled" if enabled else "disabled",
+        )
+
+    def camera_clock_observation(
+        self, camera: CameraRole
+    ) -> CameraClockObservation | None:
+        if not isinstance(camera, CameraRole):
+            raise TypeError("camera must be CameraRole")
+        return self._camera_clock_observations.get(camera)
 
     @property
     def tracking_diagnostics(self) -> TrackingEstimatorDiagnostics:
@@ -410,6 +465,10 @@ class Mediator:
                 self._stereo_target_joiner.start_generation(session.generation)
         if session.camera in self._latest_results:
             self._latest_results[session.camera] = None
+            self._camera_clock_observations[session.camera] = None
+            self._camera_clock_log_session[session.camera] = None
+            self._camera_clock_log_state[session.camera] = None
+            self._camera_clock_log_last_snapshot_receive_ns[session.camera] = None
         if self._target_intent_uses_camera(session.camera):
             # VisionPipeline.start() already reset the processor and discarded old
             # control intent. An old-generation CLEAR must not cross this barrier.
@@ -433,6 +492,7 @@ class Mediator:
         if not self._session_gate.accepts(camera, result.frame.generation):
             return False
         self._latest_results[camera] = result
+        self._observe_camera_clock(result.frame)
         if camera is CameraRole.STEREO_LEFT and self._stereo_target_joiner is not None:
             self._stereo_target_joiner.offer_vision_result(result)
         if camera is self._main_camera and self._selected_target is not None:
@@ -729,6 +789,222 @@ class Mediator:
         self._turret.stop_motion()
         return True
 
+    def _observe_camera_clock(self, frame: FramePacket) -> None:
+        tracker = self._camera_clock_trackers.get(frame.camera)
+        if tracker is None:
+            return
+        try:
+            observation = tracker.observe_frame(frame)
+        except CameraClockSessionError as exc:
+            self._camera_clock_observations[frame.camera] = None
+            _LOGGER.warning(
+                "Camera clock observation rejected camera=%s generation=%d frame=%d: %s",
+                frame.camera.value,
+                frame.generation,
+                frame.frame_id,
+                exc,
+            )
+            return
+        self._camera_clock_observations[frame.camera] = observation
+        self._log_camera_clock_observation(observation)
+
+    def _log_camera_clock_observation(
+        self, observation: CameraClockObservation
+    ) -> None:
+        camera = observation.camera
+        session = (observation.generation, observation.source)
+        if self._camera_clock_log_session[camera] != session:
+            self._camera_clock_log_session[camera] = session
+            self._camera_clock_log_state[camera] = None
+            self._camera_clock_log_last_snapshot_receive_ns[camera] = None
+            _LOGGER.info(
+                "camera-clock-session camera=%s generation=%d source=%s",
+                camera.value,
+                observation.generation,
+                observation.source.value,
+            )
+
+        diagnostics = observation.diagnostics
+        invalid_reason = (
+            None
+            if diagnostics.invalid_reason is None
+            else diagnostics.invalid_reason.value
+        )
+        state_key = (diagnostics.state, invalid_reason)
+        previous_state = self._camera_clock_log_state[camera]
+        if previous_state != state_key:
+            self._camera_clock_log_state[camera] = state_key
+            _LOGGER.info(
+                "camera-clock-state camera=%s generation=%d previous=%s current=%s "
+                "reason=%s samples=%d span_ns=%d drift_ppm=%s rms_ns=%s",
+                camera.value,
+                observation.generation,
+                "none" if previous_state is None else previous_state[0].value,
+                diagnostics.state.value,
+                invalid_reason,
+                diagnostics.sample_count,
+                diagnostics.device_span_ns,
+                diagnostics.drift_ppm,
+                diagnostics.fit_rms_ns,
+            )
+
+        if observation.sample_outcome in (
+            ClockSampleOutcome.REJECTED_OUTLIER,
+            ClockSampleOutcome.REJECTED_OUT_OF_ORDER,
+        ):
+            _LOGGER.warning(
+                "camera-clock-sample-rejected camera=%s generation=%d outcome=%s "
+                "source_timestamp_ns=%d receive_timestamp_ns=%d",
+                camera.value,
+                observation.generation,
+                observation.sample_outcome.value,
+                observation.source_timestamp_ns,
+                observation.receive_timestamp_ns,
+            )
+        elif observation.sample_outcome is ClockSampleOutcome.RESET_ACCEPTED:
+            _LOGGER.info(
+                "camera-clock-mapper-reset camera=%s generation=%d "
+                "source_timestamp_ns=%d receive_timestamp_ns=%d",
+                camera.value,
+                observation.generation,
+                observation.source_timestamp_ns,
+                observation.receive_timestamp_ns,
+            )
+
+        if not _LOGGER.isEnabledFor(logging.DEBUG):
+            return
+        last_snapshot = self._camera_clock_log_last_snapshot_receive_ns[camera]
+        receive_ns = observation.receive_timestamp_ns
+        if (
+            last_snapshot is not None
+            and receive_ns >= last_snapshot
+            and receive_ns - last_snapshot < _CAMERA_CLOCK_DEBUG_INTERVAL_NS
+        ):
+            return
+        self._camera_clock_log_last_snapshot_receive_ns[camera] = receive_ns
+        mapped = observation.receive_anchored_timestamp
+        mapped_timestamp_ns = None if mapped is None else mapped.pc_timestamp_ns
+        mapped_error_ns = None if mapped is None else mapped.estimated_error_ns
+        mapped_minus_receive_ns = (
+            None
+            if mapped_timestamp_ns is None
+            else mapped_timestamp_ns - receive_ns
+        )
+        _LOGGER.debug(
+            "camera-clock-snapshot camera=%s generation=%d source=%s "
+            "source_timestamp_ns=%d receive_timestamp_ns=%d mapped_timestamp_ns=%s "
+            "mapped_minus_receive_ns=%s estimated_error_ns=%s state=%s reason=%s "
+            "samples=%d submitted=%d rejected_outlier=%d rejected_out_of_order=%d "
+            "resets=%d span_ns=%d age_ns=%s slope=%s offset_ns=%s drift_ppm=%s "
+            "rms_ns=%s median_uncertainty_ns=%s",
+            camera.value,
+            observation.generation,
+            observation.source.value,
+            observation.source_timestamp_ns,
+            receive_ns,
+            mapped_timestamp_ns,
+            mapped_minus_receive_ns,
+            mapped_error_ns,
+            diagnostics.state.value,
+            invalid_reason,
+            diagnostics.sample_count,
+            diagnostics.submitted_sample_count,
+            diagnostics.rejected_outlier_count,
+            diagnostics.rejected_out_of_order_count,
+            diagnostics.reset_count,
+            diagnostics.device_span_ns,
+            diagnostics.age_ns,
+            diagnostics.slope,
+            diagnostics.offset_ns,
+            diagnostics.drift_ppm,
+            diagnostics.fit_rms_ns,
+            diagnostics.median_uncertainty_ns,
+        )
+
+    def _tracking_observation_timestamp(
+        self, frame: FramePacket
+    ) -> tuple[int, CameraPcTimeBasis, str | None]:
+        if not self._use_camera_time_for_tracking:
+            return frame.receive_timestamp_ns, CameraPcTimeBasis.RECEIVE_TIME, None
+        observation = self._camera_clock_observations.get(frame.camera)
+        if (
+            observation is None
+            or observation.generation != frame.generation
+            or observation.receive_timestamp_ns != frame.receive_timestamp_ns
+        ):
+            return (
+                frame.receive_timestamp_ns,
+                CameraPcTimeBasis.RECEIVE_TIME,
+                "clock-observation-unavailable",
+            )
+        if observation.source is FrameTimestampSource.RECEIVE_TIME:
+            return (
+                frame.receive_timestamp_ns,
+                CameraPcTimeBasis.RECEIVE_TIME,
+                "source-receive-time",
+            )
+        mapped = observation.receive_anchored_timestamp
+        if (
+            mapped is None
+            or mapped.basis is not CameraPcTimeBasis.RECEIVE_ANCHORED_SOURCE_CLOCK
+        ):
+            reason = f"mapper-{observation.diagnostics.state.value}"
+            if observation.diagnostics.invalid_reason is not None:
+                reason += f":{observation.diagnostics.invalid_reason.value}"
+            return frame.receive_timestamp_ns, CameraPcTimeBasis.RECEIVE_TIME, reason
+        return mapped.pc_timestamp_ns, mapped.basis, None
+
+    def _apply_tracking_time_basis(
+        self,
+        basis: CameraPcTimeBasis,
+        *,
+        frame: FramePacket,
+        fallback_reason: str | None,
+    ) -> None:
+        previous = self._tracking_time_basis
+        self._tracking_time_basis = basis
+        if previous is not basis:
+            _LOGGER.info(
+                "tracking-time-basis camera=%s generation=%d frame_id=%d "
+                "camera_time_enabled=%s previous=%s current=%s",
+                frame.camera.value,
+                frame.generation,
+                frame.frame_id,
+                self._use_camera_time_for_tracking,
+                "none" if previous is None else previous.value,
+                basis.value,
+            )
+
+        previous_fallback = self._tracking_time_fallback_reason
+        self._tracking_time_fallback_reason = fallback_reason
+        if self._use_camera_time_for_tracking and fallback_reason != previous_fallback:
+            if fallback_reason is None:
+                if previous_fallback is not None:
+                    _LOGGER.info(
+                        "tracking-time-fallback-cleared camera=%s generation=%d "
+                        "frame_id=%d previous_reason=%s",
+                        frame.camera.value,
+                        frame.generation,
+                        frame.frame_id,
+                        previous_fallback,
+                    )
+            else:
+                _LOGGER.warning(
+                    "tracking-time-fallback camera=%s generation=%d frame_id=%d "
+                    "reason=%s using=%s",
+                    frame.camera.value,
+                    frame.generation,
+                    frame.frame_id,
+                    fallback_reason,
+                    CameraPcTimeBasis.RECEIVE_TIME.value,
+                )
+
+        if previous is None or previous is basis:
+            return
+        self._tracking_estimator.reset_history()
+        self._tracking_control_visualization = None
+        self._turret.invalidate_tracking_control()
+
     def _update_tracking_from_result(self, result: VisionResult) -> None:
         target = self._selected_target
         if target is None:
@@ -761,11 +1037,22 @@ class Mediator:
             self._tracking_control_visualization = None
             self._turret.invalidate_tracking_control()
             return
+        (
+            observation_timestamp_ns,
+            time_basis,
+            fallback_reason,
+        ) = self._tracking_observation_timestamp(result.frame)
+        self._apply_tracking_time_basis(
+            time_basis,
+            frame=result.frame,
+            fallback_reason=fallback_reason,
+        )
         error = self._aiming.tracking_error(
             camera_model=model,
             frame=result.frame,
             tracked=tracked,
             target=target,
+            observation_timestamp_ns=observation_timestamp_ns,
         )
         previous_timestamp = self._tracking_estimator.diagnostics.observation_timestamp_ns
         if (
@@ -779,7 +1066,13 @@ class Mediator:
             error.timestamp_ns
         )
         diagnostics = self._tracking_estimator.observe(error, platform_rate)
-        self._log_tracking_observation(result, error, diagnostics)
+        self._log_tracking_observation(
+            result,
+            error,
+            diagnostics,
+            time_basis=time_basis,
+            fallback_reason=fallback_reason,
+        )
         self._tracking_control_visualization = TrackingControlVisualization(
             target=target,
             camera=result.frame.camera,
@@ -820,6 +1113,9 @@ class Mediator:
         result: VisionResult,
         error: TrackingError,
         diagnostics: TrackingEstimatorDiagnostics,
+        *,
+        time_basis: CameraPcTimeBasis,
+        fallback_reason: str | None,
     ) -> None:
         if not _LOGGER.isEnabledFor(logging.DEBUG):
             return
@@ -838,10 +1134,48 @@ class Mediator:
             and y.valid
             and y.raw_prediction_offset_deg != y.applied_prediction_offset_deg
         )
+        clock_observation = self._camera_clock_observations.get(result.frame.camera)
+        clock_observation_matches = (
+            clock_observation is not None
+            and clock_observation.generation == result.frame.generation
+            and clock_observation.receive_timestamp_ns
+            == result.frame.receive_timestamp_ns
+        )
+        source_timestamp_ns = (
+            result.frame.receive_timestamp_ns
+            if result.frame.source_timestamp is None
+            else result.frame.source_timestamp.timestamp_ns
+        )
+        source_timestamp_type = (
+            FrameTimestampSource.RECEIVE_TIME.value
+            if result.frame.source_timestamp is None
+            else result.frame.source_timestamp.source.value
+        )
+        mapped = (
+            None
+            if not clock_observation_matches or clock_observation is None
+            else clock_observation.receive_anchored_timestamp
+        )
+        mapped_timestamp_ns = None if mapped is None else mapped.pc_timestamp_ns
+        mapped_minus_receive_ns = (
+            None
+            if mapped_timestamp_ns is None
+            else mapped_timestamp_ns - result.frame.receive_timestamp_ns
+        )
+        mapped_error_ns = None if mapped is None else mapped.estimated_error_ns
+        mapper_state = (
+            None
+            if not clock_observation_matches or clock_observation is None
+            else clock_observation.diagnostics.state.value
+        )
         _LOGGER.debug(
             "tracking-observation "
             "target=%s camera=%s generation=%d frame_id=%d "
-            "observation_timestamp_ns=%d "
+            "camera_time_enabled=%s time_basis=%s fallback_reason=%s "
+            "source_timestamp_type=%s source_timestamp_ns=%d "
+            "receive_timestamp_ns=%d mapped_timestamp_ns=%s "
+            "mapped_minus_receive_ns=%s mapped_estimated_error_ns=%s "
+            "mapper_state=%s observation_timestamp_ns=%d "
             "real_error_x_deg=%.6f real_error_y_deg=%.6f "
             "relative_rate_x_deg_s=%s relative_rate_y_deg_s=%s "
             "platform_rate_x_deg_s=%s platform_rate_y_deg_s=%s "
@@ -857,6 +1191,16 @@ class Mediator:
             result.frame.camera.value,
             result.frame.generation,
             result.frame.frame_id,
+            self._use_camera_time_for_tracking,
+            time_basis.value,
+            fallback_reason,
+            source_timestamp_type,
+            source_timestamp_ns,
+            result.frame.receive_timestamp_ns,
+            mapped_timestamp_ns,
+            mapped_minus_receive_ns,
+            mapped_error_ns,
+            mapper_state,
             error.timestamp_ns,
             error.error_x_deg,
             error.error_y_deg,

@@ -15,8 +15,9 @@ import pytest
 from PyQt6.QtCore import QEvent, QPoint, QPointF, QSize, Qt
 from PyQt6.QtGui import QPixmap, QWheelEvent
 from PyQt6.QtTest import QTest
-from PyQt6.QtWidgets import QApplication, QMessageBox
+from PyQt6.QtWidgets import QApplication, QDoubleSpinBox, QMessageBox, QScrollArea
 
+from navmin.calibration import load_stereo_calibration, stereo_camera_models
 from navmin.concurrency import (
     CameraSessionBarrierChannel,
     LatestValue,
@@ -31,6 +32,7 @@ from navmin.config.models import (
     AxesConfig,
     AxisMechanicsConfig,
     PidControllerConfig,
+    Stm32Config,
     TrackingControlConfig,
     TrackingVisualizationConfig,
     UiConfig,
@@ -87,7 +89,12 @@ from navmin.ui.video_view import (
     project_control_prediction,
     reticle_segments,
 )
-from navmin.vision.processor import VisionTrackingDiagnostics
+from navmin.vision.processor import (
+    DEFAULT_VISION_PROCESSOR_CLASS,
+    VT11_VISION_PROCESSOR_CLASS,
+    VisionProcessorSelection,
+    VisionTrackingDiagnostics,
+)
 from navmin.vision.stereo_distance_worker import StereoDistanceCandidate
 from navmin.vision.stereo_target_join import StereoPairingKind, StereoTargetJoiner
 
@@ -251,6 +258,7 @@ def _mediator(
             or AimPointsConfig(
                 overview=AimPointConfig(50, 25),
                 stereo_left=AimPointConfig(50, 25),
+                stereo_right=AimPointConfig(50, 25),
             ),
         ),
         tracking_control_config=load_config(
@@ -260,7 +268,7 @@ def _mediator(
             / "navmin.json"
         ).tracking_control,
         tracking_gap_timeout_ms=200,
-        ui_config=UiConfig(CameraRole.OVERVIEW, False, False),
+        ui_config=UiConfig(CameraRole.OVERVIEW, False, False, True),
         turret=turret,
         target_controls={
             camera: TargetControlChannel(camera)
@@ -379,7 +387,13 @@ def _status(
     return CameraStatus(camera, state, generation, timestamp_ns, message=message)
 
 
-def _bindings() -> dict[CameraRole, CameraUiBinding]:
+def _bindings(
+    *,
+    include_right: bool = False,
+) -> dict[CameraRole, CameraUiBinding]:
+    cameras = [CameraRole.OVERVIEW, CameraRole.STEREO_LEFT]
+    if include_right:
+        cameras.append(CameraRole.STEREO_RIGHT)
     return {
         camera: CameraUiBinding(
             camera,
@@ -389,7 +403,7 @@ def _bindings() -> dict[CameraRole, CameraUiBinding]:
             LatestValue(),
             LatestValue(),
         )
-        for camera in (CameraRole.OVERVIEW, CameraRole.STEREO_LEFT)
+        for camera in cameras
     }
 
 
@@ -415,8 +429,20 @@ def _window(
     frame_preparer=prepare_vision_frame,
     camera_stale_timeout_ms: int = 500,
     aim_points: AimPointsConfig | None = None,
+    apply_aiming_tuning: Callable[[AimingConfig], None] | None = None,
     pid_controller_config: PidControllerConfig | None = None,
     apply_pid_tuning: Callable[[PidControllerConfig], None] | None = None,
+    stm32_config: Stm32Config | None = None,
+    apply_motion_limits_tuning: Callable[[Stm32Config], None] | None = None,
+    vision_processor_selections: (
+        dict[CameraRole, VisionProcessorSelection] | None
+    ) = None,
+    apply_vision_processor_selection: (
+        Callable[[CameraRole, VisionProcessorSelection], None] | None
+    ) = None,
+    include_right: bool = False,
+    ui_config: UiConfig | None = None,
+    persist_ui_config: Callable[[UiConfig], None] | None = None,
     apply_tracking_control_tuning: (
         Callable[[TrackingControlConfig], None] | None
     ) = None,
@@ -449,15 +475,40 @@ def _window(
         stereo_target_joiner=stereo_target_joiner,
         stereo_distance_results=stereo_distance_results,
     )
-    bindings = _bindings()
+    bindings = _bindings(include_right=include_right)
+    defaults = load_config(
+        Path(__file__).resolve().parents[1] / "config" / "defaults" / "navmin.json"
+    )
+    if vision_processor_selections is None:
+        vision_processor_selections = {
+            camera: VisionProcessorSelection(DEFAULT_VISION_PROCESSOR_CLASS, "default")
+            for camera in bindings
+        }
     turret_states: LatestValue[TurretState] = LatestValue()
     window = MainWindow(
         mediator=mediator,
         camera_bindings=bindings,
         turret_states=turret_states,
         camera_stale_timeout_ms=camera_stale_timeout_ms,
+        aiming_config=mediator.aiming.config,
+        apply_aiming_tuning=(
+            apply_aiming_tuning or mediator.aiming.replace_config
+        ),
         pid_controller_config=pid_controller_config or _pid_config(),
         apply_pid_tuning=apply_pid_tuning or (lambda _config: None),
+        stm32_config=stm32_config or defaults.turret.stm32,
+        apply_motion_limits_tuning=(
+            apply_motion_limits_tuning or (lambda _config: None)
+        ),
+        vision_processor_selections=vision_processor_selections,
+        apply_vision_processor_selection=(
+            apply_vision_processor_selection or (lambda _camera, _selection: None)
+        ),
+        ui_config=ui_config or replace(
+            defaults.ui,
+            show_stereo_right_camera=include_right,
+        ),
+        persist_ui_config=persist_ui_config,
         tracking_control_config=mediator.tracking_estimator.config,
         apply_tracking_control_tuning=(
             apply_tracking_control_tuning or (lambda _config: None)
@@ -526,6 +577,7 @@ def test_motion_calibration_lifecycle_always_restores_temporary_profile(
     assert mediator.accept_camera_session(_session(CameraRole.OVERVIEW, 1))
     calibration = window.motion_calibration_window
     assert calibration is not None
+    calibration.accept_vision_result(_result(CameraRole.OVERVIEW, 1))
 
     calibration._start()
 
@@ -535,7 +587,7 @@ def test_motion_calibration_lifecycle_always_restores_temporary_profile(
     calibration.accept_turret_state(
         _turret_state(speed=5.0, acceleration=10.0)
     )
-    assert turret.relative_commands == [MoveRelativeCommand(14.0, 0.0)]
+    assert turret.relative_commands == [MoveRelativeCommand(4.0, 0.0)]
 
     if termination == "emergency":
         window._emergency_stop()
@@ -572,6 +624,74 @@ def test_motion_calibration_lifecycle_always_restores_temporary_profile(
     window.close()
     qt_application.processEvents()
 
+def test_motion_calibration_preflight_blocks_unmeasurable_real_stereo_plan_before_profile(
+    qt_application: QApplication,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    axis = AxisMechanicsConfig(False, 200, 16, 45.0)
+    runtime = MotionCalibrationRuntime(
+        path=tmp_path / "motion.json",
+        axes=AxesConfig(axis, axis),
+        camera_identities={
+            CameraRole.OVERVIEW: "sha256:overview",
+            CameraRole.STEREO_LEFT: "sha256:stereo",
+        },
+    )
+    begun: list[MotionProfile] = []
+    window, mediator, turret, _bindings_value, _turret_states_value = _window(
+        qt_application,
+        motion_calibration_runtime=runtime,
+        begin_motion_calibration_profile=begun.append,
+        restore_motion_calibration_profile=lambda: None,
+    )
+    repo_root = Path(__file__).resolve().parents[1]
+    stereo = load_stereo_calibration(repo_root / "config/calibration/stereo.json")
+    left_model, _right_model = stereo_camera_models(stereo)
+    session = CameraSessionStarted(CameraRole.STEREO_LEFT, 1, left_model, 1_000_000_000)
+    assert mediator.accept_camera_session(session)
+    mediator.swap_main_preview()
+    calibration = window.motion_calibration_window
+    assert calibration is not None
+    calibration.camera_combo.setCurrentIndex(1)
+    for axis_name in ("x", "y"):
+        for index, value in enumerate((2.0, 4.0, 8.0), start=1):
+            calibration.angle_inputs[f"{axis_name}{index}"].setValue(value)
+    image = np.zeros((stereo.image_height, stereo.image_width, 3), dtype=np.uint8)
+    result = VisionResult(
+        FramePacket(
+            CameraRole.STEREO_LEFT,
+            1,
+            1,
+            None,
+            1_000_000_000,
+            image,
+        ),
+        (),
+        0,
+    )
+    calibration.accept_vision_result(result)
+    messages: list[str] = []
+    monkeypatch.setattr(
+        QMessageBox,
+        "warning",
+        lambda _owner, _title, message: messages.append(str(message)),
+    )
+
+    calibration._start()
+
+    assert begun == []
+    assert turret.relative_commands == []
+    assert not calibration.calibration_active
+    assert messages
+    assert "Набор углов нельзя измерить" in messages[-1]
+    assert "+8°" in messages[-1]
+    assert "X ≈" in messages[-1]
+    assert "Y ≈" in messages[-1]
+    window.close()
+    qt_application.processEvents()
+
+
 def test_motion_calibration_waits_for_confirmed_profile_before_first_move(
     qt_application: QApplication,
     tmp_path: Path,
@@ -598,6 +718,7 @@ def test_motion_calibration_waits_for_confirmed_profile_before_first_move(
     assert mediator.accept_camera_session(_session(CameraRole.OVERVIEW, 1))
     calibration = window.motion_calibration_window
     assert calibration is not None
+    calibration.accept_vision_result(_result(CameraRole.OVERVIEW, 1))
 
     calibration._start()
 
@@ -606,7 +727,27 @@ def test_motion_calibration_waits_for_confirmed_profile_before_first_move(
     calibration.accept_turret_state(_turret_state(speed=40.0, acceleration=80.0))
     assert turret.relative_commands == []
     calibration.accept_turret_state(_turret_state(speed=5.0, acceleration=10.0))
-    assert turret.relative_commands == [MoveRelativeCommand(14.0, 0.0)]
+    assert turret.relative_commands == [MoveRelativeCommand(4.0, 0.0)]
+    wizard = calibration._wizard
+    assert wizard is not None
+    assert wizard.settle_deadline_ns is not None
+    clock.now_ns = wizard.settle_deadline_ns
+    calibration._tick()
+    assert "Допустимая зона:" in calibration.progress_label.text()
+    window.refresh_presentation()
+    guide = window.main_view.calibration_click_guide
+    assert guide is not None
+    assert guide.axis == "x"
+    assert guide.command_deg == pytest.approx(4.0)
+
+    calibration.handle_click(
+        _result(CameraRole.OVERVIEW, 1, frame_id=2, timestamp_ns=clock.now_ns),
+        0.0,
+        25.0,
+    )
+    assert turret.relative_commands == [MoveRelativeCommand(4.0, 0.0)]
+    assert "Измерение отклонено:" in calibration.progress_label.text()
+    assert "Допустимая зона для этого шага:" in calibration.progress_label.text()
     assert restored == []
     calibration.close()
     qt_application.processEvents()
@@ -637,6 +778,7 @@ def test_motion_calibration_profile_confirmation_timeout_aborts_without_move(
     assert mediator.accept_camera_session(_session(CameraRole.OVERVIEW, 1))
     calibration = window.motion_calibration_window
     assert calibration is not None
+    calibration.accept_vision_result(_result(CameraRole.OVERVIEW, 1))
 
     calibration._start()
     assert turret.relative_commands == []
@@ -837,7 +979,15 @@ class _OverlayPainterSpy:
         self.brush = None
         self.ellipses = []
         self.rects = []
+        self.rect_brushes = []
         self.lines = []
+        self._states = []
+
+    def save(self) -> None:
+        self._states.append((self.pen, self.brush))
+
+    def restore(self) -> None:
+        self.pen, self.brush = self._states.pop()
 
     def setPen(self, pen) -> None:
         self.pen = pen
@@ -850,6 +1000,7 @@ class _OverlayPainterSpy:
 
     def drawRect(self, rect) -> None:
         self.rects.append((rect, self.pen))
+        self.rect_brushes.append(self.brush)
 
     def drawLine(self, line) -> None:
         self.lines.append((line, self.pen))
@@ -1060,6 +1211,41 @@ def test_control_prediction_uses_raw_forecast_when_control_is_disabled(
     view.close()
 
 
+def test_prediction_overlay_does_not_fill_target_bbox(
+    qt_application: QApplication,
+) -> None:
+    result = _result(CameraRole.OVERVIEW, 1, frame_id=1)
+    target = TargetRef(CameraRole.OVERVIEW, 1, 7)
+    visualization = _control_visualization(
+        CameraRole.OVERVIEW,
+        1,
+        1,
+        raw_x_deg=8.0,
+    )
+    view = VideoView(
+        camera=CameraRole.OVERVIEW,
+        preview=False,
+        stale_timeout_ns=500_000_000,
+    )
+    view.resize(200, 200)
+    view.set_prepared_frame(prepare_vision_frame(result))
+    view.set_selected_target(target)
+    view.set_tracking_control_visualization(visualization, _CameraModel())
+    view.set_tracking_visualization(
+        show_search_region=False,
+        show_best_candidate=False,
+        show_control_prediction=True,
+    )
+    painter = _OverlayPainterSpy()
+
+    view._draw_control_prediction_overlay(painter, view.rendered_rect(), result)
+    view._draw_objects(painter, view.rendered_rect(), result)
+
+    assert painter.rects
+    assert all(brush == Qt.BrushStyle.NoBrush for brush in painter.rect_brushes)
+    view.close()
+
+
 def test_control_prediction_display_off_is_independent_of_control_on(
     qt_application: QApplication,
 ) -> None:
@@ -1153,12 +1339,21 @@ def test_main_reticle_draw_uses_red_three_pixel_pen_and_preview_draws_none(
         def __init__(self) -> None:
             self.pen = None
             self.lines = []
+            self.line_pens = []
+            self._states = []
+
+        def save(self) -> None:
+            self._states.append(self.pen)
+
+        def restore(self) -> None:
+            self.pen = self._states.pop()
 
         def setPen(self, pen) -> None:
             self.pen = pen
 
         def drawLine(self, line) -> None:
             self.lines.append(line)
+            self.line_pens.append(self.pen)
 
     result = _result(CameraRole.OVERVIEW, 1)
     prepared = prepare_vision_frame(result)
@@ -1173,11 +1368,19 @@ def test_main_reticle_draw_uses_red_three_pixel_pen_and_preview_draws_none(
     painter = _PainterSpy()
     main._draw_reticle(painter, main.rendered_rect(), result)
 
-    assert painter.pen is not None
-    assert painter.pen.color().getRgb()[:3] == (255, 0, 0)
-    assert painter.pen.widthF() == 3.0
-    assert painter.pen.capStyle() == Qt.PenCapStyle.FlatCap
-    assert len(painter.lines) == 4
+    assert len(painter.lines) == 8
+    assert all(pen.color().getRgb()[:3] == (0, 0, 0) for pen in painter.line_pens[:4])
+    assert all(pen.color().getRgb()[:3] == (255, 0, 0) for pen in painter.line_pens[4:])
+    assert all(pen.capStyle() == Qt.PenCapStyle.FlatCap for pen in painter.line_pens)
+
+    main.set_aim_point((49.5, 24.5), configured=False)
+    unconfigured_painter = _PainterSpy()
+    main._draw_reticle(unconfigured_painter, main.rendered_rect(), result)
+    assert len(unconfigured_painter.lines) == 8
+    assert all(
+        pen.color().getRgb()[:3] == (255, 255, 255)
+        for pen in unconfigured_painter.line_pens[4:]
+    )
 
     preview = VideoView(
         camera=CameraRole.OVERVIEW,
@@ -1201,6 +1404,7 @@ def test_main_reticle_uses_aiming_fallback_and_clears_on_generation_boundary(
     fallback = AimPointsConfig(
         overview=AimPointConfig(None, None),
         stereo_left=AimPointConfig(None, None),
+        stereo_right=AimPointConfig(None, None),
     )
     window, _mediator_value, _turret, bindings, _states = _window(
         qt_application, aim_points=fallback
@@ -1225,6 +1429,7 @@ def test_main_reticle_follows_camera_swap_and_dynamic_aiming_config(
     initial = AimPointsConfig(
         overview=AimPointConfig(20, 10),
         stereo_left=AimPointConfig(80, 40),
+        stereo_right=AimPointConfig(50, 25),
     )
     window, mediator, _turret, bindings, _states = _window(
         qt_application, aim_points=initial
@@ -1246,6 +1451,7 @@ def test_main_reticle_follows_camera_swap_and_dynamic_aiming_config(
             aim_points=AimPointsConfig(
                 overview=AimPointConfig(25, 15),
                 stereo_left=AimPointConfig(70, 30),
+                stereo_right=AimPointConfig(50, 25),
             ),
         )
     )
@@ -2275,11 +2481,12 @@ def test_operator_window_statuses_follow_existing_ui_update_path(
 
     window.state_pump.pump_once()
 
-    assert operator.camera_labels[CameraRole.OVERVIEW].text() == "Overview: ONLINE"
+    assert operator.camera_labels[CameraRole.OVERVIEW].text() == "Обзорная: ONLINE"
     assert (
         operator.camera_labels[CameraRole.STEREO_LEFT].text()
-        == "Stereo Left: RECONNECTING"
+        == "Левая: RECONNECTING"
     )
+    assert operator.camera_labels[CameraRole.STEREO_RIGHT].text() == "Правая: ОТКЛЮЧЕНА"
     assert operator.controller_label.text() == "Контроллер: CONNECTING"
     assert operator.mode_label.text() == "Режим: TRACKING"
     assert operator.motor_label.text() == "Мотор: OFF"
@@ -2298,12 +2505,12 @@ def test_operator_pid_panel_uses_initial_values_and_queues_full_typed_update(
     )
     operator = window.operator_window
 
-    assert operator.pid_inputs["pid_kp_x"].text() == "0.25"
-    assert operator.pid_inputs["pid_ki_x"].text() == "0.01"
-    assert operator.pid_inputs["pid_kd_x"].text() == "0.04"
-    assert operator.pid_inputs["pid_kp_y"].text() == "0.3"
-    assert operator.pid_inputs["pid_ki_y"].text() == "0.02"
-    assert operator.pid_inputs["pid_kd_y"].text() == "0.05"
+    assert operator.pid_inputs["pid_kp_x"].value() == pytest.approx(0.25)
+    assert operator.pid_inputs["pid_ki_x"].value() == pytest.approx(0.01)
+    assert operator.pid_inputs["pid_kd_x"].value() == pytest.approx(0.04)
+    assert operator.pid_inputs["pid_kp_y"].value() == pytest.approx(0.30)
+    assert operator.pid_inputs["pid_ki_y"].value() == pytest.approx(0.02)
+    assert operator.pid_inputs["pid_kd_y"].value() == pytest.approx(0.05)
 
     values = {
         "pid_kp_x": "1.25",
@@ -2314,7 +2521,7 @@ def test_operator_pid_panel_uses_initial_values_and_queues_full_typed_update(
         "pid_kd_y": "0.15",
     }
     for field, text in values.items():
-        operator.pid_inputs[field].setText(text)
+        operator.pid_inputs[field].setValue(float(text))
     QTest.mouseClick(operator.pid_apply_button, Qt.MouseButton.LeftButton)
 
     assert queued == [
@@ -2334,32 +2541,45 @@ def test_operator_pid_panel_uses_initial_values_and_queues_full_typed_update(
     operator.hide()
     operator.show()
     qt_application.processEvents()
-    assert operator.pid_inputs["pid_kp_x"].text() == "1.25"
+    assert operator.pid_inputs["pid_kp_x"].value() == pytest.approx(1.25)
     window.close()
 
 
-@pytest.mark.parametrize("invalid", ["-0.1", "nan", "inf", "-inf", "", "abc"])
-def test_operator_pid_panel_rejects_invalid_input_without_changing_last_status(
+def test_operator_pid_panel_uses_numeric_spinboxes_with_non_negative_range(
     qt_application: QApplication,
-    invalid: str,
 ) -> None:
-    queued: list[PidControllerConfig] = []
     window, _mediator_value, _turret, _bindings_value, _states = _window(
-        qt_application,
-        apply_pid_tuning=queued.append,
+        qt_application
     )
     operator = window.operator_window
 
-    QTest.mouseClick(operator.pid_apply_button, Qt.MouseButton.LeftButton)
-    assert len(queued) == 1
-    successful_status = operator.pid_status_label.text()
+    editor = operator.pid_inputs["pid_kp_x"]
+    assert editor.minimum() == 0.0
+    assert editor.singleStep() == pytest.approx(0.01)
+    editor.setValue(-1.0)
+    assert editor.value() == 0.0
+    window.close()
 
-    operator.pid_inputs["pid_kp_x"].setText(invalid)
-    QTest.mouseClick(operator.pid_apply_button, Qt.MouseButton.LeftButton)
 
-    assert len(queued) == 1
-    assert operator.pid_status_label.text() == successful_status
-    assert operator.pid_error_label.text().startswith("Ошибка PID:")
+def test_operator_additional_camera_time_checkbox_is_opt_in_runtime_setting(
+    qt_application: QApplication,
+) -> None:
+    window, mediator, _turret, _bindings_value, _states = _window(qt_application)
+    operator = window.operator_window
+
+    assert not mediator.use_camera_time_for_tracking
+    assert not operator.use_camera_time_for_tracking_checkbox.isChecked()
+    assert "диагностики" in operator.camera_time_status_label.text()
+
+    operator.use_camera_time_for_tracking_checkbox.setChecked(True)
+    qt_application.processEvents()
+    assert mediator.use_camera_time_for_tracking
+    assert "включено" in operator.camera_time_status_label.text()
+
+    operator.use_camera_time_for_tracking_checkbox.setChecked(False)
+    qt_application.processEvents()
+    assert not mediator.use_camera_time_for_tracking
+    assert "диагностики" in operator.camera_time_status_label.text()
     window.close()
 
 
@@ -2382,23 +2602,15 @@ def test_operator_tracking_panel_queues_only_exposed_typed_runtime_fields(
     assert operator.ff_gain_x.singleStep() == 0.05
     assert not operator.prediction_enabled_checkbox.isChecked()
     assert "horizon_ms" not in operator.tracking_inputs
-    assert operator.tracking_inputs["window_ms"].text() == "200"
+    assert operator.tracking_inputs["window_ms"].value() == 200
 
-    operator.ff_enabled_checkbox.setChecked(True)
-    operator.ff_gain_x.setValue(0.4)
-    operator.ff_gain_y.setValue(0.5)
     operator.prediction_enabled_checkbox.setChecked(True)
-    operator.tracking_inputs["window_ms"].setText("250")
+    operator.tracking_inputs["window_ms"].setValue(250)
     QTest.mouseClick(operator.tracking_apply_button, Qt.MouseButton.LeftButton)
 
     assert len(queued) == 1
     update = queued[0]
-    assert update.feed_forward == replace(
-        initial.feed_forward,
-        enabled=True,
-        gain_x=0.4,
-        gain_y=0.5,
-    )
+    assert update.feed_forward == initial.feed_forward
     assert update.prediction == replace(
         initial.prediction,
         enabled=True,
@@ -2410,6 +2622,267 @@ def test_operator_tracking_panel_queues_only_exposed_typed_runtime_fields(
     assert update.platform_motion == initial.platform_motion
     assert operator.tracking_status_label.text().startswith("Отправлено:")
     assert operator.tracking_error_label.text() == ""
+    window.close()
+
+
+def test_operator_ff_apply_is_independent_from_tracking_apply(
+    qt_application: QApplication,
+) -> None:
+    queued: list[TrackingControlConfig] = []
+    window, mediator, _turret, _bindings_value, _states = _window(
+        qt_application,
+        apply_tracking_control_tuning=queued.append,
+    )
+    operator = window.operator_window
+    initial = mediator.tracking_estimator.config
+
+    operator.ff_enabled_checkbox.setChecked(True)
+    operator.ff_gain_x.setValue(0.4)
+    operator.ff_gain_y.setValue(0.5)
+    QTest.mouseClick(operator.ff_apply_button, Qt.MouseButton.LeftButton)
+
+    assert len(queued) == 1
+    ff_update = queued[-1]
+    assert ff_update.feed_forward == replace(
+        initial.feed_forward,
+        enabled=True,
+        gain_x=0.4,
+        gain_y=0.5,
+    )
+    assert ff_update.prediction == initial.prediction
+    assert ff_update.velocity_estimator == initial.velocity_estimator
+
+    operator.prediction_enabled_checkbox.setChecked(True)
+    operator.tracking_inputs["window_ms"].setValue(250)
+    QTest.mouseClick(operator.tracking_apply_button, Qt.MouseButton.LeftButton)
+
+    tracking_update = queued[-1]
+    assert tracking_update.feed_forward == ff_update.feed_forward
+    assert tracking_update.prediction == replace(initial.prediction, enabled=True)
+    assert tracking_update.velocity_estimator == replace(
+        initial.velocity_estimator, window_ms=250
+    )
+    window.close()
+
+
+def test_operator_motion_limits_use_spinboxes_and_separate_apply(
+    qt_application: QApplication,
+) -> None:
+    defaults = load_config(
+        Path(__file__).resolve().parents[1] / "config" / "defaults" / "navmin.json"
+    )
+    queued: list[Stm32Config] = []
+    window, _mediator_value, _turret, _bindings_value, _states = _window(
+        qt_application,
+        stm32_config=defaults.turret.stm32,
+        apply_motion_limits_tuning=queued.append,
+    )
+    operator = window.operator_window
+
+    assert all(
+        isinstance(editor, QDoubleSpinBox)
+        for editor in operator.motion_limit_inputs.values()
+    )
+    operator.motion_limit_inputs["max_speed_x_deg_s"].setValue(12.5)
+    operator.motion_limit_inputs["max_speed_y_deg_s"].setValue(13.5)
+    operator.motion_limit_inputs["acceleration_x_deg_s2"].setValue(20.0)
+    operator.motion_limit_inputs["acceleration_y_deg_s2"].setValue(21.0)
+    QTest.mouseClick(
+        operator.motion_limits_apply_button, Qt.MouseButton.LeftButton
+    )
+
+    assert len(queued) == 1
+    assert queued[0] == replace(
+        defaults.turret.stm32,
+        max_speed_x_deg_s=12.5,
+        max_speed_y_deg_s=13.5,
+        acceleration_x_deg_s2=20.0,
+        acceleration_y_deg_s2=21.0,
+    )
+    assert operator.motion_limits_status_label.text().startswith("Отправлено:")
+    window.close()
+
+
+def test_operator_uses_horizontal_left_navigation_and_runtime_detector_selection(
+    qt_application: QApplication,
+) -> None:
+    selections: list[tuple[CameraRole, VisionProcessorSelection]] = []
+    window, _mediator_value, _turret, _bindings_value, _states = _window(
+        qt_application,
+        apply_vision_processor_selection=lambda camera, selection: selections.append(
+            (camera, selection)
+        ),
+    )
+    operator = window.operator_window
+
+    assert [
+        operator.navigation.item(index).text()
+        for index in range(operator.navigation.count())
+    ] == [
+        "Камеры",
+        "Турель",
+        "Отслеживание",
+        "Калибровка",
+        "Дополнительно",
+    ]
+    assert all(
+        isinstance(operator.pages.widget(index), QScrollArea)
+        for index in range(operator.pages.count())
+    )
+    operator.navigation.setCurrentRow(2)
+    assert operator.pages.currentIndex() == 2
+
+    controls = operator.detector_controls[CameraRole.OVERVIEW]
+    detector = controls["detector"]
+    profile = controls["profile"]
+    apply_button = controls["apply"]
+    detector.setCurrentIndex(detector.findData(VT11_VISION_PROCESSOR_CLASS))
+    profile.setCurrentIndex(profile.findData("thermal"))
+    QTest.mouseClick(apply_button, Qt.MouseButton.LeftButton)
+
+    assert selections == [
+        (
+            CameraRole.OVERVIEW,
+            VisionProcessorSelection(VT11_VISION_PROCESSOR_CLASS, "thermal"),
+        )
+    ]
+    window.close()
+
+
+def test_right_camera_is_display_only_and_has_its_own_status(
+    qt_application: QApplication,
+) -> None:
+    window, mediator, _turret, bindings, _states = _window(
+        qt_application, include_right=True
+    )
+    assert window.preview_view_2.camera is CameraRole.STEREO_RIGHT
+    bindings[CameraRole.STEREO_RIGHT].status.publish(
+        _status(CameraRole.STEREO_RIGHT, 1, state=CameraState.ONLINE)
+    )
+    window.state_pump.pump_once()
+    assert (
+        window.operator_window.camera_labels[CameraRole.STEREO_RIGHT].text()
+        == "Правая: ONLINE"
+    )
+
+    control_camera = mediator.main_camera
+    window._select_second_preview()
+    assert window.main_view.camera is CameraRole.STEREO_RIGHT
+    assert mediator.main_camera is control_camera
+    window.close()
+
+
+def test_right_camera_display_checkbox_persists_and_hides_preview(
+    qt_application: QApplication,
+) -> None:
+    persisted: list[UiConfig] = []
+    defaults = load_config(
+        Path(__file__).resolve().parents[1] / "config" / "defaults" / "navmin.json"
+    )
+    window, mediator, _turret, _bindings_value, _states = _window(
+        qt_application,
+        include_right=True,
+        ui_config=replace(defaults.ui, show_stereo_right_camera=True),
+        persist_ui_config=persisted.append,
+    )
+    operator = window.operator_window
+    assert operator.show_right_camera_checkbox.isChecked()
+    assert window.preview_view_2.isVisible()
+
+    window._select_second_preview()
+    assert window.main_view.camera is CameraRole.STEREO_RIGHT
+    operator.show_right_camera_checkbox.setChecked(False)
+    qt_application.processEvents()
+
+    assert persisted[-1].show_stereo_right_camera is False
+    assert window.main_view.camera is mediator.main_camera
+    assert not window.preview_view_2.isVisible()
+    window.close()
+
+
+def test_operator_pid_precision_and_motion_limit_steps(
+    qt_application: QApplication,
+) -> None:
+    window, _mediator_value, _turret, _bindings_value, _states = _window(qt_application)
+    operator = window.operator_window
+
+    assert all(editor.decimals() == 2 for editor in operator.pid_inputs.values())
+    assert operator.motion_limit_inputs["max_speed_x_deg_s"].singleStep() == pytest.approx(5.0)
+    assert operator.motion_limit_inputs["max_speed_y_deg_s"].singleStep() == pytest.approx(5.0)
+    assert operator.motion_limit_inputs["acceleration_x_deg_s2"].singleStep() == pytest.approx(5.0)
+    assert operator.motion_limit_inputs["acceleration_y_deg_s2"].singleStep() == pytest.approx(5.0)
+    window.close()
+
+
+def test_legacy_detector_profile_is_explicit_default(
+    qt_application: QApplication,
+) -> None:
+    selections: list[tuple[CameraRole, VisionProcessorSelection]] = []
+    window, _mediator_value, _turret, _bindings_value, _states = _window(
+        qt_application,
+        apply_vision_processor_selection=lambda camera, selection: selections.append(
+            (camera, selection)
+        ),
+    )
+    controls = window.operator_window.detector_controls[CameraRole.OVERVIEW]
+    detector = controls["detector"]
+    profile = controls["profile"]
+    apply_button = controls["apply"]
+
+    detector.setCurrentIndex(detector.findData(DEFAULT_VISION_PROCESSOR_CLASS))
+    assert profile.count() == 1
+    assert profile.currentData() == "default"
+    assert profile.isEnabled()
+    QTest.mouseClick(apply_button, Qt.MouseButton.LeftButton)
+
+    assert selections[-1] == (
+        CameraRole.OVERVIEW,
+        VisionProcessorSelection(DEFAULT_VISION_PROCESSOR_CLASS, "default"),
+    )
+    window.close()
+
+
+def test_aim_point_button_updates_authoritative_aiming_config(
+    qt_application: QApplication,
+) -> None:
+    window, mediator, _turret, bindings, _states = _window(qt_application)
+    result = _result(CameraRole.OVERVIEW, 1)
+    _publish_camera(window, bindings, result)
+
+    QTest.mouseClick(window.aim_point_button, Qt.MouseButton.LeftButton)
+    assert window._aim_point_selection_active
+    displayed = window.main_view.displayed_result
+    assert displayed is not None
+    window._handle_main_click(displayed, 73.2, 31.6)
+
+    point = mediator.aiming.config.aim_points.overview
+    assert point == AimPointConfig(73, 32)
+    assert not window._aim_point_selection_active
+    window.close()
+
+
+def test_right_aim_point_can_be_set_and_reset_to_unconfigured_center(
+    qt_application: QApplication,
+) -> None:
+    window, mediator, _turret, bindings, _states = _window(
+        qt_application, include_right=True
+    )
+    result = _result(CameraRole.STEREO_RIGHT, 1)
+    _publish_camera(window, bindings, result)
+    window._select_second_preview()
+    assert window.main_view.camera is CameraRole.STEREO_RIGHT
+
+    QTest.mouseClick(window.aim_point_button, Qt.MouseButton.LeftButton)
+    displayed = window.main_view.displayed_result
+    assert displayed is not None
+    window._handle_main_click(displayed, 61.2, 22.8)
+
+    assert mediator.aiming.config.aim_points.stereo_right == AimPointConfig(61, 23)
+    assert window.main_view._aim_point_configured
+
+    window.reset_aim_point(CameraRole.STEREO_RIGHT)
+    assert mediator.aiming.config.aim_points.stereo_right == AimPointConfig(None, None)
+    assert not window.main_view._aim_point_configured
     window.close()
 
 
@@ -2582,8 +3055,14 @@ def test_main_window_can_request_fullscreen_at_startup(qt_application: QApplicat
         camera_bindings=_bindings(),
         turret_states=LatestValue(),
         camera_stale_timeout_ms=500,
+        aiming_config=mediator.aiming.config,
+        apply_aiming_tuning=mediator.aiming.replace_config,
         pid_controller_config=_pid_config(),
         apply_pid_tuning=lambda _config: None,
+        stm32_config=load_config(
+            Path(__file__).resolve().parents[1] / "config" / "defaults" / "navmin.json"
+        ).turret.stm32,
+        apply_motion_limits_tuning=lambda _config: None,
         tracking_control_config=mediator.tracking_estimator.config,
         apply_tracking_control_tuning=lambda _config: None,
         start_timer=False,

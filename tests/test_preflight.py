@@ -24,6 +24,7 @@ from navmin.config.models import (
     PidControllerConfig,
     ProcessingScope,
     RtpJpegSourceConfig,
+    RtpJpegTimestampMode,
     RtspDecoderMode,
     RtspProtocol,
     RtspSourceConfig,
@@ -78,6 +79,7 @@ def _camera(
         ),
         processing_enabled=False,
         vision_processor_class="Legacy14VisionProcessor",
+        vision_processor_profile="default",
     )
 
 
@@ -88,6 +90,7 @@ def _overview_camera(port: int) -> OverviewCameraConfig:
         source=camera.source,
         processing_enabled=camera.processing_enabled,
         vision_processor_class=camera.vision_processor_class,
+        vision_processor_profile=camera.vision_processor_profile,
         calibration_file="calibration/overview.json",
     )
 
@@ -109,6 +112,7 @@ def _rtsp_camera(
         ),
         processing_enabled=False,
         vision_processor_class="Legacy14VisionProcessor",
+        vision_processor_profile="default",
     )
 
 
@@ -126,7 +130,7 @@ def _inputs(
         max_relative_move_deg=45.0,
     )
     config = AppConfig(
-        schema_version=6,
+        schema_version=7,
         vision=VisionConfig(
             processing_scope=ProcessingScope.MAIN_AND_PREVIEW,
             cameras=CamerasConfig(
@@ -150,7 +154,7 @@ def _inputs(
         ),
         aiming=AimingConfig(
             target_lost_timeout_ms=500,
-            aim_points=AimPointsConfig(overview=center, stereo_left=center),
+            aim_points=AimPointsConfig(overview=center, stereo_left=center, stereo_right=center),
         ),
         tracking_control=_default_tracking_control_config(),
         tracking_visualization=TrackingVisualizationConfig(
@@ -195,6 +199,7 @@ def _inputs(
             default_camera=CameraRole.OVERVIEW,
             show_fps=False,
             show_stereo_right_diagnostics=False,
+            show_stereo_right_camera=True,
         ),
     )
     overview = OverviewCalibration(
@@ -556,6 +561,55 @@ def test_stereo_right_enabled_rtp_uses_stereo_calibration_and_udp_checks(
         for check in report.checks
     )
     assert ("127.0.0.1", 18_901) in udp_calls
+
+
+def test_sensor_rtp_pts_mode_requires_jitterbuffer_dependency_only_when_enabled(
+    tmp_path,
+) -> None:
+    inputs = _inputs(18_899, 18_900)
+    legacy_element_calls: list[tuple[str, ...]] = []
+    legacy_report = _run(
+        tmp_path,
+        inputs,
+        StartupBackendSelection("real", "real", "pty", stereo_right="real"),
+        receiver_check=lambda elements: legacy_element_calls.append(elements) or None,
+    )
+    assert legacy_report.ok
+    assert len(legacy_element_calls) == 1
+    assert "rtpjitterbuffer" not in legacy_element_calls[0]
+
+    overview = inputs.config.vision.cameras.overview
+    assert isinstance(overview.source, RtpJpegSourceConfig)
+    sensor_overview = replace(
+        overview,
+        source=replace(
+            overview.source,
+            timestamp_mode=RtpJpegTimestampMode.SENSOR_RTP_PTS,
+        ),
+    )
+    cameras = replace(inputs.config.vision.cameras, overview=sensor_overview)
+    config = replace(
+        inputs.config,
+        vision=replace(inputs.config.vision, cameras=cameras),
+    )
+    sensor_element_calls: list[tuple[str, ...]] = []
+
+    sensor_report = _run(
+        tmp_path,
+        replace(inputs, config=config),
+        StartupBackendSelection("real", "real", "pty", stereo_right="real"),
+        receiver_check=lambda elements: sensor_element_calls.append(elements) or None,
+    )
+
+    assert sensor_report.ok
+    assert len(sensor_element_calls) == 1
+    assert "rtpjitterbuffer" in sensor_element_calls[0]
+    detail = next(
+        check.detail
+        for check in sensor_report.checks
+        if check.name == "Overview RTP/JPEG configuration"
+    )
+    assert "timestamp-mode=sensor-rtp-pts" in detail
 
 
 def test_stereo_right_enabled_rtsp_checks_rtsp_dependencies_without_udp(

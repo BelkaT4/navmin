@@ -10,6 +10,8 @@ from navmin.contracts import (
     CameraRay,
     CameraRole,
     FramePacket,
+    FrameSourceTimestamp,
+    FrameTimestampSource,
     TargetRef,
     TrackedObject,
 )
@@ -39,12 +41,14 @@ def _config(
     *,
     overview: AimPointConfig | None = None,
     stereo_left: AimPointConfig | None = None,
+    stereo_right: AimPointConfig | None = None,
 ) -> AimingConfig:
     return AimingConfig(
         target_lost_timeout_ms=500,
         aim_points=AimPointsConfig(
             overview=overview or AimPointConfig(50, 40),
             stereo_left=stereo_left or AimPointConfig(50, 40),
+            stereo_right=stereo_right or AimPointConfig(50, 40),
         ),
     )
 
@@ -74,6 +78,13 @@ def test_aim_point_uses_configured_pixel_and_independent_center_fallback() -> No
         50.0,
         23.0,
     )
+
+
+def test_right_aim_point_uses_its_own_config_and_center_fallback() -> None:
+    aiming = Aiming(_config(stereo_right=AimPointConfig(None, None)))
+    frame = _frame(CameraRole.STEREO_RIGHT, width=121, height=91)
+
+    assert aiming.aim_point(CameraRole.STEREO_RIGHT, frame) == (60.0, 45.0)
 
 
 def test_click_on_aim_point_is_zero_delta() -> None:
@@ -152,15 +163,38 @@ def test_tracking_error_contains_target_frame_timestamp_and_finite_angles() -> N
     tracked = TrackedObject(3, BBox(50, 40, 10, 8), 4.0, -2.0, 8)
     model = _RayModel()
     frame = _frame(timestamp_ns=987654321)
+    frame = FramePacket(
+        camera=frame.camera,
+        generation=frame.generation,
+        frame_id=frame.frame_id,
+        capture_id=frame.capture_id,
+        receive_timestamp_ns=frame.receive_timestamp_ns,
+        image=frame.image,
+        source_timestamp=FrameSourceTimestamp(
+            source=FrameTimestampSource.SENSOR_RTP_PTS,
+            timestamp_ns=123_456_789,
+        ),
+    )
 
-    error = Aiming(_config()).tracking_error(
+    aiming = Aiming(_config())
+    error = aiming.tracking_error(
         camera_model=model,
         frame=frame,
         tracked=tracked,
         target=target,
     )
+    mapped_error = aiming.tracking_error(
+        camera_model=model,
+        frame=frame,
+        tracked=tracked,
+        target=target,
+        observation_timestamp_ns=123_456_789,
+    )
 
     assert error.target == target
+    assert frame.source_timestamp is not None
+    assert frame.source_timestamp.timestamp_ns != frame.receive_timestamp_ns
     assert error.timestamp_ns == frame.receive_timestamp_ns
+    assert mapped_error.timestamp_ns == 123_456_789
     assert math.isfinite(error.error_x_deg)
     assert math.isfinite(error.error_y_deg)

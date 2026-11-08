@@ -9,6 +9,7 @@ from typing import Protocol
 
 import numpy as np
 
+from navmin.concurrency import LatestValue
 from navmin.config.models import CameraConfig
 from navmin.contracts import CameraModel, CameraRole, CameraState
 from navmin.lifecycle import StopToken
@@ -21,7 +22,10 @@ from .pipeline import (
     VisionPipeline,
     VisionPipelineError,
 )
-from .processor import create_vision_processor
+from .processor import (
+    VisionProcessorSelection,
+    create_selected_vision_processor,
+)
 
 LOGGER = logging.getLogger(__name__)
 
@@ -48,6 +52,7 @@ class CameraWorker:
         idle_wait_s: float = 0.01,
         reconnect_delays_s: tuple[float, ...] = _RTSP_RECONNECT_DELAYS_S,
         thread_name: str | None = None,
+        processor_selection: VisionProcessorSelection | None = None,
     ) -> None:
         if idle_wait_s <= 0.0:
             raise ValueError("idle_wait_s must be > 0")
@@ -58,6 +63,9 @@ class CameraWorker:
         self._idle_wait_s = idle_wait_s
         self._reconnect_delays_s = reconnect_delays_s
         self._stop_token = StopToken()
+        self._processor_selection = processor_selection
+        self._processor_updates: LatestValue[VisionProcessorSelection] = LatestValue()
+        self._processor_update_revision = 0
         self._lifecycle_lock = Lock()
         self._thread = Thread(
             target=self._run,
@@ -72,6 +80,15 @@ class CameraWorker:
     @property
     def pipeline(self) -> VisionPipeline:
         return self._pipeline
+
+    @property
+    def processor_selection(self) -> VisionProcessorSelection | None:
+        return self._processor_selection
+
+    def submit_processor_selection(self, selection: VisionProcessorSelection) -> None:
+        if not isinstance(selection, VisionProcessorSelection):
+            raise TypeError("selection must be VisionProcessorSelection")
+        self._processor_updates.publish(selection)
 
     def start(self) -> None:
         self._thread.start()
@@ -114,9 +131,11 @@ class CameraWorker:
     def _run_without_reconnect(self) -> None:
         # Preserve the established RTP/JPEG ordering: the generation barrier exists
         # before source data can be published.
+        self._apply_latest_processor_selection(restart_session=False)
         self._pipeline.start()
         self._source.start()
         while not self._stop_token.is_stop_requested():
+            self._apply_latest_processor_selection(restart_session=True)
             self._pipeline.apply_latest_target_control()
             failure = self._source.failure
             if failure is not None:
@@ -140,10 +159,12 @@ class CameraWorker:
                 continue
 
             # A successful source start establishes the next camera session.
+            self._apply_latest_processor_selection(restart_session=False)
             if not self._start_pipeline_session():
                 return
 
             while not self._stop_token.is_stop_requested():
+                self._apply_latest_processor_selection(restart_session=True)
                 self._pipeline.apply_latest_target_control()
                 failure = self._source.failure
                 if failure is not None:
@@ -159,6 +180,25 @@ class CameraWorker:
                     delay_index = 0
                     continue
                 self._stop_token.wait(self._idle_wait_s)
+
+    def _apply_latest_processor_selection(self, *, restart_session: bool) -> bool:
+        snapshot = self._processor_updates.snapshot()
+        if snapshot.revision <= self._processor_update_revision or snapshot.value is None:
+            return False
+        selection = snapshot.value
+        processor = create_selected_vision_processor(selection)
+        self._pipeline.replace_processor(processor)
+        self._processor_selection = selection
+        self._processor_update_revision = snapshot.revision
+        if restart_session:
+            self._pipeline.start()
+        LOGGER.info(
+            "Vision processor update applied camera=%s class=%s profile=%s",
+            self._pipeline.camera.value,
+            selection.class_name,
+            selection.profile_name or "—",
+        )
+        return True
 
     def _start_pipeline_session(self) -> bool:
         with self._lifecycle_lock:
@@ -197,10 +237,14 @@ def build_camera_worker(
 ) -> CameraWorker:
     """Bind typed camera config to one decoded source and VisionPipeline."""
     source = source_factory(config)
+    processor_selection = VisionProcessorSelection(
+        config.vision_processor_class,
+        config.vision_processor_profile,
+    )
     pipeline = VisionPipeline(
         camera=camera,
         corrector=corrector,
-        processor=create_vision_processor(config.vision_processor_class),
+        processor=create_selected_vision_processor(processor_selection),
         processing_enabled=config.processing_enabled,
         corrected_frame_sink=corrected_frame_sink,
     )
@@ -208,6 +252,7 @@ def build_camera_worker(
         source=source,
         pipeline=pipeline,
         idle_wait_s=idle_wait_s,
+        processor_selection=processor_selection,
     )
 
 

@@ -263,12 +263,13 @@ def _synthetic_diagnostic_inputs() -> LoadedApplicationInputs:
         source=overview_base.source,
         processing_enabled=overview_base.processing_enabled,
         vision_processor_class=overview_base.vision_processor_class,
+        vision_processor_profile=overview_base.vision_processor_profile,
         calibration_file="calibration/overview.json",
     )
     stereo_left = replace(diagnostic_camera_config(8889), processing_enabled=True)
     stereo_right = diagnostic_camera_config(8890)
     config = AppConfig(
-        schema_version=6,
+        schema_version=7,
         vision=VisionConfig(
             processing_scope=ProcessingScope.MAIN_AND_PREVIEW,
             cameras=CamerasConfig(
@@ -292,7 +293,7 @@ def _synthetic_diagnostic_inputs() -> LoadedApplicationInputs:
         ),
         aiming=AimingConfig(
             target_lost_timeout_ms=500,
-            aim_points=AimPointsConfig(overview=center, stereo_left=center),
+            aim_points=AimPointsConfig(overview=center, stereo_left=center, stereo_right=center),
         ),
         tracking_control=_default_tracking_control_config(),
         tracking_visualization=TrackingVisualizationConfig(
@@ -337,6 +338,7 @@ def _synthetic_diagnostic_inputs() -> LoadedApplicationInputs:
             default_camera=CameraRole.OVERVIEW,
             show_fps=False,
             show_stereo_right_diagnostics=False,
+            show_stereo_right_camera=True,
         ),
     )
     return LoadedApplicationInputs(

@@ -10,17 +10,23 @@ from navmin.calibration import OverviewCalibration
 from navmin.config.models import (
     CameraConfig,
     RtpJpegSourceConfig,
+    RtpJpegTimestampMode,
     RtspDecoderMode,
     RtspProtocol,
     RtspSourceConfig,
 )
-from navmin.contracts import CameraRole, CameraState
+from navmin.contracts import (
+    CameraRole,
+    CameraState,
+    FrameTimestampSource,
+)
 from navmin.diagnostics.synthetic_sources import SyntheticFrameSource
 from navmin.vision import gstreamer_source
 from navmin.vision.camera_source import create_camera_source
 from navmin.vision.camera_worker import CameraWorker, build_camera_worker
 from navmin.vision.gstreamer_source import (
     CameraSourceError,
+    CameraTimestampDiscontinuityError,
     GStreamerRtpJpegSource,
     GStreamerRtspSource,
     build_rtp_jpeg_pipeline_description,
@@ -35,8 +41,8 @@ from navmin.vision.pipeline import (
     VisionPipeline,
     overview_corrector,
 )
+from navmin.vision.processor import VisionProcessorSelection
 from navmin.vision.processors.vt11 import Vt11VisionProcessor
-from navmin.vision.processors.vt11 import settings as vt11_settings
 
 WIDTH = 32
 HEIGHT = 24
@@ -48,11 +54,13 @@ def rtp_source_config(
     bind_address: str = "0.0.0.0",
     port: int = 8888,
     buffer_size: int = 1,
+    timestamp_mode: RtpJpegTimestampMode = RtpJpegTimestampMode.RECEIVE_TIME,
 ) -> RtpJpegSourceConfig:
     return RtpJpegSourceConfig(
         bind_address=bind_address,
         port=port,
         buffer_size=buffer_size,
+        timestamp_mode=timestamp_mode,
     )
 
 
@@ -79,12 +87,18 @@ def camera_config(
     source: RtpJpegSourceConfig | RtspSourceConfig | None = None,
     processing_enabled: bool = True,
     vision_processor_class: str = "Legacy14VisionProcessor",
+    vision_processor_profile: str | None = None,
 ) -> CameraConfig:
     return CameraConfig(
         enabled=True,
         source=source or rtp_source_config(),
         processing_enabled=processing_enabled,
         vision_processor_class=vision_processor_class,
+        vision_processor_profile=(
+            vision_processor_profile
+            if vision_processor_profile is not None
+            else ("day" if vision_processor_class == "Vt11VisionProcessor" else "default")
+        ),
     )
 
 
@@ -105,11 +119,18 @@ def frame(value: int) -> np.ndarray:
 
 class _FakeBackend:
     def __init__(self, on_frame, on_failure) -> None:
-        self.on_frame = on_frame
+        self._on_frame = on_frame
         self.on_failure = on_failure
         self.started = False
         self.stopped = False
         self.polled_failure: BaseException | None = None
+
+    def on_frame(
+        self,
+        image: np.ndarray,
+        transport_timestamp_ns: int | None = None,
+    ) -> None:
+        self._on_frame(image, transport_timestamp_ns)
 
     def start(self) -> None:
         self.started = True
@@ -237,6 +258,29 @@ def test_rtp_jpeg_pipeline_uses_typed_source_config_and_low_latency_appsink() ->
     assert "application/x-rtp,media=video,encoding-name=JPEG,payload=26,clock-rate=90000" in description
     assert "! rtpjpegdepay ! jpegdec ! videoconvert ! video/x-raw,format=BGR" in description
     assert "appsink name=sink emit-signals=true max-buffers=1 drop=true sync=false" in description
+
+
+def test_rtp_jpeg_receive_time_mode_keeps_legacy_pipeline_without_jitterbuffer() -> None:
+    description = build_rtp_jpeg_pipeline_description(rtp_source_config())
+
+    assert "rtpjitterbuffer" not in description
+
+
+def test_rtp_jpeg_sensor_timestamp_mode_adds_candidate_timestamp_jitterbuffer() -> None:
+    description = build_rtp_jpeg_pipeline_description(
+        rtp_source_config(timestamp_mode=RtpJpegTimestampMode.SENSOR_RTP_PTS)
+    )
+
+    assert "! rtpjitterbuffer latency=0 mode=0 ! rtpjpegdepay" in description
+
+
+def test_gstreamer_transport_timestamp_preserves_pts_and_maps_none_sentinel() -> None:
+    fake_gst = type("FakeGst", (), {"CLOCK_TIME_NONE": 2**64 - 1})
+    timestamped = type("Buffer", (), {"pts": 123_456_789})()
+    missing = type("Buffer", (), {"pts": 2**64 - 1})()
+
+    assert gstreamer_source._transport_timestamp_ns(fake_gst, timestamped) == 123_456_789
+    assert gstreamer_source._transport_timestamp_ns(fake_gst, missing) is None
 
 
 def test_rtsp_diagnostic_uri_redacts_credentials_and_query() -> None:
@@ -462,18 +506,45 @@ def test_gstreamer_source_owns_frame_memory_and_replaces_latest_without_fifo() -
     factory.backend.on_frame(first)
     first[:, :, :] = 99
     factory.backend.on_frame(frame(20))
-    factory.backend.on_frame(frame(30))
+    factory.backend.on_frame(frame(30), 5_050_000_000)
 
     latest = source.read()
     assert latest is not None
     assert latest.capture_id is None
     assert latest.receive_timestamp_ns == 303
+    assert latest.transport_timestamp_ns == 5_050_000_000
+    assert latest.source_timestamp is not None
+    assert latest.source_timestamp.source is FrameTimestampSource.RECEIVE_TIME
+    assert latest.source_timestamp.timestamp_ns == 303
     assert np.array_equal(latest.image, frame(30))
     assert source.read() is None
 
     source.stop()
     assert not source.started
     assert factory.backend.stopped
+
+
+def test_sensor_rtp_pts_source_normalizes_transport_pts_as_source_timestamp() -> None:
+    factory = _BackendFactory()
+    source = GStreamerRtpJpegSource(
+        rtp_source_config(timestamp_mode=RtpJpegTimestampMode.SENSOR_RTP_PTS),
+        timestamp_clock_ns=lambda: 909,
+        backend_factory=factory,
+    )
+
+    source.start()
+    assert factory.backend is not None
+    factory.backend.on_frame(frame(41), 7_050_000_000)
+
+    decoded = source.read()
+    assert decoded is not None
+    assert decoded.receive_timestamp_ns == 909
+    assert decoded.transport_timestamp_ns == 7_050_000_000
+    assert decoded.source_timestamp is not None
+    assert decoded.source_timestamp.source is FrameTimestampSource.SENSOR_RTP_PTS
+    assert decoded.source_timestamp.timestamp_ns == 7_050_000_000
+
+    source.stop()
 
 
 def test_rtsp_source_uses_same_decoded_frame_contract_and_cleanup() -> None:
@@ -486,13 +557,17 @@ def test_rtsp_source_uses_same_decoded_frame_contract_and_cleanup() -> None:
 
     source.start()
     assert factory.backend is not None
-    factory.backend.on_frame(frame(42))
+    factory.backend.on_frame(frame(42), 123_456_789)
 
     decoded = source.read()
     assert decoded is not None
     assert decoded.image.dtype == np.uint8
     assert decoded.image.shape == (HEIGHT, WIDTH, 3)
     assert decoded.receive_timestamp_ns == 404
+    assert decoded.transport_timestamp_ns == 123_456_789
+    assert decoded.source_timestamp is not None
+    assert decoded.source_timestamp.source is FrameTimestampSource.RECEIVE_TIME
+    assert decoded.source_timestamp.timestamp_ns == 404
     assert decoded.capture_id is None
     assert source.read() is None
 
@@ -534,6 +609,7 @@ def test_build_camera_worker_binds_existing_camera_config_without_parallel_schem
         source=rtp_source_config(bind_address="0.0.0.0", port=8889),
         processing_enabled=False,
         vision_processor_class="Legacy14VisionProcessor",
+        vision_processor_profile="default",
     )
     worker = build_camera_worker(
         camera=CameraRole.STEREO_LEFT,
@@ -546,14 +622,12 @@ def test_build_camera_worker_binds_existing_camera_config_without_parallel_schem
     assert worker.pipeline.camera is CameraRole.STEREO_LEFT
 
 
-def test_build_camera_worker_routes_configured_vt11_through_production_factory(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr(vt11_settings, "VT11_PROFILE", "thermal")
+def test_build_camera_worker_routes_configured_vt11_through_production_factory() -> None:
     config = camera_config(
         source=rtp_source_config(bind_address="0.0.0.0", port=8889),
         processing_enabled=False,
         vision_processor_class="Vt11VisionProcessor",
+        vision_processor_profile="thermal",
     )
 
     worker = build_camera_worker(
@@ -565,6 +639,32 @@ def test_build_camera_worker_routes_configured_vt11_through_production_factory(
     processor = worker.pipeline._processor
     assert isinstance(processor, Vt11VisionProcessor)
     assert processor.settings_snapshot.profile == "thermal"
+
+
+def test_camera_worker_runtime_processor_switch_starts_new_generation() -> None:
+    source = InMemoryFrameSource()
+    pipeline = VisionPipeline(
+        camera=CameraRole.OVERVIEW,
+        corrector=overview_corrector(overview_calibration()),
+        processing_enabled=False,
+    )
+    worker = CameraWorker(
+        source=source,
+        pipeline=pipeline,
+        idle_wait_s=0.005,
+        processor_selection=VisionProcessorSelection("Legacy14VisionProcessor", "default"),
+    )
+    worker.start()
+    _wait_until(lambda: pipeline.generation == 1)
+
+    selection = VisionProcessorSelection("Vt11VisionProcessor", "thermal")
+    worker.submit_processor_selection(selection)
+
+    _wait_until(lambda: pipeline.generation == 2)
+    assert worker.processor_selection == selection
+    assert isinstance(pipeline._processor, Vt11VisionProcessor)
+    assert pipeline._processor.settings_snapshot.profile == "thermal"
+    assert worker.stop(timeout=1.0)
 
 
 def test_camera_worker_uses_existing_source_to_pipeline_path_and_stops_bounded() -> None:
@@ -711,11 +811,135 @@ def test_gstreamer_reconnect_session_ignores_callbacks_from_old_backend() -> Non
 
 
 def test_transport_sources_declare_reconnect_capability() -> None:
-    rtp = GStreamerRtpJpegSource(rtp_source_config(), backend_factory=_BackendFactory())
+    legacy_rtp = GStreamerRtpJpegSource(
+        rtp_source_config(), backend_factory=_BackendFactory()
+    )
+    timestamp_rtp = GStreamerRtpJpegSource(
+        rtp_source_config(timestamp_mode=RtpJpegTimestampMode.SENSOR_RTP_PTS),
+        backend_factory=_BackendFactory(),
+    )
     rtsp = GStreamerRtspSource(rtsp_source_config(), backend_factory=_BackendFactory())
 
-    assert not rtp.supports_reconnect
+    assert not legacy_rtp.supports_reconnect
+    assert timestamp_rtp.supports_reconnect
     assert rtsp.supports_reconnect
+
+
+def test_sensor_rtp_pts_source_rejects_missing_duplicate_and_backward_pts() -> None:
+    factory = _BackendHistoryFactory()
+    source = GStreamerRtpJpegSource(
+        rtp_source_config(timestamp_mode=RtpJpegTimestampMode.SENSOR_RTP_PTS),
+        timestamp_clock_ns=iter((101, 202, 303, 404)).__next__,
+        backend_factory=factory,
+    )
+
+    source.start()
+    first_backend = factory.backends[-1]
+    first_backend.on_frame(frame(10), 0)
+    first = source.read()
+    assert first is not None
+    assert first.transport_timestamp_ns == 0
+
+    first_backend.on_frame(frame(11), 50_000_000)
+    second = source.read()
+    assert second is not None
+    assert second.transport_timestamp_ns == 50_000_000
+
+    first_backend.on_frame(frame(12), 50_000_000)
+    failure = source.failure
+    assert isinstance(failure, CameraTimestampDiscontinuityError)
+    assert "not strictly increasing" in str(failure)
+    assert source.read() is None
+    first_backend.on_frame(frame(13), 100_000_000)
+    assert source.read() is None
+
+    source.stop()
+    source.start()
+    second_backend = factory.backends[-1]
+    second_backend.on_frame(frame(20), None)
+    failure = source.failure
+    assert isinstance(failure, CameraTimestampDiscontinuityError)
+    assert "without PTS" in str(failure)
+    assert source.read() is None
+
+    source.stop()
+    source.start()
+    third_backend = factory.backends[-1]
+    third_backend.on_frame(frame(30), 100_000_000)
+    assert source.read() is not None
+    third_backend.on_frame(frame(31), 90_000_000)
+    failure = source.failure
+    assert isinstance(failure, CameraTimestampDiscontinuityError)
+    assert "previous=100000000 current=90000000" in str(failure)
+    assert source.read() is None
+    source.stop()
+
+
+def test_sensor_rtp_pts_worker_recreates_receiver_after_timestamp_discontinuity(
+) -> None:
+    factory = _BackendHistoryFactory()
+    source = GStreamerRtpJpegSource(
+        rtp_source_config(timestamp_mode=RtpJpegTimestampMode.SENSOR_RTP_PTS),
+        timestamp_clock_ns=iter((101, 202, 303, 404, 505)).__next__,
+        backend_factory=factory,
+    )
+    pipeline = _pipeline()
+    worker = CameraWorker(
+        source=source,
+        pipeline=pipeline,
+        idle_wait_s=0.001,
+        reconnect_delays_s=(0.001,),
+    )
+
+    worker.start()
+    _wait_until(lambda: pipeline.generation == 1 and len(factory.backends) == 1)
+    first_backend = factory.backends[0]
+    first_backend.on_frame(frame(10), 0)
+    _wait_until(lambda: pipeline.latest_result.get() is not None)
+    first_result = pipeline.latest_result.get()
+    assert first_result is not None
+    assert first_result.frame.generation == 1
+    assert first_result.frame.source_timestamp is not None
+    assert first_result.frame.source_timestamp.source is FrameTimestampSource.SENSOR_RTP_PTS
+    assert first_result.frame.source_timestamp.timestamp_ns == 0
+
+    first_backend.on_frame(frame(11), 50_000_000)
+    _wait_until(
+        lambda: (
+            pipeline.latest_result.get() is not None
+            and pipeline.latest_result.get().frame.frame_id >= 1
+        )
+    )
+    first_backend.on_frame(frame(12), 50_000_000)
+
+    _wait_until(lambda: pipeline.generation == 2 and len(factory.backends) == 2)
+    assert first_backend.stopped
+    second_backend = factory.backends[1]
+    second_backend.on_frame(frame(20), 0)
+    _wait_until(
+        lambda: (
+            pipeline.latest_result.get() is not None
+            and pipeline.latest_result.get().frame.generation == 2
+        )
+    )
+    recovered = pipeline.latest_result.get()
+    assert recovered is not None
+    assert recovered.frame.generation == 2
+    assert recovered.frame.source_timestamp is not None
+    assert recovered.frame.source_timestamp.source is FrameTimestampSource.SENSOR_RTP_PTS
+    assert recovered.frame.source_timestamp.timestamp_ns == 0
+    assert np.array_equal(recovered.frame.image, frame(20))
+
+    second_backend.on_frame(frame(21), 50_000_000)
+    _wait_until(
+        lambda: (
+            pipeline.latest_result.get() is not None
+            and pipeline.latest_result.get().frame.generation == 2
+            and pipeline.latest_result.get().frame.frame_id >= 1
+        )
+    )
+    assert source.failure is None
+    assert worker.stop(timeout=1.0)
 
 
 class _RecoverableSource:

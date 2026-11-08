@@ -36,6 +36,8 @@ from navmin.contracts import (
 )
 from navmin.core import Mediator
 from navmin.motion_calibration import (
+    CalibrationClickGuide,
+    CalibrationPlanAssessment,
     CameraMotionCalibration,
     MotionCalibrationError,
     MotionCalibrationRuntime,
@@ -43,12 +45,14 @@ from navmin.motion_calibration import (
     MotionProfile,
     WizardPhase,
     WizardSettings,
+    assess_calibration_plan,
 )
 
 _CAMERAS = (
     (CameraRole.OVERVIEW, "Overview"),
     (CameraRole.STEREO_LEFT, "Stereo Left"),
 )
+_CALIBRATION_CAMERAS = frozenset(camera for camera, _label in _CAMERAS)
 LOGGER = logging.getLogger(__name__)
 _PROFILE_APPLY_TIMEOUT_NS = 5_000_000_000
 
@@ -80,6 +84,8 @@ class MotionCalibrationWindow(QWidget):
         self._temporary_profile_active = False
         self._awaiting_profile_confirmation = False
         self._profile_confirmation_deadline_ns: int | None = None
+        self._latest_results: dict[CameraRole, VisionResult] = {}
+        self._plan_assessment: CalibrationPlanAssessment | None = None
 
         self.setWindowTitle("Калибровка движения")
         self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, False)
@@ -207,7 +213,11 @@ class MotionCalibrationWindow(QWidget):
             if wizard.phase == WizardPhase.CANCELLED:
                 self.abort(str(exc))
             else:
-                self.progress_label.setText(f"Измерение отклонено: {exc}")
+                message = f"Измерение отклонено: {exc}"
+                guide = self._current_click_guide()
+                if guide is not None:
+                    message += f". Допустимая зона для этого шага: {guide.describe()}"
+                self.progress_label.setText(message)
             return True
         except Exception as exc:
             LOGGER.exception("Unexpected motion calibration measurement failure")
@@ -216,6 +226,10 @@ class MotionCalibrationWindow(QWidget):
         self._refresh_progress()
         self._finish_if_complete()
         return True
+
+    def accept_vision_result(self, result: VisionResult) -> None:
+        if result.frame.camera in _CALIBRATION_CAMERAS:
+            self._latest_results[result.frame.camera] = result
 
     def accept_camera_session(self, session: CameraSessionStarted) -> None:
         wizard = self._wizard
@@ -271,6 +285,7 @@ class MotionCalibrationWindow(QWidget):
         self.start_button.setEnabled(True)
         self.save_button.setEnabled(False)
         self._profile = None
+        self._plan_assessment = None
         self._awaiting_profile_confirmation = False
         self._profile_confirmation_deadline_ns = None
         self._set_inputs_enabled(True)
@@ -326,6 +341,77 @@ class MotionCalibrationWindow(QWidget):
             extrapolation_percent=self.extrapolation_input.value(),
             motion_profile=profile,
         )
+        result = self._latest_results.get(camera)
+        if result is None or result.frame.generation != generation:
+            self._show_error(
+                "Нет свежего кадра выбранной камеры для проверки геометрии. "
+                "Дождитесь видео и повторите запуск."
+            )
+            return
+        if (
+            self._clock_ns() - result.frame.receive_timestamp_ns
+            > self._stale_timeout_ms * 1_000_000
+        ):
+            self._show_error(
+                "Последний кадр выбранной камеры устарел. Дождитесь свежего видео и повторите запуск."
+            )
+            return
+        camera_model = self._mediator.session_gate.camera_model(camera, generation)
+        if camera_model is None:
+            self._show_error("У выбранной камеры нет CameraModel для текущей generation.")
+            return
+        try:
+            assessment = assess_calibration_plan(
+                camera_model=camera_model,
+                frame=result.frame,
+                x_angles=settings.x_angles,
+                y_angles=settings.y_angles,
+                mechanics=self._runtime.axes,
+            )
+        except MotionCalibrationError as exc:
+            self._show_error(str(exc))
+            return
+        if not assessment.valid:
+            LOGGER.warning(
+                "Motion calibration preflight rejected camera=%s generation=%d issues=%s "
+                "max_x_deg=%.3f max_y_deg=%.3f",
+                camera.value,
+                generation,
+                assessment.issues,
+                assessment.maximum_measurable_deg["x"],
+                assessment.maximum_measurable_deg["y"],
+            )
+            details = "\n".join(f"• {issue}" for issue in assessment.issues)
+            self._show_error(
+                "Набор углов нельзя измерить выбранной камерой без потери ориентира.\n"
+                f"{details}\n"
+                "Приблизительный симметричный максимум, при котором существует "
+                "допустимая зона: "
+                f"X ≈ {assessment.maximum_measurable_deg['x']:.2f}°, "
+                f"Y ≈ {assessment.maximum_measurable_deg['y']:.2f}°. "
+                "Уменьшите A1/A2/A3 и повторите запуск."
+            )
+            return
+        for (axis, command_deg), guide in sorted(
+            assessment.guides.items(), key=lambda item: (item[0][0], item[0][1])
+        ):
+            LOGGER.info(
+                "Motion calibration preflight camera=%s generation=%d axis=%s "
+                "command_deg=%+g guide=%s",
+                camera.value,
+                generation,
+                axis,
+                command_deg,
+                "none" if guide is None else guide.describe(),
+            )
+        LOGGER.info(
+            "Motion calibration preflight accepted camera=%s generation=%d "
+            "max_x_deg=%.3f max_y_deg=%.3f",
+            camera.value,
+            generation,
+            assessment.maximum_measurable_deg["x"],
+            assessment.maximum_measurable_deg["y"],
+        )
         try:
             wizard = MotionCalibrationWizard(
                 settings=settings,
@@ -343,6 +429,7 @@ class MotionCalibrationWindow(QWidget):
             return
         self._wizard = wizard
         self._profile = None
+        self._plan_assessment = assessment
         self._session_generation = generation
         self._awaiting_profile_confirmation = True
         self._profile_confirmation_deadline_ns = (
@@ -368,7 +455,11 @@ class MotionCalibrationWindow(QWidget):
                     "временный профиль скорости/ускорения не подтверждён STM32"
                 )
             return
-        wizard.tick()
+        try:
+            wizard.tick()
+        except MotionCalibrationError as exc:
+            self.abort(f"ошибка автоматического движения: {exc}")
+            return
         self._refresh_progress()
         self._finish_if_complete()
 
@@ -413,6 +504,7 @@ class MotionCalibrationWindow(QWidget):
     def _discard_unsaved_result(self) -> None:
         self._wizard = None
         self._profile = None
+        self._plan_assessment = None
         self._session_generation = None
         self.save_button.setEnabled(False)
         self.summary_label.clear()
@@ -463,7 +555,10 @@ class MotionCalibrationWindow(QWidget):
         try:
             wizard.repeat_problematic_step()
         except MotionCalibrationError as exc:
-            self._show_error(str(exc))
+            if wizard.phase == WizardPhase.CANCELLED:
+                self.abort(str(exc))
+            else:
+                self._show_error(str(exc))
             return
         self._refresh_progress()
 
@@ -474,7 +569,10 @@ class MotionCalibrationWindow(QWidget):
         try:
             wizard.accept_disagreement()
         except MotionCalibrationError as exc:
-            self._show_error(str(exc))
+            if wizard.phase == WizardPhase.CANCELLED:
+                self.abort(str(exc))
+            else:
+                self._show_error(str(exc))
             return
         self._refresh_progress()
         self._finish_if_complete()
@@ -487,10 +585,23 @@ class MotionCalibrationWindow(QWidget):
         total = len(wizard.steps)
         number = min(wizard.step_index + 1, total)
         prefix = f"Camera: {wizard.settings.camera.value}; шаг {number}/{total}. "
-        if wizard.phase == WizardPhase.MOVING:
+        if wizard.phase == WizardPhase.CONDITIONING:
+            text = (
+                "Выполняется малое служебное движение перед измерением. "
+                "Не выбирайте точку до стабилизации."
+            )
+        elif wizard.phase == WizardPhase.MOVING:
             text = "Турель выполняет движение. Не выбирайте точку до стабилизации."
+        elif wizard.phase == WizardPhase.RETURNING:
+            text = (
+                "Турель возвращается к исходной области. "
+                "Не выбирайте точку до стабилизации."
+            )
         elif wizard.phase == WizardPhase.WAIT_FIRST_CLICK:
             text = "Выберите неподвижную точку."
+            guide = self._current_click_guide()
+            if guide is not None:
+                text += f" Допустимая зона: {guide.describe()}."
         elif wizard.phase == WizardPhase.WAIT_SECOND_CLICK:
             text = "Отметьте ту же неподвижную точку."
         elif wizard.phase == WizardPhase.REVIEW_REPEAT:
@@ -505,6 +616,26 @@ class MotionCalibrationWindow(QWidget):
         review = wizard.phase == WizardPhase.REVIEW_REPEAT
         self.repeat_button.setVisible(review)
         self.accept_button.setVisible(review)
+
+    def _current_click_guide(self) -> CalibrationClickGuide | None:
+        wizard = self._wizard
+        assessment = self._plan_assessment
+        if wizard is None or assessment is None:
+            return None
+        step = wizard.current_step
+        if step is None or wizard.phase != WizardPhase.WAIT_FIRST_CLICK:
+            return None
+        return assessment.guide_for(step.axis, step.command_deg)
+
+    @property
+    def current_click_guide(self) -> CalibrationClickGuide | None:
+        """Return the operator guide for the currently selectable first click."""
+        return self._current_click_guide()
+
+    @property
+    def calibration_camera(self) -> CameraRole | None:
+        wizard = self._wizard
+        return None if wizard is None else wizard.settings.camera
 
     def _restore_profile_once(self) -> None:
         if not self._temporary_profile_active:

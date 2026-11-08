@@ -20,6 +20,8 @@ from navmin.contracts import (
     CameraState,
     CameraStatus,
     FramePacket,
+    FrameSourceTimestamp,
+    FrameTimestampSource,
     VisionResult,
 )
 from navmin.vision.pipeline import (
@@ -379,12 +381,41 @@ def test_pipeline_stamps_frame_contract_and_capture_id(
     assert result.frame.frame_id == 0
     assert result.frame.capture_id == expected_capture_id
     assert result.frame.receive_timestamp_ns == 200
+    assert result.frame.source_timestamp == FrameSourceTimestamp(
+        source=FrameTimestampSource.RECEIVE_TIME,
+        timestamp_ns=200,
+    )
     assert result.frame.image.shape == (HEIGHT, WIDTH, 3)
     assert not result.frame.image.flags.writeable
     status = pipeline.status.get()
     assert status is not None
     assert status.state is CameraState.ONLINE
     assert status.generation == session.generation
+
+
+def test_pipeline_preserves_sensor_source_timestamp_without_using_it_as_receive_time() -> None:
+    pipeline = VisionPipeline(
+        camera=CameraRole.OVERVIEW,
+        corrector=overview_corrector(overview_calibration()),
+        processor=_RecordingProcessor(),
+        timestamp_clock_ns=_Clock(),
+    )
+    pipeline.start()
+    source_timestamp = FrameSourceTimestamp(
+        source=FrameTimestampSource.SENSOR_RTP_PTS,
+        timestamp_ns=7_050_000_000,
+    )
+
+    pipeline.submit_decoded_frame(
+        source_frame(5),
+        receive_timestamp_ns=9_000_000_000,
+        source_timestamp=source_timestamp,
+    )
+    result = pipeline.process_latest()
+
+    assert result is not None
+    assert result.frame.receive_timestamp_ns == 9_000_000_000
+    assert result.frame.source_timestamp == source_timestamp
 
 
 def test_camera_session_barrier_precedes_generation_data_and_restart_clears_old_state() -> None:
