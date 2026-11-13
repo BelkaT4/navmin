@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import shutil
 import subprocess
@@ -9,6 +10,8 @@ import sys
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from pathlib import Path
+
+LOGGER = logging.getLogger(__name__)
 
 CommandRunner = Callable[[Sequence[str], Path, Mapping[str, str]], int]
 
@@ -44,16 +47,25 @@ def _subprocess_runner(
     cwd: Path,
     environ: Mapping[str, str],
 ) -> int:
-    return subprocess.run(
+    completed = subprocess.run(
         tuple(command),
         cwd=cwd,
         env=dict(environ),
         check=False,
-    ).returncode
+        capture_output=True,
+        text=True,
+    )
+    for line in completed.stdout.splitlines():
+        LOGGER.info("host-helper stdout: %s", line)
+    stderr_level = logging.ERROR if completed.returncode else logging.WARNING
+    for line in completed.stderr.splitlines():
+        LOGGER.log(stderr_level, "host-helper stderr: %s", line)
+    return completed.returncode
 
 
 class HostEnvironment:
     """Minimal prepare/restore boundary for one launcher invocation."""
+
 
     def prepare(self, *, camera_network_required: bool) -> None:
         raise NotImplementedError
@@ -97,6 +109,7 @@ class LinuxHostEnvironment(HostEnvironment):
         self._environ = dict(os.environ if environ is None else environ)
         self._run_command = command_runner
         self._network_prepared = False
+        self._network_lock_file = None
 
     @property
     def network_prepared(self) -> bool:
@@ -154,29 +167,93 @@ class LinuxHostEnvironment(HostEnvironment):
         shutil.copyfile(default, host_config)
         raise HostConfigurationCreated(host_config)
 
+
+    def _network_state_path(self) -> Path:
+        explicit = self._environ.get("NAVMIN_NETWORK_STATE_FILE", "")
+        if explicit:
+            return Path(explicit)
+        runtime_dir = self._environ.get("XDG_RUNTIME_DIR", "")
+        if runtime_dir:
+            return Path(runtime_dir) / "navmin" / "camera-network.state"
+        return Path("/tmp") / f"navmin-{os.getuid()}" / "camera-network.state"
+
+    def _acquire_network_lock(self) -> None:
+        if self._network_lock_file is not None:
+            return
+        import fcntl
+
+        lock_path = self._network_state_path().with_name("camera-network.lock")
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        lock_file = lock_path.open("a+", encoding="utf-8")
+        try:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            lock_file.close()
+            raise HostEnvironmentError(
+                "camera network is already owned by another NavMin process: "
+                f"{lock_path}"
+            ) from exc
+        self._network_lock_file = lock_file
+        LOGGER.info("Camera network lifecycle lock acquired: %s", lock_path)
+
+    def _release_network_lock(self) -> None:
+        lock_file = self._network_lock_file
+        if lock_file is None:
+            return
+        import fcntl
+
+        try:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+        finally:
+            lock_file.close()
+            self._network_lock_file = None
+        LOGGER.info("Camera network lifecycle lock released")
+
+    def _run_network_helper(self, path: Path, *, action: str) -> None:
+        command = (str(path),)
+        LOGGER.info("Camera network %s starting: %s", action, path.name)
+        returncode = self._run_command(command, self._repo_root, self._environ)
+        if returncode != 0:
+            LOGGER.error(
+                "Camera network %s failed helper=%s exit_status=%d",
+                action,
+                path.name,
+                returncode,
+            )
+            raise HostCommandError(command, returncode)
+        LOGGER.info("Camera network %s complete: %s", action, path.name)
+
     def prepare(self, *, camera_network_required: bool) -> None:
         if not camera_network_required or self._network_prepared:
             return
         self._require_helpers()
         self._ensure_host_config()
-        command = (str(self._network_up),)
-        returncode = self._run_command(command, self._repo_root, self._environ)
-        if returncode != 0:
-            raise HostCommandError(command, returncode)
+        self._acquire_network_lock()
+        try:
+            # Recover stale state left by a crashed/aborted previous invocation.
+            # The process-wide lock makes this safe: a live NavMin owner cannot
+            # have its camera network torn down by a second instance.
+            self._run_network_helper(self._network_down, action="pre-start recovery")
+            self._run_network_helper(self._network_up, action="activation")
+        except HostEnvironmentError:
+            self._release_network_lock()
+            raise
         self._network_prepared = True
 
     def restore(self) -> None:
         if not self._network_prepared:
+            self._release_network_lock()
             return
-        command = (str(self._network_down),)
-        returncode = self._run_command(command, self._repo_root, self._environ)
-        if returncode != 0:
-            raise HostCommandError(command, returncode)
-        self._network_prepared = False
+        try:
+            self._run_network_helper(self._network_down, action="restore")
+        finally:
+            self._network_prepared = False
+            self._release_network_lock()
 
 
 class WindowsHostEnvironment(HostEnvironment):
     """Current Windows host backend intentionally performs no network setup."""
+
 
     def prepare(self, *, camera_network_required: bool) -> None:
         del camera_network_required

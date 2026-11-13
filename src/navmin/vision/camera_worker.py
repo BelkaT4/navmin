@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 from collections.abc import Callable
 from threading import Lock, Thread
+from time import monotonic
 from typing import Protocol
 
 import numpy as np
@@ -30,6 +31,7 @@ from .processor import (
 LOGGER = logging.getLogger(__name__)
 
 _RTSP_RECONNECT_DELAYS_S = (0.25, 0.5, 1.0, 2.0)
+_FRAME_STALE_RECONNECT_S = 5.0
 
 
 class _FrameCorrector(Protocol):
@@ -51,6 +53,8 @@ class CameraWorker:
         pipeline: VisionPipeline,
         idle_wait_s: float = 0.01,
         reconnect_delays_s: tuple[float, ...] = _RTSP_RECONNECT_DELAYS_S,
+        stale_reconnect_timeout_s: float = _FRAME_STALE_RECONNECT_S,
+        clock: Callable[[], float] = monotonic,
         thread_name: str | None = None,
         processor_selection: VisionProcessorSelection | None = None,
     ) -> None:
@@ -58,10 +62,14 @@ class CameraWorker:
             raise ValueError("idle_wait_s must be > 0")
         if not reconnect_delays_s or any(delay <= 0.0 for delay in reconnect_delays_s):
             raise ValueError("reconnect_delays_s must contain positive delays")
+        if stale_reconnect_timeout_s <= 0.0:
+            raise ValueError("stale_reconnect_timeout_s must be > 0")
         self._source = source
         self._pipeline = pipeline
         self._idle_wait_s = idle_wait_s
         self._reconnect_delays_s = reconnect_delays_s
+        self._stale_reconnect_timeout_s = float(stale_reconnect_timeout_s)
+        self._clock = clock
         self._stop_token = StopToken()
         self._processor_selection = processor_selection
         self._processor_updates: LatestValue[VisionProcessorSelection] = LatestValue()
@@ -163,6 +171,7 @@ class CameraWorker:
             if not self._start_pipeline_session():
                 return
 
+            last_frame_time_s: float | None = None
             while not self._stop_token.is_stop_requested():
                 self._apply_latest_processor_selection(restart_session=True)
                 self._pipeline.apply_latest_target_control()
@@ -177,8 +186,29 @@ class CameraWorker:
                 if self._process_source_once():
                     # A real accepted frame proves recovery; later losses restart
                     # backoff from the shortest delay.
+                    last_frame_time_s = self._clock()
                     delay_index = 0
                     continue
+                if (
+                    last_frame_time_s is not None
+                    and self._clock() - last_frame_time_s
+                    >= self._stale_reconnect_timeout_s
+                ):
+                    stale_error = CameraSourceError(
+                        "camera frame stream remained stale for "
+                        f"{self._stale_reconnect_timeout_s:.3f} s"
+                    )
+                    LOGGER.warning(
+                        "Vision source stale; restarting camera=%s timeout_s=%.3f",
+                        self._pipeline.camera.value,
+                        self._stale_reconnect_timeout_s,
+                    )
+                    self._pipeline.report_source_reconnecting(stale_error)
+                    self._source.stop()
+                    if self._wait_before_reconnect(delay_index):
+                        return
+                    delay_index = self._next_delay_index(delay_index)
+                    break
                 self._stop_token.wait(self._idle_wait_s)
 
     def _apply_latest_processor_selection(self, *, restart_session: bool) -> bool:

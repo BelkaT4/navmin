@@ -177,9 +177,21 @@ class OperatorWindow(QWidget):
             "pid_kp_x": self._non_negative_spinbox(config.pid_kp_x, step=0.01),
             "pid_ki_x": self._non_negative_spinbox(config.pid_ki_x, step=0.01),
             "pid_kd_x": self._non_negative_spinbox(config.pid_kd_x, step=0.01),
+            "pid_i_max_x": self._non_negative_spinbox(
+                self._stm32_config.max_speed_x_deg_s
+                if config.pid_integral_limit_x_deg_s is None
+                else config.pid_integral_limit_x_deg_s,
+                step=1.0,
+            ),
             "pid_kp_y": self._non_negative_spinbox(config.pid_kp_y, step=0.01),
             "pid_ki_y": self._non_negative_spinbox(config.pid_ki_y, step=0.01),
             "pid_kd_y": self._non_negative_spinbox(config.pid_kd_y, step=0.01),
+            "pid_i_max_y": self._non_negative_spinbox(
+                self._stm32_config.max_speed_y_deg_s
+                if config.pid_integral_limit_y_deg_s is None
+                else config.pid_integral_limit_y_deg_s,
+                step=1.0,
+            ),
         }
         self.pid_apply_button = QPushButton("Применить PID")
         self.pid_apply_button.clicked.connect(self._apply_pid_tuning)
@@ -477,17 +489,20 @@ class OperatorWindow(QWidget):
         pid_layout.addWidget(QLabel("Kp"), 0, 1)
         pid_layout.addWidget(QLabel("Ki"), 0, 2)
         pid_layout.addWidget(QLabel("Kd"), 0, 3)
+        pid_layout.addWidget(QLabel("I max, °/s"), 0, 4)
         pid_layout.addWidget(QLabel("Ось X"), 1, 0)
         pid_layout.addWidget(self.pid_inputs["pid_kp_x"], 1, 1)
         pid_layout.addWidget(self.pid_inputs["pid_ki_x"], 1, 2)
         pid_layout.addWidget(self.pid_inputs["pid_kd_x"], 1, 3)
+        pid_layout.addWidget(self.pid_inputs["pid_i_max_x"], 1, 4)
         pid_layout.addWidget(QLabel("Ось Y"), 2, 0)
         pid_layout.addWidget(self.pid_inputs["pid_kp_y"], 2, 1)
         pid_layout.addWidget(self.pid_inputs["pid_ki_y"], 2, 2)
         pid_layout.addWidget(self.pid_inputs["pid_kd_y"], 2, 3)
-        pid_layout.addWidget(self.pid_apply_button, 3, 0, 1, 4)
-        pid_layout.addWidget(self.pid_status_label, 4, 0, 1, 4)
-        pid_layout.addWidget(self.pid_error_label, 5, 0, 1, 4)
+        pid_layout.addWidget(self.pid_inputs["pid_i_max_y"], 2, 4)
+        pid_layout.addWidget(self.pid_apply_button, 3, 0, 1, 5)
+        pid_layout.addWidget(self.pid_status_label, 4, 0, 1, 5)
+        pid_layout.addWidget(self.pid_error_label, 5, 0, 1, 5)
         layout.addWidget(pid_group)
 
         ff_group = QGroupBox("Feed Forward")
@@ -664,6 +679,8 @@ class OperatorWindow(QWidget):
             pid_kp_y=self.pid_inputs["pid_kp_y"].value(),
             pid_ki_y=self.pid_inputs["pid_ki_y"].value(),
             pid_kd_y=self.pid_inputs["pid_kd_y"].value(),
+            pid_integral_limit_x_deg_s=self.pid_inputs["pid_i_max_x"].value(),
+            pid_integral_limit_y_deg_s=self.pid_inputs["pid_i_max_y"].value(),
         )
         try:
             self._on_apply_pid_tuning(config)
@@ -673,8 +690,10 @@ class OperatorWindow(QWidget):
         self.pid_error_label.clear()
         self.pid_status_label.setText(
             "Отправлено: "
-            f"X P={config.pid_kp_x:g} I={config.pid_ki_x:g} D={config.pid_kd_x:g}; "
-            f"Y P={config.pid_kp_y:g} I={config.pid_ki_y:g} D={config.pid_kd_y:g}"
+            f"X P={config.pid_kp_x:g} I={config.pid_ki_x:g} "
+            f"D={config.pid_kd_x:g} Imax={config.pid_integral_limit_x_deg_s:g}; "
+            f"Y P={config.pid_kp_y:g} I={config.pid_ki_y:g} "
+            f"D={config.pid_kd_y:g} Imax={config.pid_integral_limit_y_deg_s:g}"
         )
 
     def _apply_feed_forward_tuning(self) -> None:

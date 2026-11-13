@@ -216,6 +216,8 @@ class PidControllerConfig:
     pid_kp_y: float
     pid_ki_y: float
     pid_kd_y: float
+    pid_integral_limit_x_deg_s: float | None = None
+    pid_integral_limit_y_deg_s: float | None = None
 
 
 @dataclass(frozen=True)

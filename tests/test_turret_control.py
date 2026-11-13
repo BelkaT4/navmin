@@ -487,7 +487,11 @@ def test_axis_pid_first_sample_is_p_only_and_next_sample_uses_real_dt() -> None:
 
 
 def test_axis_pid_conditional_anti_windup_and_integral_limit() -> None:
-    pid = AxisPid(PidGains(2.0, 1.0, 0.0), output_limit=1.0)
+    pid = AxisPid(
+        PidGains(2.0, 1.0, 0.0),
+        output_limit=1.0,
+        integral_limit=0.25,
+    )
 
     assert pid.step(1.0, now_s=0.0) == 1.0
     assert pid.step(1.0, now_s=1.0) == 1.0
@@ -495,6 +499,13 @@ def test_axis_pid_conditional_anti_windup_and_integral_limit() -> None:
 
     assert pid.step(-0.2, now_s=2.0) == pytest.approx(-0.6)
     assert pid.i_term == pytest.approx(-0.2)
+    assert pid.step(-0.2, now_s=3.0) == pytest.approx(-0.65)
+    assert pid.i_term == pytest.approx(-0.25)
+
+    pid.set_integral_limit(0.1)
+    assert pid.i_term == pytest.approx(-0.1)
+    pid.set_integral_limit(0.0)
+    assert pid.i_term == 0.0
 
 
 def test_axis_pid_prediction_is_p_only_and_ff_is_outside_i_and_d() -> None:
@@ -901,6 +912,45 @@ def test_runtime_limit_decrease_clamps_i_increase_preserves_and_gain_reset_wins(
     assert not controller.pid_x.has_sample
     assert controller.pid_x.output_limit == 0.25
 
+
+
+def test_runtime_integral_limit_update_clamps_without_resetting_pid_history() -> None:
+    config = _config(
+        kp_x=0.0, ki_x=1.0, kd_x=0.0, max_speed_x=10.0, watchdog_ms=1000
+    )
+    controller, _, _, transport, clock = _stack(config)
+    _enter_tracking_off(controller, transport)
+    target = _target()
+    controller.submit_tracking_control(1, _tracking_error(target, 4.0))
+    clock.now = 0.5
+    controller.submit_tracking_control(2, _tracking_error(target, 4.0))
+    assert controller.pid_x.i_term == pytest.approx(2.0)
+    assert controller.pid_x.has_sample
+
+    limited = replace(
+        config,
+        controller=replace(
+            config.controller,
+            pid_integral_limit_x_deg_s=0.75,
+        ),
+    )
+    controller.apply_config_update(ConfigUpdate(1, limited))
+
+    assert controller.pid_x.integral_limit == pytest.approx(0.75)
+    assert controller.pid_x.i_term == pytest.approx(0.75)
+    assert controller.pid_x.has_sample
+
+    disabled = replace(
+        limited,
+        controller=replace(
+            limited.controller,
+            pid_integral_limit_x_deg_s=0.0,
+        ),
+    )
+    controller.apply_config_update(ConfigUpdate(2, disabled))
+    assert controller.pid_x.integral_limit == 0.0
+    assert controller.pid_x.i_term == 0.0
+    assert controller.pid_x.has_sample
 
 def test_config_update_itself_does_not_change_mode_or_create_motion() -> None:
     config = _config()

@@ -799,6 +799,10 @@ def _parse_turret(value: Any) -> TurretConfig:
             "pid-ki-y",
             "pid-kd-y",
         },
+        optional={
+            "pid-integral-limit-x-deg-s",
+            "pid-integral-limit-y-deg-s",
+        },
     )
     controller = PidControllerConfig(
         pid_kp_x=_number(
@@ -818,6 +822,24 @@ def _parse_turret(value: Any) -> TurretConfig:
         ),
         pid_kd_y=_number(
             controller_obj["pid-kd-y"], f"{path}.controller.pid-kd-y", minimum=0
+        ),
+        pid_integral_limit_x_deg_s=(
+            None
+            if "pid-integral-limit-x-deg-s" not in controller_obj
+            else _number(
+                controller_obj["pid-integral-limit-x-deg-s"],
+                f"{path}.controller.pid-integral-limit-x-deg-s",
+                minimum=0,
+            )
+        ),
+        pid_integral_limit_y_deg_s=(
+            None
+            if "pid-integral-limit-y-deg-s" not in controller_obj
+            else _number(
+                controller_obj["pid-integral-limit-y-deg-s"],
+                f"{path}.controller.pid-integral-limit-y-deg-s",
+                minimum=0,
+            )
         ),
     )
 
@@ -1078,6 +1100,22 @@ def _platform_motion_to_mapping(config: PlatformMotionConfig) -> dict[str, Any]:
     return result
 
 
+def _pid_controller_to_mapping(config: PidControllerConfig) -> dict[str, Any]:
+    result: dict[str, Any] = {
+        "pid-kp-x": config.pid_kp_x,
+        "pid-ki-x": config.pid_ki_x,
+        "pid-kd-x": config.pid_kd_x,
+        "pid-kp-y": config.pid_kp_y,
+        "pid-ki-y": config.pid_ki_y,
+        "pid-kd-y": config.pid_kd_y,
+    }
+    if config.pid_integral_limit_x_deg_s is not None:
+        result["pid-integral-limit-x-deg-s"] = config.pid_integral_limit_x_deg_s
+    if config.pid_integral_limit_y_deg_s is not None:
+        result["pid-integral-limit-y-deg-s"] = config.pid_integral_limit_y_deg_s
+    return result
+
+
 def config_to_mapping(config: AppConfig) -> dict[str, Any]:
     """Convert a typed schema-v7 snapshot to its persisted JSON structure."""
     return {
@@ -1195,14 +1233,7 @@ def config_to_mapping(config: AppConfig) -> dict[str, Any]:
                     "max-relative-move-deg": config.turret.axes.y.max_relative_move_deg,
                 },
             },
-            "controller": {
-                "pid-kp-x": config.turret.controller.pid_kp_x,
-                "pid-ki-x": config.turret.controller.pid_ki_x,
-                "pid-kd-x": config.turret.controller.pid_kd_x,
-                "pid-kp-y": config.turret.controller.pid_kp_y,
-                "pid-ki-y": config.turret.controller.pid_ki_y,
-                "pid-kd-y": config.turret.controller.pid_kd_y,
-            },
+            "controller": _pid_controller_to_mapping(config.turret.controller),
             "stm32": {
                 "max-speed-x-deg-s": config.turret.stm32.max_speed_x_deg_s,
                 "max-speed-y-deg-s": config.turret.stm32.max_speed_y_deg_s,

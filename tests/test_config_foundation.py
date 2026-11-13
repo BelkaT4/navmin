@@ -194,6 +194,8 @@ def test_valid_schema_v7_builds_typed_immutable_snapshot() -> None:
     assert config.aiming.aim_points.stereo_right.x_px is None
     assert config.vision.cameras.overview.vision_processor_profile == "default"
     assert config.turret.serial.baudrate == 115200
+    assert config.turret.controller.pid_integral_limit_x_deg_s is None
+    assert config.turret.controller.pid_integral_limit_y_deg_s is None
     assert not config.imu.enabled
     assert config.imu.bind_address == "0.0.0.0"
     assert config.imu.port == 8891
@@ -1248,6 +1250,35 @@ def test_atomic_replace_failure_preserves_existing_file(tmp_path, monkeypatch) -
     assert path.read_bytes() == original
     assert not list(tmp_path.glob(".config.json.*.tmp"))
 
+
+
+def test_pid_integral_limits_are_optional_strict_and_round_trip() -> None:
+    default_config = parse_config(_valid_config())
+    default_mapping = config_to_mapping(default_config)["turret"]["controller"]
+    assert "pid-integral-limit-x-deg-s" not in default_mapping
+    assert "pid-integral-limit-y-deg-s" not in default_mapping
+
+    data = _valid_config()
+    data["turret"]["controller"]["pid-integral-limit-x-deg-s"] = 12.5
+    data["turret"]["controller"]["pid-integral-limit-y-deg-s"] = 0.0
+    config = parse_config(data)
+    assert config.turret.controller.pid_integral_limit_x_deg_s == pytest.approx(12.5)
+    assert config.turret.controller.pid_integral_limit_y_deg_s == 0.0
+    mapping = config_to_mapping(config)["turret"]["controller"]
+    assert mapping["pid-integral-limit-x-deg-s"] == pytest.approx(12.5)
+    assert mapping["pid-integral-limit-y-deg-s"] == 0.0
+    assert parse_config(config_to_mapping(config)) == config
+
+
+@pytest.mark.parametrize("value", [-1, True, "1.0", float("inf")])
+def test_pid_integral_limits_reject_invalid_values(value) -> None:
+    data = _valid_config()
+    data["turret"]["controller"]["pid-integral-limit-x-deg-s"] = value
+
+    with pytest.raises(ConfigValidationError) as exc_info:
+        parse_config(data)
+
+    assert exc_info.value.path == "turret.controller.pid-integral-limit-x-deg-s"
 
 def test_platform_motion_video_latency_is_optional_strict_and_round_trips() -> None:
     default_config = parse_config(_valid_config())

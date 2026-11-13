@@ -428,14 +428,17 @@ class ApplicationRuntime:
         self._turret_config_revision = next_revision
         LOGGER.info(
             "PID tuning update queued revision=%d "
-            "x=(kp=%g, ki=%g, kd=%g) y=(kp=%g, ki=%g, kd=%g)",
+            "x=(kp=%g, ki=%g, kd=%g, i_max=%s) "
+            "y=(kp=%g, ki=%g, kd=%g, i_max=%s)",
             next_revision,
             config.pid_kp_x,
             config.pid_ki_x,
             config.pid_kd_x,
+            config.pid_integral_limit_x_deg_s,
             config.pid_kp_y,
             config.pid_ki_y,
             config.pid_kd_y,
+            config.pid_integral_limit_y_deg_s,
         )
 
     def begin_motion_calibration_profile(self, profile: MotionProfile) -> None:
@@ -601,8 +604,12 @@ class ApplicationRuntime:
             "pid_kp_y",
             "pid_ki_y",
             "pid_kd_y",
+            "pid_integral_limit_x_deg_s",
+            "pid_integral_limit_y_deg_s",
         ):
             value = getattr(config, name)
+            if value is None and name.startswith("pid_integral_limit_"):
+                continue
             if type(value) not in (int, float):
                 raise TypeError(f"{name} must be a number")
             try:

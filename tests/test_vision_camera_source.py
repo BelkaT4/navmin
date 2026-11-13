@@ -820,7 +820,7 @@ def test_transport_sources_declare_reconnect_capability() -> None:
     )
     rtsp = GStreamerRtspSource(rtsp_source_config(), backend_factory=_BackendFactory())
 
-    assert not legacy_rtp.supports_reconnect
+    assert legacy_rtp.supports_reconnect
     assert timestamp_rtp.supports_reconnect
     assert rtsp.supports_reconnect
 
@@ -1110,6 +1110,43 @@ def test_recoverable_worker_reconnects_with_new_generation_and_clears_old_result
     recovered = pipeline.latest_result.get()
     assert recovered is not None
     assert recovered.frame.generation == 2
+    assert recovered.frame.receive_timestamp_ns == 200
+    assert worker.stop(timeout=1.0)
+
+
+def test_recoverable_worker_restarts_after_prolonged_frame_stall() -> None:
+    source = _RecoverableSource()
+    pipeline = _pipeline()
+    worker = CameraWorker(
+        source=source,
+        pipeline=pipeline,
+        idle_wait_s=0.001,
+        reconnect_delays_s=(0.001,),
+        stale_reconnect_timeout_s=0.02,
+    )
+    worker.start()
+    _wait_until(lambda: pipeline.generation == 1)
+
+    source.push(10, timestamp_ns=100)
+    _wait_until(lambda: pipeline.latest_result.get() is not None)
+    first = pipeline.latest_result.get()
+    assert first is not None and first.frame.generation == 1
+
+    _wait_until(lambda: source.start_calls >= 2)
+    _wait_until(lambda: pipeline.generation == 2)
+    status = pipeline.status.get()
+    assert status is not None
+    assert status.generation == 2
+
+    source.push(20, timestamp_ns=200)
+    _wait_until(
+        lambda: (
+            pipeline.latest_result.get() is not None
+            and pipeline.latest_result.get().frame.generation == 2
+        )
+    )
+    recovered = pipeline.latest_result.get()
+    assert recovered is not None
     assert recovered.frame.receive_timestamp_ns == 200
     assert worker.stop(timeout=1.0)
 

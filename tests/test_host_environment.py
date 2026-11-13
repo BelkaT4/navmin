@@ -150,6 +150,7 @@ def test_linux_prepare_and_restore_use_existing_helpers(tmp_path: Path) -> None:
     host.restore()
 
     assert [Path(call[0][0]).name for call in calls] == [
+        "camera_network_down.sh",
         "camera_network_up.sh",
         "camera_network_down.sh",
     ]
@@ -171,7 +172,7 @@ def test_linux_prepare_failure_does_not_call_restore(tmp_path: Path) -> None:
     with pytest.raises(HostCommandError), host.activation(camera_network_required=True):
         pytest.fail("body must not start after prepare failure")
 
-    assert calls == ["camera_network_up.sh"]
+    assert calls == ["camera_network_down.sh"]
 
 
 def test_activation_restores_after_success_and_runtime_failure(tmp_path: Path) -> None:
@@ -186,7 +187,11 @@ def test_activation_restores_after_success_and_runtime_failure(tmp_path: Path) -
     with host.activation(camera_network_required=True):
         pass
 
-    assert calls == ["camera_network_up.sh", "camera_network_down.sh"]
+    assert calls == [
+        "camera_network_down.sh",
+        "camera_network_up.sh",
+        "camera_network_down.sh",
+    ]
 
     calls.clear()
     with pytest.raises(
@@ -194,7 +199,11 @@ def test_activation_restores_after_success_and_runtime_failure(tmp_path: Path) -
     ), host.activation(camera_network_required=True):
         raise RuntimeError("runtime failed")
 
-    assert calls == ["camera_network_up.sh", "camera_network_down.sh"]
+    assert calls == [
+        "camera_network_down.sh",
+        "camera_network_up.sh",
+        "camera_network_down.sh",
+    ]
     assert host.network_prepared is False
 
 
@@ -215,7 +224,11 @@ def test_activation_restores_for_controlled_base_exceptions(
     with pytest.raises(type(failure)), host.activation(camera_network_required=True):
         raise failure
 
-    assert calls == ["camera_network_up.sh", "camera_network_down.sh"]
+    assert calls == [
+        "camera_network_down.sh",
+        "camera_network_up.sh",
+        "camera_network_down.sh",
+    ]
     assert host.network_prepared is False
 
 def test_activation_preserves_body_failure_when_restore_also_fails(
@@ -224,10 +237,16 @@ def test_activation_preserves_body_failure_when_restore_also_fails(
     repo = _write_linux_tree(tmp_path)
     calls: list[str] = []
 
+    down_calls = 0
+
     def runner(command, _cwd, _env) -> int:
+        nonlocal down_calls
         name = Path(command[0]).name
         calls.append(name)
-        return 11 if name == "camera_network_down.sh" else 0
+        if name == "camera_network_down.sh":
+            down_calls += 1
+            return 11 if down_calls == 2 else 0
+        return 0
 
     host = LinuxHostEnvironment(repo, environ={}, command_runner=runner)
     with pytest.raises(
@@ -235,16 +254,26 @@ def test_activation_preserves_body_failure_when_restore_also_fails(
     ) as error, host.activation(camera_network_required=True):
         raise RuntimeError("runtime failed")
 
-    assert calls == ["camera_network_up.sh", "camera_network_down.sh"]
+    assert calls == [
+        "camera_network_down.sh",
+        "camera_network_up.sh",
+        "camera_network_down.sh",
+    ]
     assert any("Host restore also failed" in note for note in error.value.__notes__)
-    assert host.network_prepared is True
+    assert host.network_prepared is False
 
 
 def test_activation_reports_restore_failure_after_success(tmp_path: Path) -> None:
     repo = _write_linux_tree(tmp_path)
 
+    down_calls = 0
+
     def runner(command, _cwd, _env) -> int:
-        return 12 if Path(command[0]).name == "camera_network_down.sh" else 0
+        nonlocal down_calls
+        if Path(command[0]).name == "camera_network_down.sh":
+            down_calls += 1
+            return 12 if down_calls == 2 else 0
+        return 0
 
     host = LinuxHostEnvironment(repo, environ={}, command_runner=runner)
 
@@ -254,7 +283,40 @@ def test_activation_reports_restore_failure_after_success(tmp_path: Path) -> Non
         pass
 
     assert error.value.returncode == 12
-    assert host.network_prepared is True
+    assert host.network_prepared is False
+
+
+def test_linux_network_lock_prevents_second_process_from_running_recovery(
+    tmp_path: Path,
+) -> None:
+    repo = _write_linux_tree(tmp_path)
+    state_file = tmp_path / "camera-network.state"
+    environ = {"NAVMIN_NETWORK_STATE_FILE": str(state_file)}
+    first_calls: list[str] = []
+    second_calls: list[str] = []
+
+    first = LinuxHostEnvironment(
+        repo,
+        environ=environ,
+        command_runner=lambda command, _cwd, _env: (
+            first_calls.append(Path(command[0]).name) or 0
+        ),
+    )
+    second = LinuxHostEnvironment(
+        repo,
+        environ=environ,
+        command_runner=lambda command, _cwd, _env: (
+            second_calls.append(Path(command[0]).name) or 0
+        ),
+    )
+
+    first.prepare(camera_network_required=True)
+    with pytest.raises(HostEnvironmentError, match="already owned"):
+        second.prepare(camera_network_required=True)
+
+    assert first_calls == ["camera_network_down.sh", "camera_network_up.sh"]
+    assert second_calls == []
+    first.restore()
 
 
 def test_windows_backend_never_invokes_linux_helpers(tmp_path: Path) -> None:

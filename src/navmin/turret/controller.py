@@ -79,10 +79,12 @@ class TurretController:
         self._pid_x = AxisPid(
             self._x_gains(config.controller),
             output_limit=config.stm32.max_speed_x_deg_s,
+            integral_limit=self._x_integral_limit(config),
         )
         self._pid_y = AxisPid(
             self._y_gains(config.controller),
             output_limit=config.stm32.max_speed_y_deg_s,
+            integral_limit=self._y_integral_limit(config),
         )
 
     @property
@@ -376,6 +378,8 @@ class TurretController:
             new_gains=self._x_gains(new.controller),
             old_limit=old.stm32.max_speed_x_deg_s,
             new_limit=new.stm32.max_speed_x_deg_s,
+            old_integral_limit=self._x_integral_limit(old),
+            new_integral_limit=self._x_integral_limit(new),
         )
         self._apply_axis_runtime_config(
             self._pid_y,
@@ -383,6 +387,8 @@ class TurretController:
             new_gains=self._y_gains(new.controller),
             old_limit=old.stm32.max_speed_y_deg_s,
             new_limit=new.stm32.max_speed_y_deg_s,
+            old_integral_limit=self._y_integral_limit(old),
+            new_integral_limit=self._y_integral_limit(new),
         )
         self._config = new
         self._config_revision = update.revision
@@ -399,13 +405,18 @@ class TurretController:
         new_gains: PidGains,
         old_limit: float,
         new_limit: float,
+        old_integral_limit: float,
+        new_integral_limit: float,
     ) -> None:
         gains_changed = new_gains != old_gains
         limit_changed = new_limit != old_limit
+        integral_limit_changed = new_integral_limit != old_integral_limit
         if gains_changed:
             pid.set_gains(new_gains)
         if limit_changed:
             pid.set_output_limit(new_limit)
+        if integral_limit_changed:
+            pid.set_integral_limit(new_integral_limit)
         if gains_changed and self._control_mode is TurretControlMode.TRACKING:
             # Gain reset has priority over any same-revision output-limit clamp.
             pid.reset()
@@ -423,6 +434,16 @@ class TurretController:
     @staticmethod
     def _zero_velocity() -> AxisVelocitySetpoint:
         return AxisVelocitySetpoint(0.0, 0.0, 0)
+
+    @staticmethod
+    def _x_integral_limit(config: TurretConfig) -> float:
+        value = config.controller.pid_integral_limit_x_deg_s
+        return config.stm32.max_speed_x_deg_s if value is None else value
+
+    @staticmethod
+    def _y_integral_limit(config: TurretConfig) -> float:
+        value = config.controller.pid_integral_limit_y_deg_s
+        return config.stm32.max_speed_y_deg_s if value is None else value
 
     @staticmethod
     def _x_gains(config: PidControllerConfig) -> PidGains:

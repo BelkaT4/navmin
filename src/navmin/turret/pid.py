@@ -54,12 +54,23 @@ class PidGains:
 class AxisPid:
     """One-axis PID in application units (degrees / degrees per second)."""
 
-    def __init__(self, gains: PidGains, *, output_limit: float) -> None:
+    def __init__(
+        self,
+        gains: PidGains,
+        *,
+        output_limit: float,
+        integral_limit: float | None = None,
+    ) -> None:
         if not isinstance(gains, PidGains):
             raise TypeError("gains must be PidGains")
         self._gains = gains
         self._output_limit = _require_positive_finite(
             output_limit, name="output_limit"
+        )
+        self._integral_limit = (
+            self._output_limit
+            if integral_limit is None
+            else _require_nonnegative_finite(integral_limit, name="integral_limit")
         )
         self._i_term = 0.0
         self._previous_error = 0.0
@@ -74,6 +85,10 @@ class AxisPid:
     @property
     def output_limit(self) -> float:
         return self._output_limit
+
+    @property
+    def integral_limit(self) -> float:
+        return self._integral_limit
 
     @property
     def i_term(self) -> float:
@@ -103,7 +118,17 @@ class AxisPid:
         self._output_limit = _require_positive_finite(
             output_limit, name="output_limit"
         )
-        self._i_term = _clamp(self._i_term, self._output_limit)
+        self._i_term = _clamp(
+            self._i_term, min(self._integral_limit, self._output_limit)
+        )
+
+    def set_integral_limit(self, integral_limit: float) -> None:
+        self._integral_limit = _require_nonnegative_finite(
+            integral_limit, name="integral_limit"
+        )
+        self._i_term = _clamp(
+            self._i_term, min(self._integral_limit, self._output_limit)
+        )
 
     def step(
         self,
@@ -152,7 +177,7 @@ class AxisPid:
             d_term = self._gains.kd * (error_value - self._previous_error) / dt
             candidate_i = _clamp(
                 self._i_term + self._gains.ki * error_value * dt,
-                self._output_limit,
+                min(self._integral_limit, self._output_limit),
             )
 
         candidate_output = p_term + candidate_i + d_term + ff_term

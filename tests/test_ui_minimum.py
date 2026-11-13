@@ -415,6 +415,8 @@ def _pid_config() -> PidControllerConfig:
         pid_kp_y=0.30,
         pid_ki_y=0.02,
         pid_kd_y=0.05,
+        pid_integral_limit_x_deg_s=12.0,
+        pid_integral_limit_y_deg_s=13.0,
     )
 
 
@@ -2511,6 +2513,8 @@ def test_operator_pid_panel_uses_initial_values_and_queues_full_typed_update(
     assert operator.pid_inputs["pid_kp_y"].value() == pytest.approx(0.30)
     assert operator.pid_inputs["pid_ki_y"].value() == pytest.approx(0.02)
     assert operator.pid_inputs["pid_kd_y"].value() == pytest.approx(0.05)
+    assert operator.pid_inputs["pid_i_max_x"].value() == pytest.approx(12.0)
+    assert operator.pid_inputs["pid_i_max_y"].value() == pytest.approx(13.0)
 
     values = {
         "pid_kp_x": "1.25",
@@ -2519,6 +2523,8 @@ def test_operator_pid_panel_uses_initial_values_and_queues_full_typed_update(
         "pid_kp_y": "1.30",
         "pid_ki_y": "0.12",
         "pid_kd_y": "0.15",
+        "pid_i_max_x": "7.5",
+        "pid_i_max_y": "8.5",
     }
     for field, text in values.items():
         operator.pid_inputs[field].setValue(float(text))
@@ -2532,6 +2538,8 @@ def test_operator_pid_panel_uses_initial_values_and_queues_full_typed_update(
             pid_kp_y=1.30,
             pid_ki_y=0.12,
             pid_kd_y=0.15,
+            pid_integral_limit_x_deg_s=7.5,
+            pid_integral_limit_y_deg_s=8.5,
         )
     ]
     assert operator.pid_status_label.text().startswith("Отправлено:")
@@ -2542,6 +2550,8 @@ def test_operator_pid_panel_uses_initial_values_and_queues_full_typed_update(
     operator.show()
     qt_application.processEvents()
     assert operator.pid_inputs["pid_kp_x"].value() == pytest.approx(1.25)
+    assert operator.pid_inputs["pid_i_max_x"].value() == pytest.approx(7.5)
+    assert operator.pid_inputs["pid_i_max_y"].value() == pytest.approx(8.5)
     window.close()
 
 
@@ -2558,6 +2568,10 @@ def test_operator_pid_panel_uses_numeric_spinboxes_with_non_negative_range(
     assert editor.singleStep() == pytest.approx(0.01)
     editor.setValue(-1.0)
     assert editor.value() == 0.0
+    integral_editor = operator.pid_inputs["pid_i_max_x"]
+    assert integral_editor.minimum() == 0.0
+    integral_editor.setValue(0.0)
+    assert integral_editor.value() == 0.0
     window.close()
 
 

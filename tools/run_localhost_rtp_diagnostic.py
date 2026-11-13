@@ -32,7 +32,8 @@ from navmin.vision.gstreamer_source import CameraSourceError, GStreamerRtpJpegSo
 from navmin.vision.pipeline import overview_corrector, stereo_left_corrector
 
 _WAIT_TIMEOUT_SECONDS = 5.0
-_STALE_WAIT_SECONDS = 0.65
+_SHORT_SILENCE_OBSERVATION_SECONDS = 0.65
+_STALE_RECOVERY_TIMEOUT_SECONDS = 8.0
 _WRONG_WIDTH = 352
 
 
@@ -509,63 +510,104 @@ def _gate_d_and_e(
         sleep(0.2)
         overview_stopped = overview.pipeline.latest_result.snapshot()
         stereo_during_stop = stereo.pipeline.latest_result.snapshot().revision
-        sleep(_STALE_WAIT_SECONDS)
-        overview_after_stale = overview.pipeline.latest_result.snapshot()
-        stereo_after_stale = stereo.pipeline.latest_result.snapshot()
-        overview_status = overview.pipeline.status.get()
-        if overview_after_stale.revision != overview_stopped.revision:
-            raise DiagnosticFailure("Overview revisions continued after sender stop")
-        if stereo_after_stale.revision <= stereo_during_stop:
-            raise DiagnosticFailure("Stereo Left stopped progressing with Overview sender")
-        if overview.pipeline.generation != 1 or not overview.is_alive():
-            raise DiagnosticFailure("Overview worker/generation changed during UDP silence")
-        if overview_status is None or overview_status.last_receive_timestamp_ns is None:
+        first_generation = overview.pipeline.generation
+        first_status = overview.pipeline.status.get()
+        if first_status is None or first_status.last_receive_timestamp_ns is None:
             raise DiagnosticFailure("Overview lost its last receive timestamp")
-        stale_age_ms = (
-            monotonic_ns() - overview_status.last_receive_timestamp_ns
-        ) / 1_000_000.0
-        if stale_age_ms <= 500.0:
+
+        # First prove a short UDP gap does not immediately restart the worker.
+        sleep(_SHORT_SILENCE_OBSERVATION_SECONDS)
+        overview_during_short_silence = overview.pipeline.latest_result.snapshot()
+        if overview_during_short_silence.revision != overview_stopped.revision:
+            raise DiagnosticFailure("Overview revisions continued after sender stop")
+        if overview.pipeline.generation != first_generation or not overview.is_alive():
             raise DiagnosticFailure(
-                f"Overview timestamp age only reached {stale_age_ms:.1f} ms"
+                "Overview restarted before the prolonged-stall watchdog boundary"
+            )
+
+        # Keep the sender down long enough for the production stale-frame watchdog
+        # (5 s by default) to recycle the RTP/JPEG receiver and publish a new
+        # camera generation. This is the suspend/resume-like recovery boundary.
+        _wait_until(
+            lambda: overview.pipeline.generation > first_generation,
+            timeout=_STALE_RECOVERY_TIMEOUT_SECONDS,
+            failure=(
+                "Overview did not restart with a new generation after prolonged "
+                "RTP/JPEG silence"
+            ),
+        )
+        restarted_generation = overview.pipeline.generation
+        if restarted_generation != first_generation + 1:
+            raise DiagnosticFailure(
+                "Overview recovery skipped an unexpected number of generations: "
+                f"{first_generation} -> {restarted_generation}"
+            )
+        restarted_snapshot = overview.pipeline.latest_result.snapshot()
+        if restarted_snapshot.value is not None:
+            raise DiagnosticFailure(
+                "Overview retained an old VisionResult across the recovery generation"
+            )
+        stereo_after_restart = stereo.pipeline.latest_result.snapshot()
+        if stereo_after_restart.revision <= stereo_during_stop:
+            raise DiagnosticFailure(
+                "Stereo Left stopped progressing while Overview recovered"
+            )
+
+        stale_age_ms = (
+            monotonic_ns() - first_status.last_receive_timestamp_ns
+        ) / 1_000_000.0
+        if stale_age_ms < 5_000.0:
+            raise DiagnosticFailure(
+                "Overview restarted before five seconds of frame silence: "
+                f"{stale_age_ms:.1f} ms"
             )
 
         resumed_sender = resources.new_sender(RtpJpegSenderConfig(port=overview_port))
         resumed_sender.start()
+        resumed_revision = restarted_snapshot.revision
 
         def overview_resumed() -> bool:
             _status_or_failure(overview)
             snapshot = overview.pipeline.latest_result.snapshot()
             return (
-                snapshot.revision > overview_after_stale.revision
+                overview.pipeline.generation == restarted_generation
+                and snapshot.revision > resumed_revision
                 and snapshot.value is not None
+                and snapshot.value.frame.generation == restarted_generation
                 and snapshot.value.frame.receive_timestamp_ns
-                > overview_status.last_receive_timestamp_ns
+                > first_status.last_receive_timestamp_ns
             )
 
         _wait_until(
             overview_resumed,
             timeout=_WAIT_TIMEOUT_SECONDS,
-            failure="Overview did not resume on the same running receiver",
+            failure="Overview did not resume after stale-receiver restart",
         )
         resumed_status = overview.pipeline.status.get()
         if (
-            overview.pipeline.generation != 1
-            or resumed_status is None
+            resumed_status is None
             or resumed_status.state is not CameraState.ONLINE
+            or resumed_status.generation != restarted_generation
         ):
-            raise DiagnosticFailure("Overview resume changed generation/status")
+            raise DiagnosticFailure(
+                "Overview did not return ONLINE in the restarted generation"
+            )
         gate_e = GateOutcome(
             "E",
             "GREEN",
             (
-                f"Overview revision frozen at {overview_after_stale.revision}",
-                f"Overview last-frame age after silence: {stale_age_ms:.1f} ms",
+                f"Overview revision froze at {overview_stopped.revision}",
+                f"prolonged silence age before restart: {stale_age_ms:.1f} ms",
                 (
-                    "Stereo Left revision progressed "
-                    f"{stereo_during_stop} -> {stereo_after_stale.revision}"
+                    "Overview stale watchdog restarted generation "
+                    f"{first_generation} -> {restarted_generation}"
                 ),
-                "Overview resumed on port reuse with same worker and generation=1",
-                "CameraStatus after resume: ONLINE",
+                (
+                    "Stereo Left revision progressed independently "
+                    f"{stereo_during_stop} -> {stereo_after_restart.revision}"
+                ),
+                "Overview resumed on the same UDP port after receiver restart",
+                f"CameraStatus after resume: ONLINE generation={restarted_generation}",
             ),
         )
         return gate_d, gate_e

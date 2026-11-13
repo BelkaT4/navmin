@@ -466,7 +466,7 @@ class GStreamerRtpJpegSource(_GStreamerDecodedFrameSource):
                 f"bind={config.bind_address} port={config.port} "
                 f"timestamp_mode={config.timestamp_mode.value}"
             ),
-            supports_reconnect=sensor_timestamp_mode,
+            supports_reconnect=True,
             require_strict_transport_timestamp=sensor_timestamp_mode,
             frame_timestamp_source=(
                 FrameTimestampSource.SENSOR_RTP_PTS
