@@ -236,6 +236,13 @@ class PlatformMotionRate:
 
 
 @dataclass(frozen=True)
+class PlatformMotionAngle:
+    timestamp_ns: int
+    angle_x_deg: float | None
+    angle_y_deg: float | None
+
+
+@dataclass(frozen=True)
 class PlatformMotionAnchor:
     timestamp_ns: int
     modeled_rate_x_deg_s: float
@@ -254,14 +261,7 @@ class PlatformMotionSnapshot:
 
     def rate_at(self, timestamp_ns: int) -> PlatformMotionRate | None:
         """Reconstruct command-modeled platform rate at an observation time."""
-        if (
-            isinstance(timestamp_ns, bool)
-            or not isinstance(timestamp_ns, int)
-            or timestamp_ns < 0
-            or not self.valid
-            or not self.anchors
-            or timestamp_ns < self.anchors[0].timestamp_ns
-        ):
+        if not self._timestamp_is_covered(timestamp_ns):
             return None
 
         anchor = self.anchors[0]
@@ -270,17 +270,7 @@ class PlatformMotionSnapshot:
                 break
             anchor = candidate
         elapsed_s = (timestamp_ns - anchor.timestamp_ns) / 1_000_000_000.0
-        if not all(
-            isfinite(value)
-            for value in (
-                anchor.modeled_rate_x_deg_s,
-                anchor.modeled_rate_y_deg_s,
-                anchor.commanded_rate_x_deg_s,
-                anchor.commanded_rate_y_deg_s,
-                anchor.acceleration_x_deg_s2,
-                anchor.acceleration_y_deg_s2,
-            )
-        ):
+        if not _valid_platform_anchor(anchor):
             return None
         return PlatformMotionRate(
             timestamp_ns=timestamp_ns,
@@ -296,11 +286,112 @@ class PlatformMotionSnapshot:
             ),
         )
 
+    def angle_at(self, timestamp_ns: int) -> PlatformMotionAngle | None:
+        """Return modeled angular displacement relative to the first retained anchor.
+
+        The absolute zero is intentionally arbitrary: callers use these values for
+        slopes, where a constant offset cancels. Returning ``None`` when the
+        requested timestamp is not covered preserves the same safety semantics as
+        :meth:`rate_at`.
+        """
+        if not self._timestamp_is_covered(timestamp_ns):
+            return None
+
+        angle_x = 0.0
+        angle_y = 0.0
+        for index, anchor in enumerate(self.anchors):
+            if not _valid_platform_anchor(anchor):
+                return None
+            if index > 0 and anchor.timestamp_ns < self.anchors[index - 1].timestamp_ns:
+                return None
+            if timestamp_ns <= anchor.timestamp_ns:
+                break
+            segment_end_ns = timestamp_ns
+            if index + 1 < len(self.anchors):
+                segment_end_ns = min(
+                    segment_end_ns,
+                    self.anchors[index + 1].timestamp_ns,
+                )
+            elapsed_s = (segment_end_ns - anchor.timestamp_ns) / 1_000_000_000.0
+            if elapsed_s < 0.0:
+                return None
+            angle_x += _integrate_approach_rate(
+                anchor.modeled_rate_x_deg_s,
+                anchor.commanded_rate_x_deg_s,
+                anchor.acceleration_x_deg_s2,
+                elapsed_s,
+            )
+            angle_y += _integrate_approach_rate(
+                anchor.modeled_rate_y_deg_s,
+                anchor.commanded_rate_y_deg_s,
+                anchor.acceleration_y_deg_s2,
+                elapsed_s,
+            )
+            if segment_end_ns == timestamp_ns:
+                break
+
+        return PlatformMotionAngle(
+            timestamp_ns=timestamp_ns,
+            angle_x_deg=angle_x,
+            angle_y_deg=angle_y,
+        )
+
+    def _timestamp_is_covered(self, timestamp_ns: int) -> bool:
+        return not (
+            isinstance(timestamp_ns, bool)
+            or not isinstance(timestamp_ns, int)
+            or timestamp_ns < 0
+            or not self.valid
+            or not self.anchors
+            or timestamp_ns < self.anchors[0].timestamp_ns
+        )
+
+
+def _valid_platform_anchor(anchor: PlatformMotionAnchor) -> bool:
+    return (
+        all(
+            isfinite(value)
+            for value in (
+                anchor.modeled_rate_x_deg_s,
+                anchor.modeled_rate_y_deg_s,
+                anchor.commanded_rate_x_deg_s,
+                anchor.commanded_rate_y_deg_s,
+                anchor.acceleration_x_deg_s2,
+                anchor.acceleration_y_deg_s2,
+            )
+        )
+        and anchor.acceleration_x_deg_s2 > 0.0
+        and anchor.acceleration_y_deg_s2 > 0.0
+    )
+
 
 def _approach_rate(current: float, target: float, maximum_delta: float) -> float:
     if current < target:
         return min(target, current + maximum_delta)
     return max(target, current - maximum_delta)
+
+
+def _integrate_approach_rate(
+    current: float,
+    target: float,
+    acceleration: float,
+    elapsed_s: float,
+) -> float:
+    if elapsed_s <= 0.0:
+        return 0.0
+    delta = target - current
+    if delta == 0.0:
+        return current * elapsed_s
+    direction = 1.0 if delta > 0.0 else -1.0
+    time_to_target_s = abs(delta) / acceleration
+    ramp_s = min(elapsed_s, time_to_target_s)
+    displacement = (
+        current * ramp_s
+        + 0.5 * direction * acceleration * ramp_s * ramp_s
+    )
+    if elapsed_s > ramp_s:
+        displacement += target * (elapsed_s - ramp_s)
+    return displacement
 
 
 @dataclass(frozen=True)

@@ -1247,3 +1247,46 @@ def test_atomic_replace_failure_preserves_existing_file(tmp_path, monkeypatch) -
 
     assert path.read_bytes() == original
     assert not list(tmp_path.glob(".config.json.*.tmp"))
+
+
+def test_platform_motion_video_latency_is_optional_strict_and_round_trips() -> None:
+    default_config = parse_config(_valid_config())
+    assert default_config.tracking_control.platform_motion.video_latency_ms == 0
+    assert (
+        "video-latency-ms"
+        not in config_to_mapping(default_config)["tracking-control"]["platform-motion"]
+    )
+
+    data = _valid_config()
+    data["tracking-control"]["platform-motion"]["video-latency-ms"] = 150
+    config = parse_config(data)
+    assert config.tracking_control.platform_motion.video_latency_ms == 150
+    assert (
+        config_to_mapping(config)["tracking-control"]["platform-motion"][
+            "video-latency-ms"
+        ]
+        == 150
+    )
+    assert parse_config(config_to_mapping(config)) == config
+
+
+@pytest.mark.parametrize("value", [-1, True, 1.5, "150"])
+def test_platform_motion_video_latency_rejects_invalid_values(value) -> None:
+    data = _valid_config()
+    data["tracking-control"]["platform-motion"]["video-latency-ms"] = value
+
+    with pytest.raises(ConfigValidationError) as exc_info:
+        parse_config(data)
+
+    assert exc_info.value.path == "tracking-control.platform-motion.video-latency-ms"
+
+
+def test_platform_motion_video_latency_requires_application_restart() -> None:
+    old = parse_config(_valid_config())
+    data = _valid_config()
+    data["tracking-control"]["platform-motion"]["video-latency-ms"] = 150
+    new = parse_config(data)
+    path = "tracking-control.platform-motion.video-latency-ms"
+
+    assert path in changed_config_paths(old, new)
+    assert config_apply_policy(path) is ConfigApplyPolicy.APPLICATION_RESTART

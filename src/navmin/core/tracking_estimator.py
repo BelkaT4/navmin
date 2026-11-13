@@ -10,6 +10,7 @@ from navmin.config.models import TrackingControlConfig, VelocityEstimatorConfig
 from navmin.contracts import (
     CameraRole,
     PlatformMotionRate,
+    PlatformMotionSnapshot,
     PlatformMotionSource,
     TargetRef,
     TrackingError,
@@ -122,9 +123,11 @@ class TrackingEstimator:
         if not isinstance(config, TrackingControlConfig):
             raise TypeError("config must be TrackingControlConfig")
         estimator_changed = config.velocity_estimator != self._config.velocity_estimator
-        source_changed = config.platform_motion != self._config.platform_motion
+        platform_motion_changed = (
+            config.platform_motion != self._config.platform_motion
+        )
         self._config = config
-        if estimator_changed or source_changed:
+        if estimator_changed or platform_motion_changed:
             self.reset_history()
 
     def reset(self) -> None:
@@ -148,14 +151,17 @@ class TrackingEstimator:
     def observe(
         self,
         error: TrackingError,
-        platform_motion: PlatformMotionRate | None,
+        platform_motion: PlatformMotionRate | PlatformMotionSnapshot | None,
     ) -> TrackingEstimatorDiagnostics:
         if not isinstance(error, TrackingError):
             raise TypeError("error must be TrackingError")
         if platform_motion is not None and not isinstance(
-            platform_motion, PlatformMotionRate
+            platform_motion, (PlatformMotionRate, PlatformMotionSnapshot)
         ):
-            raise TypeError("platform_motion must be PlatformMotionRate or None")
+            raise TypeError(
+                "platform_motion must be PlatformMotionRate, "
+                "PlatformMotionSnapshot, or None"
+            )
         if not math.isfinite(error.error_x_deg) or not math.isfinite(error.error_y_deg):
             raise ValueError("tracking error must be finite")
 
@@ -198,7 +204,7 @@ class TrackingEstimator:
         self,
         *,
         observation_timestamp_ns: int,
-        platform_motion: PlatformMotionRate | None,
+        platform_motion: PlatformMotionRate | PlatformMotionSnapshot | None,
         forced_reason: TrackingEstimateInvalidReason | None = None,
     ) -> TrackingEstimatorDiagnostics:
         sample_count = len(self._history)
@@ -301,15 +307,18 @@ class TrackingEstimator:
         )
 
     def _fit(self, axis: str) -> _Fit | None:
-        if len(self._history) < 2:
+        values = [
+            sample.error_x_deg if axis == "x" else sample.error_y_deg
+            for sample in self._history
+        ]
+        return self._fit_values(values)
+
+    def _fit_values(self, values: list[float]) -> _Fit | None:
+        if len(self._history) < 2 or len(values) != len(self._history):
             return None
         first_timestamp = self._history[0].timestamp_ns
         times_s = [
             (sample.timestamp_ns - first_timestamp) / 1_000_000_000.0
-            for sample in self._history
-        ]
-        values = [
-            sample.error_x_deg if axis == "x" else sample.error_y_deg
             for sample in self._history
         ]
         mean_time = sum(times_s) / len(times_s)
@@ -341,26 +350,58 @@ class TrackingEstimator:
             self._history[-1].timestamp_ns - self._history[0].timestamp_ns
         ) / 1_000_000.0
 
-    @staticmethod
     def _platform_rates(
-        platform_motion: PlatformMotionRate | None,
+        self,
+        platform_motion: PlatformMotionRate | PlatformMotionSnapshot | None,
         observation_timestamp_ns: int,
     ) -> tuple[float | None, float | None]:
+        if isinstance(platform_motion, PlatformMotionSnapshot):
+            return self._window_aligned_platform_rates(platform_motion)
         if (
             platform_motion is None
             or platform_motion.timestamp_ns != observation_timestamp_ns
         ):
             return None, None
 
-        def finite_or_none(value: float | None) -> float | None:
-            if value is None or not math.isfinite(value):
-                return None
-            return value
-
         return (
-            finite_or_none(platform_motion.rate_x_deg_s),
-            finite_or_none(platform_motion.rate_y_deg_s),
+            self._finite_or_none(platform_motion.rate_x_deg_s),
+            self._finite_or_none(platform_motion.rate_y_deg_s),
         )
+
+    def _window_aligned_platform_rates(
+        self, platform_motion: PlatformMotionSnapshot
+    ) -> tuple[float | None, float | None]:
+        if len(self._history) < 2:
+            return None, None
+        latency_ns = self._config.platform_motion.video_latency_ms * 1_000_000
+        angles_x: list[float] = []
+        angles_y: list[float] = []
+        for sample in self._history:
+            corrected_timestamp_ns = sample.timestamp_ns - latency_ns
+            if corrected_timestamp_ns < 0:
+                return None, None
+            angle = platform_motion.angle_at(corrected_timestamp_ns)
+            if angle is None:
+                return None, None
+            angle_x = self._finite_or_none(angle.angle_x_deg)
+            angle_y = self._finite_or_none(angle.angle_y_deg)
+            if angle_x is None or angle_y is None:
+                return None, None
+            angles_x.append(angle_x)
+            angles_y.append(angle_y)
+
+        fit_x = self._fit_values(angles_x)
+        fit_y = self._fit_values(angles_y)
+        return (
+            None if fit_x is None else fit_x.slope_deg_s,
+            None if fit_y is None else fit_y.slope_deg_s,
+        )
+
+    @staticmethod
+    def _finite_or_none(value: float | None) -> float | None:
+        if value is None or not math.isfinite(value):
+            return None
+        return value
 
     def _empty_diagnostics(
         self, reason: TrackingEstimateInvalidReason

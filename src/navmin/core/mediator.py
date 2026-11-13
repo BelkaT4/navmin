@@ -1062,10 +1062,8 @@ class Mediator:
             > self._tracking_gap_timeout_ns
         ):
             self._tracking_estimator.reset_history()
-        platform_rate = self._turret.platform_motion_snapshot().rate_at(
-            error.timestamp_ns
-        )
-        diagnostics = self._tracking_estimator.observe(error, platform_rate)
+        platform_motion = self._turret.platform_motion_snapshot()
+        diagnostics = self._tracking_estimator.observe(error, platform_motion)
         self._log_tracking_observation(
             result,
             error,
@@ -1182,6 +1180,7 @@ class Mediator:
             "target_rate_x_deg_s=%s target_rate_y_deg_s=%s "
             "rate_valid_x=%s rate_valid_y=%s "
             "invalid_reason_x=%s invalid_reason_y=%s "
+            "platform_video_latency_ms=%d "
             "prediction_enabled=%s prediction_horizon_ms=%d "
             "prediction_raw_x_deg=%.6f prediction_raw_y_deg=%.6f "
             "prediction_applied_x_deg=%.6f prediction_applied_y_deg=%.6f "
@@ -1214,6 +1213,7 @@ class Mediator:
             y.valid,
             None if x.invalid_reason is None else x.invalid_reason.value,
             None if y.invalid_reason is None else y.invalid_reason.value,
+            config.platform_motion.video_latency_ms,
             prediction.enabled,
             prediction.horizon_ms,
             x.raw_prediction_offset_deg,

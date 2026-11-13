@@ -625,6 +625,7 @@ def _parse_tracking_control(value: Any) -> TrackingControlConfig:
         obj["platform-motion"],
         platform_path,
         required={"source"},
+        optional={"video-latency-ms"},
     )
     source = _enum_string(
         platform_obj["source"],
@@ -636,7 +637,18 @@ def _parse_tracking_control(value: Any) -> TrackingControlConfig:
         velocity_estimator=velocity_estimator,
         feed_forward=feed_forward,
         prediction=prediction,
-        platform_motion=PlatformMotionConfig(source=PlatformMotionSource(source)),
+        platform_motion=PlatformMotionConfig(
+            source=PlatformMotionSource(source),
+            video_latency_ms=(
+                0
+                if "video-latency-ms" not in platform_obj
+                else _int(
+                    platform_obj["video-latency-ms"],
+                    f"{platform_path}.video-latency-ms",
+                    minimum=0,
+                )
+            ),
+        ),
     )
 
 
@@ -1059,6 +1071,13 @@ def _aim_point_to_mapping(config: AimPointConfig) -> dict[str, Any]:
     return {"x-px": config.x_px, "y-px": config.y_px}
 
 
+def _platform_motion_to_mapping(config: PlatformMotionConfig) -> dict[str, Any]:
+    result: dict[str, Any] = {"source": config.source.value}
+    if config.video_latency_ms != 0:
+        result["video-latency-ms"] = config.video_latency_ms
+    return result
+
+
 def config_to_mapping(config: AppConfig) -> dict[str, Any]:
     """Convert a typed schema-v7 snapshot to its persisted JSON structure."""
     return {
@@ -1129,9 +1148,9 @@ def config_to_mapping(config: AppConfig) -> dict[str, Any]:
                 "max-angle-x-deg": (config.tracking_control.prediction.max_angle_x_deg),
                 "max-angle-y-deg": (config.tracking_control.prediction.max_angle_y_deg),
             },
-            "platform-motion": {
-                "source": config.tracking_control.platform_motion.source.value,
-            },
+            "platform-motion": _platform_motion_to_mapping(
+                config.tracking_control.platform_motion
+            ),
         },
         "tracking-visualization": {
             "show-search-region": config.tracking_visualization.show_search_region,

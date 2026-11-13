@@ -153,6 +153,7 @@ class PredictionConfig:
 @dataclass(frozen=True)
 class PlatformMotionConfig:
     source: PlatformMotionSource
+    video_latency_ms: int = 0
 
 
 @dataclass(frozen=True)
@@ -294,7 +295,10 @@ def config_apply_policy(path: str) -> ConfigApplyPolicy | None:
         return ConfigApplyPolicy.DYNAMIC
 
     parts = path.split(".")
-    if path == "tracking-control.platform-motion.source":
+    if path in {
+        "tracking-control.platform-motion.source",
+        "tracking-control.platform-motion.video-latency-ms",
+    }:
         return ConfigApplyPolicy.APPLICATION_RESTART
 
     if path == "recording.directory":

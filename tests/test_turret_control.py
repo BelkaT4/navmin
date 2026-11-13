@@ -1159,3 +1159,31 @@ def test_motor_off_invalidates_tracking_motion_and_resets_pid() -> None:
     assert [decode_request(raw).command for raw in transport.raw_write_history] == [
         CommandCode.MOTOR_OFF
     ]
+
+
+def test_disabled_prediction_and_ff_ignore_valid_rate_after_time_compensation() -> None:
+    tracking = _tracking_control_config()
+    assert not tracking.prediction.enabled
+    assert not tracking.feed_forward.enabled
+    config = _config(kp_x=2.0, ki_x=0.0, kd_x=0.0)
+    controller, _, _, transport, _ = _stack(
+        config,
+        tracking_control_config=tracking,
+    )
+    _enter_tracking_off(controller, transport)
+
+    controller.submit_tracking_control(
+        1,
+        _tracking_error(
+            _target(),
+            1.5,
+            target_rate_x=80.0,
+            prediction_x=5.0,
+            valid_x=True,
+        ),
+    )
+
+    assert controller.pending_motion == AxisVelocitySetpoint(3.0, 0.0, 1)
+    assert controller.pid_x.last_step is not None
+    assert controller.pid_x.last_step.proportional_offset == 0.0
+    assert controller.pid_x.last_step.feed_forward == 0.0
