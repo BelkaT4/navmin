@@ -17,6 +17,9 @@ from navmin.config.models import (
 )
 from navmin.contracts import CameraRole, TurretState
 from navmin.core import Mediator
+from navmin.diagnostics.live_video_latency_calibration import (
+    LiveVideoLatencyCalibrationState,
+)
 from navmin.imu import ImuCalibrationControls, ImuRuntimeState
 from navmin.motion_calibration import MotionCalibrationRuntime, MotionProfile
 from navmin.recording import RecordingRuntime, RecordingSessionInfo
@@ -52,6 +55,11 @@ def run_ui(
     motion_calibration_runtime: MotionCalibrationRuntime | None = None,
     begin_motion_calibration_profile: Callable[[MotionProfile], None] | None = None,
     restore_motion_calibration_profile: Callable[[], None] | None = None,
+    video_latency_calibration_states: (
+        LatestValue[LiveVideoLatencyCalibrationState] | None
+    ) = None,
+    start_video_latency_calibration: Callable[[], bool] | None = None,
+    cancel_video_latency_calibration: Callable[[], None] | None = None,
     persist_tracking_visualization: (
         Callable[[TrackingVisualizationConfig], None] | None
     ) = None,
@@ -87,6 +95,9 @@ def run_ui(
         motion_calibration_runtime=motion_calibration_runtime,
         begin_motion_calibration_profile=begin_motion_calibration_profile,
         restore_motion_calibration_profile=restore_motion_calibration_profile,
+        video_latency_calibration_states=video_latency_calibration_states,
+        start_video_latency_calibration=start_video_latency_calibration,
+        cancel_video_latency_calibration=cancel_video_latency_calibration,
         persist_tracking_visualization=persist_tracking_visualization,
         imu_states=imu_states,
         imu_controls=imu_controls,

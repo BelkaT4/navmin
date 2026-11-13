@@ -322,6 +322,18 @@ class TurretController:
             return self._hal.set_velocity(self._zero_velocity())
         return None
 
+    def set_calibration_velocity(self, setpoint: AxisVelocitySetpoint) -> SessionResult:
+        """Apply one calibration-owned velocity without changing control mode."""
+        if not isinstance(setpoint, AxisVelocitySetpoint):
+            raise TypeError("setpoint must be AxisVelocitySetpoint")
+        if self._hal.motor_state is not MotorState.ON:
+            raise ControllerStateError("calibration velocity requires MOTOR ON")
+        self._pending_motion = None
+        self._reset_pid()
+        self._target = None
+        self._last_tracking_time_s = None
+        return self._hal.set_velocity(setpoint)
+
     def motor_off(self) -> SessionResult:
         self._pending_motion = None
         self._reset_pid()

@@ -257,6 +257,16 @@ def _run_noninteractive(
                     stereo_calibration=effective_inputs.stereo_calibration,
                     source_paths=effective_inputs.source_paths,
                 )
+                from navmin.diagnostics.live_video_latency_calibration import (
+                    write_live_video_latency_calibration_json,
+                )
+
+                def persist_video_latency_calibration(result) -> None:
+                    write_live_video_latency_calibration_json(
+                        result,
+                        artifacts.session_dir / "video-latency-calibration.json",
+                    )
+
                 exit_code = run_loaded_application(
                     effective_inputs,
                     show_diagnostic_clock=bindings.show_diagnostic_clock,
@@ -268,6 +278,9 @@ def _run_noninteractive(
                     ),
                     stereo_right_source_factory=(
                         bindings.factories.stereo_right_source_factory
+                    ),
+                    video_latency_calibration_result_writer=(
+                        persist_video_latency_calibration
                     ),
                 )
         except KeyboardInterrupt as exc:

@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import logging
+import math
+import time
 from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -12,6 +14,7 @@ from threading import Event, Lock, Thread
 from navmin.concurrency import InvalidatableLatest, LatestValue
 from navmin.config.models import SerialConfig, TrackingControlConfig, TurretConfig
 from navmin.contracts import (
+    AxisVelocitySetpoint,
     ConfigUpdate,
     MotorState,
     MoveRelativeCommand,
@@ -56,6 +59,18 @@ class _RecoveryConfigStatus(Enum):
     COMPLETE = "complete"
     EMERGENCY_HANDLED = "emergency_handled"
     FAILED = "failed"
+
+
+class _CalibrationKind(Enum):
+    BEGIN = "begin"
+    SET_Y_VELOCITY = "set_y_velocity"
+    END = "end"
+
+
+@dataclass(frozen=True)
+class _CalibrationIntent:
+    kind: _CalibrationKind
+    rate_y_deg_s: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -148,6 +163,9 @@ class TurretWorker:
         self._emergency_signal_lock = Lock()
         self._normal_ingress_lock = Lock()
         self._normal_ingress_open = False
+        self._calibration_mailbox: deque[_CalibrationIntent] = deque()
+        self._video_latency_calibration_requested = False
+        self._video_latency_calibration_active = False
         self._last_motion_revision = 0
         self._last_config_revision = 0
         self._last_tracking_config_slot_revision = 0
@@ -170,6 +188,14 @@ class TurretWorker:
     @property
     def ready(self) -> bool:
         return self._ready
+
+    @property
+    def video_latency_calibration_active(self) -> bool:
+        with self._normal_ingress_lock:
+            return (
+                self._video_latency_calibration_requested
+                or self._video_latency_calibration_active
+            )
 
     def platform_motion_snapshot(self) -> PlatformMotionSnapshot:
         hal = self._hal
@@ -267,6 +293,66 @@ class TurretWorker:
                 return
             if session.signal_emergency():
                 self._emergency_signal.set()
+
+    def begin_video_latency_calibration(self) -> bool:
+        """Reserve Turret motion ownership for an in-runtime calibration session."""
+        state = self.current_state
+        if (
+            state.connection_state is not TurretConnectionState.READY
+            or state.motor_state is not MotorState.ON
+        ):
+            return False
+        with self._normal_ingress_lock:
+            if (
+                not self._normal_ingress_open
+                or self._video_latency_calibration_requested
+                or self._video_latency_calibration_active
+            ):
+                return False
+            self._video_latency_calibration_requested = True
+            self._normal_ingress_open = False
+            self._motion_inputs.invalidate()
+            self._last_motion_revision = self._motion_inputs.snapshot().revision
+            self._control_mailbox.clear()
+            self._calibration_mailbox.append(
+                _CalibrationIntent(_CalibrationKind.BEGIN)
+            )
+            return True
+
+    def submit_video_latency_calibration_velocity_y(
+        self, rate_y_deg_s: float
+    ) -> bool:
+        """Queue one calibration-owned logical Y velocity; X is always zero."""
+        if isinstance(rate_y_deg_s, bool) or not isinstance(
+            rate_y_deg_s, int | float
+        ):
+            raise TypeError("rate_y_deg_s must be a number")
+        value = float(rate_y_deg_s)
+        if not math.isfinite(value):
+            raise ValueError("rate_y_deg_s must be finite")
+        if abs(value) > self._desired_config.stm32.max_speed_y_deg_s:
+            raise ValueError("rate_y_deg_s exceeds configured Y speed limit")
+        with self._normal_ingress_lock:
+            if not (
+                self._video_latency_calibration_requested
+                or self._video_latency_calibration_active
+            ):
+                return False
+            self._calibration_mailbox.append(
+                _CalibrationIntent(_CalibrationKind.SET_Y_VELOCITY, value)
+            )
+            return True
+
+    def end_video_latency_calibration(self) -> bool:
+        """Queue zero velocity and release calibration ownership after confirmation."""
+        with self._normal_ingress_lock:
+            if not (
+                self._video_latency_calibration_requested
+                or self._video_latency_calibration_active
+            ):
+                return False
+            self._calibration_mailbox.append(_CalibrationIntent(_CalibrationKind.END))
+            return True
 
     def submit_config_update(self, update: ConfigUpdate[TurretConfig]) -> None:
         if not isinstance(update, ConfigUpdate):
@@ -541,6 +627,16 @@ class TurretWorker:
             return True
 
         with self._normal_ingress_lock:
+            calibration_intent = (
+                self._calibration_mailbox.popleft()
+                if self._calibration_mailbox
+                else None
+            )
+        if calibration_intent is not None:
+            self._handle_calibration(calibration_intent)
+            return True
+
+        with self._normal_ingress_lock:
             control_intent = (
                 self._control_mailbox.popleft() if self._control_mailbox else None
             )
@@ -555,6 +651,46 @@ class TurretWorker:
             return True
 
         return False
+
+    def _handle_calibration(self, intent: _CalibrationIntent) -> None:
+        controller = self._controller_required()
+        if intent.kind is _CalibrationKind.BEGIN:
+            result = controller.stop_motion()
+            if result is not None:
+                self._handle_session_result(result)
+            with self._normal_ingress_lock:
+                self._video_latency_calibration_requested = False
+                self._video_latency_calibration_active = True
+            self._publish_state(TurretConnectionState.READY)
+            return
+        if intent.kind is _CalibrationKind.SET_Y_VELOCITY:
+            if not self._video_latency_calibration_active:
+                return
+            result = controller.set_calibration_velocity(
+                AxisVelocitySetpoint(
+                    velocity_x_deg_s=0.0,
+                    velocity_y_deg_s=intent.rate_y_deg_s,
+                    timestamp_ns=time.monotonic_ns(),
+                )
+            )
+            self._handle_session_result(result)
+            self._publish_state(TurretConnectionState.READY)
+            return
+        if intent.kind is _CalibrationKind.END:
+            result = controller.stop_motion()
+            if result is not None:
+                self._handle_session_result(result)
+            self._release_video_latency_calibration()
+            self._publish_state(TurretConnectionState.READY)
+            return
+        raise RuntimeError(f"unsupported calibration intent: {intent.kind}")
+
+    def _release_video_latency_calibration(self) -> None:
+        with self._normal_ingress_lock:
+            self._video_latency_calibration_requested = False
+            self._video_latency_calibration_active = False
+            self._calibration_mailbox.clear()
+            self._normal_ingress_open = self._ready
 
     def _handle_tracking_control_config_update(
         self,
@@ -650,6 +786,8 @@ class TurretWorker:
         response = self._controller_required().emergency_stop()
         if response is not None and response.result is ResultCode.OK:
             self._clear_emergency_signal_if_serviced()
+        if self.video_latency_calibration_active:
+            self._release_video_latency_calibration()
         self._publish_state(TurretConnectionState.READY)
 
     def _handle_session_result(self, result: SessionResult) -> None:
@@ -712,6 +850,9 @@ class TurretWorker:
             self._motion_inputs.invalidate()
             self._last_motion_revision = self._motion_inputs.snapshot().revision
             self._control_mailbox.clear()
+            self._calibration_mailbox.clear()
+            self._video_latency_calibration_requested = False
+            self._video_latency_calibration_active = False
 
     def _bind_stack(self, session: TurretSession) -> None:
         if self._hal is None or self._controller is None:

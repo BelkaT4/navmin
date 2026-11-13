@@ -50,6 +50,9 @@ from navmin.core import (
     Mediator,
     TrackingControlVisualization,
 )
+from navmin.diagnostics.live_video_latency_calibration import (
+    LiveVideoLatencyCalibrationState,
+)
 from navmin.imu import ImuCalibrationControls, ImuRuntimeState
 from navmin.motion_calibration import MotionCalibrationRuntime, MotionProfile
 from navmin.recording import (
@@ -69,6 +72,7 @@ from .bridge import CameraUiBinding, UiStatePump
 from .imu_window import ImuWindow
 from .motion_calibration_window import MotionCalibrationWindow
 from .operator_window import OperatorWindow
+from .video_latency_calibration_window import VideoLatencyCalibrationWindow
 from .video_view import (
     PreparedVisionFrame,
     VideoView,
@@ -179,6 +183,11 @@ class MainWindow(QMainWindow):
         motion_calibration_runtime: MotionCalibrationRuntime | None = None,
         begin_motion_calibration_profile: Callable[[MotionProfile], None] | None = None,
         restore_motion_calibration_profile: Callable[[], None] | None = None,
+        video_latency_calibration_states: (
+            LatestValue[LiveVideoLatencyCalibrationState] | None
+        ) = None,
+        start_video_latency_calibration: Callable[[], bool] | None = None,
+        cancel_video_latency_calibration: Callable[[], None] | None = None,
         persist_tracking_visualization: (
             Callable[[TrackingVisualizationConfig], None] | None
         ) = None,
@@ -440,6 +449,21 @@ class MainWindow(QMainWindow):
                 stale_timeout_ms=camera_stale_timeout_ms,
                 clock_ns=clock_ns,
             )
+        self.video_latency_calibration_window: (
+            VideoLatencyCalibrationWindow | None
+        ) = None
+        if (
+            video_latency_calibration_states is not None
+            and start_video_latency_calibration is not None
+            and cancel_video_latency_calibration is not None
+        ):
+            self.video_latency_calibration_window = VideoLatencyCalibrationWindow(
+                owner=self,
+                states=video_latency_calibration_states,
+                start_calibration=start_video_latency_calibration,
+                cancel_calibration=cancel_video_latency_calibration,
+            )
+
         self.operator_window = OperatorWindow(
             owner=self,
             on_toggle_fullscreen=self.toggle_fullscreen,
@@ -467,6 +491,11 @@ class MainWindow(QMainWindow):
             on_show_motion_calibration=(
                 self.show_motion_calibration_window
                 if self.motion_calibration_window is not None
+                else None
+            ),
+            on_show_video_latency_calibration=(
+                self.show_video_latency_calibration_window
+                if self.video_latency_calibration_window is not None
                 else None
             ),
         )
@@ -511,6 +540,8 @@ class MainWindow(QMainWindow):
         self._stop_recording()
         if self.motion_calibration_window is not None:
             self.motion_calibration_window.close()
+        if self.video_latency_calibration_window is not None:
+            self.video_latency_calibration_window.close()
         self.imu_window.close()
         self.operator_window.close()
         super().closeEvent(event)
@@ -537,6 +568,14 @@ class MainWindow(QMainWindow):
 
     def show_motion_calibration_window(self) -> None:
         window = self.motion_calibration_window
+        if window is None:
+            return
+        window.show()
+        window.raise_()
+        window.activateWindow()
+
+    def show_video_latency_calibration_window(self) -> None:
+        window = self.video_latency_calibration_window
         if window is None:
             return
         window.show()

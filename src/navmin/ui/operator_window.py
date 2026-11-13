@@ -88,6 +88,7 @@ class OperatorWindow(QWidget):
             CameraRole.STEREO_LEFT,
         ),
         on_show_motion_calibration: Callable[[], None] | None = None,
+        on_show_video_latency_calibration: Callable[[], None] | None = None,
     ) -> None:
         super().__init__(owner, Qt.WindowType.Tool)
         self._on_toggle_fullscreen = on_toggle_fullscreen
@@ -111,6 +112,7 @@ class OperatorWindow(QWidget):
         self._on_apply_vision_processor_selection = on_apply_vision_processor_selection
         self._available_cameras = set(available_cameras)
         self._on_show_motion_calibration = on_show_motion_calibration
+        self._on_show_video_latency_calibration = on_show_video_latency_calibration
         self._syncing_tracking_visualization = False
 
         self.setWindowTitle("NavMin — настройки")
@@ -371,6 +373,16 @@ class OperatorWindow(QWidget):
             self.motion_calibration_button.clicked.connect(
                 self._on_show_motion_calibration
             )
+        self.video_latency_calibration_button = QPushButton(
+            "КАЛИБРОВКА ЗАДЕРЖКИ ВИДЕО"
+        )
+        self.video_latency_calibration_button.setEnabled(
+            self._on_show_video_latency_calibration is not None
+        )
+        if self._on_show_video_latency_calibration is not None:
+            self.video_latency_calibration_button.clicked.connect(
+                self._on_show_video_latency_calibration
+            )
         self.fullscreen_button = QPushButton()
         self.fullscreen_button.clicked.connect(self._on_toggle_fullscreen)
         self.exit_button = QPushButton("Выход")
@@ -562,6 +574,15 @@ class OperatorWindow(QWidget):
             reset_layout.addWidget(self.aim_point_reset_buttons[camera])
         layout.addWidget(reset_row)
         layout.addWidget(self.motion_calibration_button)
+        layout.addWidget(self.video_latency_calibration_button)
+        if self._on_show_video_latency_calibration is None:
+            note = QLabel(
+                "Калибровка задержки видео доступна только с "
+                "реальным STM32; software/synthetic coverage "
+                "выполняется без движения железа."
+            )
+            note.setWordWrap(True)
+            layout.addWidget(note)
         layout.addWidget(self.position_button)
         layout.addStretch(1)
         return page

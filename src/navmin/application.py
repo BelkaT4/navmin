@@ -30,6 +30,11 @@ from navmin.contracts import (
     TurretState,
 )
 from navmin.core import DistanceMeasurementMode, Mediator
+from navmin.diagnostics.live_video_latency_calibration import (
+    InRuntimeVideoLatencyCalibration,
+    LiveVideoLatencyCalibrationResult,
+    LiveVideoLatencyCalibrationState,
+)
 from navmin.diagnostics.stereo_runtime import (
     StereoDiagnosticsReporter,
     StereoRuntimeDiagnostics,
@@ -129,6 +134,11 @@ class UiRuntimeDependencies:
     motion_calibration_runtime: MotionCalibrationRuntime | None = None
     begin_motion_calibration_profile: Callable[[MotionProfile], None] | None = None
     restore_motion_calibration_profile: Callable[[], None] | None = None
+    video_latency_calibration_states: (
+        LatestValue[LiveVideoLatencyCalibrationState] | None
+    ) = None
+    start_video_latency_calibration: Callable[[], bool] | None = None
+    cancel_video_latency_calibration: Callable[[], None] | None = None
 
 
 @dataclass(frozen=True)
@@ -230,6 +240,17 @@ class ApplicationRuntime:
         if stereo_right_worker is not None:
             camera_bindings[CameraRole.STEREO_RIGHT] = self._binding(stereo_right_worker)
         self._camera_bindings = MappingProxyType(camera_bindings)
+        self.video_latency_calibration_runtime = InRuntimeVideoLatencyCalibration(
+            overview_results=overview_worker.pipeline.latest_result,
+            camera_model_provider=lambda generation: mediator.session_gate.camera_model(
+                CameraRole.OVERVIEW, generation
+            ),
+            turret=turret_worker,
+            configured_video_latency_ms=(
+                tracking_control_config.platform_motion.video_latency_ms
+            ),
+        )
+        calibration_available = not turret_config.emulate_stm32
         self._ui_dependencies = UiRuntimeDependencies(
             mediator=mediator,
             camera_bindings=self._camera_bindings,
@@ -254,6 +275,21 @@ class ApplicationRuntime:
             motion_calibration_runtime=self.motion_calibration_runtime,
             begin_motion_calibration_profile=self.begin_motion_calibration_profile,
             restore_motion_calibration_profile=self.restore_motion_calibration_profile,
+            video_latency_calibration_states=(
+                self.video_latency_calibration_runtime.state_updates
+                if calibration_available
+                else None
+            ),
+            start_video_latency_calibration=(
+                self.start_video_latency_calibration
+                if calibration_available
+                else None
+            ),
+            cancel_video_latency_calibration=(
+                self.cancel_video_latency_calibration
+                if calibration_available
+                else None
+            ),
         )
         self._active_components: set[str] = set()
         self._start_attempted = False
@@ -313,6 +349,10 @@ class ApplicationRuntime:
 
     def apply_motion_limits_tuning(self, config: Stm32Config) -> None:
         """Queue a temporary speed/acceleration-only Turret config update."""
+        if self.video_latency_calibration_runtime.active:
+            raise RuntimeError(
+                "motion limits are unavailable during video latency calibration"
+            )
         if self._pre_calibration_turret_config is not None:
             raise RuntimeError("motion limits are unavailable during motion calibration")
         if not isinstance(config, Stm32Config):
@@ -372,6 +412,10 @@ class ApplicationRuntime:
 
     def apply_pid_tuning(self, config: PidControllerConfig) -> None:
         """Queue a temporary PID-only runtime config update for Turret."""
+        if self.video_latency_calibration_runtime.active:
+            raise RuntimeError(
+                "PID tuning is unavailable during video latency calibration"
+            )
         if self._pre_calibration_turret_config is not None:
             raise RuntimeError("PID tuning is unavailable during motion calibration")
         self._validate_pid_tuning(config)
@@ -398,6 +442,10 @@ class ApplicationRuntime:
         """Queue a bounded temporary STM32 profile for one calibration session."""
         if not isinstance(profile, MotionProfile):
             raise TypeError("profile must be MotionProfile")
+        if self.video_latency_calibration_runtime.active:
+            raise RuntimeError(
+                "motion calibration is unavailable during video latency calibration"
+            )
         if self._pre_calibration_turret_config is not None:
             raise RuntimeError("motion calibration profile is already active")
         current = self._runtime_turret_config
@@ -443,11 +491,39 @@ class ApplicationRuntime:
         self._pre_calibration_turret_config = None
         self._turret_config_revision = next_revision
 
+    def start_video_latency_calibration(self) -> bool:
+        """Start in-runtime Overview latency calibration without restarting workers."""
+        if self._pre_calibration_turret_config is not None:
+            raise RuntimeError(
+                "video latency calibration is unavailable during motion calibration"
+            )
+        if self.video_latency_calibration_runtime.active:
+            return False
+        if (
+            self.mediator.pending_selection is not None
+            or self.mediator.selected_target is not None
+        ):
+            self.mediator.deselect_target()
+        return self.video_latency_calibration_runtime.start()
+
+    def cancel_video_latency_calibration(self) -> None:
+        self.video_latency_calibration_runtime.cancel()
+
+    def set_video_latency_calibration_result_writer(
+        self,
+        writer: Callable[[LiveVideoLatencyCalibrationResult], None] | None,
+    ) -> None:
+        self.video_latency_calibration_runtime.set_result_writer(writer)
+
     def apply_tracking_control_tuning(
         self,
         config: TrackingControlConfig,
     ) -> None:
         """Apply one temporary tracking-control snapshot to both runtime owners."""
+        if self.video_latency_calibration_runtime.active:
+            raise RuntimeError(
+                "tracking tuning is unavailable during video latency calibration"
+            )
         self._validate_tracking_control_tuning(config)
         next_revision = self._tracking_tuning_revision + 1
         update = ConfigUpdate(revision=next_revision, config=config)
@@ -595,6 +671,11 @@ class ApplicationRuntime:
             return
         if not self._start_attempted:
             self._start_attempted = True
+
+        try:
+            self.video_latency_calibration_runtime.shutdown(timeout)
+        except RuntimeError as error:
+            LOGGER.error("Video latency calibration cleanup failed: %s", error)
 
         self.restore_motion_calibration_profile()
 

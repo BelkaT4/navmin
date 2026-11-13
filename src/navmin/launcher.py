@@ -22,6 +22,9 @@ from navmin.vision.camera_worker import SourceFactory
 
 if TYPE_CHECKING:
     from navmin.application import ApplicationRuntime
+    from navmin.diagnostics.live_video_latency_calibration import (
+        LiveVideoLatencyCalibrationResult,
+    )
 
 
 @dataclass(frozen=True)
@@ -200,6 +203,9 @@ def run_loaded_application(
     overview_source_factory: SourceFactory | None = None,
     stereo_left_source_factory: SourceFactory | None = None,
     stereo_right_source_factory: SourceFactory | None = None,
+    video_latency_calibration_result_writer: (
+        Callable[[LiveVideoLatencyCalibrationResult], None] | None
+    ) = None,
 ) -> int:
     """Build/start one shared runtime, run Qt, then always perform safe shutdown."""
     using_default_runtime_builder = runtime_builder is None
@@ -238,6 +244,10 @@ def run_loaded_application(
             stereo_right_source_factory=stereo_right_source_factory,
         )
     runtime = runtime_builder(**runtime_kwargs)
+    if video_latency_calibration_result_writer is not None:
+        setter = getattr(runtime, "set_video_latency_calibration_result_writer", None)
+        if setter is not None:
+            setter(video_latency_calibration_result_writer)
     imu_runtime = runtime.imu_runtime
     if imu_runtime is not None and inputs.source_paths is not None:
         imu_calibration_path = resolve_imu_calibration_path(
@@ -384,6 +394,15 @@ def run_loaded_application(
             ),
             restore_motion_calibration_profile=getattr(
                 ui, "restore_motion_calibration_profile", None
+            ),
+            video_latency_calibration_states=getattr(
+                ui, "video_latency_calibration_states", None
+            ),
+            start_video_latency_calibration=getattr(
+                ui, "start_video_latency_calibration", None
+            ),
+            cancel_video_latency_calibration=getattr(
+                ui, "cancel_video_latency_calibration", None
             ),
             persist_tracking_visualization=persist_tracking_visualization,
             show_diagnostic_clock=show_diagnostic_clock,

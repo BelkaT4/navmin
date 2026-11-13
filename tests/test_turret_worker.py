@@ -27,7 +27,12 @@ from navmin.contracts import (
     TurretConnectionState,
     TurretControlMode,
 )
-from navmin.turret.protocol import CommandCode, ResultCode, decode_request
+from navmin.turret.protocol import (
+    CommandCode,
+    ResultCode,
+    SetVelocityPayload,
+    decode_request,
+)
 from navmin.turret.simulator import (
     FakeReadFailure,
     FakeResponseSpec,
@@ -1281,3 +1286,79 @@ def test_simulated_startup_log_does_not_claim_physical_connection(caplog) -> Non
 
     assert "Turret simulated connection ready at 9600 baud" in caplog.text
     assert "Turret physical connection found" not in caplog.text
+
+
+def _wait_until(predicate, *, timeout: float = 1.0) -> None:
+    deadline = monotonic() + timeout
+    while not predicate():
+        assert monotonic() < deadline
+        Event().wait(0.002)
+
+
+def test_video_latency_calibration_owns_only_y_velocity_and_restores_ingress() -> None:
+    endpoint = FakeStm32Endpoint()
+    factory = _RecordingFactory(endpoint)
+    worker = TurretWorker(_config(), transport_factory=factory)
+    worker.start()
+    try:
+        _wait_state(worker, TurretConnectionState.READY)
+        assert worker.motor_on()
+        _wait_until(lambda: worker.current_state.motor_state is MotorState.ON)
+        history_start = len(endpoint.executed_request_history)
+
+        assert worker.begin_video_latency_calibration()
+        _wait_until(lambda: worker.video_latency_calibration_active)
+
+        # Normal owner ingress is closed while calibration owns motion.
+        worker.submit_move_relative(MoveRelativeCommand(5.0, 5.0))
+        assert not worker.stop_motion()
+        assert worker.submit_video_latency_calibration_velocity_y(6.0)
+        _wait_until(
+            lambda: any(
+                request.command is CommandCode.SET_VELOCITY
+                and isinstance(request.payload, SetVelocityPayload)
+                and request.payload.velocity_y_steps_s != 0
+                for request in endpoint.executed_request_history[history_start:]
+            )
+        )
+        assert worker.submit_video_latency_calibration_velocity_y(-6.0)
+        assert worker.end_video_latency_calibration()
+        _wait_until(lambda: not worker.video_latency_calibration_active)
+
+        velocity_payloads = [
+            request.payload
+            for request in endpoint.executed_request_history[history_start:]
+            if request.command is CommandCode.SET_VELOCITY
+            and isinstance(request.payload, SetVelocityPayload)
+        ]
+        assert velocity_payloads
+        assert all(payload.velocity_x_steps_s == 0 for payload in velocity_payloads)
+        assert any(payload.velocity_y_steps_s > 0 for payload in velocity_payloads)
+        assert any(payload.velocity_y_steps_s < 0 for payload in velocity_payloads)
+        assert velocity_payloads[-1].velocity_y_steps_s == 0
+        assert worker.stop_motion()
+    finally:
+        _shutdown(worker)
+
+
+def test_emergency_preempts_video_latency_calibration_and_releases_ownership() -> None:
+    endpoint = FakeStm32Endpoint()
+    factory = _RecordingFactory(endpoint)
+    worker = TurretWorker(_config(), transport_factory=factory)
+    worker.start()
+    try:
+        _wait_state(worker, TurretConnectionState.READY)
+        assert worker.motor_on()
+        _wait_until(lambda: worker.current_state.motor_state is MotorState.ON)
+        assert worker.begin_video_latency_calibration()
+        _wait_until(lambda: worker.video_latency_calibration_active)
+        assert worker.submit_video_latency_calibration_velocity_y(6.0)
+
+        worker.request_emergency()
+        _wait_until(lambda: not worker.video_latency_calibration_active)
+        assert any(
+            request.command is CommandCode.EMERGENCY_STOP
+            for request in endpoint.executed_request_history
+        )
+    finally:
+        _shutdown(worker)

@@ -88,6 +88,16 @@ class OpticalFlowRateObservation:
 
 
 @dataclass(frozen=True, slots=True)
+class OpticalFlowRateObservationY:
+    receive_midpoint_timestamp_ns: int
+    source_interval_ns: int
+    background_rate_y_deg_s: float
+    translation_y_px: float
+    inliers: int
+    tracked_points: int
+
+
+@dataclass(frozen=True, slots=True)
 class LatencyCandidateScore:
     latency_ms: int
     observation_count: int
@@ -180,6 +190,10 @@ class _SyntheticCameraModel:
 
 def _yaw_deg(ray: CameraRay) -> float:
     return degrees(atan2(ray.x, ray.z))
+
+
+def _pitch_deg(ray: CameraRay) -> float:
+    return -degrees(atan2(ray.y, hypot(ray.x, ray.z)))
 
 
 def _analysis_mask(
@@ -317,6 +331,155 @@ def estimate_optical_flow_rate_x(
     )
 
 
+def estimate_optical_flow_rate_y(
+    previous_frame: np.ndarray,
+    current_frame: np.ndarray,
+    *,
+    previous_receive_timestamp_ns: int,
+    current_receive_timestamp_ns: int,
+    source_interval_ns: int,
+    camera_model: Any,
+    exclusions: tuple[BBox, ...] = (),
+    config: OpticalFlowLatencyConfig | None = None,
+) -> OpticalFlowRateObservationY:
+    """Estimate background vertical angular velocity using LK + RANSAC.
+
+    The sign convention matches Core/Aiming logical Y: positive turret Y is
+    compared with the opposite apparent background pitch rate.
+    """
+    cfg = config or OpticalFlowLatencyConfig()
+    cfg.validate()
+    if previous_frame.shape != current_frame.shape:
+        raise VideoLatencyCalibrationError("calibration frames must have equal shape")
+    if previous_frame.ndim not in (2, 3):
+        raise VideoLatencyCalibrationError("calibration frame must be gray or BGR")
+    if type(source_interval_ns) is not int or source_interval_ns <= 0:
+        raise ValueError("source_interval_ns must be a positive integer")
+    if (
+        type(previous_receive_timestamp_ns) is not int
+        or type(current_receive_timestamp_ns) is not int
+        or previous_receive_timestamp_ns < 0
+        or current_receive_timestamp_ns <= previous_receive_timestamp_ns
+    ):
+        raise ValueError("receive timestamps must be non-negative and increasing")
+
+    previous_gray = (
+        cv2.cvtColor(previous_frame, cv2.COLOR_BGR2GRAY)
+        if previous_frame.ndim == 3
+        else previous_frame
+    )
+    current_gray = (
+        cv2.cvtColor(current_frame, cv2.COLOR_BGR2GRAY)
+        if current_frame.ndim == 3
+        else current_frame
+    )
+    mask = _analysis_mask(previous_gray.shape, exclusions, cfg.exclusion_margin_px)
+    points = cv2.goodFeaturesToTrack(
+        previous_gray,
+        maxCorners=cfg.max_corners,
+        qualityLevel=cfg.quality_level,
+        minDistance=cfg.min_distance_px,
+        mask=mask,
+        blockSize=5,
+        useHarrisDetector=False,
+    )
+    if points is None or len(points) < cfg.min_inliers:
+        raise VideoLatencyCalibrationError("insufficient background features")
+    next_points, status, _errors = cv2.calcOpticalFlowPyrLK(
+        previous_gray,
+        current_gray,
+        points,
+        None,
+        winSize=(21, 21),
+        maxLevel=3,
+        criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 30, 0.01),
+    )
+    if next_points is None or status is None:
+        raise VideoLatencyCalibrationError("optical flow did not return tracked points")
+    good = status.reshape(-1) > 0
+    source_points = points.reshape(-1, 2)[good]
+    destination_points = next_points.reshape(-1, 2)[good]
+    if len(source_points) < cfg.min_inliers:
+        raise VideoLatencyCalibrationError("insufficient tracked background features")
+    transform, inlier_mask = cv2.estimateAffinePartial2D(
+        source_points,
+        destination_points,
+        method=cv2.RANSAC,
+        ransacReprojThreshold=cfg.ransac_threshold_px,
+        maxIters=500,
+        confidence=0.99,
+        refineIters=10,
+    )
+    if transform is None or inlier_mask is None:
+        raise VideoLatencyCalibrationError("RANSAC background transform failed")
+    inlier_count = int(np.count_nonzero(inlier_mask))
+    if inlier_count < cfg.min_inliers:
+        raise VideoLatencyCalibrationError("insufficient RANSAC background inliers")
+
+    dy_px = float(transform[1, 2])
+    height, width = previous_gray.shape
+    center_x = (width - 1) / 2.0
+    center_y = (height - 1) / 2.0
+    center_pitch = _pitch_deg(camera_model.pixel_to_ray(center_x, center_y))
+    shifted_pitch = _pitch_deg(camera_model.pixel_to_ray(center_x, center_y + dy_px))
+    angular_delta_deg = shifted_pitch - center_pitch
+    interval_s = source_interval_ns / 1_000_000_000.0
+    background_rate = angular_delta_deg / interval_s
+    if not isfinite(background_rate):
+        raise VideoLatencyCalibrationError("optical-flow angular rate is not finite")
+    return OpticalFlowRateObservationY(
+        receive_midpoint_timestamp_ns=(
+            previous_receive_timestamp_ns + current_receive_timestamp_ns
+        )
+        // 2,
+        source_interval_ns=source_interval_ns,
+        background_rate_y_deg_s=background_rate,
+        translation_y_px=dy_px,
+        inliers=inlier_count,
+        tracked_points=len(source_points),
+    )
+
+
+def _candidate_score_y(
+    observations: tuple[OpticalFlowRateObservationY, ...],
+    platform_motion: PlatformMotionSnapshot,
+    latency_ms: int,
+) -> LatencyCandidateScore | None:
+    latency_ns = latency_ms * 1_000_000
+    visual_world_rates: list[float] = []
+    platform_rates: list[float] = []
+    for observation in observations:
+        query_timestamp_ns = observation.receive_midpoint_timestamp_ns - latency_ns
+        if query_timestamp_ns < 0:
+            continue
+        motion = platform_motion.rate_at(query_timestamp_ns)
+        if motion is None or motion.rate_y_deg_s is None:
+            continue
+        visual_world_rates.append(-observation.background_rate_y_deg_s)
+        platform_rates.append(float(motion.rate_y_deg_s))
+    if len(platform_rates) < 2:
+        return None
+    visual = np.asarray(visual_world_rates, dtype=np.float64)
+    platform = np.asarray(platform_rates, dtype=np.float64)
+    residual = visual - platform
+    rmse = float(np.sqrt(np.mean(residual * residual)))
+    platform_std = float(np.std(platform))
+    rms_signal = float(np.sqrt(np.mean(platform * platform)))
+    normalized_rmse = rmse / max(rms_signal, 1e-12)
+    if float(np.std(visual)) <= 1e-12 or platform_std <= 1e-12:
+        correlation = 0.0
+    else:
+        correlation = float(np.corrcoef(visual, platform)[0, 1])
+    return LatencyCandidateScore(
+        latency_ms=latency_ms,
+        observation_count=len(platform_rates),
+        rmse_deg_s=rmse,
+        normalized_rmse=normalized_rmse,
+        correlation=correlation,
+        platform_rate_std_deg_s=platform_std,
+    )
+
+
 def _candidate_score(
     observations: tuple[OpticalFlowRateObservation, ...],
     platform_motion: PlatformMotionSnapshot,
@@ -401,6 +564,54 @@ def estimate_video_latency(
             len(observations),
             None,
             (),
+        )
+    best = min(candidates, key=lambda item: (item.rmse_deg_s, -item.correlation))
+    if best.observation_count < cfg.min_observations:
+        reason = "insufficient-observations"
+    elif best.platform_rate_std_deg_s < cfg.min_excitation_std_deg_s:
+        reason = "insufficient-excitation"
+    elif best.correlation < cfg.min_correlation:
+        reason = "low-correlation"
+    elif best.normalized_rmse > cfg.max_normalized_rmse:
+        reason = "high-fit-error"
+    else:
+        reason = None
+    return VideoLatencyEstimate(
+        valid=reason is None,
+        reason=reason,
+        estimated_latency_ms=best.latency_ms if reason is None else None,
+        observation_count=best.observation_count,
+        best_score=best,
+        candidates=candidates,
+    )
+
+
+def estimate_video_latency_y(
+    observations: tuple[OpticalFlowRateObservationY, ...],
+    platform_motion: PlatformMotionSnapshot,
+    *,
+    config: OpticalFlowLatencyConfig | None = None,
+) -> VideoLatencyEstimate:
+    """Estimate effective video latency from logical Y platform motion."""
+    cfg = config or OpticalFlowLatencyConfig()
+    cfg.validate()
+    if not platform_motion.valid:
+        return VideoLatencyEstimate(False, "platform-motion-invalid", None, 0, None, ())
+    if len(observations) < cfg.min_observations:
+        return VideoLatencyEstimate(
+            False, "insufficient-observations", None, len(observations), None, ()
+        )
+    candidates = tuple(
+        score
+        for latency_ms in range(
+            cfg.search_min_ms, cfg.search_max_ms + 1, cfg.search_step_ms
+        )
+        if (score := _candidate_score_y(observations, platform_motion, latency_ms))
+        is not None
+    )
+    if not candidates:
+        return VideoLatencyEstimate(
+            False, "platform-motion-unavailable", None, len(observations), None, ()
         )
     best = min(candidates, key=lambda item: (item.rmse_deg_s, -item.correlation))
     if best.observation_count < cfg.min_observations:
@@ -756,6 +967,7 @@ __all__ = [
     "LatencyCandidateScore",
     "OpticalFlowLatencyConfig",
     "OpticalFlowRateObservation",
+    "OpticalFlowRateObservationY",
     "SyntheticLatencyRunResult",
     "VideoLatencyAggregate",
     "VideoLatencyCalibrationError",
@@ -763,7 +975,9 @@ __all__ = [
     "VideoLatencyEstimate",
     "aggregate_latency_estimates",
     "estimate_optical_flow_rate_x",
+    "estimate_optical_flow_rate_y",
     "estimate_video_latency",
+    "estimate_video_latency_y",
     "run_synthetic_latency_calibration",
     "run_video_latency_calibration_proof",
     "write_video_latency_calibration_json",
