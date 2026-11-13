@@ -144,7 +144,10 @@ class VideoLatencyCalibrationWindow(QWidget):
                 f"median: {aggregate.median_latency_ms} мс\n"
                 f"MAD: {aggregate.mad_latency_ms} мс\n"
                 f"valid runs: {aggregate.valid_run_count}/{state.result.run_count}\n"
-                "Значение автоматически в config не записывается."
+                "Значение автоматически в конфигурацию не записывается.\n"
+                "Для использования результата укажите его вручную в "
+                "tracking-control → platform-motion → video-latency-ms "
+                "в config/navmin.json."
             )
         elif state.phase in (
             LiveCalibrationPhase.FAILED, LiveCalibrationPhase.CANCELLED
