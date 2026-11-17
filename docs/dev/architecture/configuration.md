@@ -82,9 +82,12 @@ parse JSON
 calibration/
   overview.json
   stereo.json
+  backlash.json
 ```
 
-Calibration содержит measured camera/stereo geometry и собственный `schema_version`. Для первой реализации `schema_version = 1`.
+Calibration содержит measured camera/stereo geometry и собственный `schema_version`. Для первой реализации `schema_version = 1`. `backlash.json` отдельно хранит измеренную гироскопом задержку реального движения после реверса механики и не зависит от camera motion calibration.
+
+`backlash.json` имеет `schema_version = 1`, `axes_identity` (SHA-256 идентичности mechanics config) и четыре конечных значения задержки в секундах: X/Y для обоих направлений реверса, в диапазоне `0..5`. Неизвестные поля и несовместимая `axes_identity` отклоняются; профиль при несовпадении механики не применяется. Его создаёт только отдельный backlash calibration wizard после stationary gyro-bias calibration.
 
 Calibration files также валидируются строго: malformed JSON, неизвестное поле, неверный тип/shape, non-finite matrix value или несовпадение `image_width/image_height` с source resolution дают calibration error. Config Manager/Vision не исправляют и не перезаписывают calibration автоматически; только отдельный явно подтверждённый startup recovery может заменить local input set после создания backup.
 

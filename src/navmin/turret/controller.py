@@ -49,6 +49,14 @@ class ControllerStateError(ControllerError):
 type PendingMotion = MoveRelativeCommand | AxisVelocitySetpoint | None
 
 
+def _sign(value: float) -> int:
+    if value > 0.0:
+        return 1
+    if value < 0.0:
+        return -1
+    return 0
+
+
 class TurretController:
     """Single owner of applied control mode, PID, and latest pending motion."""
 
@@ -76,6 +84,12 @@ class TurretController:
         self._last_processed_revision: int | None = None
         self._target: TargetRef | None = None
         self._last_tracking_time_s: float | None = None
+        self._imu_motion_valid = False
+        self._imu_redirect_timestamp_s: float | None = None
+        self._last_velocity_x = 0.0
+        self._last_velocity_y = 0.0
+        self._backlash_wait_x: tuple[int, float, float | None] | None = None
+        self._backlash_wait_y: tuple[int, float, float | None] | None = None
         self._pid_x = AxisPid(
             self._x_gains(config.controller),
             output_limit=config.stm32.max_speed_x_deg_s,
@@ -145,6 +159,48 @@ class TurretController:
         feed_forward = self._tracking_control_config.feed_forward
         x_usable = sample.rate_valid_x and sample.target_rate_x_deg_s is not None
         y_usable = sample.rate_valid_y and sample.target_rate_y_deg_s is not None
+        expected_x = self._pid_x.gains.kp * (
+            sample.real_error_x_deg
+            + (
+                sample.prediction_offset_x_deg
+                if x_usable and prediction.enabled
+                else 0.0
+            )
+        ) + self._pid_x.i_term + (
+            feed_forward.gain_x * sample.target_rate_x_deg_s
+            if x_usable and feed_forward.enabled
+            else 0.0
+        )
+        expected_y = self._pid_y.gains.kp * (
+            sample.real_error_y_deg
+            + (
+                sample.prediction_offset_y_deg
+                if y_usable and prediction.enabled
+                else 0.0
+            )
+        ) + self._pid_y.i_term + (
+            feed_forward.gain_y * sample.target_rate_y_deg_s
+            if y_usable and feed_forward.enabled
+            else 0.0
+        )
+        self._backlash_wait_x = self._update_backlash_wait(
+            self._backlash_wait_x,
+            previous_velocity=self._last_velocity_x,
+            direction_request=expected_x,
+            positive_to_negative_s=sample.backlash_x_positive_to_negative_delay_s,
+            negative_to_positive_s=sample.backlash_x_negative_to_positive_delay_s,
+            acceleration_deg_s2=self._config.stm32.acceleration_x_deg_s2,
+            now_s=now,
+        )
+        self._backlash_wait_y = self._update_backlash_wait(
+            self._backlash_wait_y,
+            previous_velocity=self._last_velocity_y,
+            direction_request=expected_y,
+            positive_to_negative_s=sample.backlash_y_positive_to_negative_delay_s,
+            negative_to_positive_s=sample.backlash_y_negative_to_positive_delay_s,
+            acceleration_deg_s2=self._config.stm32.acceleration_y_deg_s2,
+            now_s=now,
+        )
         velocity_x = self._pid_x.step(
             sample.real_error_x_deg,
             now_s=now,
@@ -158,6 +214,7 @@ class TurretController:
                 if x_usable and feed_forward.enabled
                 else 0.0
             ),
+            integrate=self._backlash_wait_x is None,
         )
         velocity_y = self._pid_y.step(
             sample.real_error_y_deg,
@@ -172,7 +229,10 @@ class TurretController:
                 if y_usable and feed_forward.enabled
                 else 0.0
             ),
+            integrate=self._backlash_wait_y is None,
         )
+        self._last_velocity_x = velocity_x
+        self._last_velocity_y = velocity_y
         self._log_tracking_control(sample, x_usable=x_usable, y_usable=y_usable)
         self._pending_motion = AxisVelocitySetpoint(
             velocity_x_deg_s=velocity_x,
@@ -183,6 +243,71 @@ class TurretController:
         self._last_tracking_time_s = now
         self._last_processed_revision = revision
         return True
+
+    def update_imu_motion(
+        self,
+        *,
+        valid: bool,
+        redirected_timestamp_s: float | None,
+    ) -> None:
+        self._imu_motion_valid = bool(valid)
+        self._imu_redirect_timestamp_s = redirected_timestamp_s if valid else None
+        if not valid:
+            self._backlash_wait_x = None
+            self._backlash_wait_y = None
+
+    def _update_backlash_wait(
+        self,
+        current: tuple[int, float, float | None] | None,
+        *,
+        previous_velocity: float,
+        direction_request: float,
+        positive_to_negative_s: float | None,
+        negative_to_positive_s: float | None,
+        acceleration_deg_s2: float,
+        now_s: float,
+    ) -> tuple[int, float, float | None] | None:
+        if not self._imu_motion_valid:
+            return None
+        new_direction = _sign(direction_request)
+        previous_direction = _sign(previous_velocity)
+        if current is not None:
+            wait_direction, deadline_s, baseline_redirect = current
+            if new_direction != 0 and new_direction != wait_direction:
+                _LOGGER.info("Tracking backlash hold cancelled by new direction")
+                return None
+            if (
+                self._imu_redirect_timestamp_s is not None
+                and self._imu_redirect_timestamp_s != baseline_redirect
+            ):
+                _LOGGER.info("Tracking backlash hold released by gyro redirect")
+                return None
+            if now_s >= deadline_s:
+                _LOGGER.info("Tracking backlash hold released by calibrated timeout")
+                return None
+            return current
+        if (
+            new_direction == 0
+            or previous_direction == 0
+            or new_direction == previous_direction
+        ):
+            return None
+        reversal_delay_s = (
+            positive_to_negative_s
+            if previous_direction > 0
+            else negative_to_positive_s
+        )
+        if reversal_delay_s is None or reversal_delay_s <= 0.0:
+            return None
+        braking_time_s = abs(previous_velocity) / max(acceleration_deg_s2, 0.1)
+        deadline_s = now_s + braking_time_s + reversal_delay_s
+        _LOGGER.info(
+            "Tracking backlash hold started direction=%+d delay_s=%.4f deadline_s=%.3f",
+            new_direction,
+            reversal_delay_s,
+            deadline_s,
+        )
+        return (new_direction, deadline_s, self._imu_redirect_timestamp_s)
 
     def _log_tracking_control(
         self,
@@ -403,6 +528,10 @@ class TurretController:
         self._pid_y.reset()
         self._target = None
         self._last_tracking_time_s = None
+        self._last_velocity_x = 0.0
+        self._last_velocity_y = 0.0
+        self._backlash_wait_x = None
+        self._backlash_wait_y = None
 
     @staticmethod
     def _session_result_ok(result: SessionResult) -> bool:

@@ -15,6 +15,7 @@ flowchart TB
     subgraph turret_thread["Turret worker"]
       controller["Turret Controller<br/>authoritative control_mode<br/>ownership boundaries"]
       pid["PID<br/>owned by Controller<br/>revision exactly once"]
+      backlash["Directional backlash hold<br/>profile + gyro redirect"]
       hal["Turret HAL<br/>units / invert / recovery"]
       arbiter["TX Arbiter<br/>one physical request in flight<br/>committed ordinary request"]
       serial["Serial Protocol<br/>one REQUEST_ID counter<br/>ID + COMMAND correlation"]
@@ -26,7 +27,8 @@ flowchart TB
   flag_motion_in --> controller
   controller -->|"RELATIVE intent"| pending_motion
   controller --> pid
-  pid -->|"TRACKING velocity"| pending_motion
+  pid --> backlash
+  backlash -->|"TRACKING velocity"| pending_motion
   pending_motion --> hal
 
   flag_mode_in --> control_ops --> controller
@@ -43,6 +45,6 @@ flowchart TB
   hal --> turret_state
   serial --> turret_state
   turret_state --> flag_core_out
-%% graph:positions {"turret":{"x":24,"y":156,"w":1140,"h":820},"turret_thread":{"x":250,"y":80,"w":544,"h":602},"flag_motion_in":{"x":1212,"y":714},"flag_mode_in":{"x":514,"y":1080},"flag_control_in":{"x":696,"y":1056,"w":160,"h":78},"flag_config_in":{"x":1212,"y":558},"flag_core_out":{"x":1212,"y":363,"w":160,"h":66},"stm32":{"x":604,"y":-12,"w":160,"h":90},"pending_motion":{"x":64,"y":414,"w":160,"h":78},"pending_config":{"x":948,"y":402},"control_ops":{"x":580,"y":726,"w":160,"h":66},"controller":{"x":330,"y":466,"w":160,"h":78},"pid":{"x":110,"y":508,"w":160,"h":66},"hal":{"x":330,"y":322},"arbiter":{"x":330,"y":180,"w":160,"h":93},"serial":{"x":330,"y":46,"w":160,"h":93},"turret_state":{"x":948,"y":207,"w":160,"h":66}}
-%% graph:edges {"flag_motion_in>controller":{"label":[0,-15]},"controller>pending_motion":{"label":[3,-61]},"controller>pid":{"label":[0,-20]},"pid>pending_motion":{"label":[11,73]},"flag_mode_in>control_ops":{"label":[10,15]},"flag_control_in>control_ops":{"label":[-45,-20]},"flag_config_in>pending_config":{"label":[70,-10]},"arbiter>serial":{"label":[0,-20]},"serial>stm32":{"label":[1,-57]},"turret_state>flag_core_out":{"label":[45,10]}}
+%% graph:positions {"turret":{"x":24,"y":156,"w":1140,"h":820},"turret_thread":{"x":250,"y":80,"w":544,"h":602},"flag_motion_in":{"x":1212,"y":714},"flag_mode_in":{"x":514,"y":1080},"flag_control_in":{"x":696,"y":1056,"w":160,"h":78},"flag_config_in":{"x":1212,"y":558},"flag_core_out":{"x":1212,"y":363,"w":160,"h":66},"stm32":{"x":604,"y":-12,"w":160,"h":90},"pending_motion":{"x":64,"y":414,"w":160,"h":78},"pending_config":{"x":948,"y":402},"control_ops":{"x":580,"y":726,"w":160,"h":66},"controller":{"x":330,"y":466,"w":160,"h":78},"pid":{"x":110,"y":508,"w":160,"h":66},"backlash":{"x":110,"y":600,"w":192,"h":72},"hal":{"x":330,"y":322},"arbiter":{"x":330,"y":180,"w":160,"h":93},"serial":{"x":330,"y":46,"w":160,"h":93},"turret_state":{"x":948,"y":207,"w":160,"h":66}}
+%% graph:edges {"flag_motion_in>controller":{"label":[0,-15]},"controller>pending_motion":{"label":[3,-61]},"controller>pid":{"label":[0,-20]},"pid>backlash":{"label":[0,-18]},"backlash>pending_motion":{"label":[11,73]},"flag_mode_in>control_ops":{"label":[10,15]},"flag_control_in>control_ops":{"label":[-45,-20]},"flag_config_in>pending_config":{"label":[70,-10]},"arbiter>serial":{"label":[0,-20]},"serial>stm32":{"label":[1,-57]},"turret_state>flag_core_out":{"label":[45,10]}}
 %% graph:waypoints {"controller>pending_motion":[[506,609]],"pid>pending_motion":[[345,774]],"hal>turret_state":[[846,594]]}

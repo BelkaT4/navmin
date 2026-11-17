@@ -226,6 +226,10 @@ class TrackingControlSample:
     rate_valid_x: bool
     rate_valid_y: bool
     observation_timestamp_ns: int
+    backlash_x_positive_to_negative_delay_s: float | None = None
+    backlash_x_negative_to_positive_delay_s: float | None = None
+    backlash_y_positive_to_negative_delay_s: float | None = None
+    backlash_y_negative_to_positive_delay_s: float | None = None
 
 
 @dataclass(frozen=True)

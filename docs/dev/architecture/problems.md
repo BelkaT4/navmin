@@ -128,15 +128,6 @@ inter-request-delay-ms = 2
 
 После измерений нужно подобрать camera FPS, Vision frequency, latency/jitter, watchdog, target-lost timeout и запас на config/serial exchanges.
 
-### 16. Backlash compensation
-
-После mechanical tests решить:
-
-- нужна ли software compensation;
-- только MoveRelative или также TRACKING;
-- Controller/HAL/STM32;
-- взаимодействие с PID и acceleration limiter.
-
 ### 17. Camera-to-turret rotational extrinsic
 
 Первая версия предполагает близкую параллельность axes и компенсирует constant boresight через aim point.

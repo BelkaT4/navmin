@@ -366,6 +366,8 @@ class TrackingError:
 
 Latest-state abstraction должна поддерживать `clear()/invalidate()`. Invalidation тоже создаёт новое monotonic revision, чтобы consumer гарантированно увидел границу даже без нового `TrackingError` value.
 
+При TRACKING Core прикладывает к tracking sample доступные измеренные directional backlash delays из отдельного `backlash.json`. Turret Controller удерживает интегрирование PID по оси после смены знака ожидаемого движения на время измеренной задержки и расчётного торможения; подтверждённый IMU gyro redirect снимает удержание раньше. Без свежего гироскопа или совместимого профиля эта компенсация не применяется. Профиль создаётся отдельным UI wizard, который перед измерениями повторно калибрует gyro bias на неподвижной турели и выполняет только короткие движения в RELATIVE.
+
 ## `AxisVelocitySetpoint`
 
 ```python

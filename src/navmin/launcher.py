@@ -222,6 +222,9 @@ def run_loaded_application(
         runtime_kwargs["motion_calibration_path"] = (
             inputs.source_paths.config.parent / "calibration" / "motion.json"
         )
+        runtime_kwargs["backlash_calibration_path"] = (
+            inputs.source_paths.config.parent / "calibration" / "backlash.json"
+        )
     source_factories = (
         overview_source_factory,
         stereo_left_source_factory,
@@ -378,6 +381,9 @@ def run_loaded_application(
             start_recording=getattr(ui, "start_recording", None),
             motion_calibration_runtime=getattr(
                 ui, "motion_calibration_runtime", None
+            ),
+            backlash_calibration_runtime=getattr(
+                ui, "backlash_calibration_runtime", None
             ),
             begin_motion_calibration_profile=getattr(
                 ui, "begin_motion_calibration_profile", None
