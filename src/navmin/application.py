@@ -10,6 +10,7 @@ from pathlib import Path
 from time import monotonic
 from types import MappingProxyType
 
+from navmin.backlash_calibration import BacklashCalibrationRuntime
 from navmin.calibration import OverviewCalibration, StereoCalibration
 from navmin.concurrency import LatestValue
 from navmin.config.models import (
@@ -127,6 +128,7 @@ class UiRuntimeDependencies:
     recording_runtime: RecordingRuntime | None = None
     start_recording: Callable[[CameraRole, int, int], RecordingSessionInfo] | None = None
     motion_calibration_runtime: MotionCalibrationRuntime | None = None
+    backlash_calibration_runtime: BacklashCalibrationRuntime | None = None
     begin_motion_calibration_profile: Callable[[MotionProfile], None] | None = None
     restore_motion_calibration_profile: Callable[[], None] | None = None
 
@@ -173,6 +175,7 @@ class ApplicationRuntime:
         tracking_visualization_config: TrackingVisualizationConfig,
         ui_config: UiConfig,
         motion_calibration_runtime: MotionCalibrationRuntime,
+        backlash_calibration_runtime: BacklashCalibrationRuntime | None = None,
         recording_runtime: RecordingRuntime | None = None,
         vision_processor_selections: Mapping[CameraRole, VisionProcessorSelection] | None = None,
     ) -> None:
@@ -201,6 +204,7 @@ class ApplicationRuntime:
         self.mediator = mediator
         self.recording_runtime = recording_runtime or RecordingRuntime(Path("recordings"))
         self.motion_calibration_runtime = motion_calibration_runtime
+        self.backlash_calibration_runtime = backlash_calibration_runtime
         self._runtime_vision_processor_selections = (
             {}
             if vision_processor_selections is None
@@ -252,6 +256,7 @@ class ApplicationRuntime:
             recording_runtime=self.recording_runtime,
             start_recording=self.start_recording,
             motion_calibration_runtime=self.motion_calibration_runtime,
+            backlash_calibration_runtime=self.backlash_calibration_runtime,
             begin_motion_calibration_profile=self.begin_motion_calibration_profile,
             restore_motion_calibration_profile=self.restore_motion_calibration_profile,
         )
@@ -757,6 +762,7 @@ def build_application_runtime(
     imu_calibration: ImuCalibration | None = None,
     factories: ApplicationFactories | None = None,
     motion_calibration_path: Path = Path("config/calibration/motion.json"),
+    backlash_calibration_path: Path = Path("config/calibration/backlash.json"),
 ) -> ApplicationRuntime:
     """Compose the production NavMin runtime from already-loaded typed inputs."""
     if not isinstance(config, AppConfig):
@@ -829,6 +835,7 @@ def build_application_runtime(
         config.turret,
         config.tracking_control,
         transport_factory=selected_factories.turret_transport_factory,
+        imu_states=None if imu_runtime is None else imu_runtime.state_updates,
     )
     motion_calibration_runtime = MotionCalibrationRuntime.load(
         path=motion_calibration_path,
@@ -837,6 +844,10 @@ def build_application_runtime(
             CameraRole.OVERVIEW: calibration_identity(overview_calibration),
             CameraRole.STEREO_LEFT: calibration_identity(stereo_calibration),
         },
+    )
+    backlash_calibration_runtime = BacklashCalibrationRuntime.load(
+        path=backlash_calibration_path,
+        axes=config.turret.axes,
     )
     mediator = Mediator(
         aiming_config=config.aiming,
@@ -861,6 +872,7 @@ def build_application_runtime(
             ),
         },
         motion_calibration=motion_calibration_runtime,
+        backlash_calibration=backlash_calibration_runtime,
     )
     if stereo_frame_sink is not None:
         def active_pairing_kind() -> StereoPairingKind | None:
@@ -925,6 +937,7 @@ def build_application_runtime(
         tracking_visualization_config=config.tracking_visualization,
         ui_config=config.ui,
         motion_calibration_runtime=motion_calibration_runtime,
+        backlash_calibration_runtime=backlash_calibration_runtime,
         recording_runtime=recording_runtime,
         vision_processor_selections=vision_processor_selections,
     )

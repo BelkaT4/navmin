@@ -6,6 +6,7 @@ from collections.abc import Callable, Mapping, Sequence
 
 from PyQt6.QtWidgets import QApplication
 
+from navmin.backlash_calibration import BacklashCalibrationRuntime
 from navmin.concurrency import LatestValue
 from navmin.config.models import (
     AimingConfig,
@@ -50,6 +51,7 @@ def run_ui(
     recording_runtime: RecordingRuntime | None = None,
     start_recording: Callable[[CameraRole, int, int], RecordingSessionInfo] | None = None,
     motion_calibration_runtime: MotionCalibrationRuntime | None = None,
+    backlash_calibration_runtime: BacklashCalibrationRuntime | None = None,
     begin_motion_calibration_profile: Callable[[MotionProfile], None] | None = None,
     restore_motion_calibration_profile: Callable[[], None] | None = None,
     persist_tracking_visualization: (
@@ -85,6 +87,7 @@ def run_ui(
         recording_runtime=recording_runtime,
         start_recording=start_recording,
         motion_calibration_runtime=motion_calibration_runtime,
+        backlash_calibration_runtime=backlash_calibration_runtime,
         begin_motion_calibration_profile=begin_motion_calibration_profile,
         restore_motion_calibration_profile=restore_motion_calibration_profile,
         persist_tracking_visualization=persist_tracking_visualization,

@@ -65,7 +65,10 @@ Calibration хранится отдельно от `config.json`:
 calibration/
   overview.json
   stereo.json
+  backlash.json
 ```
+
+Gearbox backlash имеет отдельную калибровку без камеры: wizard сначала калибрует gyro bias на неподвижной турели, затем измеряет задержку фактического движения при реверсе по IMU и сохраняет профиль, привязанный к mechanics config. В TRACKING Turret использует совместимый профиль для временной блокировки I-term при перенаправлении движения.
 
 Overview использует OpenCV fisheye calibration (`K`, ровно 4 коэффициента `D`, `new_camera_matrix`) и fisheye-undistortion. Геометрия исправленного working frame строится по `new_camera_matrix`. Stereo Left/Right сохраняют отдельную pinhole/stereo OpenCV calibration и rectification.
 

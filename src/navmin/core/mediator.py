@@ -134,6 +134,12 @@ class MotionCalibrationCorrectionPort(Protocol):
     ) -> MoveRelativeCommand: ...
 
 
+class BacklashCalibrationPort(Protocol):
+    """Mechanics-only reversal delays independent of camera profiles."""
+
+    def delay(self, axis: str, from_direction: int) -> float | None: ...
+
+
 class StereoDistanceCandidatePort(Protocol):
     """Narrow internal result shape produced by the stereo distance worker."""
 
@@ -181,6 +187,7 @@ class Mediator:
         distance_stale_timeout_ms: int = 300,
         clock_ns: Callable[[], int] = monotonic_ns,
         motion_calibration: MotionCalibrationCorrectionPort | None = None,
+        backlash_calibration: BacklashCalibrationPort | None = None,
     ) -> None:
         if ui_config.default_camera not in _NORMAL_CAMERAS:
             raise ValueError("ui.default_camera must be Overview or Stereo Left")
@@ -254,6 +261,8 @@ class Mediator:
         self._distance_stale_timeout_ns = distance_stale_timeout_ms * 1_000_000
         self._clock_ns = clock_ns
         self._motion_calibration = motion_calibration
+        self._backlash_calibration = backlash_calibration
+        self._backlash_calibration_active = False
         self._distance_intent_revision = 0
         self._current_distance: DistanceResult | None = None
         self._distance_shutdown = False
@@ -557,6 +566,8 @@ class Mediator:
     ) -> bool:
         if self._turret_state.control_mode is not TurretControlMode.RELATIVE:
             return False
+        if self._backlash_calibration_active:
+            return False
         if self._pending_control_mode is not None:
             return False
         frame = vision_result.frame
@@ -585,6 +596,8 @@ class Mediator:
         """Submit one wizard-owned baseline move without active click correction."""
         if not isinstance(command, MoveRelativeCommand):
             raise TypeError("command must be MoveRelativeCommand")
+        if self._backlash_calibration_active:
+            return False
         state = self._turret_state
         if (
             camera is not self._main_camera
@@ -597,6 +610,46 @@ class Mediator:
             return False
         self._turret.submit_move_relative(command)
         return True
+
+    def submit_backlash_calibration_move(
+        self, command: MoveRelativeCommand
+    ) -> bool:
+        """Submit a mechanics-only move reserved by the backlash wizard."""
+        if not isinstance(command, MoveRelativeCommand):
+            raise TypeError("command must be MoveRelativeCommand")
+        if not self._backlash_calibration_active:
+            return False
+        state = self._turret_state
+        if (
+            state.connection_state is not TurretConnectionState.READY
+            or state.motor_state is not MotorState.ON
+            or state.control_mode is not TurretControlMode.RELATIVE
+            or self._pending_control_mode is not None
+        ):
+            return False
+        self._turret.submit_move_relative(command)
+        return True
+
+    def begin_backlash_calibration(self) -> bool:
+        """Reserve relative motion for one standalone calibration session."""
+        state = self._turret_state
+        if (
+            self._backlash_calibration_active
+            or state.connection_state is not TurretConnectionState.READY
+            or state.motor_state is not MotorState.ON
+            or state.control_mode is not TurretControlMode.RELATIVE
+            or self._pending_control_mode is not None
+        ):
+            return False
+        self._backlash_calibration_active = True
+        return True
+
+    def end_backlash_calibration(self) -> None:
+        self._backlash_calibration_active = False
+
+    @property
+    def backlash_calibration_active(self) -> bool:
+        return self._backlash_calibration_active
 
     def request_target_selection(
         self,
@@ -680,6 +733,8 @@ class Mediator:
     def request_control_mode(self, mode: TurretControlMode) -> bool:
         if not isinstance(mode, TurretControlMode):
             raise TypeError("mode must be TurretControlMode")
+        if self._backlash_calibration_active:
+            return False
         if not self._turret.set_control_mode(mode):
             return False
         if (
@@ -1093,6 +1148,11 @@ class Mediator:
                 diagnostics.y.applied_prediction_offset_deg
             ),
         )
+        backlash_delay = (
+            None
+            if self._backlash_calibration is None
+            else self._backlash_calibration.delay
+        )
         self._turret.submit_tracking_control(
             TrackingControlSample(
                 target=error.target,
@@ -1105,6 +1165,18 @@ class Mediator:
                 rate_valid_x=diagnostics.x.valid,
                 rate_valid_y=diagnostics.y.valid,
                 observation_timestamp_ns=error.timestamp_ns,
+                backlash_x_positive_to_negative_delay_s=(
+                    None if backlash_delay is None else backlash_delay("x", 1)
+                ),
+                backlash_x_negative_to_positive_delay_s=(
+                    None if backlash_delay is None else backlash_delay("x", -1)
+                ),
+                backlash_y_positive_to_negative_delay_s=(
+                    None if backlash_delay is None else backlash_delay("y", 1)
+                ),
+                backlash_y_negative_to_positive_delay_s=(
+                    None if backlash_delay is None else backlash_delay("y", -1)
+                ),
             )
         )
 

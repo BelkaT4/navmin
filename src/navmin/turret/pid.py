@@ -112,6 +112,7 @@ class AxisPid:
         now_s: float,
         proportional_offset: float = 0.0,
         feed_forward: float = 0.0,
+        integrate: bool = True,
     ) -> float:
         error_value = _require_nonnegative_or_signed_finite(
             real_error, name="real_error"
@@ -150,9 +151,13 @@ class AxisPid:
             candidate_i = self._i_term
         else:
             d_term = self._gains.kd * (error_value - self._previous_error) / dt
-            candidate_i = _clamp(
-                self._i_term + self._gains.ki * error_value * dt,
-                self._output_limit,
+            candidate_i = (
+                _clamp(
+                    self._i_term + self._gains.ki * error_value * dt,
+                    self._output_limit,
+                )
+                if integrate
+                else self._i_term
             )
 
         candidate_output = p_term + candidate_i + d_term + ff_term

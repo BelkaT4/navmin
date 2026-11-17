@@ -45,6 +45,10 @@ _ACCEL_FACE_WINDOW_S = 1.0
 _ACCEL_FACE_MAX_GAP_S = 0.15
 _ACCEL_STD_LIMIT_G = 0.025
 _GYRO_STD_LIMIT_DPS = 1.5
+_MOTION_START_RATE_DPS = 2.0
+_MOTION_STOP_RATE_DPS = 1.0
+_MOTION_CONFIRM_SAMPLES = 3
+_MOTION_REDIRECT_ANGLE_DEG = 30.0
 
 
 class GyroBiasState(StrEnum):
@@ -118,6 +122,9 @@ class ImuRuntimeState:
     mag_calibration_sample_count: int = 0
     mag_calibration_octants: int = 0
     calibration_message: str | None = None
+    motion_detected: bool = False
+    motion_started_timestamp_s: float | None = None
+    motion_redirected_timestamp_s: float | None = None
 
 
 class _UdpSocket(Protocol):
@@ -186,6 +193,16 @@ class ImuStreamState:
         self._calibration_revision = 0
         self._calibration_message: str | None = None
         self._last_error: str | None = None
+        self._motion_detected = False
+        self._motion_started_timestamp_s: float | None = None
+        self._motion_candidate_timestamp_s: float | None = None
+        self._motion_candidate_samples = 0
+        self._motion_stop_samples = 0
+        self._motion_direction: np.ndarray | None = None
+        self._motion_redirect_candidate: np.ndarray | None = None
+        self._motion_redirect_timestamp_s: float | None = None
+        self._motion_redirect_samples = 0
+        self._motion_redirected_timestamp_s: float | None = None
         self.invalid_packets = 0
         self.duplicate_packets = 0
         self.out_of_order_packets = 0
@@ -265,12 +282,14 @@ class ImuStreamState:
             self._mag_calibration_samples.append(sample)
         self._filter.update(sample, self._calibration)
         self._advance_gyro_bias(sample)
+        self._advance_motion_detection(sample)
         return True
 
     def _begin_stream_session(self, peer: tuple[str, int]) -> None:
         recovered = self._last_receive_s is not None
         interrupted_calibration = bool(self._accel_faces) or self._mag_calibration_active
         self._filter = OrientationFilter()
+        self._reset_motion_detection()
         self._gyro_bias_samples.clear()
         self._recent_samples.clear()
         self._accel_faces.clear()
@@ -328,10 +347,134 @@ class ImuStreamState:
         self._calibration_message = "Гироскоп: смещение рассчитано."
         LOGGER.info("IMU gyro bias acquired")
 
+    def _reset_motion_detection(self, *, preserve_events: bool = False) -> None:
+        self._motion_detected = False
+        self._motion_candidate_timestamp_s = None
+        self._motion_candidate_samples = 0
+        self._motion_stop_samples = 0
+        if not preserve_events:
+            self._motion_direction = None
+            self._motion_started_timestamp_s = None
+            self._motion_redirected_timestamp_s = None
+        self._motion_redirect_candidate = None
+        self._motion_redirect_timestamp_s = None
+        self._motion_redirect_samples = 0
+
+    def _advance_motion_detection(self, sample: ImuSample) -> None:
+        if self._gyro_bias_state is not GyroBiasState.READY:
+            self._reset_motion_detection()
+            return
+        mapping = axis_matrix(self._calibration.axes)
+        corrected = mapping @ (sample.gyro - self._calibration.gyro_bias)
+        rate = float(np.max(np.abs(corrected)))
+        direction = corrected / max(float(np.linalg.norm(corrected)), 1e-12)
+        if not self._motion_detected:
+            self._motion_stop_samples = 0
+            if rate < _MOTION_START_RATE_DPS:
+                self._motion_candidate_timestamp_s = None
+                self._motion_candidate_samples = 0
+                return
+            if self._motion_candidate_samples == 0:
+                self._motion_candidate_timestamp_s = sample.timestamp
+            self._motion_candidate_samples += 1
+            if self._motion_candidate_samples < _MOTION_CONFIRM_SAMPLES:
+                return
+            started_at = self._motion_candidate_timestamp_s
+            assert started_at is not None
+            previous_direction = self._motion_direction
+            if previous_direction is not None:
+                cosine = float(
+                    np.clip(np.dot(previous_direction, direction), -1.0, 1.0)
+                )
+                turn_angle = float(np.degrees(np.arccos(cosine)))
+                if turn_angle >= _MOTION_REDIRECT_ANGLE_DEG:
+                    self._motion_redirected_timestamp_s = started_at
+                    LOGGER.info(
+                        "IMU motion redirected after pause sender_timestamp_s=%.6f "
+                        "angle_deg=%.1f gyro_rate_dps=%.3f",
+                        started_at,
+                        turn_angle,
+                        rate,
+                    )
+            self._motion_detected = True
+            self._motion_started_timestamp_s = started_at
+            self._motion_direction = direction
+            self._motion_candidate_timestamp_s = None
+            self._motion_candidate_samples = 0
+            LOGGER.info(
+                "IMU motion started sender_timestamp_s=%.6f gyro_rate_dps=%.3f",
+                started_at,
+                rate,
+            )
+            return
+        if rate > _MOTION_STOP_RATE_DPS:
+            self._motion_stop_samples = 0
+            self._advance_motion_direction(direction, sample.timestamp, rate)
+            return
+        self._clear_motion_redirect_candidate()
+        self._motion_stop_samples += 1
+        if self._motion_stop_samples >= _MOTION_CONFIRM_SAMPLES:
+            LOGGER.info(
+                "IMU motion stopped sender_timestamp_s=%.6f gyro_rate_dps=%.3f",
+                sample.timestamp,
+                rate,
+            )
+            self._reset_motion_detection(preserve_events=True)
+
+    def _clear_motion_redirect_candidate(self) -> None:
+        self._motion_redirect_candidate = None
+        self._motion_redirect_timestamp_s = None
+        self._motion_redirect_samples = 0
+
+    def _advance_motion_direction(
+        self,
+        direction: np.ndarray,
+        timestamp_s: float,
+        rate_dps: float,
+    ) -> None:
+        baseline = self._motion_direction
+        if baseline is None or rate_dps < _MOTION_START_RATE_DPS:
+            self._clear_motion_redirect_candidate()
+            return
+        cosine = float(np.clip(np.dot(baseline, direction), -1.0, 1.0))
+        angle_deg = float(np.degrees(np.arccos(cosine)))
+        if angle_deg < _MOTION_REDIRECT_ANGLE_DEG:
+            self._clear_motion_redirect_candidate()
+            return
+        candidate = self._motion_redirect_candidate
+        candidate_angle = (
+            0.0
+            if candidate is None
+            else float(
+                np.degrees(
+                    np.arccos(np.clip(np.dot(candidate, direction), -1.0, 1.0))
+                )
+            )
+        )
+        if candidate is None or candidate_angle > 20.0:
+            self._motion_redirect_candidate = direction.copy()
+            self._motion_redirect_timestamp_s = timestamp_s
+            self._motion_redirect_samples = 1
+            return
+        self._motion_redirect_candidate = direction.copy()
+        self._motion_redirect_samples += 1
+        if self._motion_redirect_samples < _MOTION_CONFIRM_SAMPLES:
+            return
+        self._motion_direction = direction.copy()
+        self._motion_redirected_timestamp_s = self._motion_redirect_timestamp_s
+        LOGGER.info(
+            "IMU motion redirected sender_timestamp_s=%.6f angle_deg=%.1f gyro_rate_dps=%.3f",
+            self._motion_redirected_timestamp_s,
+            angle_deg,
+            rate_dps,
+        )
+        self._clear_motion_redirect_candidate()
+
     def restart_gyro_bias_calibration(self) -> None:
         """Restart the existing five-second stationary gyro-bias acquisition."""
         self._gyro_bias_samples.clear()
         self._recent_samples.clear()
+        self._reset_motion_detection()
         self._gyro_bias_state = GyroBiasState.ACQUIRING
         self._calibration = replace(self._calibration, gyro_ready=False)
         self._filter = OrientationFilter()
@@ -559,6 +702,13 @@ class ImuStreamState:
                 else 0
             ),
             calibration_message=self._calibration_message,
+            motion_detected=self._motion_detected and fresh,
+            motion_started_timestamp_s=(
+                self._motion_started_timestamp_s if fresh else None
+            ),
+            motion_redirected_timestamp_s=(
+                self._motion_redirected_timestamp_s if fresh else None
+            ),
         )
 
 

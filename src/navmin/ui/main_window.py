@@ -24,6 +24,7 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
+from navmin.backlash_calibration import BacklashCalibrationRuntime
 from navmin.concurrency import LatestValue
 from navmin.config.models import (
     AimingConfig,
@@ -65,6 +66,7 @@ from navmin.recording import (
 from navmin.recording_adapter import assemble_recording_frame_packet
 from navmin.vision.processor import VisionProcessorSelection, VisionTrackingDiagnostics
 
+from .backlash_calibration_window import BacklashCalibrationWindow
 from .bridge import CameraUiBinding, UiStatePump
 from .imu_window import ImuWindow
 from .motion_calibration_window import MotionCalibrationWindow
@@ -177,6 +179,7 @@ class MainWindow(QMainWindow):
         recording_runtime: RecordingRuntime | None = None,
         start_recording: Callable[[CameraRole, int, int], RecordingSessionInfo] | None = None,
         motion_calibration_runtime: MotionCalibrationRuntime | None = None,
+        backlash_calibration_runtime: BacklashCalibrationRuntime | None = None,
         begin_motion_calibration_profile: Callable[[MotionProfile], None] | None = None,
         restore_motion_calibration_profile: Callable[[], None] | None = None,
         persist_tracking_visualization: (
@@ -440,6 +443,30 @@ class MainWindow(QMainWindow):
                 stale_timeout_ms=camera_stale_timeout_ms,
                 clock_ns=clock_ns,
             )
+        self.backlash_calibration_window: BacklashCalibrationWindow | None = None
+        if (
+            backlash_calibration_runtime is not None
+            and imu_states is not None
+            and imu_controls is not None
+        ):
+            self.backlash_calibration_window = BacklashCalibrationWindow(
+                owner=self,
+                mediator=mediator,
+                imu_states=imu_states,
+                imu_controls=imu_controls,
+                turret_states=turret_states,
+                runtime=backlash_calibration_runtime,
+                motion_calibration_active=lambda: (
+                    self.motion_calibration_window is not None
+                    and self.motion_calibration_window.calibration_active
+                ),
+                max_relative_move_x_deg=(
+                    backlash_calibration_runtime.max_relative_move["x"]
+                ),
+                max_relative_move_y_deg=(
+                    backlash_calibration_runtime.max_relative_move["y"]
+                ),
+            )
         self.operator_window = OperatorWindow(
             owner=self,
             on_toggle_fullscreen=self.toggle_fullscreen,
@@ -467,6 +494,11 @@ class MainWindow(QMainWindow):
             on_show_motion_calibration=(
                 self.show_motion_calibration_window
                 if self.motion_calibration_window is not None
+                else None
+            ),
+            on_show_backlash_calibration=(
+                self.show_backlash_calibration_window
+                if self.backlash_calibration_window is not None
                 else None
             ),
         )
@@ -511,6 +543,8 @@ class MainWindow(QMainWindow):
         self._stop_recording()
         if self.motion_calibration_window is not None:
             self.motion_calibration_window.close()
+        if self.backlash_calibration_window is not None:
+            self.backlash_calibration_window.close()
         self.imu_window.close()
         self.operator_window.close()
         super().closeEvent(event)
@@ -537,6 +571,14 @@ class MainWindow(QMainWindow):
 
     def show_motion_calibration_window(self) -> None:
         window = self.motion_calibration_window
+        if window is None:
+            return
+        window.show()
+        window.raise_()
+        window.activateWindow()
+
+    def show_backlash_calibration_window(self) -> None:
+        window = self.backlash_calibration_window
         if window is None:
             return
         window.show()

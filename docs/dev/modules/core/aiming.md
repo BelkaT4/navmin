@@ -128,7 +128,10 @@ Calibration хранится отдельно от `config.json`:
 ```text
 calibration/overview.json
 calibration/stereo.json
+calibration/backlash.json
 ```
+
+Mediator прикладывает значения directional backlash delay к TrackingError sample; сами измерения принадлежат отдельному mechanics-only wizard и применяются только Turret Controller.
 
 Vision загружает calibration и строит working-frame `CameraModel`. При calibration mismatch/error pipeline не публикует raw frame как замену working frame.
 

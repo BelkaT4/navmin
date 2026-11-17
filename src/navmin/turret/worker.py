@@ -22,6 +22,7 @@ from navmin.contracts import (
     TurretControlMode,
     TurretState,
 )
+from navmin.imu import ImuRuntimeState
 from navmin.lifecycle import StopToken, stop_and_join
 
 from .controller import ControllerError, TurretController
@@ -109,6 +110,7 @@ class TurretWorker:
         *,
         transport_factory: TransportFactory | None = None,
         cooperative_wait: CooperativeWait = _default_wait,
+        imu_states: LatestValue[ImuRuntimeState] | None = None,
     ) -> None:
         if not isinstance(config, TurretConfig):
             raise TypeError("config must be TurretConfig")
@@ -124,6 +126,7 @@ class TurretWorker:
         )
         self._transport_factory = transport_factory or self._default_transport_factory
         self._cooperative_wait = cooperative_wait
+        self._imu_states = imu_states
 
         self._stop_token = StopToken()
         self._thread: Thread | None = None
@@ -640,6 +643,19 @@ class TurretWorker:
         if isinstance(motion, MoveRelativeCommand):
             controller.submit_move_relative(motion)
         else:
+            imu_state = None if self._imu_states is None else self._imu_states.get()
+            controller.update_imu_motion(
+                valid=bool(
+                    imu_state is not None
+                    and imu_state.fresh
+                    and imu_state.orientation_valid
+                ),
+                redirected_timestamp_s=(
+                    None
+                    if imu_state is None
+                    else imu_state.motion_redirected_timestamp_s
+                ),
+            )
             controller.submit_tracking_control(revision, motion)
         result = controller.flush_pending_motion()
         if result is not None:
