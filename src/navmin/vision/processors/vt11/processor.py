@@ -679,14 +679,32 @@ class Vt11VisionProcessor:
         self._discard_active_episode(reset_legacy=True)
         return (event,)
 
-    @staticmethod
     def _tracking_diagnostics(
+        self,
         frame: FramePacket,
         result: TrackFrameResult | ReacqFrameResult,
         *,
         phase: str,
     ) -> VisionTrackingDiagnostics:
         best_bbox = result.best_candidate_bbox
+        live = self._live_features.snapshot
+        if isinstance(result, TrackFrameResult):
+            if not live.day_maneuver_search_enabled:
+                maneuver_state = "DISABLED"
+            elif result.maneuver_hits >= 2:
+                maneuver_state = "CONFIRMED"
+            elif result.maneuver_hits == 1:
+                maneuver_state = "PENDING"
+            else:
+                maneuver_state = "IDLE"
+            maneuver_hits = int(result.maneuver_hits)
+        else:
+            maneuver_state = "NOT_APPLICABLE"
+            maneuver_hits = 0
+        adaptation_reason = str(getattr(result, "adaptation_reason", ""))
+        adaptation_block_reason = (
+            adaptation_reason if adaptation_reason.startswith("BLOCKED_") else None
+        )
         return VisionTrackingDiagnostics(
             camera=frame.camera,
             generation=frame.generation,
@@ -733,6 +751,16 @@ class Vt11VisionProcessor:
                 else float(result.prediction_error_px)
             ),
             diagnostic_reason=result.diagnostic_reason,
+            detection_channel=str(getattr(result, "candidate_channel", "NONE")),
+            separated_from_line=bool(
+                getattr(result, "candidate_separated_from_line", False)
+            ),
+            blur_robust_enabled=bool(live.visible_blur_robust),
+            blur_variant=getattr(result, "blur_variant", None),
+            maneuver_state=maneuver_state,
+            maneuver_hits=maneuver_hits,
+            line_recovery_hits=int(getattr(result, "line_recovery_hits", 0)),
+            adaptation_block_reason=adaptation_block_reason,
         )
 
     def _process_target_frame(

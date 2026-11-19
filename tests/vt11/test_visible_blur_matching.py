@@ -78,6 +78,7 @@ def test_recognizes_directional_blur_without_promoting_a_wire(
     assert distractor.total < 0.45
     assert robust.geometry == original.geometry
     assert robust.color == original.color
+    assert robust.blur_variant == f"5-{direction}"
 
 
 def test_blur_is_opt_in_and_preserves_sharp_reference() -> None:
@@ -99,7 +100,11 @@ def test_blur_is_opt_in_and_preserves_sharp_reference() -> None:
         identity_weights=dict(WEIGHTS, _visible_blur_robust=0),
     )
     assert plain == disabled
-    descriptor_similarity(reference, candidate, identity_weights=BLUR_WEIGHTS)
+    assert plain.blur_variant is None
+    robust = descriptor_similarity(
+        reference, candidate, identity_weights=BLUR_WEIGHTS
+    )
+    assert robust.blur_variant is not None
     np.testing.assert_array_equal(reference.appearance, before)
 
 

@@ -388,6 +388,9 @@ class ReacqFrameResult:
     active_tracklets: int = 0
     reacq_mode: str = "LOCAL_CONSERVATIVE"
     candidate_channel: str = "NONE"
+    candidate_separated_from_line: bool = False
+    line_recovery_hits: int = 0
+    blur_variant: str | None = None
     anchor_distance_px: float = 0.0
     anchor_distance_norm: float = 0.0
     anchor_age_frames: int = 0
@@ -907,7 +910,9 @@ def _reacquisition_incremental_engine(
                 promotion_evidence_hits=sum(promotion_window), promotion_reason=promotion_reason,
                 active_tracklets=len(tracklets.tracklets) if tracklets is not None else 0,
                 reacq_mode=("GLOBAL_EMERGENCY_SCAN" if full_frame else ("ROBUST_LOCAL" if broken else "LOCAL_CONSERVATIVE")),
-                candidate_channel="NONE", anchor_distance_px=0.0, anchor_distance_norm=0.0,
+                candidate_channel="NONE", candidate_separated_from_line=False,
+                line_recovery_hits=0, blur_variant=None,
+                anchor_distance_px=0.0, anchor_distance_norm=0.0,
                 anchor_age_frames=max(0, frame_index - reliable_anchor_frame), anchor_allowed_distance_px=0.0,
                 reliable_area_anchor_px=(float(reliable_scale_anchor.reliable_area_px) if reliable_scale_anchor is not None else 0.0),
                 scale_anchor_age_frames=(max(0, int(frame_index - reliable_scale_anchor.reliable_frame)) if reliable_scale_anchor is not None else 0),
@@ -1231,7 +1236,33 @@ def _reacquisition_incremental_engine(
             tracklet_id=tracklet_id,
             active_tracklets=len(tracklets.tracklets) if tracklets is not None else 0,
             reacq_mode=("GLOBAL_EMERGENCY_SCAN" if full_frame else ("ROBUST_LOCAL" if broken else "LOCAL_CONSERVATIVE")),
-            candidate_channel=getattr(best.candidate, "detection_channel", "NORMAL"),
+            candidate_channel=str(
+                getattr(
+                    selected if selected is not None else best.candidate,
+                    "detection_channel",
+                    "NORMAL",
+                )
+            ),
+            candidate_separated_from_line=bool(
+                getattr(
+                    selected if selected is not None else best.candidate,
+                    "separated_from_line",
+                    False,
+                )
+            ),
+            line_recovery_hits=(
+                int(hits)
+                if str(
+                    getattr(
+                        selected if selected is not None else best.candidate,
+                        "detection_channel",
+                        "NORMAL",
+                    )
+                )
+                == "LINE_RECOVERY"
+                else 0
+            ),
+            blur_variant=best.similarity.blur_variant,
             anchor_distance_px=float(hypot(best.candidate.center_x - visual_anchor[0], best.candidate.center_y - visual_anchor[1])),
             anchor_distance_norm=float(hypot(best.candidate.center_x - visual_anchor[0], best.candidate.center_y - visual_anchor[1]) / max(1e-9, anchor_allowance(frame_index, speed, uncertainty)[1])),
             anchor_age_frames=int(anchor_allowance(frame_index, speed, uncertainty)[0]),

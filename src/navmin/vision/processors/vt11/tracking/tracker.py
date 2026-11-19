@@ -470,6 +470,9 @@ class TrackFrameResult:
     maneuver_hypothesis_xy: tuple[float, float] | None = None
     maneuver_hits: int = 0
     line_recovery_hits: int = 0
+    candidate_channel: str = "NONE"
+    candidate_separated_from_line: bool = False
+    blur_variant: str | None = None
     # HOTFIX-2: retain diagnostics for the best evaluated candidate even when
     # it is rejected by gates. This is essential for distinguishing detector
     # failure from identity/threshold failure.
@@ -1313,6 +1316,9 @@ def _tracking_incremental_engine(
                 adaptation_drift_reason=adapt_event.drift_reason if adapt_event is not None else "",
                 adaptation_recent_count=adapt_event.recent_count if adapt_event is not None else 0,
                 adaptation_fast_remaining=adapt_event.fast_remaining if adapt_event is not None else 0,
+                candidate_channel="NONE",
+                candidate_separated_from_line=False,
+                blur_variant=None,
                 motion_break_active=motion_break_active,
                 motion_break_triggered=False,
                 motion_break_reason="ACTIVE_NO_CANDIDATE" if motion_break_active else "",
@@ -1968,6 +1974,11 @@ def _tracking_incremental_engine(
             miss_count=((frame_index - start_frame) + 1) if warmup and selected is None else miss_count,
             prediction_error_px=prediction_error, confidence=confidence, diagnostic_reason=reason,
             line_recovery_hits=line_recovery_hits,
+            candidate_channel=str(getattr(best.candidate, "detection_channel", "NORMAL")),
+            candidate_separated_from_line=bool(
+                getattr(best.candidate, "separated_from_line", False)
+            ),
+            blur_variant=best.similarity.blur_variant,
             best_candidate_center=(float(best.candidate.center_x), float(best.candidate.center_y)),
             best_candidate_bbox=(int(best.candidate.bbox.x), int(best.candidate.bbox.y), int(best.candidate.bbox.width), int(best.candidate.bbox.height)),
             best_candidate_area_px=int(best.candidate.area_px), best_candidate_mean_response=float(best.candidate.mean_response),

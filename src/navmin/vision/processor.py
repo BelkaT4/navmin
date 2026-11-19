@@ -72,6 +72,14 @@ class VisionTrackingDiagnostics:
     confidence: float
     prediction_error_px: float | None
     diagnostic_reason: str
+    detection_channel: str = "NONE"
+    separated_from_line: bool = False
+    blur_robust_enabled: bool = False
+    blur_variant: str | None = None
+    maneuver_state: str = "NOT_APPLICABLE"
+    maneuver_hits: int = 0
+    line_recovery_hits: int = 0
+    adaptation_block_reason: str | None = None
 
 
 @dataclass(frozen=True)

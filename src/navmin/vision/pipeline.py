@@ -977,6 +977,31 @@ class VisionPipeline:
                 }
             ),
             confidence=None if diagnostics is None else diagnostics.confidence,
+            detection_channel=(
+                None if diagnostics is None else diagnostics.detection_channel
+            ),
+            separated_from_line=(
+                False if diagnostics is None else diagnostics.separated_from_line
+            ),
+            blur_robust_enabled=(
+                False if diagnostics is None else diagnostics.blur_robust_enabled
+            ),
+            blur_variant=None if diagnostics is None else diagnostics.blur_variant,
+            maneuver_state=(
+                None if diagnostics is None else diagnostics.maneuver_state
+            ),
+            maneuver_hits=0 if diagnostics is None else diagnostics.maneuver_hits,
+            line_recovery_hits=(
+                0 if diagnostics is None else diagnostics.line_recovery_hits
+            ),
+            decision_reason=(
+                None if diagnostics is None else diagnostics.diagnostic_reason
+            ),
+            adaptation_block_reason=(
+                None
+                if diagnostics is None
+                else diagnostics.adaptation_block_reason
+            ),
             transition=transition,
             transition_reason=transition_reason,
             no_detection_reason=(

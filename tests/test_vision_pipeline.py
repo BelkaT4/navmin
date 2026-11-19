@@ -8,6 +8,7 @@ import cv2
 import numpy as np
 import pytest
 
+import navmin.vision.pipeline as pipeline_module
 from navmin.calibration import (
     OverviewCalibration,
     StereoCalibration,
@@ -146,7 +147,15 @@ class _DiagnosticsProcessor(_RecordingProcessor):
                 best_candidate_bbox=BBox(8, 9, 10, 11),
                 confidence=0.8,
                 prediction_error_px=1.5,
-                diagnostic_reason="OK",
+                diagnostic_reason="ACCEPTED_DAY_MANEUVER_RELOCK",
+                detection_channel="LINE_RECOVERY",
+                separated_from_line=True,
+                blur_robust_enabled=True,
+                blur_variant="5-horizontal",
+                maneuver_state="CONFIRMED",
+                maneuver_hits=2,
+                line_recovery_hits=2,
+                adaptation_block_reason="BLOCKED_DAY_MANEUVER_RELOCK",
             ),
         )
 
@@ -511,6 +520,36 @@ def test_tracking_diagnostics_are_latest_only_exact_frame_bound_and_reset() -> N
 
     pipeline.start()
     assert pipeline.latest_tracking_diagnostics.get() is None
+
+
+def test_verbose_tracking_event_includes_rev5_diagnostics(monkeypatch) -> None:
+    events: list[tuple[str, dict[str, object]]] = []
+
+    def capture_event(_logger, event_name: str, **fields) -> None:
+        events.append((event_name, fields))
+
+    monkeypatch.setattr(pipeline_module, "emit_event", capture_event)
+    pipeline = VisionPipeline(
+        camera=CameraRole.OVERVIEW,
+        corrector=overview_corrector(overview_calibration()),
+        processor=_DiagnosticsProcessor(),
+        timestamp_clock_ns=_Clock(),
+    )
+    pipeline.start()
+    pipeline.submit_decoded_frame(source_frame(1))
+    result = pipeline.process_latest()
+    assert result is not None
+
+    payload = next(fields for name, fields in events if name == "VISION_TRACKING_FRAME")
+    assert payload["detection_channel"] == "LINE_RECOVERY"
+    assert payload["separated_from_line"] is True
+    assert payload["blur_robust_enabled"] is True
+    assert payload["blur_variant"] == "5-horizontal"
+    assert payload["maneuver_state"] == "CONFIRMED"
+    assert payload["maneuver_hits"] == 2
+    assert payload["line_recovery_hits"] == 2
+    assert payload["decision_reason"] == "ACCEPTED_DAY_MANEUVER_RELOCK"
+    assert payload["adaptation_block_reason"] == "BLOCKED_DAY_MANEUVER_RELOCK"
 
 
 def test_stereo_right_session_barrier_and_generation_are_role_correct() -> None:
