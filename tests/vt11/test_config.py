@@ -13,7 +13,9 @@ def test_default_config_loads():
     assert cfg["tracking"]["search_radius_px"] == 90
     assert cfg["tracking"]["lost_after_misses"] == 3
     assert cfg["tracking"]["dynamic_search_enabled"] is True
-    assert cfg["tracking"]["max_search_radius_px"] == 240
+    assert cfg["tracking"]["global_shift_enabled"] is False
+    assert cfg["reacquisition"]["global_shift_enabled"] is False
+    assert cfg["tracking"]["max_search_radius_px"] == 180
     assert cfg["adaptation"]["mode"] == "adaptive_memory"
     assert cfg["adaptation"]["ema"]["alpha"] == 0.05
     assert cfg["evaluation"]["ground_truth_tolerance_px"] == 20.0

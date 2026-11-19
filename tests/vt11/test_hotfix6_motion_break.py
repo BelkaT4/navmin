@@ -135,7 +135,7 @@ def test_hotfix6_config_has_cpu_budget_and_event_driven_motion():
     cfg = load_config()
     assert cfg["project"]["checkpoint"] == "VT-11-HOTFIX-4-REV5-REACQ-CONTINUITY-FIX"
     assert cfg["tracking"]["motion_break_enabled"] is True
-    assert cfg["tracking"]["global_shift_enabled"] is True
+    assert cfg["tracking"]["global_shift_enabled"] is False
     assert cfg["tracking"]["performance_target_fps"] == 25.0
     assert cfg["reacquisition"]["tracklets_enabled"] is True
     assert cfg["reacquisition"]["full_frame_after_frames"] == 15

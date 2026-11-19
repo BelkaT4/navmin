@@ -456,9 +456,25 @@ Backlash compensation пока не входит в обязательную к�
 ui.default-camera = overview | stereo-left
 ui.show-fps
 ui.show-stereo-right-diagnostics
+ui.show-stereo-right-camera
+
+ui.vt11.low-light-blur-mode = bool
+ui.vt11.auto-select-candidate-on-first-click = bool
+ui.vt11.candidate-click-tolerance-px = 0..50
 ```
 
 `ui.default-camera` задаёт startup `main_camera`. `stereo-right` здесь недопустима.
+
+Schema v8 добавляет группу `ui.vt11` как persisted operator preferences, а не как
+внутренний tuning detector/tracker. Значения по умолчанию при in-memory migration
+старых schema: `false`, `false`, `15 px`. Все три поля имеют dynamic apply policy.
+
+`low-light-blur-mode` относится к операторскому DAY-режиму VT11; THERMAL его не
+применяет. `auto-select-candidate-on-first-click` и
+`candidate-click-tolerance-px` задают способ выбора кандидата оператором и не
+заменяют последующее initial-train подтверждение цели. Алгоритмическое подключение
+этих preferences выполняется соответствующими этапами VT11 REV5; наличие поля в
+`config.json` само по себе не включает скрытый альтернативный tracker path.
 
 При недоступности main camera автоматического switch на preview нет.
 
@@ -485,7 +501,7 @@ UI overlays не являются частью recorded working frame.
 | max speed / acceleration / velocity watchdog | dynamic full STM32 `SET_CONFIG` snapshot; уменьшение max speed также clamp'ит application-side PID I-term соответствующей оси без полного reset |
 | `invert`, steps/rev, microstep, `max-relative-move-deg` | restart-only; применяются только после Turret/application restart, не dynamic |
 | `emulate-stm32` | application restart; runtime real ↔ fake transport switching в v1 отсутствует |
-| UI-only display settings | dynamic |
+| UI-only display settings и `ui.vt11.*` operator preferences | dynamic |
 
 Processor-specific tuning в v1 не является частью config schema и поэтому не имеет runtime apply policy. Смена `vision-processor-class` остаётся restart/new-generation boundary.
 

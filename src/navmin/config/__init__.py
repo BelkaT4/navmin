@@ -1,4 +1,4 @@
-"""Typed configuration foundation for NavMin schema v7."""
+"""Typed configuration foundation for NavMin schema v8."""
 
 from .manager import ConfigManager, save_config
 from .models import (
@@ -35,6 +35,7 @@ from .models import (
     VelocityEstimatorConfig,
     VisionConfig,
     VisionDistanceConfig,
+    Vt11UiConfig,
     changed_config_paths,
     config_apply_policy,
 )
@@ -91,6 +92,7 @@ __all__ = [
     "VelocityEstimatorConfig",
     "VisionConfig",
     "VisionDistanceConfig",
+    "Vt11UiConfig",
     "changed_config_paths",
     "config_apply_policy",
     "config_to_mapping",
