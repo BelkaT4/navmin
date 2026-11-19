@@ -258,6 +258,7 @@ def _mediator(
     distance_stale_timeout_ms: int = 300,
     clock_ns=monotonic_ns,
     motion_calibration=None,
+    tracking_stereo_left_nominal_hfov_deg: float | None = None,
 ) -> tuple[Mediator, _FakeTurret, dict[CameraRole, TargetControlChannel]]:
     turret = _FakeTurret(_turret_state(mode=mode, motor=motor))
     controls = _controls()
@@ -274,6 +275,9 @@ def _mediator(
         distance_stale_timeout_ms=distance_stale_timeout_ms,
         clock_ns=clock_ns,
         motion_calibration=motion_calibration,
+        tracking_stereo_left_nominal_hfov_deg=(
+            tracking_stereo_left_nominal_hfov_deg
+        ),
     )
     return mediator, turret, controls
 
@@ -837,6 +841,52 @@ def test_control_visualization_is_exact_frame_bound_and_cleared_on_new_select() 
 
     assert mediator.request_target_selection(current, 60.0, 40.0)
     assert mediator.tracking_control_visualization is None
+
+
+def test_stereo_left_tracking_hfov_override_changes_control_geometry_only() -> None:
+    mediator, turret, _controls_value = _mediator(
+        mode=TurretControlMode.TRACKING,
+        main=CameraRole.STEREO_LEFT,
+        tracking_stereo_left_nominal_hfov_deg=10.0,
+    )
+    initial = _accept_main(mediator)
+    request = _request(mediator, initial)
+    assert mediator.accept_target_lifecycle_event(_acquired(request))
+    baseline_sample = turret.tracking_controls[-1]
+    base_model = mediator.session_gate.camera_model(CameraRole.STEREO_LEFT, 1)
+    assert base_model is not None
+    baseline_invalidations = turret.invalidations
+
+    mediator.set_tracking_stereo_left_hfov_deg(20.0)
+
+    assert mediator.tracking_stereo_left_hfov_deg == 20.0
+    assert mediator.session_gate.camera_model(CameraRole.STEREO_LEFT, 1) is base_model
+    assert mediator.tracking_camera_model(CameraRole.STEREO_LEFT, 1) is not base_model
+    assert turret.invalidations == baseline_invalidations + 1
+    assert mediator.tracking_estimator.sample_count == 0
+
+    updated = _result(
+        CameraRole.STEREO_LEFT,
+        1,
+        frame_id=5,
+        timestamp_ns=50_000_000,
+    )
+    assert mediator.accept_vision_result(updated)
+    override_sample = turret.tracking_controls[-1]
+
+    assert abs(override_sample.real_error_x_deg) > abs(
+        baseline_sample.real_error_x_deg
+    )
+
+
+def test_stereo_left_tracking_hfov_override_rejects_invalid_values() -> None:
+    mediator, _turret, _controls_value = _mediator(
+        tracking_stereo_left_nominal_hfov_deg=10.0
+    )
+
+    for invalid in (0.0, 179.0, float("nan"), float("inf")):
+        with pytest.raises(ValueError):
+            mediator.set_tracking_stereo_left_hfov_deg(invalid)
 
 
 def test_new_target_requires_estimator_history_to_be_collected_again() -> None:

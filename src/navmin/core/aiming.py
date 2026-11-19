@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+from dataclasses import dataclass
 
 from navmin.config.models import AimingConfig, AimPointConfig
 from navmin.contracts import (
@@ -18,6 +19,40 @@ from navmin.contracts import (
 
 type PixelPoint = tuple[float, float]
 type TurretAngles = tuple[float, float]
+
+
+@dataclass(frozen=True, slots=True)
+class FocalScaleCameraModel:
+    """Scale focal lengths of an existing working-frame model without remapping."""
+
+    base: CameraModel
+    focal_scale: float
+
+    def __post_init__(self) -> None:
+        scale = self.focal_scale
+        if isinstance(scale, bool) or not isinstance(scale, int | float):
+            raise TypeError("focal_scale must be a number")
+        if not math.isfinite(float(scale)) or float(scale) <= 0.0:
+            raise ValueError("focal_scale must be a finite number > 0")
+
+    def pixel_to_ray(self, x_px: float, y_px: float) -> CameraRay:
+        ray = self.base.pixel_to_ray(x_px, y_px)
+        scale = float(self.focal_scale)
+        x = ray.x / scale
+        y = ray.y / scale
+        z = ray.z
+        norm = math.sqrt(x * x + y * y + z * z)
+        if not math.isfinite(norm) or norm == 0.0:
+            raise ValueError("scaled camera ray must be finite and non-zero")
+        return CameraRay(x / norm, y / norm, z / norm)
+
+    def ray_to_pixel(self, ray: CameraRay) -> tuple[float, float]:
+        if not isinstance(ray, CameraRay):
+            raise TypeError("ray must be CameraRay")
+        scale = float(self.focal_scale)
+        return self.base.ray_to_pixel(
+            CameraRay(ray.x * scale, ray.y * scale, ray.z)
+        )
 
 
 class Aiming:
@@ -138,4 +173,4 @@ class Aiming:
         return horizontal, vertical
 
 
-__all__ = ["Aiming", "PixelPoint", "TurretAngles"]
+__all__ = ["Aiming", "FocalScaleCameraModel", "PixelPoint", "TurretAngles"]

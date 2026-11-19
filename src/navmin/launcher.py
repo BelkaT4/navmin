@@ -388,6 +388,12 @@ def run_loaded_application(
             apply_motion_limits_tuning=apply_motion_limits_tuning,
             tracking_control_config=ui.tracking_control_config,
             apply_tracking_control_tuning=apply_tracking_control_tuning,
+            tracking_stereo_left_hfov_deg=getattr(
+                ui, "tracking_stereo_left_hfov_deg", None
+            ),
+            apply_tracking_stereo_left_hfov_deg=getattr(
+                ui, "apply_tracking_stereo_left_hfov_deg", None
+            ),
             tracking_visualization_config=ui.tracking_visualization_config,
             ui_config=ui.ui_config,
             persist_ui_config=persist_ui_config,

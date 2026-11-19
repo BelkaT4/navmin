@@ -477,6 +477,18 @@ def stereo_camera_models(
     )
 
 
+def stereo_left_horizontal_fov_deg(calibration: StereoCalibration) -> float:
+    """Return the effective horizontal FOV implied by rectified Stereo Left P1."""
+    if not isinstance(calibration, StereoCalibration):
+        raise TypeError("calibration must be StereoCalibration")
+    focal_length_px = float(calibration.P1[0][0])
+    if not math.isfinite(focal_length_px) or focal_length_px <= 0.0:
+        raise ValueError("Stereo Left P1 horizontal focal length must be > 0")
+    return math.degrees(
+        2.0 * math.atan(calibration.image_width / (2.0 * focal_length_px))
+    )
+
+
 __all__ = [
     "OPENCV_PINHOLE_DISTORTION_LENGTHS",
     "CalibrationError",
@@ -492,4 +504,5 @@ __all__ = [
     "load_stereo_calibration",
     "overview_camera_model",
     "stereo_camera_models",
+    "stereo_left_horizontal_fov_deg",
 ]

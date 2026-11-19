@@ -45,6 +45,8 @@ def run_ui(
     apply_tracking_control_tuning: Callable[[TrackingControlConfig], None],
     tracking_visualization_config: TrackingVisualizationConfig,
     ui_config: UiConfig,
+    tracking_stereo_left_hfov_deg: float | None = None,
+    apply_tracking_stereo_left_hfov_deg: Callable[[float], None] | None = None,
     persist_ui_config: Callable[[UiConfig], None] | None = None,
     vision_processor_selections: Mapping[CameraRole, VisionProcessorSelection] | None = None,
     apply_vision_processor_selection: (
@@ -85,6 +87,8 @@ def run_ui(
         apply_motion_limits_tuning=apply_motion_limits_tuning,
         tracking_control_config=tracking_control_config,
         apply_tracking_control_tuning=apply_tracking_control_tuning,
+        tracking_stereo_left_hfov_deg=tracking_stereo_left_hfov_deg,
+        apply_tracking_stereo_left_hfov_deg=apply_tracking_stereo_left_hfov_deg,
         tracking_visualization_config=tracking_visualization_config,
         ui_config=ui_config,
         persist_ui_config=persist_ui_config,

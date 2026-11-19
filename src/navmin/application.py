@@ -10,7 +10,11 @@ from pathlib import Path
 from time import monotonic
 from types import MappingProxyType
 
-from navmin.calibration import OverviewCalibration, StereoCalibration
+from navmin.calibration import (
+    OverviewCalibration,
+    StereoCalibration,
+    stereo_left_horizontal_fov_deg,
+)
 from navmin.concurrency import LatestValue
 from navmin.config.models import (
     AimingConfig,
@@ -125,6 +129,8 @@ class UiRuntimeDependencies:
     apply_tracking_control_tuning: Callable[[TrackingControlConfig], None]
     tracking_visualization_config: TrackingVisualizationConfig
     ui_config: UiConfig
+    tracking_stereo_left_hfov_deg: float | None = None
+    apply_tracking_stereo_left_hfov_deg: Callable[[float], None] | None = None
     vision_processor_selections: Mapping[CameraRole, VisionProcessorSelection] | None = None
     apply_vision_processor_selection: (
         Callable[[CameraRole, VisionProcessorSelection], None] | None
@@ -266,6 +272,12 @@ class ApplicationRuntime:
             apply_motion_limits_tuning=self.apply_motion_limits_tuning,
             tracking_control_config=tracking_control_config,
             apply_tracking_control_tuning=self.apply_tracking_control_tuning,
+            tracking_stereo_left_hfov_deg=(
+                mediator.tracking_stereo_left_hfov_deg
+            ),
+            apply_tracking_stereo_left_hfov_deg=(
+                mediator.set_tracking_stereo_left_hfov_deg
+            ),
             tracking_visualization_config=tracking_visualization_config,
             ui_config=ui_config,
             vision_processor_selections=self._vision_processor_selections,
@@ -949,6 +961,9 @@ def build_application_runtime(
             ),
         },
         motion_calibration=motion_calibration_runtime,
+        tracking_stereo_left_nominal_hfov_deg=(
+            stereo_left_horizontal_fov_deg(stereo_calibration)
+        ),
     )
     if stereo_frame_sink is not None:
         def active_pairing_kind() -> StereoPairingKind | None:

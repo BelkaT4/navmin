@@ -15,6 +15,7 @@ from navmin.calibration import (
     load_stereo_calibration,
     overview_camera_model,
     stereo_camera_models,
+    stereo_left_horizontal_fov_deg,
 )
 
 
@@ -259,6 +260,16 @@ def test_stereo_models_use_rectified_p1_p2_geometry(tmp_path) -> None:
     assert right.x == pytest.approx(1 / math.sqrt(2))
     assert left.z == pytest.approx(1 / math.sqrt(2))
     assert right.z == pytest.approx(1 / math.sqrt(2))
+
+
+def test_stereo_left_horizontal_fov_uses_rectified_p1_focal_length(tmp_path) -> None:
+    path = tmp_path / "stereo.json"
+    _write(path, _stereo_calibration())
+    calibration = load_stereo_calibration(path)
+
+    assert stereo_left_horizontal_fov_deg(calibration) == pytest.approx(
+        math.degrees(2.0 * math.atan(640.0 / 400.0))
+    )
 
 
 @pytest.mark.parametrize(

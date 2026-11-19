@@ -6,7 +6,7 @@ import logging
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from enum import Enum
-from math import isfinite
+from math import isfinite, radians, tan
 from threading import Lock
 from time import monotonic_ns
 from typing import Protocol
@@ -20,6 +20,7 @@ from navmin.camera_time_sync import (
 from navmin.concurrency import LatestValue, TargetControlChannel
 from navmin.config.models import AimingConfig, TrackingControlConfig, UiConfig
 from navmin.contracts import (
+    CameraModel,
     CameraRole,
     CameraSessionStarted,
     CameraState,
@@ -50,7 +51,7 @@ from navmin.contracts import (
 from navmin.time_sync import ClockMappingState, ClockSampleOutcome
 from navmin.vision.stereo_target_join import StereoPairingKind
 
-from .aiming import Aiming
+from .aiming import Aiming, FocalScaleCameraModel
 from .distance import DistanceMeasurementMode, quantize_constant_distance
 from .session_gate import CameraSessionGate
 from .tracking_estimator import (
@@ -181,6 +182,7 @@ class Mediator:
         distance_stale_timeout_ms: int = 300,
         clock_ns: Callable[[], int] = monotonic_ns,
         motion_calibration: MotionCalibrationCorrectionPort | None = None,
+        tracking_stereo_left_nominal_hfov_deg: float | None = None,
     ) -> None:
         if ui_config.default_camera not in _NORMAL_CAMERAS:
             raise ValueError("ui.default_camera must be Overview or Stereo Left")
@@ -215,6 +217,8 @@ class Mediator:
             raise ValueError("distance_stale_timeout_ms must be a positive integer")
         if not callable(clock_ns):
             raise TypeError("clock_ns must be callable")
+        if tracking_stereo_left_nominal_hfov_deg is not None:
+            self._validate_tracking_hfov(tracking_stereo_left_nominal_hfov_deg)
 
         self._turret = turret
         self._target_controls = dict(target_controls)
@@ -254,6 +258,14 @@ class Mediator:
         self._distance_stale_timeout_ns = distance_stale_timeout_ms * 1_000_000
         self._clock_ns = clock_ns
         self._motion_calibration = motion_calibration
+        self._tracking_stereo_left_nominal_hfov_deg = (
+            None
+            if tracking_stereo_left_nominal_hfov_deg is None
+            else float(tracking_stereo_left_nominal_hfov_deg)
+        )
+        self._tracking_stereo_left_hfov_deg = (
+            self._tracking_stereo_left_nominal_hfov_deg
+        )
         self._distance_intent_revision = 0
         self._current_distance: DistanceResult | None = None
         self._distance_shutdown = False
@@ -317,6 +329,64 @@ class Mediator:
     @property
     def tracking_control_visualization(self) -> TrackingControlVisualization | None:
         return self._tracking_control_visualization
+
+    @property
+    def tracking_stereo_left_hfov_deg(self) -> float | None:
+        return self._tracking_stereo_left_hfov_deg
+
+    @property
+    def tracking_stereo_left_nominal_hfov_deg(self) -> float | None:
+        return self._tracking_stereo_left_nominal_hfov_deg
+
+    def set_tracking_stereo_left_hfov_deg(self, hfov_deg: float) -> None:
+        """Apply a temporary tracking-only focal scale for Stereo Left."""
+        nominal = self._tracking_stereo_left_nominal_hfov_deg
+        if nominal is None:
+            raise RuntimeError("Stereo Left tracking HFOV tuning is unavailable")
+        value = self._validate_tracking_hfov(hfov_deg)
+        if value == self._tracking_stereo_left_hfov_deg:
+            return
+        self._tracking_stereo_left_hfov_deg = value
+        self._tracking_estimator.reset_history()
+        self._tracking_control_visualization = None
+        self._turret.invalidate_tracking_control()
+        _LOGGER.info(
+            "Stereo Left tracking HFOV updated nominal=%.6f effective=%.6f "
+            "focal_scale=%.6f",
+            nominal,
+            value,
+            self._tracking_stereo_left_focal_scale(),
+        )
+
+    def tracking_camera_model(
+        self,
+        camera: CameraRole,
+        generation: int,
+    ) -> CameraModel | None:
+        """Return the camera model used only by the tracking-control path."""
+        model = self._session_gate.camera_model(camera, generation)
+        if model is None or camera is not CameraRole.STEREO_LEFT:
+            return model
+        scale = self._tracking_stereo_left_focal_scale()
+        if scale == 1.0:
+            return model
+        return FocalScaleCameraModel(model, scale)
+
+    @staticmethod
+    def _validate_tracking_hfov(hfov_deg: float) -> float:
+        if isinstance(hfov_deg, bool) or not isinstance(hfov_deg, int | float):
+            raise TypeError("tracking HFOV must be a number")
+        value = float(hfov_deg)
+        if not isfinite(value) or not 0.1 <= value < 179.0:
+            raise ValueError("tracking HFOV must be in [0.1, 179.0) degrees")
+        return value
+
+    def _tracking_stereo_left_focal_scale(self) -> float:
+        nominal = self._tracking_stereo_left_nominal_hfov_deg
+        effective = self._tracking_stereo_left_hfov_deg
+        if nominal is None or effective is None or effective == nominal:
+            return 1.0
+        return tan(radians(nominal) / 2.0) / tan(radians(effective) / 2.0)
 
     @property
     def main_camera(self) -> CameraRole:
@@ -1031,7 +1101,7 @@ class Mediator:
         tracked: TrackedObject,
         target: TargetRef,
     ) -> None:
-        model = self._session_gate.camera_model(target.camera, target.generation)
+        model = self.tracking_camera_model(target.camera, target.generation)
         if model is None:
             self._tracking_estimator.reset_history()
             self._tracking_control_visualization = None

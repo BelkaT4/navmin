@@ -3,6 +3,7 @@ from __future__ import annotations
 import math
 
 import numpy as np
+import pytest
 
 from navmin.config.models import AimingConfig, AimPointConfig, AimPointsConfig
 from navmin.contracts import (
@@ -15,7 +16,7 @@ from navmin.contracts import (
     TargetRef,
     TrackedObject,
 )
-from navmin.core.aiming import Aiming
+from navmin.core.aiming import Aiming, FocalScaleCameraModel
 
 
 class _RayModel:
@@ -27,6 +28,9 @@ class _RayModel:
     def pixel_to_ray(self, x_px: float, y_px: float) -> CameraRay:
         self.calls.append((x_px, y_px))
         return CameraRay((x_px - self.cx) / 50.0, (y_px - self.cy) / 40.0, 1.0)
+
+    def ray_to_pixel(self, ray: CameraRay) -> tuple[float, float]:
+        return self.cx + 50.0 * ray.x / ray.z, self.cy + 40.0 * ray.y / ray.z
 
 
 class _NonLinearRayModel(_RayModel):
@@ -127,6 +131,25 @@ def test_angular_delta_comes_from_camera_model_rays_not_linear_pixels() -> None:
 
     assert model.calls == [(55, 40), (50.0, 40.0), (60, 40), (50.0, 40.0)]
     assert not math.isclose(far.delta_x_deg, near.delta_x_deg * 2.0)
+
+
+def test_focal_scale_camera_model_changes_angles_without_changing_pixel_origin() -> None:
+    base = _RayModel()
+    scaled = FocalScaleCameraModel(base, 0.5)
+
+    base_center = base.pixel_to_ray(50.0, 40.0)
+    scaled_center = scaled.pixel_to_ray(50.0, 40.0)
+    base_right = base.pixel_to_ray(60.0, 40.0)
+    scaled_right = scaled.pixel_to_ray(60.0, 40.0)
+
+    assert scaled_center == base_center
+    assert math.degrees(math.atan2(base_right.x, base_right.z)) == pytest.approx(
+        math.degrees(math.atan(0.2))
+    )
+    assert math.degrees(math.atan2(scaled_right.x, scaled_right.z)) == pytest.approx(
+        math.degrees(math.atan(0.4))
+    )
+    assert scaled.ray_to_pixel(scaled_right) == pytest.approx((60.0, 40.0))
 
 
 def test_tracked_center_uses_current_bbox_center() -> None:

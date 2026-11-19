@@ -276,6 +276,7 @@ def _mediator(
         },
         stereo_target_joiner=stereo_target_joiner,
         stereo_distance_results=stereo_distance_results,
+        tracking_stereo_left_nominal_hfov_deg=6.3,
     )
     return mediator, turret
 
@@ -514,6 +515,10 @@ def _window(
         tracking_control_config=mediator.tracking_estimator.config,
         apply_tracking_control_tuning=(
             apply_tracking_control_tuning or (lambda _config: None)
+        ),
+        tracking_stereo_left_hfov_deg=mediator.tracking_stereo_left_hfov_deg,
+        apply_tracking_stereo_left_hfov_deg=(
+            mediator.set_tracking_stereo_left_hfov_deg
         ),
         tracking_visualization_config=(
             tracking_visualization_config
@@ -2635,6 +2640,28 @@ def test_operator_tracking_panel_queues_only_exposed_typed_runtime_fields(
     )
     assert update.platform_motion == initial.platform_motion
     assert operator.tracking_status_label.text().startswith("Отправлено:")
+    assert operator.tracking_error_label.text() == ""
+    window.close()
+
+
+def test_operator_tracking_hfov_uses_numeric_degrees_and_applies_runtime_override(
+    qt_application: QApplication,
+) -> None:
+    window, mediator, turret, _bindings_value, _states = _window(qt_application)
+    operator = window.operator_window
+
+    assert operator.tracking_hfov_input.isEnabled()
+    assert operator.tracking_hfov_input.value() == pytest.approx(6.3)
+    assert operator.tracking_hfov_input.suffix() == " °"
+    assert operator.tracking_hfov_input.singleStep() == pytest.approx(0.1)
+    invalidations = turret.invalidations
+
+    operator.tracking_hfov_input.setValue(10.0)
+    QTest.mouseClick(operator.tracking_hfov_apply_button, Qt.MouseButton.LeftButton)
+
+    assert mediator.tracking_stereo_left_hfov_deg == pytest.approx(10.0)
+    assert turret.invalidations == invalidations + 1
+    assert "10.000°" in operator.tracking_hfov_status_label.text()
     assert operator.tracking_error_label.text() == ""
     window.close()
 

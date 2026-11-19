@@ -172,6 +172,8 @@ class MainWindow(QMainWindow):
         tracking_control_config: TrackingControlConfig,
         apply_tracking_control_tuning: Callable[[TrackingControlConfig], None],
         ui_config: UiConfig | None = None,
+        tracking_stereo_left_hfov_deg: float | None = None,
+        apply_tracking_stereo_left_hfov_deg: Callable[[float], None] | None = None,
         persist_ui_config: Callable[[UiConfig], None] | None = None,
         vision_processor_selections: Mapping[CameraRole, VisionProcessorSelection] | None = None,
         apply_vision_processor_selection: (
@@ -479,6 +481,10 @@ class MainWindow(QMainWindow):
             on_apply_motion_limits_tuning=apply_motion_limits_tuning,
             tracking_control_config=tracking_control_config,
             on_apply_tracking_control_tuning=self._apply_tracking_control_tuning,
+            tracking_stereo_left_hfov_deg=tracking_stereo_left_hfov_deg,
+            on_apply_tracking_stereo_left_hfov_deg=(
+                apply_tracking_stereo_left_hfov_deg
+            ),
             tracking_visualization_config=tracking_visualization_config,
             on_tracking_visualization_changed=self._set_tracking_visualization,
             use_camera_time_for_tracking=mediator.use_camera_time_for_tracking,
@@ -971,7 +977,7 @@ class MainWindow(QMainWindow):
         model = (
             None
             if result is None or not is_control_main
-            else self._mediator.session_gate.camera_model(
+            else self._mediator.tracking_camera_model(
                 result.frame.camera,
                 result.frame.generation,
             )
