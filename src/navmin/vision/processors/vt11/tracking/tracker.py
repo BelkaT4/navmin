@@ -468,6 +468,7 @@ class TrackFrameResult:
     diagnostic_reason: str = ""
     maneuver_hypothesis_xy: tuple[float, float] | None = None
     maneuver_hits: int = 0
+    line_recovery_hits: int = 0
     # HOTFIX-2: retain diagnostics for the best evaluated candidate even when
     # it is rejected by gates. This is essential for distinguishing detector
     # failure from identity/threshold failure.
@@ -895,6 +896,7 @@ def _tracking_incremental_engine(
     previous_global_shift_frame: int | None = None
     maneuver_freeze_until = -1
     maneuver_evidence: ManeuverEvidence | None = None
+    line_evidence: deque[tuple[int, Candidate, float, float]] = deque(maxlen=2)
 
     # HOTFIX-2 reliable spatial anchor: unlike normal motion history this is
     # changed only by a trusted observation or a temporally confirmed jump.
@@ -1661,6 +1663,38 @@ def _tracking_incremental_engine(
         # drift rescue or visual motion-break logic.
         if hud_hard_reject:
             reasons.append("HUD_HARD_REJECT")
+
+        line_recovery_hits = 0
+        if best.candidate.detection_channel == "LINE_RECOVERY":
+            line_evidence.append((frame_index, best.candidate, best.similarity.total, gap))
+            confirmed_line = False
+            if len(line_evidence) == 2:
+                first_line, second_line = line_evidence
+                confirmed_line = bool(
+                    second_line[0] == first_line[0] + 1
+                    and min(first_line[2], second_line[2])
+                    >= max(0.50, config.min_identity_similarity)
+                    and min(first_line[3], second_line[3])
+                    >= max(0.08, config.min_confidence_gap)
+                    and hypot(
+                        first_line[1].center_x - second_line[1].center_x,
+                        first_line[1].center_y - second_line[1].center_y,
+                    )
+                    <= 90
+                    and abs(
+                        np.log(
+                            max(1, first_line[1].area_px)
+                            / max(1, second_line[1].area_px)
+                        )
+                    )
+                    <= 0.5
+                )
+            if not confirmed_line:
+                reasons.append("LINE_RECOVERY_PENDING_OR_INCONSISTENT")
+            line_recovery_hits = 2 if confirmed_line else 1
+        else:
+            line_evidence.clear()
+
         if reticle_occlusion_active and hud_exit_candidate and not reticle_exit_confirmed:
             reasons.append(f"HUD_EXIT_CONFIRM_{reticle_exit_hits}_OF_{config.hud_exit_confirm_hits}")
         if reticle_exit_confirmed:
@@ -1757,6 +1791,7 @@ def _tracking_incremental_engine(
                 and best_hud_probability <= config.hud_soft_probability_threshold
                 and (not warmup or prediction_error <= config.warmup_max_unexplained_jump_px)
                 and (not scale_suspicious or scale_quarantine_confirmed)
+                and not selected.separated_from_line
             )
             trusted_anchor = bool(
                 jump_quarantine_confirmed
@@ -1767,12 +1802,17 @@ def _tracking_incremental_engine(
                          or ((not has_competitor) and float(best.motion_score) >= 0.75))
                     and not best_hud_hard
                     and best_hud_probability <= config.hud_soft_probability_threshold
+                    and not selected.separated_from_line
                 )
             )
             if trusted_anchor:
                 reliable_anchor_xy = (float(selected.center_x), float(selected.center_y))
                 reliable_anchor_frame = int(frame_index)
-            if reliable_scale_anchor is not None and reliable_scale_anchor.config.enabled:
+            if (
+                reliable_scale_anchor is not None
+                and reliable_scale_anchor.config.enabled
+                and not selected.separated_from_line
+            ):
                 if scale_quarantine_confirmed:
                     recent_areas = [float(e["area"]) for e in list(scale_evidence)[-max(1, scale_quarantine_required_hits):]]
                     if bool(getattr(best, "scale_is_expansion", False)) and recent_areas:
@@ -1819,6 +1859,10 @@ def _tracking_incremental_engine(
                 reason = "ACCEPTED_DRIFT_RESCUE"
             elif anchor_continuity_override:
                 reason = "ACCEPTED_ANCHOR_CONTINUITY"
+            elif selected.detection_channel == "LINE_RECOVERY":
+                reason = "ACCEPTED_LINE_RECOVERY_CONFIRMED"
+            elif selected.separated_from_line:
+                reason = "ACCEPTED_LINE_SEPARATED_CORE"
             elif warmup:
                 reason = "ACCEPTED_TRACK_WARMUP"
             else:
@@ -1828,6 +1872,8 @@ def _tracking_incremental_engine(
                     adapt_event = adaptation_adapter.blocked_event(
                         frame_index, "BLOCKED_DAY_MANEUVER_RELOCK"
                     )
+                elif selected.separated_from_line:
+                    adapt_event = adaptation_adapter.blocked_event(frame_index, "BLOCKED_LINE_OVERLAP")
                 elif best_hud_probability >= config.hud_soft_probability_threshold:
                     adapt_event = adaptation_adapter.blocked_event(frame_index, "BLOCKED_HUD_NEGATIVE")
                 elif scale_expansion_uncertain and not scale_quarantine_confirmed:
@@ -1883,6 +1929,7 @@ def _tracking_incremental_engine(
             motion_score=float(best.motion_score), size_score=float(best.size_score), status=status,
             miss_count=((frame_index - start_frame) + 1) if warmup and selected is None else miss_count,
             prediction_error_px=prediction_error, confidence=confidence, diagnostic_reason=reason,
+            line_recovery_hits=line_recovery_hits,
             best_candidate_center=(float(best.candidate.center_x), float(best.candidate.center_y)),
             best_candidate_bbox=(int(best.candidate.bbox.x), int(best.candidate.bbox.y), int(best.candidate.bbox.width), int(best.candidate.bbox.height)),
             best_candidate_area_px=int(best.candidate.area_px), best_candidate_mean_response=float(best.candidate.mean_response),

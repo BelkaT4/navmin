@@ -1135,8 +1135,15 @@ def _reacquisition_incremental_engine(
             trusted_scale = (
                 (float(selected_tracklet_identity) if selected_tracklet_identity > 0 else float(best.similarity.total)) >= config.size_update_min_identity
                 and (float(selected_tracklet_gap) if selected_tracklet_identity > 0 else float(evidence_gap)) >= config.size_update_min_gap
+                and not selected.separated_from_line
+                and selected.detection_channel != "LINE_RECOVERY"
             )
-            if reliable_scale_anchor is not None and reliable_scale_anchor.config.enabled:
+            if (
+                reliable_scale_anchor is not None
+                and reliable_scale_anchor.config.enabled
+                and not selected.separated_from_line
+                and selected.detection_channel != "LINE_RECOVERY"
+            ):
                 if selected_scale_confirmed:
                     reliable_scale_anchor.commit_confirmed_transition(
                         confirmed_scale_areas or [float(max(1, selected.area_px))], frame_index

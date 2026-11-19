@@ -23,6 +23,7 @@ acquire:
   - 40
   - 50
   candidate_detector:
+    reject_line_components: true
     method: local_contrast_components
     blur_sigma_px: 3.0
     threshold_sigma: 2.5
@@ -500,6 +501,7 @@ profiles:
       acquire:
         candidate_detector:
           method: local_contrast_components
+          visible_line_recovery_enabled: false
           micro_enabled: false
           adaptive_min_area_ratio: 0.12
           adaptive_max_area_ratio: 4.5

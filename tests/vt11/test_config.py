@@ -30,6 +30,13 @@ def test_default_config_loads():
     assert cfg["hotfix2"]["make_zip_bundle"] is True
     assert cfg["acquire"]["candidate_detector"]["adaptive_area_enabled"] is True
     assert cfg["acquire"]["candidate_detector"]["adaptive_min_area_ratio"] == 0.15
+    assert cfg["acquire"]["candidate_detector"]["reject_line_components"] is True
+    assert (
+        cfg["profiles"]["day"]["overrides"]["acquire"]["candidate_detector"][
+            "visible_line_recovery_enabled"
+        ]
+        is False
+    )
     assert cfg["reacquisition"]["confirm_frames"] == 3
     assert cfg["reacquisition"]["confirm_window_frames"] == 5
     assert cfg["adaptation"]["ema"]["min_confidence"] == 0.68

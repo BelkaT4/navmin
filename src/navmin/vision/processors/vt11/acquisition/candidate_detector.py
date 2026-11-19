@@ -10,7 +10,7 @@ components while the tracked object occupied roughly 1.3-2.4 kpx.
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
-from math import exp, hypot, log
+from math import exp, hypot, log, sqrt
 
 import cv2
 import numpy as np
@@ -30,6 +30,8 @@ class CandidateDetectorConfig:
     spatial_sigma_px: float = 35.0
     spatial_weight: float = 0.80
     detector_weight: float = 0.20
+    reject_line_components: bool = False
+    visible_line_recovery_enabled: bool = False
 
     # HOTFIX-3 target-relative size filtering/ranking.  These parameters are
     # ignored during the first ACQUIRE click where expected_area_px is unknown.
@@ -145,7 +147,8 @@ class Candidate:
     rank_score: float
     # 1.0 when target-relative filtering is not active.
     size_prior: float = 1.0
-    detection_channel: str = "NORMAL"  # NORMAL | MICRO
+    detection_channel: str = "NORMAL"  # NORMAL | MICRO | LINE_RECOVERY
+    separated_from_line: bool = False
 
     @property
     def center(self) -> tuple[float, float]:
@@ -163,6 +166,7 @@ class DetectionDiagnostics:
     effective_min_area_px: int = 0
     effective_max_area_px: int = 0
     micro_valid_components: int = 0
+    rejected_line_components: int = 0
 
 
 @dataclass(frozen=True)
@@ -184,6 +188,8 @@ def config_from_dict(data: dict | None) -> CandidateDetectorConfig:
         spatial_sigma_px=float(data.get("spatial_sigma_px", 35.0)),
         spatial_weight=float(data.get("spatial_weight", 0.80)),
         detector_weight=float(data.get("detector_weight", 0.20)),
+        reject_line_components=bool(data.get("reject_line_components", False)),
+        visible_line_recovery_enabled=bool(data.get("visible_line_recovery_enabled", False)),
         adaptive_area_enabled=bool(data.get("adaptive_area_enabled", True)),
         adaptive_hard_max_area_px=int(data.get("adaptive_hard_max_area_px", 50000)),
         adaptive_min_area_ratio=float(data.get("adaptive_min_area_ratio", 0.15)),
@@ -337,6 +343,102 @@ def _expected_area_prior(area_px: int, expected_area_px: float | None, sigma_log
     return float(exp(-abs(log(ratio)) / max(1e-9, sigma_log)))
 
 
+def _component_spread(component: np.ndarray, area: int) -> tuple[float, float]:
+    y, x = np.nonzero(component)
+    points = np.column_stack((x, y)).astype(np.float64)
+    points -= points.mean(axis=0)
+    minor, major = np.linalg.eigvalsh((points.T @ points) / area)
+    return float(major), max(0.25, float(minor))
+
+
+def _thin_line_overlap_core(pixels: np.ndarray, expected_area: float) -> np.ndarray:
+    """Keep local thickness anomalies, bounded to the expected target scale."""
+    mask = pixels.astype(np.uint8)
+    padded = cv2.copyMakeBorder(mask, 1, 1, 1, 1, cv2.BORDER_CONSTANT, value=0)
+    distance = cv2.distanceTransform(padded, cv2.DIST_L2, 5)[1:-1, 1:-1]
+    thickness = max(2.0, min(6.0, 0.10 * sqrt(expected_area)))
+    seeds = (distance >= thickness).astype(np.uint8)
+    count, labels, stats, _ = cv2.connectedComponentsWithStats(seeds)
+    result = np.zeros_like(mask, dtype=bool)
+    radius = int(np.ceil(thickness))
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * radius + 1, 2 * radius + 1))
+    for label in range(1, count):
+        x, y, w, h, area = stats[label]
+        if area < max(6, 0.02 * expected_area) or max(w, h) > 3 * sqrt(expected_area):
+            continue
+        core = cv2.dilate((labels == label).astype(np.uint8), kernel).astype(bool) & pixels
+        core_area = int(core.sum())
+        if not 0.20 * expected_area <= core_area <= 2.5 * expected_area:
+            continue
+        major, minor = _component_spread(core, core_area)
+        if major >= 25 * minor:
+            continue
+        result |= core
+    return result
+
+
+def _suppress_lines(
+    labels: np.ndarray,
+    stats: np.ndarray,
+    expected_area: float | None,
+    *,
+    recover_blurred_cores: bool = False,
+) -> tuple[np.ndarray, np.ndarray, int]:
+    """Remove long line responses and retain plausible compact cores."""
+    cleaned = (labels != 0).astype(np.uint8)
+    restored = np.zeros_like(cleaned)
+    rejected = 0
+    kernel = None
+    if expected_area is not None and expected_area >= 100:
+        core_width = _odd_kernel(max(5, min(25, int(round(0.5 * expected_area**0.5)))))
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (core_width, core_width))
+    for label, (x, y, w, h, area) in enumerate(stats[1:], 1):
+        if max(w, h) < 30:
+            continue
+        region = np.s_[y:y + h, x:x + w]
+        pixels = labels[region] == label
+        major, minor = _component_spread(pixels, int(area))
+        pure_line = major >= 100.0 and major >= 64.0 * minor
+        possible_overlap = (
+            kernel is not None
+            and expected_area is not None
+            and max(w, h) >= 5.0 * expected_area**0.5
+            and major >= 16.0 * minor
+        )
+        if not pure_line and not possible_overlap:
+            continue
+        rejected += 1
+        cleaned[region][pixels] = 0
+        if possible_overlap:
+            opened = cv2.morphologyEx(
+                pixels.astype(np.uint8),
+                cv2.MORPH_OPEN,
+                kernel,
+                borderType=cv2.BORDER_CONSTANT,
+                borderValue=0,
+            )
+            count, parts, core_stats, _ = cv2.connectedComponentsWithStats(opened, connectivity=8)
+            for part in range(1, count):
+                core_area = int(core_stats[part, cv2.CC_STAT_AREA])
+                if not 0.45 * expected_area <= core_area <= 1.7 * expected_area:
+                    continue
+                core = parts == part
+                core_major, core_minor = _component_spread(core, core_area)
+                if core_major < 16.0 * core_minor:
+                    cleaned[region][core] = 1
+                    restored[region][core] = 1
+        if (
+            recover_blurred_cores
+            and expected_area is not None
+            and expected_area >= 100
+            and not np.any(restored[region][pixels])
+        ):
+            core = _thin_line_overlap_core(pixels, expected_area)
+            cleaned[region][core] = 1
+            restored[region][core] = 2
+    return cleaned, restored, rejected
+
+
 def detect_local_candidates(
     frame_bgr: np.ndarray,
     selection: OperatorSelection,
@@ -396,6 +498,17 @@ def detect_local_candidates(
         cfg, expected_area_px, roi_area_px=int(roi.width * roi.height),
         acquire_large_scale_pass=acquire_large_scale_pass,
     )
+    restored: np.ndarray | None = None
+    rejected_lines = 0
+    if cfg.reject_line_components and cfg.method == "local_contrast_components":
+        cleaned, restored, rejected_lines = _suppress_lines(
+            labels,
+            stats,
+            expected,
+            recover_blurred_cores=cfg.visible_line_recovery_enabled,
+        )
+        if rejected_lines:
+            count, labels, stats, centroids = cv2.connectedComponentsWithStats(cleaned, connectivity=8)
 
     provisional: list[Candidate] = []
     micro_provisional: list[Candidate] = []
@@ -425,7 +538,8 @@ def detect_local_candidates(
         distance = hypot(cx - selection.click_x, cy - selection.click_y)
         spatial_prior = exp(-(distance * distance) / (2.0 * cfg.spatial_sigma_px * cfg.spatial_sigma_px))
 
-        component_values = response[labels == label_id]
+        component = labels[y:y + h, x:x + w] == label_id
+        component_values = response[y:y + h, x:x + w][component]
         mean_response = float(component_values.mean()) if component_values.size else 0.0
         peak_response = float(component_values.max()) if component_values.size else 0.0
         detector_strength = min(1.0, mean_response / max(threshold * 2.0, 1e-6))
@@ -436,6 +550,8 @@ def detect_local_candidates(
             size_prior = _expected_area_prior(area, expected, cfg.expected_area_sigma_log)
             rank_score = spatial_w * spatial_prior + detector_w * detector_strength + size_w * size_prior
             channel = "NORMAL"
+            if restored is not None and np.any(restored[y:y + h, x:x + w][component] == 2):
+                channel = "LINE_RECOVERY"
             target_list = provisional
         else:
             if mean_response < threshold * cfg.micro_response_multiplier:
@@ -462,6 +578,11 @@ def detect_local_candidates(
                 rank_score=float(rank_score),
                 size_prior=float(size_prior),
                 detection_channel=channel,
+                separated_from_line=bool(
+                    rejected_lines
+                    and restored is not None
+                    and np.any(restored[y:y + h, x:x + w][component])
+                ),
             )
         )
 
@@ -522,6 +643,7 @@ def detect_local_candidates(
                 rank_score=c.rank_score,
                 size_prior=c.size_prior,
                 detection_channel=c.detection_channel,
+                separated_from_line=c.separated_from_line,
             )
         )
 
@@ -537,6 +659,7 @@ def detect_local_candidates(
             effective_min_area_px=effective_min_area,
             effective_max_area_px=effective_max_area,
             micro_valid_components=len(micro_provisional),
+            rejected_line_components=rejected_lines,
         ),
     )
 

@@ -406,9 +406,9 @@ def run_initial_train(
         selected = best.candidate
         prev_center = selected.center
         history.append(prev_center)
-        if large_target_train:
+        if large_target_train and not selected.separated_from_line:
             area_history.append(float(selected.area_px))
-        if best.total_score >= config.bank_update_min_score:
+        if best.total_score >= config.bank_update_min_score and not selected.separated_from_line:
             bank.add(descriptor_from_candidate(frame, selected))
         frame_results.append(
             TrainFrameResult(
