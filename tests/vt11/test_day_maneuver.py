@@ -108,6 +108,9 @@ def test_two_observations_restore_target_and_seed_new_velocity_without_training(
     assert result.frames[1].adaptation_reason == "BLOCKED_DAY_MANEUVER_RELOCK"
     assert result.frames[2].adaptation_reason == "BLOCKED_DAY_MANEUVER_RELOCK"
     assert adapter.update_count == 0
+    assert adapter.bank.adaptive_descriptor is None
+    assert adapter.bank.fast_descriptor is None
+    assert adapter.bank.recent_count == 0
     assert abs(result.frames[2].selected.center_x - 80) < 3
 
 
@@ -123,6 +126,9 @@ def test_one_observation_then_disappearance_cannot_be_confirmed():
     assert result.frames[-1].status == "LOST"
     assert all(frame.selected is None for frame in result.frames)
     assert adapter.update_count == 0
+    assert adapter.bank.adaptive_descriptor is None
+    assert adapter.bank.fast_descriptor is None
+    assert adapter.bank.recent_count == 0
 
 
 def test_branch_cannot_override_thermal_profile():
@@ -203,3 +209,94 @@ def test_adaptation_freeze_includes_confirmation_frame_plus_three():
         "BLOCKED_DAY_MANEUVER_RELOCK",
     ]
     assert result.frames[5].adaptation_reason != "BLOCKED_DAY_MANEUVER_RELOCK"
+
+
+def test_maneuver_freeze_blocks_scale_and_spatial_anchor_through_three_followups():
+    width = 520
+
+    def image(x: int, scale: float = 1.0) -> np.ndarray:
+        frame = np.full((180, width, 3), 28, np.uint8)
+        half_w = round(10 * scale)
+        half_h = round(8 * scale)
+        cv2.rectangle(
+            frame,
+            (x - half_w, 88 - half_h),
+            (x + half_w, 88 + half_h),
+            (225, 225, 225),
+            -1,
+        )
+        cv2.rectangle(
+            frame,
+            (x + round(7 * scale), 83),
+            (x + round(16 * scale), 89),
+            (150, 150, 150),
+            -1,
+        )
+        return frame
+
+    detector = CandidateDetectorConfig(
+        threshold_sigma=1.8,
+        min_response=3,
+        max_area_px=3000,
+    )
+    initial = image(300)
+    selection = make_operator_selection(
+        frame_index=0,
+        click_xy=(300, 88),
+        radius_px=70,
+        frame_width=width,
+        frame_height=180,
+    )
+    candidate = detect_local_candidates(initial, selection, config=detector).candidates[0]
+    bank = ReferenceBank(descriptors=[descriptor_from_candidate(initial, candidate)])
+    adapter = EMAReferenceAdapter(bank, EMAConfig(mode="adaptive_memory"))
+    frames = [initial] * 3 + [
+        image(260),
+        image(220),
+        image(180, 1.05),
+        image(140, 1.05),
+        image(100, 1.05),
+        image(60, 1.05),
+        image(30, 1.05),
+    ]
+
+    result = run_tracking(
+        frame_reader=lambda i: (i, frames[i]),
+        frame_count=len(frames),
+        frame_width=width,
+        frame_height=180,
+        start_frame=3,
+        reference_bank=bank,
+        initial_history=[(260, 88), (280, 88), (300, 88)],
+        detector_config=detector,
+        config=TrackingConfig(
+            day_maneuver_search_enabled=True,
+            search_radius_px=70,
+            dynamic_search_enabled=False,
+            min_track_score=0.8,
+            motion_sigma_px=8,
+            size_update_min_identity=0.0,
+            size_update_min_gap=0.0,
+            size_update_max_prediction_error_px=999.0,
+            reliable_anchor_update_max_prediction_error_px=999.0,
+            expected_area_update_alpha=1.0,
+            size_update_max_step_ratio=10.0,
+        ),
+        thermal_profile=ThermalProfile(
+            "visible",
+            "off",
+            np.zeros((180, width), np.uint8),
+            (),
+        ),
+        adaptation_adapter=adapter,
+    )
+
+    confirm = result.frames[1]
+    assert confirm.frame_index == 4
+    assert confirm.diagnostic_reason == "ACCEPTED_DAY_MANEUVER_RELOCK"
+    frozen_area = confirm.expected_area_px
+    for frame in result.frames[1:5]:
+        assert frame.expected_area_px == pytest.approx(frozen_area)
+        assert frame.reliable_anchor_xy == pytest.approx((300.0, 88.0))
+    assert result.frames[5].expected_area_px != pytest.approx(frozen_area)
+    assert result.frames[6].reliable_anchor_xy != pytest.approx((300.0, 88.0))

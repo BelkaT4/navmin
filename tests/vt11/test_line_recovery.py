@@ -110,6 +110,9 @@ def test_requires_two_observations_and_blocks_training_on_recovered_component():
     assert result.frames[1].line_recovery_hits == 2
     assert result.frames[1].adaptation_reason == 'BLOCKED_LINE_OVERLAP'
     assert adapter.update_count == 0
+    assert adapter.bank.adaptive_descriptor is None
+    assert adapter.bank.fast_descriptor is None
+    assert adapter.bank.recent_count == 0
 
 
 def test_single_recovered_object_then_disappearance_is_never_accepted():
@@ -117,6 +120,9 @@ def test_single_recovered_object_then_disappearance_is_never_accepted():
     assert not any(r.selected is not None for r in result.frames)
     assert result.frames[-1].status == 'LOST'
     assert adapter.update_count == 0
+    assert adapter.bank.adaptive_descriptor is None
+    assert adapter.bank.fast_descriptor is None
+    assert adapter.bank.recent_count == 0
 
 
 def test_reacq_line_recovery_keeps_temporal_confirmation_without_scale_learning():

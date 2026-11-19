@@ -468,6 +468,7 @@ class ReacquisitionContinuitySnapshot:
     auto_promoted: bool
     scale_model: ScaleStabilityModel | None
     reliable_scale_anchor: ReliableScaleAnchor | None
+    memory_freeze_until_frame: int
 
 
 @dataclass
@@ -482,6 +483,7 @@ class _ReacquisitionContinuityState:
     auto_promoted: bool = False
     scale_model: ScaleStabilityModel | None = None
     reliable_scale_anchor: ReliableScaleAnchor | None = None
+    memory_freeze_until_frame: int = -1
 
 
 def _radius_for_frame(*, cfg: ReacquisitionConfig, elapsed_frames: int, speed_px_per_frame: float, uncertainty_px: float) -> int:
@@ -586,6 +588,7 @@ def _reacquisition_incremental_engine(
     motion_broken: bool = False,
     scale_model: ScaleStabilityModel | None = None,
     reliable_scale_anchor: ReliableScaleAnchor | None = None,
+    initial_memory_freeze_until_frame: int = -1,
     continuity_state: _ReacquisitionContinuityState | None = None,
 ) -> Iterator[ReacqFrameResult]:
     """Attempt reacquisition; use robust visual tracklets after MOTION_BREAK."""
@@ -730,6 +733,9 @@ def _reacquisition_incremental_engine(
         continuity_state.auto_promoted = bool(auto_promoted)
         continuity_state.scale_model = scale_model
         continuity_state.reliable_scale_anchor = reliable_scale_anchor
+        continuity_state.memory_freeze_until_frame = int(
+            initial_memory_freeze_until_frame
+        )
 
     def thermal_profile_score(sim) -> float:
         vals = [
@@ -1133,7 +1139,8 @@ def _reacquisition_incremental_engine(
             # redefine the session-wide ReliableAreaAnchor after a large change.
             # Ordinary confirmations only follow it slowly when trusted.
             trusted_scale = (
-                (float(selected_tracklet_identity) if selected_tracklet_identity > 0 else float(best.similarity.total)) >= config.size_update_min_identity
+                frame_index > initial_memory_freeze_until_frame
+                and (float(selected_tracklet_identity) if selected_tracklet_identity > 0 else float(best.similarity.total)) >= config.size_update_min_identity
                 and (float(selected_tracklet_gap) if selected_tracklet_identity > 0 else float(evidence_gap)) >= config.size_update_min_gap
                 and not selected.separated_from_line
                 and selected.detection_channel != "LINE_RECOVERY"
@@ -1141,6 +1148,7 @@ def _reacquisition_incremental_engine(
             if (
                 reliable_scale_anchor is not None
                 and reliable_scale_anchor.config.enabled
+                and frame_index > initial_memory_freeze_until_frame
                 and not selected.separated_from_line
                 and selected.detection_channel != "LINE_RECOVERY"
             ):
@@ -1282,6 +1290,7 @@ class ReacquisitionRuntime:
         motion_broken: bool = False,
         scale_model: ScaleStabilityModel | None = None,
         reliable_scale_anchor: ReliableScaleAnchor | None = None,
+        initial_memory_freeze_until_frame: int = -1,
         frame_count: int | None = None,
     ) -> None:
         config.validate()
@@ -1345,6 +1354,7 @@ class ReacquisitionRuntime:
             motion_broken=motion_broken,
             scale_model=scale_model,
             reliable_scale_anchor=reliable_scale_anchor,
+            initial_memory_freeze_until_frame=initial_memory_freeze_until_frame,
             continuity_state=self._continuity_state,
         )
 
@@ -1390,6 +1400,7 @@ class ReacquisitionRuntime:
             auto_promoted=bool(state.auto_promoted),
             scale_model=state.scale_model,
             reliable_scale_anchor=state.reliable_scale_anchor,
+            memory_freeze_until_frame=int(state.memory_freeze_until_frame),
         )
 
     def collection_state_sizes(self) -> dict[str, int]:
@@ -1433,6 +1444,7 @@ def run_reacquisition(
     motion_broken: bool = False,
     scale_model: ScaleStabilityModel | None = None,
     reliable_scale_anchor: ReliableScaleAnchor | None = None,
+    initial_memory_freeze_until_frame: int = -1,
 ) -> ReacquisitionResult:
     """Compatibility batch wrapper over :class:`ReacquisitionRuntime`."""
     config.validate()
@@ -1482,6 +1494,7 @@ def run_reacquisition(
         motion_broken=motion_broken,
         scale_model=scale_model,
         reliable_scale_anchor=reliable_scale_anchor,
+        initial_memory_freeze_until_frame=initial_memory_freeze_until_frame,
     )
     results: list[ReacqFrameResult] = []
     stopped = False

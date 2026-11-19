@@ -188,6 +188,7 @@ class Vt11TargetSession:
         self.expected_area_px = float(self.reference_bank.expected_size_px())
         self.scale_model: ScaleStabilityModel | None = None
         self.reliable_scale_anchor: ReliableScaleAnchor | None = None
+        self._memory_freeze_until_frame = -1
         self._initialize_scale_continuity()
 
         self.phase = "TRACK"
@@ -271,6 +272,7 @@ class Vt11TargetSession:
             thermal_profile=self.thermal_profile,
             scale_model=self.scale_model,
             reliable_scale_anchor=self.reliable_scale_anchor,
+            initial_memory_freeze_until_frame=self._memory_freeze_until_frame,
             _adaptation_event_history_limit=(
                 None
                 if self._collect_compatibility_history
@@ -303,6 +305,7 @@ class Vt11TargetSession:
             motion_broken=snapshot.motion_broken_at_lost,
             scale_model=self.scale_model,
             reliable_scale_anchor=self.reliable_scale_anchor,
+            initial_memory_freeze_until_frame=snapshot.memory_freeze_until_frame,
         )
         self._tracking_runtime = None
         self.next_frame_index = lost_frame + 1
@@ -338,6 +341,9 @@ class Vt11TargetSession:
                 self.expected_area_px = float(snapshot.expected_area_px)
                 self.scale_model = snapshot.scale_model
                 self.reliable_scale_anchor = snapshot.reliable_scale_anchor
+                self._memory_freeze_until_frame = int(
+                    snapshot.memory_freeze_until_frame
+                )
                 self.motion_break_events += int(snapshot.motion_break_events)
                 self.lost_events += 1
                 if (
@@ -376,6 +382,9 @@ class Vt11TargetSession:
             self.expected_area_px = float(snapshot.expected_area_px)
             self.scale_model = snapshot.scale_model
             self.reliable_scale_anchor = snapshot.reliable_scale_anchor
+            self._memory_freeze_until_frame = int(
+                snapshot.memory_freeze_until_frame
+            )
             if snapshot.motion_relocked and snapshot.confirmation_points:
                 self.motion_history = list(snapshot.confirmation_points)
             else:
@@ -407,6 +416,9 @@ class Vt11TargetSession:
             )
             self.scale_model = snapshot.scale_model
             self.reliable_scale_anchor = snapshot.reliable_scale_anchor
+            self._memory_freeze_until_frame = int(
+                snapshot.memory_freeze_until_frame
+            )
             finite_eof = (
                 self.frame_count is not None
                 and runtime.end_frame_exclusive >= self.frame_count

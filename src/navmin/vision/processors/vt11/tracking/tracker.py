@@ -604,6 +604,7 @@ class TrackingContinuitySnapshot:
     scale_model: ScaleStabilityModel | None
     reliable_scale_anchor: ReliableScaleAnchor | None
     motion_break_events: int
+    memory_freeze_until_frame: int
 
 
 @dataclass
@@ -616,6 +617,7 @@ class _TrackingContinuityState:
     scale_model: ScaleStabilityModel | None = None
     reliable_scale_anchor: ReliableScaleAnchor | None = None
     motion_break_events: int = 0
+    memory_freeze_until_frame: int = -1
 
 
 FrameReader = Callable[[int], tuple[int, np.ndarray]]
@@ -817,6 +819,7 @@ def _tracking_incremental_engine(
     thermal_profile: ThermalProfile | None = None,
     scale_model: ScaleStabilityModel | None = None,
     reliable_scale_anchor: ReliableScaleAnchor | None = None,
+    initial_memory_freeze_until_frame: int = -1,
     continuity_state: _TrackingContinuityState | None = None,
 ) -> Iterator[TrackFrameResult]:
     """Track until EOF/LOST with event-driven HOTFIX-6 motion recovery.
@@ -894,7 +897,7 @@ def _tracking_incremental_engine(
     prev_raw_frame: np.ndarray | None = None
     previous_global_shift_xy: tuple[float, float] | None = None
     previous_global_shift_frame: int | None = None
-    maneuver_freeze_until = -1
+    memory_freeze_until_frame = int(initial_memory_freeze_until_frame)
     maneuver_evidence: ManeuverEvidence | None = None
     line_evidence: deque[tuple[int, Candidate, float, float]] = deque(maxlen=2)
 
@@ -955,6 +958,7 @@ def _tracking_incremental_engine(
         continuity_state.scale_model = scale_model
         continuity_state.reliable_scale_anchor = reliable_scale_anchor
         continuity_state.motion_break_events = int(motion_break_events)
+        continuity_state.memory_freeze_until_frame = int(memory_freeze_until_frame)
 
     def clipped(xy: tuple[float, float]) -> tuple[float, float]:
         return (
@@ -1185,7 +1189,9 @@ def _tracking_incremental_engine(
                         predicted = center
                         radius = alternate_radius
                         detection, ranked = alternate_detection, alternate
-                        maneuver_freeze_until = frame_index + 3
+                        memory_freeze_until_frame = max(
+                            memory_freeze_until_frame, frame_index + 3
+                        )
                     maneuver_evidence = None if maneuver_relocked else evidence
                 else:
                     maneuver_evidence = None
@@ -1784,6 +1790,7 @@ def _tracking_incremental_engine(
                     del warmup_points[:-warmup_limit]
             trusted_scale = (
                 float(best.similarity.total) >= config.size_update_min_identity
+                and frame_index > memory_freeze_until_frame
                 and float(gap) >= config.size_update_min_gap
                 and prediction_error <= config.size_update_max_prediction_error_px
                 and not motion_break_triggered
@@ -1794,15 +1801,26 @@ def _tracking_incremental_engine(
                 and not selected.separated_from_line
             )
             trusted_anchor = bool(
-                jump_quarantine_confirmed
-                or (
-                    prediction_error <= config.reliable_anchor_update_max_prediction_error_px
-                    and float(best.similarity.total) >= config.size_update_min_identity
-                    and ((has_competitor and gap >= config.min_confidence_gap)
-                         or ((not has_competitor) and float(best.motion_score) >= 0.75))
-                    and not best_hud_hard
-                    and best_hud_probability <= config.hud_soft_probability_threshold
-                    and not selected.separated_from_line
+                frame_index > memory_freeze_until_frame
+                and (
+                    jump_quarantine_confirmed
+                    or (
+                        prediction_error
+                        <= config.reliable_anchor_update_max_prediction_error_px
+                        and float(best.similarity.total)
+                        >= config.size_update_min_identity
+                        and (
+                            (has_competitor and gap >= config.min_confidence_gap)
+                            or (
+                                (not has_competitor)
+                                and float(best.motion_score) >= 0.75
+                            )
+                        )
+                        and not best_hud_hard
+                        and best_hud_probability
+                        <= config.hud_soft_probability_threshold
+                        and not selected.separated_from_line
+                    )
                 )
             )
             if trusted_anchor:
@@ -1811,6 +1829,7 @@ def _tracking_incremental_engine(
             if (
                 reliable_scale_anchor is not None
                 and reliable_scale_anchor.config.enabled
+                and frame_index > memory_freeze_until_frame
                 and not selected.separated_from_line
             ):
                 if scale_quarantine_confirmed:
@@ -1868,7 +1887,7 @@ def _tracking_incremental_engine(
             else:
                 reason = "ACCEPTED" if prediction_error <= config.prediction_error_warn_px else "ACCEPTED_PREDICTION_ERROR_HIGH"
             if adaptation_adapter is not None and adaptation_adapter.enabled:
-                if frame_index <= maneuver_freeze_until:
+                if frame_index <= memory_freeze_until_frame:
                     adapt_event = adaptation_adapter.blocked_event(
                         frame_index, "BLOCKED_DAY_MANEUVER_RELOCK"
                     )
@@ -2048,6 +2067,7 @@ class TrackingRuntime:
         thermal_profile: ThermalProfile | None = None,
         scale_model: ScaleStabilityModel | None = None,
         reliable_scale_anchor: ReliableScaleAnchor | None = None,
+        initial_memory_freeze_until_frame: int = -1,
         frame_count: int | None = None,
         _adaptation_event_history_limit: int | None = DEFAULT_ADAPTATION_EVENT_HISTORY,
     ) -> None:
@@ -2113,6 +2133,7 @@ class TrackingRuntime:
             thermal_profile=thermal_profile,
             scale_model=scale_model,
             reliable_scale_anchor=reliable_scale_anchor,
+            initial_memory_freeze_until_frame=initial_memory_freeze_until_frame,
             continuity_state=self._continuity_state,
         )
 
@@ -2172,6 +2193,7 @@ class TrackingRuntime:
             scale_model=state.scale_model,
             reliable_scale_anchor=state.reliable_scale_anchor,
             motion_break_events=int(state.motion_break_events),
+            memory_freeze_until_frame=int(state.memory_freeze_until_frame),
         )
 
     def collection_state_sizes(self) -> dict[str, int]:
@@ -2211,6 +2233,7 @@ def run_tracking(
     thermal_profile: ThermalProfile | None = None,
     scale_model: ScaleStabilityModel | None = None,
     reliable_scale_anchor: ReliableScaleAnchor | None = None,
+    initial_memory_freeze_until_frame: int = -1,
 ) -> TrackingResult:
     """Compatibility batch wrapper over :class:`TrackingRuntime`."""
     adapt_event_start = len(adaptation_adapter.events) if adaptation_adapter is not None else 0
@@ -2231,6 +2254,7 @@ def run_tracking(
         thermal_profile=thermal_profile,
         scale_model=scale_model,
         reliable_scale_anchor=reliable_scale_anchor,
+        initial_memory_freeze_until_frame=initial_memory_freeze_until_frame,
         _adaptation_event_history_limit=None,
     )
     results: list[TrackFrameResult] = []
