@@ -22,6 +22,8 @@ from navmin.contracts import (
     FramePacket,
     FrameSourceTimestamp,
     FrameTimestampSource,
+    TargetCandidateProposal,
+    TargetCandidateSet,
     VisionResult,
 )
 from navmin.vision.pipeline import (
@@ -145,6 +147,33 @@ class _DiagnosticsProcessor(_RecordingProcessor):
                 confidence=0.8,
                 prediction_error_px=1.5,
                 diagnostic_reason="OK",
+            ),
+        )
+
+
+class _CandidateProcessor(_RecordingProcessor):
+    def __init__(self) -> None:
+        super().__init__()
+        self.frame_id_offset = 0
+
+    def process(
+        self,
+        frame: FramePacket,
+        *,
+        processing_enabled: bool = True,
+    ) -> VisionProcessorOutput:
+        self.frames.append(frame)
+        self.processing_flags.append(processing_enabled)
+        return VisionProcessorOutput(
+            result=VisionResult(frame=frame, tracked_objects=(), processing_time_ns=0),
+            acquisition_candidates=TargetCandidateSet(
+                selection_id=3,
+                camera=frame.camera,
+                generation=frame.generation,
+                frame_id=frame.frame_id + self.frame_id_offset,
+                candidates=(
+                    TargetCandidateProposal(7, BBox(5, 6, 7, 8), 0.9, 1),
+                ),
             ),
         )
 
@@ -884,3 +913,32 @@ def test_camera_diagnostics_log_once_per_generation_and_measure_fps(
             f"decoded_resolution={WIDTH}x{HEIGHT}"
         ),
     ]
+
+
+def test_acquisition_candidates_are_latest_only_exact_frame_bound_and_reset() -> None:
+    processor = _CandidateProcessor()
+    pipeline = VisionPipeline(
+        camera=CameraRole.OVERVIEW,
+        corrector=overview_corrector(overview_calibration()),
+        processor=processor,
+        timestamp_clock_ns=_Clock(),
+    )
+
+    pipeline.start()
+    pipeline.submit_decoded_frame(source_frame(1))
+    first = pipeline.process_latest()
+    assert first is not None
+    candidates = pipeline.latest_acquisition_candidates.get()
+    assert candidates is not None
+    assert candidates.camera is first.frame.camera
+    assert candidates.generation == first.frame.generation
+    assert candidates.frame_id == first.frame.frame_id
+
+    processor.frame_id_offset = -1
+    pipeline.submit_decoded_frame(source_frame(2))
+    second = pipeline.process_latest()
+    assert second is not None
+    assert pipeline.latest_acquisition_candidates.get() is None
+
+    pipeline.start()
+    assert pipeline.latest_acquisition_candidates.get() is None

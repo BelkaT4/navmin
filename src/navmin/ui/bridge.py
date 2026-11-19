@@ -17,6 +17,7 @@ from navmin.contracts import (
     CameraRole,
     CameraSessionStarted,
     CameraStatus,
+    TargetCandidateSet,
     TurretState,
     VisionResult,
 )
@@ -33,6 +34,7 @@ class CameraUiBinding:
     target_events: TargetLifecycleEventChannel
     latest_result: LatestValue[VisionResult]
     tracking_diagnostics: LatestValue[VisionTrackingDiagnostics]
+    acquisition_candidates: LatestValue[TargetCandidateSet]
     status: LatestValue[CameraStatus]
 
 

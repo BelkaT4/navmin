@@ -40,6 +40,7 @@ from navmin.contracts import (
     CameraStatus,
     DistanceSource,
     MotorState,
+    TargetCandidateSet,
     TargetRef,
     TurretControlMode,
     TurretState,
@@ -66,6 +67,7 @@ from navmin.recording import (
     RecordingState,
 )
 from navmin.recording_adapter import assemble_recording_frame_packet
+from navmin.vision.candidate_selection import candidate_at_point
 from navmin.vision.processor import VisionProcessorSelection, VisionTrackingDiagnostics
 
 from .bridge import CameraUiBinding, UiStatePump
@@ -257,6 +259,7 @@ class MainWindow(QMainWindow):
         self._prepared_frames: dict[CameraRole, PreparedVisionFrame] = {}
         self._camera_statuses: dict[CameraRole, CameraStatus] = {}
         self._tracking_diagnostics: dict[CameraRole, VisionTrackingDiagnostics] = {}
+        self._acquisition_candidates: dict[CameraRole, TargetCandidateSet] = {}
         self._shown_main_camera = mediator.main_camera
         self._shown_selection = mediator.selected_target
         stale_timeout_ns = camera_stale_timeout_ms * 1_000_000
@@ -895,6 +898,7 @@ class MainWindow(QMainWindow):
             self.motion_calibration_window.accept_camera_session(session)
         self._prepared_frames.pop(session.camera, None)
         self._tracking_diagnostics.pop(session.camera, None)
+        self._acquisition_candidates.pop(session.camera, None)
         self._apply_camera_to_views(session.camera)
         self.refresh_presentation()
 
@@ -904,12 +908,19 @@ class MainWindow(QMainWindow):
         prepared = self._frame_preparer(result)
         camera = result.frame.camera
         self._prepared_frames[camera] = prepared
-        diagnostics = self._camera_bindings[camera].tracking_diagnostics.get()
+        binding = self._camera_bindings[camera]
+        diagnostics = binding.tracking_diagnostics.get()
         if self._diagnostics_match_result(diagnostics, result):
             assert diagnostics is not None
             self._tracking_diagnostics[camera] = diagnostics
         else:
             self._tracking_diagnostics.pop(camera, None)
+        candidates = binding.acquisition_candidates.get()
+        if self._candidate_set_matches_result(candidates, result):
+            assert candidates is not None
+            self._acquisition_candidates[camera] = candidates
+        else:
+            self._acquisition_candidates.pop(camera, None)
         self._apply_camera_to_views(camera)
         self._refresh_recording_presentation(self._clock_ns())
         recording_diagnostics = (
@@ -927,6 +938,18 @@ class MainWindow(QMainWindow):
             and diagnostics.camera is result.frame.camera
             and diagnostics.generation == result.frame.generation
             and diagnostics.frame_id == result.frame.frame_id
+        )
+
+    @staticmethod
+    def _candidate_set_matches_result(
+        candidates: TargetCandidateSet | None,
+        result: VisionResult,
+    ) -> bool:
+        return bool(
+            candidates is not None
+            and candidates.camera is result.frame.camera
+            and candidates.generation == result.frame.generation
+            and candidates.frame_id == result.frame.frame_id
         )
 
     def _camera_status_changed(self, status: CameraStatus) -> None:
@@ -971,6 +994,9 @@ class MainWindow(QMainWindow):
         )
         view.set_tracking_diagnostics(
             self._tracking_diagnostics.get(camera) if is_control_main else None
+        )
+        view.set_acquisition_candidates(
+            self._acquisition_candidates.get(camera) if is_control_main else None
         )
         result = view.displayed_result
         control = self._control_visualization_for_result(result) if is_control_main else None
@@ -1055,11 +1081,42 @@ class MainWindow(QMainWindow):
         if mode is TurretControlMode.RELATIVE:
             self._mediator.handle_relative_click(displayed_result, x_px, y_px)
         elif mode is TurretControlMode.TRACKING:
+            candidates = self._acquisition_candidates.get(
+                displayed_result.frame.camera
+            )
+            pending = self._mediator.pending_selection
+            if (
+                pending is not None
+                and self._candidate_set_matches_result(candidates, displayed_result)
+                and candidates is not None
+                and candidates.selection_id == pending.selection_id
+            ):
+                selected = candidate_at_point(
+                    candidates.candidates,
+                    x_px,
+                    y_px,
+                    tolerance_px=self._ui_config.vt11.candidate_click_tolerance_px,
+                )
+                if selected is not None:
+                    self._mediator.request_target_candidate_selection(
+                        candidates,
+                        selected.candidate_id,
+                        x_px,
+                        y_px,
+                    )
+                    self.refresh_presentation()
+                    return
             self._record_selection_for_pending(displayed_result, x_px, y_px)
             self._mediator.request_target_selection(
                 displayed_result,
                 x_px,
                 y_px,
+                auto_select_candidate_on_first_click=(
+                    self._ui_config.vt11.auto_select_candidate_on_first_click
+                ),
+                candidate_click_tolerance_px=(
+                    self._ui_config.vt11.candidate_click_tolerance_px
+                ),
             )
         self.refresh_presentation()
 

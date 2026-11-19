@@ -36,6 +36,7 @@ from navmin.contracts import (
     FrameTimestampSource,
     TargetAcquired,
     TargetAcquisitionFailed,
+    TargetCandidateSet,
     TargetLifecycleEvent,
     TargetTrackingEnded,
     VisionResult,
@@ -339,6 +340,9 @@ class VisionPipeline:
         latest_tracking_diagnostics: (
             InvalidatableLatest[VisionTrackingDiagnostics] | None
         ) = None,
+        latest_acquisition_candidates: (
+            InvalidatableLatest[TargetCandidateSet] | None
+        ) = None,
         status: LatestValue[CameraStatus] | None = None,
         timestamp_clock_ns: Callable[[], int] = monotonic_ns,
         processing_enabled: bool = True,
@@ -361,6 +365,9 @@ class VisionPipeline:
         self.latest_result = latest_result or InvalidatableLatest()
         self.latest_tracking_diagnostics = (
             latest_tracking_diagnostics or InvalidatableLatest()
+        )
+        self.latest_acquisition_candidates = (
+            latest_acquisition_candidates or InvalidatableLatest()
         )
         self.status = status or LatestValue()
         self._timestamp_clock_ns = timestamp_clock_ns
@@ -431,6 +438,7 @@ class VisionPipeline:
             self._processor.reset()
             self.latest_result.invalidate()
             self.latest_tracking_diagnostics.invalidate()
+            self.latest_acquisition_candidates.invalidate()
             self._reset_diagnostics_locked()
             timestamp_ns = self._timestamp_clock_ns()
             self.status.publish(
@@ -521,6 +529,34 @@ class VisionPipeline:
             )
             return
         self.latest_tracking_diagnostics.publish(diagnostics)
+
+    def _publish_acquisition_candidates(
+        self,
+        candidates: TargetCandidateSet | None,
+        *,
+        frame: FramePacket,
+    ) -> None:
+        if candidates is None:
+            self.latest_acquisition_candidates.invalidate()
+            return
+        if (
+            candidates.camera is not frame.camera
+            or candidates.generation != frame.generation
+            or candidates.frame_id != frame.frame_id
+        ):
+            self.latest_acquisition_candidates.invalidate()
+            LOGGER.warning(
+                "Vision acquisition candidates rejected camera=%s generation=%d "
+                "frame_id=%d candidates=(%s,%d,%d)",
+                frame.camera.value,
+                frame.generation,
+                frame.frame_id,
+                candidates.camera.value,
+                candidates.generation,
+                candidates.frame_id,
+            )
+            return
+        self.latest_acquisition_candidates.publish(candidates)
 
     def stop(self) -> None:
         with self._state_lock:
@@ -800,6 +836,10 @@ class VisionPipeline:
             )
             self._publish_tracking_diagnostics(
                 processor_output.tracking_diagnostics,
+                frame=result.frame,
+            )
+            self._publish_acquisition_candidates(
+                processor_output.acquisition_candidates,
                 frame=result.frame,
             )
             self.latest_result.publish(result)

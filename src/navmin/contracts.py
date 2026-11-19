@@ -122,6 +122,20 @@ class TargetSelectionRequest:
     frame_id: int
     x_px: float
     y_px: float
+    candidate_selection_enabled: bool = False
+    auto_select_candidate_on_first_click: bool = False
+    candidate_click_tolerance_px: int = 15
+
+
+@dataclass(frozen=True)
+class TargetCandidateSelectionRequest:
+    selection_id: int
+    camera: CameraRole
+    generation: int
+    frame_id: int
+    candidate_id: int
+    x_px: float
+    y_px: float
 
 
 @dataclass(frozen=True)
@@ -130,7 +144,26 @@ class ClearTargetSelection:
     generation: int
 
 
-VisionTargetControlCommand = TargetSelectionRequest | ClearTargetSelection
+VisionTargetControlCommand = (
+    TargetSelectionRequest | TargetCandidateSelectionRequest | ClearTargetSelection
+)
+
+
+@dataclass(frozen=True)
+class TargetCandidateProposal:
+    candidate_id: int
+    bbox: BBox
+    score: float
+    rank: int
+
+
+@dataclass(frozen=True)
+class TargetCandidateSet:
+    selection_id: int
+    camera: CameraRole
+    generation: int
+    frame_id: int
+    candidates: tuple[TargetCandidateProposal, ...]
 
 
 class TargetAcquisitionFailureReason(Enum):

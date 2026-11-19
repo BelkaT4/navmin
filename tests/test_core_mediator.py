@@ -33,6 +33,9 @@ from navmin.contracts import (
     TargetAcquired,
     TargetAcquisitionFailed,
     TargetAcquisitionFailureReason,
+    TargetCandidateProposal,
+    TargetCandidateSelectionRequest,
+    TargetCandidateSet,
     TargetRef,
     TargetSelectionRequest,
     TargetTrackingEnded,
@@ -2121,3 +2124,73 @@ def test_s5_3_mode_switch_rejects_late_old_kind_and_clears_distance(
         capture_id=77 if new_kind is StereoPairingKind.EXACT else None,
     ))
     assert mediator.current_distance is not None
+
+
+def test_target_selection_publishes_candidate_policy_for_production_vt11() -> None:
+    mediator, _turret, controls = _mediator(mode=TurretControlMode.TRACKING)
+    result = _accept_main(mediator)
+
+    assert mediator.request_target_selection(
+        result,
+        60.0,
+        40.0,
+        auto_select_candidate_on_first_click=True,
+        candidate_click_tolerance_px=23,
+    )
+
+    command = controls[result.frame.camera].consume_latest(
+        generation=result.frame.generation
+    )
+    assert isinstance(command, TargetSelectionRequest)
+    assert command.candidate_selection_enabled is True
+    assert command.auto_select_candidate_on_first_click is True
+    assert command.candidate_click_tolerance_px == 23
+
+
+def test_candidate_selection_keeps_pending_target_intent_and_uses_exact_latest_frame() -> None:
+    mediator, turret, controls = _mediator(mode=TurretControlMode.TRACKING)
+    first = _accept_main(mediator)
+    request = _request(mediator, first)
+    assert controls[first.frame.camera].consume_latest(
+        generation=first.frame.generation
+    ) == request
+
+    current = _result(first.frame.camera, first.frame.generation, frame_id=1)
+    assert mediator.accept_vision_result(current)
+    candidates = TargetCandidateSet(
+        selection_id=request.selection_id,
+        camera=current.frame.camera,
+        generation=current.frame.generation,
+        frame_id=current.frame.frame_id,
+        candidates=(TargetCandidateProposal(7, BBox(50, 30, 20, 20), 0.9, 1),),
+    )
+    invalidations_before = turret.invalidations
+    stops_before = turret.stop_requests
+
+    assert mediator.request_target_candidate_selection(
+        candidates, 7, 60.0, 40.0
+    )
+
+    command = controls[current.frame.camera].consume_latest(
+        generation=current.frame.generation
+    )
+    assert isinstance(command, TargetCandidateSelectionRequest)
+    assert command.selection_id == request.selection_id
+    assert command.frame_id == current.frame.frame_id
+    assert command.candidate_id == 7
+    assert mediator.pending_selection == request
+    assert mediator.selected_target is None
+    assert turret.invalidations == invalidations_before
+    assert turret.stop_requests == stops_before
+
+    stale = TargetCandidateSet(
+        selection_id=request.selection_id,
+        camera=current.frame.camera,
+        generation=current.frame.generation,
+        frame_id=0,
+        candidates=candidates.candidates,
+    )
+    assert not mediator.request_target_candidate_selection(stale, 7, 60.0, 40.0)
+    assert controls[current.frame.camera].consume_latest(
+        generation=current.frame.generation
+    ) is None

@@ -12,6 +12,7 @@ from .contracts import (
     ClearTargetSelection,
     TargetAcquired,
     TargetAcquisitionFailed,
+    TargetCandidateSelectionRequest,
     TargetLifecycleEvent,
     TargetSelectionRequest,
     TargetTrackingEnded,
@@ -109,7 +110,10 @@ class TargetControlChannel:
         self._command: VisionTargetControlCommand | None = None
 
     def publish(self, command: VisionTargetControlCommand) -> None:
-        if not isinstance(command, (TargetSelectionRequest, ClearTargetSelection)):
+        if not isinstance(
+            command,
+            (TargetSelectionRequest, TargetCandidateSelectionRequest, ClearTargetSelection),
+        ):
             raise TypeError("command must be a VisionTargetControlCommand")
         if command.camera is not self.camera:
             raise ValueError("target-control command belongs to another camera")

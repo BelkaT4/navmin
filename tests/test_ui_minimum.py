@@ -52,6 +52,9 @@ from navmin.contracts import (
     PlatformMotionSnapshot,
     PlatformMotionSource,
     TargetAcquired,
+    TargetCandidateProposal,
+    TargetCandidateSelectionRequest,
+    TargetCandidateSet,
     TargetRef,
     TrackedObject,
     TrackingControlSample,
@@ -400,6 +403,7 @@ def _bindings(
             camera,
             CameraSessionBarrierChannel(),
             TargetLifecycleEventChannel(),
+            LatestValue(),
             LatestValue(),
             LatestValue(),
             LatestValue(),
@@ -1521,10 +1525,92 @@ def test_tracking_click_sends_exact_displayed_frame_to_mediator(
     assert request.generation == 1
     assert request.frame_id == displayed.frame.frame_id
     assert (request.x_px, request.y_px) == (50.0, 25.0)
+    assert request.candidate_selection_enabled is True
+    assert request.auto_select_candidate_on_first_click is False
+    assert request.candidate_click_tolerance_px == 15
     assert mediator.selected_target is None
 
     selected = _publish_acquired(window, mediator, bindings, track_id=3)
     assert mediator.selected_target == selected
+    window.close()
+
+
+def test_tracking_second_click_selects_current_candidate_without_new_target_intent(
+    qt_application: QApplication,
+) -> None:
+    window, mediator, _turret, bindings, _states = _window(
+        qt_application, mode=TurretControlMode.TRACKING
+    )
+    first = _result(CameraRole.OVERVIEW, 1, frame_id=1, objects=())
+    _publish_camera(window, bindings, first)
+    window._handle_main_click(first, 50.0, 25.0)
+    pending = mediator.pending_selection
+    assert pending is not None
+    first_command = mediator._target_controls[CameraRole.OVERVIEW].consume_latest(
+        generation=1
+    )
+    assert first_command == pending
+
+    current = _result(CameraRole.OVERVIEW, 1, frame_id=2, objects=())
+    proposals = TargetCandidateSet(
+        selection_id=pending.selection_id,
+        camera=CameraRole.OVERVIEW,
+        generation=1,
+        frame_id=2,
+        candidates=(
+            TargetCandidateProposal(7, BBox(45, 20, 12, 12), 0.9, 1),
+        ),
+    )
+    bindings[CameraRole.OVERVIEW].acquisition_candidates.publish(proposals)
+    bindings[CameraRole.OVERVIEW].latest_result.publish(current)
+    window.state_pump.pump_once()
+
+    window._handle_main_click(current, 50.0, 25.0)
+
+    command = mediator._target_controls[CameraRole.OVERVIEW].consume_latest(
+        generation=1
+    )
+    assert isinstance(command, TargetCandidateSelectionRequest)
+    assert command.selection_id == pending.selection_id
+    assert command.candidate_id == 7
+    assert command.frame_id == 2
+    assert mediator.pending_selection == pending
+    window.close()
+
+
+def test_tracking_click_far_from_candidates_starts_new_selection(
+    qt_application: QApplication,
+) -> None:
+    window, mediator, _turret, bindings, _states = _window(
+        qt_application, mode=TurretControlMode.TRACKING
+    )
+    first = _result(CameraRole.OVERVIEW, 1, frame_id=1, objects=())
+    _publish_camera(window, bindings, first)
+    window._handle_main_click(first, 50.0, 25.0)
+    previous = mediator.pending_selection
+    assert previous is not None
+    mediator._target_controls[CameraRole.OVERVIEW].consume_latest(generation=1)
+
+    current = _result(CameraRole.OVERVIEW, 1, frame_id=2, objects=())
+    proposals = TargetCandidateSet(
+        selection_id=previous.selection_id,
+        camera=CameraRole.OVERVIEW,
+        generation=1,
+        frame_id=2,
+        candidates=(
+            TargetCandidateProposal(7, BBox(45, 20, 12, 12), 0.9, 1),
+        ),
+    )
+    bindings[CameraRole.OVERVIEW].acquisition_candidates.publish(proposals)
+    bindings[CameraRole.OVERVIEW].latest_result.publish(current)
+    window.state_pump.pump_once()
+
+    window._handle_main_click(current, 5.0, 5.0)
+
+    replacement = mediator.pending_selection
+    assert replacement is not None
+    assert replacement.selection_id == previous.selection_id + 1
+    assert replacement.frame_id == 2
     window.close()
 
 

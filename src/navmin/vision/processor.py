@@ -10,6 +10,7 @@ from navmin.contracts import (
     BBox,
     CameraRole,
     FramePacket,
+    TargetCandidateSet,
     TargetLifecycleEvent,
     VisionResult,
     VisionTargetControlCommand,
@@ -73,6 +74,7 @@ class VisionProcessorOutput:
     result: VisionResult
     target_events: tuple[TargetLifecycleEvent, ...] = ()
     tracking_diagnostics: VisionTrackingDiagnostics | None = None
+    acquisition_candidates: TargetCandidateSet | None = None
 
 
 class VisionProcessor(Protocol):

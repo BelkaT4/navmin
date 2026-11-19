@@ -906,6 +906,7 @@ class ApplicationRuntime:
             target_events=pipeline.target_events,
             latest_result=pipeline.latest_result,
             tracking_diagnostics=pipeline.latest_tracking_diagnostics,
+            acquisition_candidates=pipeline.latest_acquisition_candidates,
             status=pipeline.status,
         )
 
