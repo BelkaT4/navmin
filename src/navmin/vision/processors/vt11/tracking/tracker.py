@@ -53,6 +53,10 @@ from navmin.vision.processors.vt11.tracking.live_events import (
     LiveProgressCallback,
     StopRequested,
 )
+from navmin.vision.processors.vt11.tracking.maneuver import (
+    ManeuverEvidence,
+    confirms_maneuver,
+)
 from navmin.vision.processors.vt11.tracking.motion_model import (
     MotionPoint,
     dynamic_search_radius,
@@ -81,6 +85,7 @@ class TrackingConfig:
     min_identity_similarity: float = 0.42
     min_confidence_gap: float = 0.02
     lost_after_misses: int = 3
+    day_maneuver_search_enabled: bool = False
 
     # VT-7 dynamic motion/confidence parameters.
     dynamic_search_enabled: bool = True
@@ -461,6 +466,8 @@ class TrackFrameResult:
     prediction_error_px: float | None = None
     confidence: float = 0.0
     diagnostic_reason: str = ""
+    maneuver_hypothesis_xy: tuple[float, float] | None = None
+    maneuver_hits: int = 0
     # HOTFIX-2: retain diagnostics for the best evaluated candidate even when
     # it is rejected by gates. This is essential for distinguishing detector
     # failure from identity/threshold failure.
@@ -886,6 +893,8 @@ def _tracking_incremental_engine(
     prev_raw_frame: np.ndarray | None = None
     previous_global_shift_xy: tuple[float, float] | None = None
     previous_global_shift_frame: int | None = None
+    maneuver_freeze_until = -1
+    maneuver_evidence: ManeuverEvidence | None = None
 
     # HOTFIX-2 reliable spatial anchor: unlike normal motion history this is
     # changed only by a trusted observation or a temporally confirmed jump.
@@ -1039,12 +1048,17 @@ def _tracking_incremental_engine(
         if config.motion_break_enabled and (motion_break_active or miss_count > 0 or prior_high >= 1):
             try_global_shift()
 
-        def evaluate_at_prediction(pred_xy: tuple[float, float]):
+        def evaluate_at_prediction(
+            pred_xy: tuple[float, float],
+            *,
+            motion_sigma_override: float | None = None,
+            radius_override: int | None = None,
+        ):
             nonlocal detector_time_ms, identity_time_ms
             selection = make_operator_selection(
                 frame_index=frame_index,
                 click_xy=pred_xy,
-                radius_px=radius,
+                radius_px=radius if radius_override is None else radius_override,
                 frame_width=frame_width,
                 frame_height=frame_height,
             )
@@ -1078,7 +1092,11 @@ def _tracking_incremental_engine(
                     expected_area_px=float(expected_area_px),
                     motion_weight=config.warmup_motion_weight if warmup else None,
                     size_weight=config.warmup_size_weight if warmup else None,
-                    motion_sigma_px=config.warmup_motion_sigma_px if warmup else None,
+                    motion_sigma_px=(
+                        motion_sigma_override
+                        if motion_sigma_override is not None
+                        else (config.warmup_motion_sigma_px if warmup else None)
+                    ),
                     reliable_scale_anchor=reliable_scale_anchor,
                     frame_index=frame_index,
                 )
@@ -1090,6 +1108,89 @@ def _tracking_incremental_engine(
         # on this same frame before declaring a miss.
         if not ranked and try_global_shift():
             detection, ranked = evaluate_at_prediction(predicted)
+
+        maneuver_relocked = False
+        maneuver_pair: tuple[ManeuverEvidence, ManeuverEvidence] | None = None
+        maneuver_xy: tuple[float, float] | None = None
+        maneuver_hits = 0
+        if (
+            config.day_maneuver_search_enabled
+            and thermal_profile is not None
+            and not thermal_profile.is_thermal
+            and not warmup
+            and not frame_degraded_active
+        ):
+            primary_gap = (
+                ranked[0].total_score - ranked[1].total_score
+                if len(ranked) > 1
+                else (ranked[0].total_score if ranked else 0.0)
+            )
+            primary_failed = not ranked or bool(
+                _gate_reasons(ranked[0], primary_gap, config, warmup=False)
+            )
+            if primary_failed:
+                origin = timed_history[-1].xy
+                center = origin
+                if (
+                    maneuver_evidence is not None
+                    and maneuver_evidence.frame == frame_index - 1
+                ):
+                    center = maneuver_evidence.center
+                else:
+                    maneuver_evidence = None
+                alternate_radius = max(180, radius)
+                alternate_detection, alternate = evaluate_at_prediction(
+                    center,
+                    motion_sigma_override=float(alternate_radius),
+                    radius_override=alternate_radius,
+                )
+                alternative_gap = (
+                    alternate[0].total_score - alternate[1].total_score
+                    if len(alternate) > 1
+                    else (alternate[0].total_score if alternate else 0.0)
+                )
+                if (
+                    alternate
+                    and alternative_gap >= max(0.08, config.min_confidence_gap)
+                    and not _gate_reasons(
+                        alternate[0], alternative_gap, config, warmup=False
+                    )
+                    and alternate[0].similarity.total >= 0.50
+                    and not bool(
+                        getattr(alternate[0].candidate, "separated_from_line", False)
+                    )
+                    and alternate[0].candidate.detection_channel != "BLUR_REGION"
+                    and 0.4
+                    <= alternate[0].candidate.area_px / max(1, expected_area_px)
+                    <= 2.5
+                ):
+                    proposal = alternate[0]
+                    evidence = ManeuverEvidence(
+                        frame_index,
+                        proposal.candidate.center,
+                        proposal.candidate.area_px,
+                        proposal.similarity.total,
+                    )
+                    maneuver_xy = evidence.center
+                    maneuver_hits = 1
+                    if (
+                        maneuver_evidence is not None
+                        and confirms_maneuver(maneuver_evidence, evidence, origin)
+                    ):
+                        maneuver_relocked = True
+                        maneuver_pair = (maneuver_evidence, evidence)
+                        maneuver_hits = 2
+                        predicted = center
+                        radius = alternate_radius
+                        detection, ranked = alternate_detection, alternate
+                        maneuver_freeze_until = frame_index + 3
+                    maneuver_evidence = None if maneuver_relocked else evidence
+                else:
+                    maneuver_evidence = None
+            else:
+                maneuver_evidence = None
+        else:
+            maneuver_evidence = None
 
         phase = (
             "TRACK_DEGRADED" if frame_degraded_active
@@ -1105,6 +1206,8 @@ def _tracking_incremental_engine(
             motion_uncertainty_px=estimate.uncertainty_px,
             search_radius_px=radius,
             tracking_phase=phase,
+            maneuver_hypothesis_xy=maneuver_xy,
+            maneuver_hits=maneuver_hits,
             frame_reliability_score=float(frame_quality.score),
             frame_reliability_residual=float(frame_quality.residual),
             frame_reliability_phase_response=float(frame_quality.phase_response),
@@ -1541,6 +1644,7 @@ def _tracking_incremental_engine(
             and (not jump_suspicious or jump_quarantine_confirmed)
             and (not scale_suspicious or scale_quarantine_confirmed)
         )
+        visual_break = visual_break or maneuver_relocked
         if jump_quarantine_confirmed and not frame_degraded_active:
             reasons = [r for r in reasons if r.startswith("SCALE_") or r.startswith("HUD_") or r.startswith("FRAME_")]
             visual_break = bool(not scale_suspicious or scale_quarantine_confirmed)
@@ -1617,8 +1721,12 @@ def _tracking_incremental_engine(
                     "JUMP_QUARANTINE_CONFIRMED" if jump_quarantine_confirmed
                     else ("VISUAL_JUMP" if visual_break else "PREDICTION_ERROR_WINDOW")
                 )
-                relock_points = [point]
-                timed_history = [point]
+                relock_points = (
+                    [MotionPoint(e.frame, *e.center) for e in maneuver_pair]
+                    if maneuver_pair is not None
+                    else [point]
+                )
+                timed_history = list(relock_points)
                 recent_prediction_errors.clear()
             elif motion_break_active:
                 relock_points.append(point)
@@ -1691,7 +1799,9 @@ def _tracking_incremental_engine(
                 step = float(config.size_update_max_step_ratio)
                 expected_area_px = min(expected_area_px * step, max(expected_area_px / step, proposed_area))
             status = "TRACK"
-            if accepted_after_hud_occlusion:
+            if maneuver_relocked:
+                reason = "ACCEPTED_DAY_MANEUVER_RELOCK"
+            elif accepted_after_hud_occlusion:
                 reason = "ACCEPTED_HUD_EXIT_REACQ"
             elif scale_quarantine_confirmed:
                 reason = "ACCEPTED_SCALE_QUARANTINE_CONFIRMED"
@@ -1714,7 +1824,11 @@ def _tracking_incremental_engine(
             else:
                 reason = "ACCEPTED" if prediction_error <= config.prediction_error_warn_px else "ACCEPTED_PREDICTION_ERROR_HIGH"
             if adaptation_adapter is not None and adaptation_adapter.enabled:
-                if best_hud_probability >= config.hud_soft_probability_threshold:
+                if frame_index <= maneuver_freeze_until:
+                    adapt_event = adaptation_adapter.blocked_event(
+                        frame_index, "BLOCKED_DAY_MANEUVER_RELOCK"
+                    )
+                elif best_hud_probability >= config.hud_soft_probability_threshold:
                     adapt_event = adaptation_adapter.blocked_event(frame_index, "BLOCKED_HUD_NEGATIVE")
                 elif scale_expansion_uncertain and not scale_quarantine_confirmed:
                     adapt_event = adaptation_adapter.blocked_event(frame_index, "BLOCKED_SCALE_EXPANSION_UNCERTAIN")

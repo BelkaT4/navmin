@@ -103,6 +103,8 @@ def test_resolved_config_keeps_original_algorithm_budgets() -> None:
     assert thermal.initial_train.temporal_click_acquire_enabled
     assert thermal.initial_train.temporal_click_bootstrap_frames == 5
     assert day.reacquisition.max_frames == thermal.reacquisition.max_frames == 90
+    assert not day.tracking.day_maneuver_search_enabled
+    assert not thermal.tracking.day_maneuver_search_enabled
     assert day.finite_session.max_reacq_cycles == 5
 
 
