@@ -36,7 +36,11 @@ from navmin.contracts import (
     VisionTargetControlCommand,
 )
 from navmin.vision.candidate_selection import auto_select_candidate_at_point
-from navmin.vision.processor import VisionProcessorOutput, VisionTrackingDiagnostics
+from navmin.vision.processor import (
+    VisionProcessorOutput,
+    VisionRuntimeSettings,
+    VisionTrackingDiagnostics,
+)
 from navmin.vision.tracking import PublicTrackIdAllocator
 
 from ..legacy_14 import Legacy14VisionProcessor
@@ -49,6 +53,7 @@ from .acquisition.acquire import (
 from .acquisition.candidate_detector import Candidate
 from .config.loader import DEFAULT_CONFIG, load_config
 from .frame_history import FramePacketHistory
+from .live_features import Vt11LiveFeatureSnapshot, Vt11LiveFeatures
 from .profiles import effective_config
 from .runtime_config import Vt11ResolvedConfig, Vt11RuntimeSettings
 from .tracking.reacquisition import ReacqFrameResult
@@ -139,6 +144,8 @@ class Vt11VisionProcessor:
             profile,
             effective,
         )
+        self._live_features = Vt11LiveFeatures(profile)
+        self._target_identity_weights = dict(self._resolved_config.identity_weights)
         self._duration_clock_ns = duration_clock_ns
         self._history_clock_ns = history_clock_ns
         self._public_track_ids = PublicTrackIdAllocator()
@@ -201,6 +208,19 @@ class Vt11VisionProcessor:
     @property
     def settings_snapshot(self) -> Vt11ProcessorSettingsSnapshot:
         return self._settings_snapshot
+
+    @property
+    def live_feature_snapshot(self) -> Vt11LiveFeatureSnapshot:
+        return self._live_features.snapshot
+
+    def apply_runtime_settings(self, settings: VisionRuntimeSettings) -> None:
+        if not isinstance(settings, VisionRuntimeSettings):
+            raise TypeError("settings must be VisionRuntimeSettings")
+        self._live_features.set_low_light_blur_mode(settings.low_light_blur_mode)
+        if self._live_features.snapshot.visible_blur_robust:
+            self._target_identity_weights["_visible_blur_robust"] = 1.0
+        else:
+            self._target_identity_weights.pop("_visible_blur_robust", None)
 
     def reset(self) -> None:
         """Clear every generation-local component while preserving configuration."""
@@ -322,6 +342,8 @@ class Vt11VisionProcessor:
             frame_height=selection_frame.image.shape[0],
             resolved_config=self._resolved_config,
             runtime_settings=self._runtime_settings,
+            live_features=self._live_features,
+            target_identity_weights=self._target_identity_weights,
             candidate_id=candidate_id,
             train_click_xy=train_click_xy,
         )
@@ -850,6 +872,8 @@ class Vt11VisionProcessor:
                 frame_height=selection_frame.image.shape[0],
                 resolved_config=self._resolved_config,
                 runtime_settings=self._runtime_settings,
+                live_features=self._live_features,
+                target_identity_weights=self._target_identity_weights,
             )
             self._acquisition = _AcquisitionContext(
                 request=command,

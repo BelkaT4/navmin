@@ -47,6 +47,13 @@ class VisionProcessorSelection:
 
 
 @dataclass(frozen=True, slots=True)
+class VisionRuntimeSettings:
+    """Owner-thread runtime observation settings shared by Vision backends."""
+
+    low_light_blur_mode: bool = False
+
+
+@dataclass(frozen=True, slots=True)
 class VisionTrackingDiagnostics:
     """Backend-neutral read-only tracking diagnostics for one exact frame."""
 
@@ -82,6 +89,10 @@ class VisionProcessor(Protocol):
 
     def reset(self) -> None:
         """Clear all generation-local processing state."""
+        ...
+
+    def apply_runtime_settings(self, settings: VisionRuntimeSettings) -> None:
+        """Apply owner-thread runtime observation settings without resetting state."""
         ...
 
     def apply_target_control(
@@ -167,6 +178,7 @@ __all__ = [
     "VisionProcessor",
     "VisionProcessorOutput",
     "VisionProcessorSelection",
+    "VisionRuntimeSettings",
     "VisionTrackingDiagnostics",
     "create_selected_vision_processor",
     "create_vision_processor",

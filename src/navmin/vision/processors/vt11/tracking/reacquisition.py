@@ -11,7 +11,7 @@ from __future__ import annotations
 from collections import deque
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from itertools import pairwise
 from math import hypot, sqrt
 from statistics import mean
@@ -26,6 +26,7 @@ from navmin.vision.processors.vt11.acquisition.candidate_detector import (
 )
 from navmin.vision.processors.vt11.acquisition.roi import make_operator_selection
 from navmin.vision.processors.vt11.identity.reference_bank import ReferenceBank
+from navmin.vision.processors.vt11.live_features import Vt11LiveFeatures
 from navmin.vision.processors.vt11.thermal.processing import (
     ThermalProfile,
     preprocess_frame,
@@ -589,6 +590,7 @@ def _reacquisition_incremental_engine(
     scale_model: ScaleStabilityModel | None = None,
     reliable_scale_anchor: ReliableScaleAnchor | None = None,
     initial_memory_freeze_until_frame: int = -1,
+    live_features: Vt11LiveFeatures | None = None,
     continuity_state: _ReacquisitionContinuityState | None = None,
 ) -> Iterator[ReacqFrameResult]:
     """Attempt reacquisition; use robust visual tracklets after MOTION_BREAK."""
@@ -635,6 +637,7 @@ def _reacquisition_incremental_engine(
             )
         )
     runtime_detector = runtime_detector_config(detector_config, thermal_profile)
+    live_feature_revision = -1
     start_frame = lost_frame + 1
     if start_frame >= frame_count:
         return
@@ -768,6 +771,23 @@ def _reacquisition_incremental_engine(
     for frame_index in range(start_frame, max_frame_exclusive):
         frame_t0 = perf_counter()
         _idx, frame = frame_reader(frame_index)
+        live_snapshot = None if live_features is None else live_features.snapshot
+        if live_snapshot is not None and live_snapshot.revision != live_feature_revision:
+            if live_feature_revision >= 0:
+                confirmation_window.clear()
+                confirmation_area_window.clear()
+                promotion_window.clear()
+                if broken:
+                    tracklets = make_tracklets()
+            live_feature_revision = live_snapshot.revision
+        effective_detector = runtime_detector
+        if live_snapshot is not None:
+            effective_detector = replace(
+                runtime_detector,
+                visible_line_recovery_enabled=(
+                    live_snapshot.visible_line_recovery_enabled
+                ),
+            )
         analysis_frame = preprocess_frame(frame, thermal_profile)
         frame_quality = estimate_frame_reliability(quality_reference_frame, frame, config=quality_cfg)
         if quality_cfg.enabled and frame_quality.valid:
@@ -858,7 +878,7 @@ def _reacquisition_incremental_engine(
             and thermal_profile is not None and thermal_profile.is_thermal
         )
         detection = detect_local_candidates(
-            analysis_frame, selection, top_k=config.top_k, config=runtime_detector,
+            analysis_frame, selection, top_k=config.top_k, config=effective_detector,
             expected_area_px=float(expected_area_px), include_micro=micro_enabled_now,
             global_search=full_frame, diversity_min_distance_px=config.global_diversity_min_distance_px,
         )
@@ -1291,6 +1311,7 @@ class ReacquisitionRuntime:
         scale_model: ScaleStabilityModel | None = None,
         reliable_scale_anchor: ReliableScaleAnchor | None = None,
         initial_memory_freeze_until_frame: int = -1,
+        live_features: Vt11LiveFeatures | None = None,
         frame_count: int | None = None,
     ) -> None:
         config.validate()
@@ -1355,6 +1376,7 @@ class ReacquisitionRuntime:
             scale_model=scale_model,
             reliable_scale_anchor=reliable_scale_anchor,
             initial_memory_freeze_until_frame=initial_memory_freeze_until_frame,
+            live_features=live_features,
             continuity_state=self._continuity_state,
         )
 

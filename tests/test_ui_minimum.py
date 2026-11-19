@@ -36,6 +36,7 @@ from navmin.config.models import (
     TrackingControlConfig,
     TrackingVisualizationConfig,
     UiConfig,
+    Vt11UiConfig,
 )
 from navmin.contracts import (
     BBox,
@@ -450,6 +451,7 @@ def _window(
     include_right: bool = False,
     ui_config: UiConfig | None = None,
     persist_ui_config: Callable[[UiConfig], None] | None = None,
+    apply_vt11_ui_config: Callable[[Vt11UiConfig], None] | None = None,
     apply_tracking_control_tuning: (
         Callable[[TrackingControlConfig], None] | None
     ) = None,
@@ -516,6 +518,7 @@ def _window(
             show_stereo_right_camera=include_right,
         ),
         persist_ui_config=persist_ui_config,
+        apply_vt11_ui_config=apply_vt11_ui_config,
         tracking_control_config=mediator.tracking_estimator.config,
         apply_tracking_control_tuning=(
             apply_tracking_control_tuning or (lambda _config: None)
@@ -2966,6 +2969,80 @@ def test_legacy_detector_profile_is_explicit_default(
         CameraRole.OVERVIEW,
         VisionProcessorSelection(DEFAULT_VISION_PROCESSOR_CLASS, "default"),
     )
+    window.close()
+
+
+def test_vt11_candidate_selection_controls_persist_for_day_and_thermal(
+    qt_application: QApplication,
+) -> None:
+    persisted: list[UiConfig] = []
+    selections = {
+        CameraRole.OVERVIEW: VisionProcessorSelection(
+            VT11_VISION_PROCESSOR_CLASS, "day"
+        ),
+        CameraRole.STEREO_LEFT: VisionProcessorSelection(
+            VT11_VISION_PROCESSOR_CLASS, "thermal"
+        ),
+    }
+    window, _mediator_value, _turret, _bindings_value, _states = _window(
+        qt_application,
+        vision_processor_selections=selections,
+        persist_ui_config=persisted.append,
+    )
+    operator = window.operator_window
+
+    assert not operator.vt11_auto_select_checkbox.isChecked()
+    assert operator.vt11_candidate_tolerance_input.minimum() == 0
+    assert operator.vt11_candidate_tolerance_input.maximum() == 50
+    assert operator.vt11_candidate_tolerance_input.value() == 15
+
+    operator.vt11_auto_select_checkbox.setChecked(True)
+    operator.vt11_candidate_tolerance_input.setValue(23)
+
+    assert persisted[-1].vt11.auto_select_candidate_on_first_click
+    assert persisted[-1].vt11.candidate_click_tolerance_px == 23
+    assert window._ui_config.vt11 == persisted[-1].vt11
+    window.close()
+
+
+def test_vt11_low_light_control_is_day_only_and_applies_without_ui_reset(
+    qt_application: QApplication,
+) -> None:
+    applied: list[Vt11UiConfig] = []
+    persisted: list[UiConfig] = []
+    thermal_only = {
+        CameraRole.OVERVIEW: VisionProcessorSelection(
+            VT11_VISION_PROCESSOR_CLASS, "thermal"
+        ),
+        CameraRole.STEREO_LEFT: VisionProcessorSelection(
+            DEFAULT_VISION_PROCESSOR_CLASS, "default"
+        ),
+    }
+    window, _mediator_value, _turret, _bindings_value, _states = _window(
+        qt_application,
+        vision_processor_selections=thermal_only,
+        apply_vt11_ui_config=applied.append,
+        persist_ui_config=persisted.append,
+    )
+    operator = window.operator_window
+
+    assert not operator.vt11_low_light_blur_checkbox.isEnabled()
+    assert "THERMAL" in operator.vt11_low_light_note_label.text()
+
+    controls = operator.detector_controls[CameraRole.OVERVIEW]
+    detector = controls["detector"]
+    profile = controls["profile"]
+    apply_button = controls["apply"]
+    detector.setCurrentIndex(detector.findData(VT11_VISION_PROCESSOR_CLASS))
+    profile.setCurrentIndex(profile.findData("day"))
+    QTest.mouseClick(apply_button, Qt.MouseButton.LeftButton)
+
+    assert operator.vt11_low_light_blur_checkbox.isEnabled()
+    operator.vt11_low_light_blur_checkbox.setChecked(True)
+
+    assert applied[-1].low_light_blur_mode
+    assert persisted[-1].vt11.low_light_blur_mode
+    assert window._ui_config.vt11.low_light_blur_mode
     window.close()
 
 

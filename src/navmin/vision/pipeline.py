@@ -45,6 +45,7 @@ from navmin.diagnostic_logging import emit_event
 
 from .processor import (
     VisionProcessor,
+    VisionRuntimeSettings,
     VisionTrackingDiagnostics,
     create_vision_processor,
 )
@@ -390,6 +391,14 @@ class VisionPipeline:
         if processor is None:
             raise TypeError("processor must not be None")
         self._processor = processor
+
+    def apply_processor_runtime_settings(self, settings: VisionRuntimeSettings) -> None:
+        """Apply runtime Vision settings on the processor-owner thread."""
+        if not isinstance(settings, VisionRuntimeSettings):
+            raise TypeError("settings must be VisionRuntimeSettings")
+        apply_settings = getattr(self._processor, "apply_runtime_settings", None)
+        if apply_settings is not None:
+            apply_settings(settings)
 
     @property
     def generation(self) -> int:

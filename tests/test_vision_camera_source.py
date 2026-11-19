@@ -18,6 +18,7 @@ from navmin.config.models import (
 from navmin.contracts import (
     CameraRole,
     CameraState,
+    ConfigUpdate,
     FrameTimestampSource,
 )
 from navmin.diagnostics.synthetic_sources import SyntheticFrameSource
@@ -41,7 +42,7 @@ from navmin.vision.pipeline import (
     VisionPipeline,
     overview_corrector,
 )
-from navmin.vision.processor import VisionProcessorSelection
+from navmin.vision.processor import VisionProcessorSelection, VisionRuntimeSettings
 from navmin.vision.processors.vt11 import Vt11VisionProcessor
 
 WIDTH = 32
@@ -664,6 +665,44 @@ def test_camera_worker_runtime_processor_switch_starts_new_generation() -> None:
     assert worker.processor_selection == selection
     assert isinstance(pipeline._processor, Vt11VisionProcessor)
     assert pipeline._processor.settings_snapshot.profile == "thermal"
+    assert worker.stop(timeout=1.0)
+
+
+def test_camera_worker_reapplies_live_settings_across_processor_switch_without_generation_reset() -> None:
+    source = InMemoryFrameSource()
+    pipeline = VisionPipeline(
+        camera=CameraRole.OVERVIEW,
+        corrector=overview_corrector(overview_calibration()),
+        processing_enabled=False,
+    )
+    worker = CameraWorker(
+        source=source,
+        pipeline=pipeline,
+        idle_wait_s=0.005,
+        processor_selection=VisionProcessorSelection(
+            "Legacy14VisionProcessor", "default"
+        ),
+    )
+    worker.start()
+    _wait_until(lambda: pipeline.generation == 1)
+
+    worker.submit_runtime_settings(ConfigUpdate(1, VisionRuntimeSettings(True)))
+    worker.submit_processor_selection(
+        VisionProcessorSelection("Vt11VisionProcessor", "day")
+    )
+
+    _wait_until(lambda: pipeline.generation == 2)
+    processor = pipeline._processor
+    assert isinstance(processor, Vt11VisionProcessor)
+    _wait_until(lambda: processor.live_feature_snapshot.visible_blur_robust)
+    generation = pipeline.generation
+
+    worker.submit_runtime_settings(ConfigUpdate(2, VisionRuntimeSettings(False)))
+    _wait_until(lambda: not processor.live_feature_snapshot.visible_blur_robust)
+
+    assert pipeline.generation == generation
+    assert not processor.live_feature_snapshot.day_maneuver_search_enabled
+    assert not processor.live_feature_snapshot.visible_line_recovery_enabled
     assert worker.stop(timeout=1.0)
 
 

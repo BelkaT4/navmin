@@ -33,6 +33,7 @@ from navmin.config.models import (
     TrackingControlConfig,
     TrackingVisualizationConfig,
     UiConfig,
+    Vt11UiConfig,
 )
 from navmin.contracts import (
     CameraRole,
@@ -177,6 +178,7 @@ class MainWindow(QMainWindow):
         tracking_stereo_left_hfov_deg: float | None = None,
         apply_tracking_stereo_left_hfov_deg: Callable[[float], None] | None = None,
         persist_ui_config: Callable[[UiConfig], None] | None = None,
+        apply_vt11_ui_config: Callable[[Vt11UiConfig], None] | None = None,
         vision_processor_selections: Mapping[CameraRole, VisionProcessorSelection] | None = None,
         apply_vision_processor_selection: (
             Callable[[CameraRole, VisionProcessorSelection], None] | None
@@ -229,6 +231,7 @@ class MainWindow(QMainWindow):
             )
         self._ui_config = ui_config
         self._persist_ui_config = persist_ui_config
+        self._apply_vt11_ui_config = apply_vt11_ui_config
         self._show_stereo_right_camera = bool(
             ui_config.show_stereo_right_camera
             and CameraRole.STEREO_RIGHT in self._available_cameras
@@ -490,6 +493,8 @@ class MainWindow(QMainWindow):
             ),
             tracking_visualization_config=tracking_visualization_config,
             on_tracking_visualization_changed=self._set_tracking_visualization,
+            vt11_ui_config=self._ui_config.vt11,
+            on_vt11_ui_config_changed=self._set_vt11_ui_config,
             use_camera_time_for_tracking=mediator.use_camera_time_for_tracking,
             on_use_camera_time_for_tracking_changed=(
                 mediator.set_use_camera_time_for_tracking
@@ -648,6 +653,18 @@ class MainWindow(QMainWindow):
         self.aim_point_button.setText("ПРИЦЕЛ: КЛИК" if active else "ПРИЦЕЛ")
         if hasattr(self, "operator_window"):
             self.operator_window.set_aim_point_selection_state(active)
+
+    def _set_vt11_ui_config(self, config: Vt11UiConfig) -> None:
+        if not isinstance(config, Vt11UiConfig):
+            raise TypeError("config must be Vt11UiConfig")
+        next_ui_config = replace(self._ui_config, vt11=config)
+        if next_ui_config == self._ui_config:
+            return
+        if self._apply_vt11_ui_config is not None:
+            self._apply_vt11_ui_config(config)
+        if self._persist_ui_config is not None:
+            self._persist_ui_config(next_ui_config)
+        self._ui_config = next_ui_config
 
     def _set_show_stereo_right_camera(self, enabled: bool) -> None:
         enabled = bool(enabled)

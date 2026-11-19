@@ -7,7 +7,7 @@ from __future__ import annotations
 
 from collections import deque
 from collections.abc import Callable, Iterator, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from itertools import pairwise
 from math import exp, hypot, sqrt
 from statistics import median
@@ -31,6 +31,7 @@ from navmin.vision.processors.vt11.identity.descriptor import (
     descriptor_from_candidate,
 )
 from navmin.vision.processors.vt11.identity.reference_bank import ReferenceBank
+from navmin.vision.processors.vt11.live_features import Vt11LiveFeatures
 from navmin.vision.processors.vt11.thermal.processing import (
     ThermalProfile,
     hud_evidence,
@@ -820,6 +821,7 @@ def _tracking_incremental_engine(
     scale_model: ScaleStabilityModel | None = None,
     reliable_scale_anchor: ReliableScaleAnchor | None = None,
     initial_memory_freeze_until_frame: int = -1,
+    live_features: Vt11LiveFeatures | None = None,
     continuity_state: _TrackingContinuityState | None = None,
 ) -> Iterator[TrackFrameResult]:
     """Track until EOF/LOST with event-driven HOTFIX-6 motion recovery.
@@ -886,6 +888,7 @@ def _tracking_incremental_engine(
             ),
         )
     runtime_detector = runtime_detector_config(detector_config, thermal_profile)
+    live_feature_revision = -1
     warmup_points: list[MotionPoint] = []
     drift_rescue_streak = 0
 
@@ -969,6 +972,22 @@ def _tracking_incremental_engine(
     for frame_index in range(start_frame, frame_count):
         frame_t0 = perf_counter()
         _idx, frame = frame_reader(frame_index)
+        live_snapshot = None if live_features is None else live_features.snapshot
+        if live_snapshot is not None and live_snapshot.revision != live_feature_revision:
+            if live_feature_revision >= 0:
+                maneuver_evidence = None
+                line_evidence.clear()
+            live_feature_revision = live_snapshot.revision
+        effective_detector = runtime_detector
+        maneuver_search_enabled = config.day_maneuver_search_enabled
+        if live_snapshot is not None:
+            effective_detector = replace(
+                runtime_detector,
+                visible_line_recovery_enabled=(
+                    live_snapshot.visible_line_recovery_enabled
+                ),
+            )
+            maneuver_search_enabled = live_snapshot.day_maneuver_search_enabled
         analysis_frame = preprocess_frame(frame, thermal_profile)
         warmup = (frame_index - start_frame) < config.track_warmup_frames
 
@@ -1079,7 +1098,7 @@ def _tracking_incremental_engine(
                 )
             )
             detection = detect_local_candidates(
-                analysis_frame, selection, top_k=config.top_k, config=runtime_detector,
+                analysis_frame, selection, top_k=config.top_k, config=effective_detector,
                 expected_area_px=float(expected_area_px), include_micro=include_micro,
             )
             detector_time_ms += (perf_counter() - td) * 1000.0
@@ -1120,7 +1139,7 @@ def _tracking_incremental_engine(
         maneuver_xy: tuple[float, float] | None = None
         maneuver_hits = 0
         if (
-            config.day_maneuver_search_enabled
+            maneuver_search_enabled
             and thermal_profile is not None
             and not thermal_profile.is_thermal
             and not warmup
@@ -2068,6 +2087,7 @@ class TrackingRuntime:
         scale_model: ScaleStabilityModel | None = None,
         reliable_scale_anchor: ReliableScaleAnchor | None = None,
         initial_memory_freeze_until_frame: int = -1,
+        live_features: Vt11LiveFeatures | None = None,
         frame_count: int | None = None,
         _adaptation_event_history_limit: int | None = DEFAULT_ADAPTATION_EVENT_HISTORY,
     ) -> None:
@@ -2134,6 +2154,7 @@ class TrackingRuntime:
             scale_model=scale_model,
             reliable_scale_anchor=reliable_scale_anchor,
             initial_memory_freeze_until_frame=initial_memory_freeze_until_frame,
+            live_features=live_features,
             continuity_state=self._continuity_state,
         )
 

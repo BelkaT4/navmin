@@ -63,7 +63,7 @@ from navmin.vision.gstreamer_source import (
     GStreamerRtspSource,
 )
 from navmin.vision.pipeline import InMemoryFrameSource
-from navmin.vision.processor import VisionProcessorSelection
+from navmin.vision.processor import VisionProcessorSelection, VisionRuntimeSettings
 
 WIDTH = 32
 HEIGHT = 24
@@ -918,6 +918,38 @@ def test_ui_vision_processor_selection_is_queued_to_camera_owner(
         runtime.ui_dependencies.vision_processor_selections[CameraRole.OVERVIEW]
         == selection
     )
+
+
+def test_ui_vt11_low_light_setting_queues_one_atomic_runtime_update_per_camera(
+    monkeypatch,
+) -> None:
+    runtime, _sources, _endpoint = _injected_runtime(stereo_right_enabled=True)
+    queued: dict[CameraRole, list[ConfigUpdate[VisionRuntimeSettings]]] = {
+        camera: [] for camera in runtime.camera_workers
+    }
+    for camera, worker in runtime.camera_workers.items():
+        monkeypatch.setattr(
+            worker,
+            "submit_runtime_settings",
+            queued[camera].append,
+        )
+
+    initial = runtime.ui_dependencies.ui_config.vt11
+    enabled = replace(initial, low_light_blur_mode=True)
+    runtime.ui_dependencies.apply_vt11_ui_config(enabled)
+
+    assert all(len(items) == 1 for items in queued.values())
+    for items in queued.values():
+        assert items[0].revision == 1
+        assert items[0].config == VisionRuntimeSettings(low_light_blur_mode=True)
+
+    ui_only_change = replace(
+        enabled,
+        auto_select_candidate_on_first_click=True,
+        candidate_click_tolerance_px=23,
+    )
+    runtime.ui_dependencies.apply_vt11_ui_config(ui_only_change)
+    assert all(len(items) == 1 for items in queued.values())
 
 
 def test_motion_calibration_profile_is_temporary_bounded_and_restored_once(

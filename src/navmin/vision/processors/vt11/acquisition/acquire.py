@@ -1,6 +1,7 @@
 """Bounded original VT11 ACQUIRE -> INITIAL TRAIN coordination."""
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 
 import numpy as np
@@ -24,6 +25,7 @@ from navmin.vision.processors.vt11.identity.scorer import (
     ScoringResult,
     score_candidates,
 )
+from navmin.vision.processors.vt11.live_features import Vt11LiveFeatures
 from navmin.vision.processors.vt11.runtime_config import (
     Vt11ResolvedConfig,
     Vt11RuntimeSettings,
@@ -128,6 +130,8 @@ class Vt11AcquisitionAttempt:
         frame_height: int,
         resolved_config: Vt11ResolvedConfig,
         runtime_settings: Vt11RuntimeSettings | None = None,
+        live_features: Vt11LiveFeatures | None = None,
+        target_identity_weights: Mapping[str, float] | None = None,
         candidate_id: int | None = None,
         train_click_xy: tuple[float, float] | None = None,
     ) -> None:
@@ -143,6 +147,8 @@ class Vt11AcquisitionAttempt:
         self.start_frame = int(frame_index)
         self.resolved_config = resolved_config
         self.runtime_settings = settings
+        self.live_features = live_features
+        self.target_identity_weights = target_identity_weights
         self._train_click_xy = (
             tuple(map(float, train_click_xy))
             if train_click_xy is not None
@@ -296,9 +302,14 @@ class Vt11AcquisitionAttempt:
                         detector_config=cfg.detector,
                         tracking_config=cfg.tracking,
                         reacquisition_config=cfg.reacquisition,
-                        identity_weights=cfg.identity_weights,
+                        identity_weights=(
+                            cfg.identity_weights
+                            if self.target_identity_weights is None
+                            else self.target_identity_weights
+                        ),
                         adaptation_config=cfg.adaptation,
                         thermal_profile=train.thermal_profile,
+                        live_features=self.live_features,
                     )
                     for replay_index, replay_frame in catch_up:
                         target_session.step(replay_index, replay_frame)
