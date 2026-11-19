@@ -338,6 +338,21 @@ def test_diagnostic_corrections_preserve_synthetic_pixels() -> None:
     assert np.array_equal(stereo_right_corrector(stereo).correct(stereo_frame), stereo_frame)
 
 
+def test_identity_synthetic_correction_reuses_read_only_frame() -> None:
+    frame = SyntheticDiagnosticFrameGenerator(
+        camera=CameraRole.STEREO_LEFT,
+        width=320,
+        height=240,
+    ).next_frame()
+    frame.flags.writeable = False
+
+    corrected = stereo_left_corrector(diagnostic_stereo_calibration()).correct(frame)
+
+    assert corrected is frame
+    assert corrected.flags.c_contiguous
+    assert not corrected.flags.writeable
+
+
 def test_synthetic_scene_renders_target_source_time_and_advancing_frame_counter() -> None:
     fixed = datetime(2026, 9, 22, 14, 58, 21, 372_000, tzinfo=UTC)
     generator = SyntheticDiagnosticFrameGenerator(

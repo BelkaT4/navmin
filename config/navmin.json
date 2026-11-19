@@ -1,5 +1,5 @@
 {
-  "schema-version": 6,
+  "schema-version": 7,
   "vision": {
     "processing-scope": "main-and-preview",
     "cameras": {
@@ -13,6 +13,7 @@
         },
         "processing-enabled": true,
         "vision-processor-class": "Vt11VisionProcessor",
+        "vision-processor-profile": "day",
         "calibration-file": "calibration/overview_day.json"
       },
       "stereo-left": {
@@ -24,7 +25,8 @@
           "buffer-size": 1
         },
         "processing-enabled": true,
-        "vision-processor-class": "Vt11VisionProcessor"
+        "vision-processor-class": "Vt11VisionProcessor",
+        "vision-processor-profile": "day"
       },
       "stereo-right": {
         "enabled": true,
@@ -35,7 +37,8 @@
           "buffer-size": 1
         },
         "processing-enabled": false,
-        "vision-processor-class": "Legacy14VisionProcessor"
+        "vision-processor-class": "Legacy14VisionProcessor",
+        "vision-processor-profile": "default"
       }
     },
     "distance": {
@@ -62,6 +65,10 @@
       "stereo-left": {
         "x-px": null,
         "y-px": null
+      },
+      "stereo-right": {
+        "x-px": null,
+        "y-px": null
       }
     }
   },
@@ -76,12 +83,12 @@
       "max-target-rate-y-deg-s": 90.0
     },
     "feed-forward": {
-      "enabled": false,
-      "gain-x": 0.0,
-      "gain-y": 0.0
+      "enabled": true,
+      "gain-x": 0.8,
+      "gain-y": 0.8
     },
     "prediction": {
-      "enabled": false,
+      "enabled": true,
       "horizon-ms": 0,
       "max-angle-x-deg": 5.0,
       "max-angle-y-deg": 5.0
@@ -128,12 +135,14 @@
       }
     },
     "controller": {
-      "pid-kp-x": 0.25,
+      "pid-kp-x": 2.0,
       "pid-ki-x": 0.0,
       "pid-kd-x": 0.0,
-      "pid-kp-y": 0.25,
+      "pid-kp-y": 2.0,
       "pid-ki-y": 0.0,
-      "pid-kd-y": 0.0
+      "pid-kd-y": 0.0,
+      "pid-integral-limit-x-deg-s": 800.0,
+      "pid-integral-limit-y-deg-s": 800.0
     },
     "stm32": {
       "max-speed-x-deg-s": 800.0,
@@ -147,6 +156,7 @@
   "ui": {
     "default-camera": "overview",
     "show-fps": true,
-    "show-stereo-right-diagnostics": false
+    "show-stereo-right-diagnostics": false,
+    "show-stereo-right-camera": false
   }
 }

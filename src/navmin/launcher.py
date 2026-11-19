@@ -18,6 +18,7 @@ from navmin.contracts import CameraRole
 from navmin.imu import ImuCalibration
 from navmin.logging_setup import session_file_logging
 from navmin.session_artifacts import SourceInputPaths
+from navmin.turret.worker import TransportFactory
 from navmin.vision.camera_worker import SourceFactory
 
 if TYPE_CHECKING:
@@ -203,6 +204,7 @@ def run_loaded_application(
     overview_source_factory: SourceFactory | None = None,
     stereo_left_source_factory: SourceFactory | None = None,
     stereo_right_source_factory: SourceFactory | None = None,
+    turret_transport_factory: TransportFactory | None = None,
     video_latency_calibration_result_writer: (
         Callable[[LiveVideoLatencyCalibrationResult], None] | None
     ) = None,
@@ -242,6 +244,13 @@ def run_loaded_application(
             overview_source_factory=overview_source_factory,
             stereo_left_source_factory=stereo_left_source_factory,
             stereo_right_source_factory=stereo_right_source_factory,
+            turret_transport_factory=turret_transport_factory,
+        )
+    elif turret_transport_factory is not None:
+        from navmin.application import ApplicationFactories
+
+        runtime_kwargs["factories"] = ApplicationFactories(
+            turret_transport_factory=turret_transport_factory,
         )
     runtime = runtime_builder(**runtime_kwargs)
     if video_latency_calibration_result_writer is not None:

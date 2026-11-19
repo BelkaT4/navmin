@@ -90,6 +90,12 @@ class _OpenCvMapCorrector:
         self._height = image_height
         self._map_x = map_x
         self._map_y = map_y
+        x = np.arange(image_width, dtype=np.float32)[None, :]
+        y = np.arange(image_height, dtype=np.float32)[:, None]
+        self._identity_map = bool(
+            np.allclose(map_x, x, rtol=0.0, atol=1e-4)
+            and np.allclose(map_y, y, rtol=0.0, atol=1e-4)
+        )
         self.camera_model = camera_model
 
     def correct(self, image: np.ndarray) -> np.ndarray:
@@ -108,13 +114,18 @@ class _OpenCvMapCorrector:
                 f"source resolution {actual[0]}x{actual[1]} does not match "
                 f"calibration {expected[0]}x{expected[1]}"
             )
-        corrected = cv2.remap(
-            image,
-            self._map_x,
-            self._map_y,
-            interpolation=cv2.INTER_LINEAR,
-            borderMode=cv2.BORDER_CONSTANT,
-        )
+        if self._identity_map:
+            if image.flags.c_contiguous and not image.flags.writeable:
+                return image
+            corrected = np.array(image, dtype=np.uint8, order="C", copy=True)
+        else:
+            corrected = cv2.remap(
+                image,
+                self._map_x,
+                self._map_y,
+                interpolation=cv2.INTER_LINEAR,
+                borderMode=cv2.BORDER_CONSTANT,
+            )
         if corrected.shape != image.shape or corrected.dtype != np.uint8:
             raise WorkingFrameError("OpenCV correction returned an invalid working frame")
         corrected = np.ascontiguousarray(corrected)

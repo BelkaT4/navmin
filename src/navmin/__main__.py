@@ -279,6 +279,9 @@ def _run_noninteractive(
                     stereo_right_source_factory=(
                         bindings.factories.stereo_right_source_factory
                     ),
+                    turret_transport_factory=(
+                        bindings.factories.turret_transport_factory
+                    ),
                     video_latency_calibration_result_writer=(
                         persist_video_latency_calibration
                     ),

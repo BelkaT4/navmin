@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 
-from navmin.calibration import OverviewCalibration
+from navmin.calibration import OverviewCalibration, StereoCalibration
 from navmin.contracts import CameraRole
 from navmin.diagnostics.localhost_rtp import (
     DEFAULT_FPS,
@@ -20,14 +20,24 @@ from navmin.diagnostics.synthetic_stereo import (
     rectified_synthetic_calibration,
     rectified_synthetic_side_calibration,
 )
+from navmin.diagnostics.synthetic_tracking_turret import (
+    RealtimeSyntheticTrackingRig,
+    SyntheticTrackingFrameSource,
+    SyntheticTrackingStm32Endpoint,
+    SyntheticTurretPlant,
+)
+from navmin.diagnostics.synthetic_tracking_world import SyntheticTrackingWorld
 from navmin.launch_options import (
     CameraSourceMode,
     EffectiveLaunchSelection,
     LaunchOptions,
     StereoRightMode,
+    Stm32Mode,
     apply_launch_options,
 )
 from navmin.launcher import LoadedApplicationInputs
+from navmin.turret.simulator import FakeTransport
+from navmin.turret.worker import TransportFactory
 from navmin.vision.camera_source import create_camera_source
 from navmin.vision.camera_worker import SourceFactory
 
@@ -38,11 +48,12 @@ class LaunchRuntimeBindingError(ValueError):
 
 @dataclass(frozen=True)
 class LaunchRuntimeFactories:
-    """Camera source factories selected for one application launch."""
+    """Camera/turret factories selected for one application launch."""
 
     overview_source_factory: SourceFactory
     stereo_left_source_factory: SourceFactory
     stereo_right_source_factory: SourceFactory
+    turret_transport_factory: TransportFactory | None = None
 
 
 @dataclass(frozen=True)
@@ -88,6 +99,54 @@ def _synthetic_stereo_factory(
     return factory
 
 
+def _full_tracking_sim_factories(
+    inputs: LoadedApplicationInputs,
+    selection: EffectiveLaunchSelection,
+) -> tuple[LaunchRuntimeFactories, OverviewCalibration, StereoCalibration]:
+    reference = inputs.stereo_calibration
+    if (
+        reference.image_width != DEFAULT_SYNTHETIC_WIDTH
+        or reference.image_height != DEFAULT_SYNTHETIC_HEIGHT
+    ):
+        raise LaunchRuntimeBindingError(
+            "synthetic tracking world requires a 1296x976 reference stereo calibration"
+        )
+    world = SyntheticTrackingWorld(reference)
+    plant = SyntheticTurretPlant(selection.config.turret)
+    rig = RealtimeSyntheticTrackingRig(world, plant)
+    endpoint = SyntheticTrackingStm32Endpoint(
+        plant,
+        request_sink=rig.apply_executed_request,
+    )
+
+    def source_factory(camera: CameraRole) -> SourceFactory:
+        def factory(_config):
+            return SyntheticTrackingFrameSource(rig, camera)
+
+        return factory
+
+    def turret_transport_factory(_port: str, baudrate: int, emulate_stm32: bool):
+        if not emulate_stm32:
+            raise RuntimeError("synthetic tracking transport requires STM32 SIM mode")
+        return FakeTransport(endpoint, baudrate=baudrate)
+
+    overview_calibration = diagnostic_overview_calibration(
+        width=DEFAULT_SYNTHETIC_WIDTH,
+        height=DEFAULT_SYNTHETIC_HEIGHT,
+    )
+    stereo_calibration = rectified_synthetic_calibration(reference)
+    return (
+        LaunchRuntimeFactories(
+            overview_source_factory=source_factory(CameraRole.OVERVIEW),
+            stereo_left_source_factory=source_factory(CameraRole.STEREO_LEFT),
+            stereo_right_source_factory=source_factory(CameraRole.STEREO_RIGHT),
+            turret_transport_factory=turret_transport_factory,
+        ),
+        overview_calibration,
+        stereo_calibration,
+    )
+
+
 def build_launch_runtime_bindings(
     inputs: LoadedApplicationInputs,
     options: LaunchOptions,
@@ -100,13 +159,28 @@ def build_launch_runtime_bindings(
     overview_factory = create_camera_source
     left_factory = create_camera_source
     right_factory = create_camera_source
+    turret_transport_factory: TransportFactory | None = None
 
-    if options.overview is CameraSourceMode.SIM:
+    full_tracking_sim = (
+        options.overview is CameraSourceMode.SIM
+        and options.stereo_left is CameraSourceMode.SIM
+        and options.stereo_right is StereoRightMode.SIM
+        and options.stm32 is Stm32Mode.SIM
+    )
+    if full_tracking_sim:
+        tracking_factories, overview_calibration, stereo_calibration = (
+            _full_tracking_sim_factories(inputs, selection)
+        )
+        overview_factory = tracking_factories.overview_source_factory
+        left_factory = tracking_factories.stereo_left_source_factory
+        right_factory = tracking_factories.stereo_right_source_factory
+        turret_transport_factory = tracking_factories.turret_transport_factory
+    elif options.overview is CameraSourceMode.SIM:
         overview_factory, overview_calibration = _synthetic_overview_factory(inputs)
 
     left_sim = options.stereo_left is CameraSourceMode.SIM
     right_sim = options.stereo_right is StereoRightMode.SIM
-    if left_sim or right_sim:
+    if (left_sim or right_sim) and not full_tracking_sim:
         reference = inputs.stereo_calibration
         if (
             reference.image_width != DEFAULT_SYNTHETIC_WIDTH
@@ -140,6 +214,7 @@ def build_launch_runtime_bindings(
             overview_source_factory=overview_factory,
             stereo_left_source_factory=left_factory,
             stereo_right_source_factory=right_factory,
+            turret_transport_factory=turret_transport_factory,
         ),
         show_diagnostic_clock=bool(selection.simulated_camera_roles),
     )

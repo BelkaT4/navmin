@@ -31,6 +31,29 @@ from .pty_stm32 import (
     StableDiagnosticPort,
     check_pty_preflight,
 )
+from .synthetic_tracking_closed_loop import (
+    SyntheticAngularCameraModel,
+    SyntheticClosedLoopFrame,
+    SyntheticClosedLoopPhaseSummary,
+    SyntheticClosedLoopResult,
+    run_synthetic_tracking_closed_loop,
+    write_synthetic_tracking_closed_loop_json,
+)
+from .synthetic_tracking_stereo import (
+    SyntheticTrackingStereoDistanceSample,
+    SyntheticTrackingStereoResult,
+    run_synthetic_tracking_stereo_diagnostic,
+    write_synthetic_tracking_stereo_json,
+)
+from .synthetic_tracking_turret import (
+    RealtimeSyntheticTrackingRig,
+    SyntheticTrackingFrameSource,
+    SyntheticTrackingSimulation,
+    SyntheticTrackingSimulationSnapshot,
+    SyntheticTrackingStm32Endpoint,
+    SyntheticTurretPlant,
+    SyntheticTurretPlantState,
+)
 
 __all__ = [
     "GST_RECEIVER_ELEMENTS",
@@ -48,11 +71,24 @@ __all__ = [
     "PtyReplacement",
     "PtyRequestRecord",
     "PtyStm32Emulator",
+    "RealtimeSyntheticTrackingRig",
     "RequestFrameAssembler",
     "RtpJpegSenderConfig",
     "SenderProcessError",
     "StableDiagnosticPort",
+    "SyntheticAngularCameraModel",
+    "SyntheticClosedLoopFrame",
+    "SyntheticClosedLoopPhaseSummary",
+    "SyntheticClosedLoopResult",
     "SyntheticDiagnosticFrameGenerator",
+    "SyntheticTrackingFrameSource",
+    "SyntheticTrackingSimulation",
+    "SyntheticTrackingSimulationSnapshot",
+    "SyntheticTrackingStereoDistanceSample",
+    "SyntheticTrackingStereoResult",
+    "SyntheticTrackingStm32Endpoint",
+    "SyntheticTurretPlant",
+    "SyntheticTurretPlantState",
     "build_sender_command",
     "check_gstreamer_runtime",
     "check_gstreamer_sender_runtime",
@@ -60,4 +96,8 @@ __all__ = [
     "diagnostic_camera_config",
     "diagnostic_overview_calibration",
     "diagnostic_stereo_calibration",
+    "run_synthetic_tracking_closed_loop",
+    "run_synthetic_tracking_stereo_diagnostic",
+    "write_synthetic_tracking_closed_loop_json",
+    "write_synthetic_tracking_stereo_json",
 ]

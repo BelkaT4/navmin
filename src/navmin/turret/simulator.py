@@ -75,6 +75,14 @@ class FakeStm32Endpoint:
         self._last_signature: tuple[int, CommandCode, object | None] | None = None
         self._last_response: bytes | None = None
 
+    def _on_executed_request(
+        self,
+        request: ProtocolRequest,
+        response: ProtocolResponse,
+    ) -> None:
+        """Hook for diagnostics that observe newly executed requests."""
+        del request, response
+
     @property
     def baudrate(self) -> int:
         return self._baudrate
@@ -147,6 +155,7 @@ class FakeStm32Endpoint:
             result=spec.result,
         )
         canonical_response = encode_response(response)
+        self._on_executed_request(request, response)
 
         self._expected_request_id = (request.request_id + 1) & 0xFFFF
         self._last_signature = signature

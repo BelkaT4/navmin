@@ -67,7 +67,7 @@ from navmin.diagnostic_launcher import (
     _parser as diagnostic_parser,
 )
 from navmin.diagnostic_launcher import main as diagnostic_main
-from navmin.diagnostics.synthetic_sources import SyntheticFrameSource
+from navmin.diagnostics.synthetic_tracking_turret import SyntheticTrackingFrameSource
 from navmin.host_environment import WindowsHostEnvironment
 from navmin.imu import ImuCalibration
 from navmin.input_recovery import InputRecoveryError, recover_default_inputs
@@ -477,15 +477,20 @@ def test_launch_runtime_bindings_all_sim_are_in_process_and_show_clock() -> None
     overview_source = bindings.factories.overview_source_factory(cameras.overview)
     left_source = bindings.factories.stereo_left_source_factory(cameras.stereo_left)
     right_source = bindings.factories.stereo_right_source_factory(cameras.stereo_right)
+    assert bindings.factories.turret_transport_factory is not None
+    captured = []
     for source in (overview_source, left_source, right_source):
-        assert isinstance(source, SyntheticFrameSource)
+        assert isinstance(source, SyntheticTrackingFrameSource)
         source.start()
         frame = source.read()
         assert frame is not None
-        assert frame.capture_id is None
+        assert frame.capture_id is not None
         assert frame.receive_timestamp_ns is not None
+        captured.append(frame)
         source.stop()
 
+    assert captured[1].capture_id == captured[2].capture_id
+    assert captured[1].receive_timestamp_ns == captured[2].receive_timestamp_ns
     assert overview_source.read() is None
     assert left_source.read() is None
     assert right_source.read() is None
