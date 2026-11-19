@@ -35,6 +35,17 @@ class FocalScaleCameraModel:
         if not math.isfinite(float(scale)) or float(scale) <= 0.0:
             raise ValueError("focal_scale must be a finite number > 0")
 
+    @property
+    def projection_matrix(self):
+        projection = getattr(self.base, "projection_matrix", None)
+        if projection is None:
+            return None
+        scale = float(self.focal_scale)
+        rows = [list(row) for row in projection]
+        rows[0][0] *= scale
+        rows[1][1] *= scale
+        return tuple(tuple(float(item) for item in row) for row in rows)
+
     def pixel_to_ray(self, x_px: float, y_px: float) -> CameraRay:
         ray = self.base.pixel_to_ray(x_px, y_px)
         scale = float(self.focal_scale)

@@ -89,7 +89,7 @@
     },
     "prediction": {
       "enabled": true,
-      "horizon-ms": 0,
+      "horizon-ms": 100,
       "max-angle-x-deg": 5.0,
       "max-angle-y-deg": 5.0
     },
@@ -115,7 +115,7 @@
   "turret": {
     "serial": {
       "port": "/dev/ttyUSB0",
-      "baudrate": 9600,
+      "baudrate": 57600,
       "response-timeout-ms": 100,
       "max-retries": 2,
       "inter-request-delay-ms": 2

@@ -293,6 +293,18 @@ class WorkingFrameCameraModel:
     _inverse_projection: Matrix3x3
     _projection: Matrix3x3 | None = None
 
+    @property
+    def projection_matrix(self) -> Matrix3x3:
+        """Return the effective working-frame projection for diagnostics."""
+        if self._projection is not None:
+            return self._projection
+        matrix = np.linalg.inv(np.asarray(self._inverse_projection, dtype=np.float64))
+        if not np.isfinite(matrix).all():
+            raise ValueError("camera projection must be finite")
+        return tuple(
+            tuple(float(item) for item in row) for row in matrix.tolist()
+        )
+
     def pixel_to_ray(self, x_px: float, y_px: float) -> CameraRay:
         if type(x_px) not in (int, float) or type(y_px) not in (int, float):
             raise TypeError("pixel coordinates must be numbers")

@@ -16,6 +16,10 @@
 - [Открытые вопросы](./architecture/problems.md)
 - [Временные уточнения архитектуры](./architecture/architecture-updates.md)
 
+## Диагностика
+
+- [Контракт подробного VERBOSE-логирования](./diagnostics/verbose-logging-contract.md)
+
 ## Модули
 
 - [Core](./modules/core/index.md)

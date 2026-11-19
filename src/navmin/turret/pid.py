@@ -37,6 +37,8 @@ class PidStepDiagnostics:
     unclamped_output: float
     output: float
     clamped: bool
+    integrator_updated: bool
+    anti_windup_active: bool
 
 
 @dataclass(frozen=True)
@@ -166,6 +168,8 @@ class AxisPid:
                 unclamped_output=unclamped_output,
                 output=output,
                 clamped=output != unclamped_output,
+                integrator_updated=False,
+                anti_windup_active=False,
             )
             return output
 
@@ -187,7 +191,9 @@ class AxisPid:
         drives_negative_saturation = (
             candidate_output < -self._output_limit and error_value < 0
         )
-        if not drives_positive_saturation and not drives_negative_saturation:
+        anti_windup_active = drives_positive_saturation or drives_negative_saturation
+        integrator_updated = not anti_windup_active
+        if integrator_updated:
             self._i_term = candidate_i
 
         unclamped_output = p_term + self._i_term + d_term + ff_term
@@ -202,6 +208,8 @@ class AxisPid:
             unclamped_output=unclamped_output,
             output=output,
             clamped=output != unclamped_output,
+            integrator_updated=integrator_updated,
+            anti_windup_active=anti_windup_active,
         )
         self._previous_error = error_value
         self._previous_time_s = now

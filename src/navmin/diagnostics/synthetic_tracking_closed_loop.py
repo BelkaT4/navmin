@@ -9,7 +9,7 @@ production control path; it is retained only for diagnostics and assertions.
 from __future__ import annotations
 
 import json
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass
 from math import atan2, cos, degrees, hypot, radians, sin
 from pathlib import Path
 from statistics import fmean
@@ -44,7 +44,6 @@ from .synthetic_tracking_turret import (
 from .synthetic_tracking_world import (
     SyntheticTrackingCameraGeometry,
     SyntheticTrackingWorld,
-    stereo_fov_deg,
 )
 
 
@@ -146,8 +145,6 @@ class SyntheticClosedLoopPhaseSummary:
 class SyntheticClosedLoopResult:
     status: str
     fps: int
-    true_stereo_hfov_deg: float
-    tracking_stereo_hfov_deg: float
     frames: int
     duration_s: float
     target_acquired_frame: int | None
@@ -212,16 +209,11 @@ def run_synthetic_tracking_closed_loop(
     frame_count: int | None = None,
     selection_frame: int = 8,
     sample_stride: int = 1,
-    true_stereo_hfov_deg: float | None = None,
-    tracking_stereo_hfov_deg: float | None = None,
 ) -> SyntheticClosedLoopResult:
     """Run one deterministic headless closed-loop tracking diagnostic."""
     config = load_config(config_path)
     stereo_calibration = load_stereo_calibration(stereo_calibration_path)
-    world = SyntheticTrackingWorld(
-        stereo_calibration,
-        stereo_true_hfov_deg=true_stereo_hfov_deg,
-    )
+    world = SyntheticTrackingWorld(stereo_calibration)
     total_frames = (
         round(world.cycle_duration_s * world.fps)
         if frame_count is None
@@ -270,22 +262,7 @@ def run_synthetic_tracking_closed_loop(
     aiming = Aiming(config.aiming)
     estimator = TrackingEstimator(config.tracking_control)
     camera = CameraRole.STEREO_LEFT
-    true_geometry = world.geometries[camera]
-    calibration_hfov, calibration_vfov = stereo_fov_deg(stereo_calibration)
-    if tracking_stereo_hfov_deg is None:
-        tracking_hfov = calibration_hfov
-        tracking_vfov = calibration_vfov
-    else:
-        tracking_hfov = float(tracking_stereo_hfov_deg)
-        if not 0.0 < tracking_hfov < 180.0:
-            raise ValueError("tracking_stereo_hfov_deg must be in (0, 180)")
-        tracking_vfov = tracking_hfov * true_geometry.height / true_geometry.width
-    tracking_geometry = replace(
-        true_geometry,
-        horizontal_fov_deg=tracking_hfov,
-        vertical_fov_deg=tracking_vfov,
-    )
-    camera_model = SyntheticAngularCameraModel(tracking_geometry)
+    camera_model = SyntheticAngularCameraModel(world.geometries[camera])
 
     selected_target: TargetRef | None = None
     acquired_frame: int | None = None
@@ -445,8 +422,6 @@ def run_synthetic_tracking_closed_loop(
     return SyntheticClosedLoopResult(
         status="COMPLETE",
         fps=world.fps,
-        true_stereo_hfov_deg=true_geometry.horizontal_fov_deg,
-        tracking_stereo_hfov_deg=tracking_geometry.horizontal_fov_deg,
         frames=total_frames,
         duration_s=total_frames / world.fps,
         target_acquired_frame=acquired_frame,

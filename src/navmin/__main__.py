@@ -29,6 +29,7 @@ from navmin.launch_options import (
 from navmin.launch_runtime import build_launch_runtime_bindings
 from navmin.launcher import (
     LauncherPaths,
+    emit_config_snapshot,
     load_application_inputs,
     run_loaded_application,
     session_file_logging,
@@ -142,6 +143,7 @@ def _create_noninteractive_artifacts(args: argparse.Namespace) -> SessionArtifac
         stereo_left_backend=_artifact_backend(args.stereo_left),
         turret_backend=_artifact_backend(args.stm32),
         input_mode="files",
+        logging_mode="verbose" if args.verbose else "normal",
     )
 
 
@@ -165,7 +167,13 @@ def _run_noninteractive(
     artifacts = _create_noninteractive_artifacts(args)
     log_level = logging.DEBUG if args.verbose else logging.INFO
 
-    with session_file_logging(artifacts.runtime_log_path, level=log_level):
+    with session_file_logging(
+        artifacts.runtime_log_path,
+        level=log_level,
+        run_id=artifacts.session_id,
+        verbose=args.verbose,
+        integrity_callback=artifacts.update_logging_integrity,
+    ):
         LOGGER.info(
             "Unified %s launcher: config=%s overview=%s "
             "stereo_left=%s stereo_right=%s stm32=%s preflight_only=%s "
@@ -257,6 +265,13 @@ def _run_noninteractive(
                     stereo_calibration=effective_inputs.stereo_calibration,
                     source_paths=effective_inputs.source_paths,
                 )
+                emit_config_snapshot(
+                    effective_inputs,
+                    overview_backend=options.overview.value,
+                    stereo_left_backend=options.stereo_left.value,
+                    stereo_right_backend=options.stereo_right.value,
+                    turret_backend=options.stm32.value,
+                )
                 from navmin.diagnostics.live_video_latency_calibration import (
                     write_live_video_latency_calibration_json,
                 )
@@ -347,6 +362,7 @@ def _interactive_failure_artifacts() -> SessionArtifacts:
         stereo_left_backend="config-default",
         turret_backend="config-default",
         input_mode="files",
+        logging_mode="normal",
     )
 
 
@@ -355,7 +371,12 @@ def _handle_interactive_input_failure(
     error: BaseException,
 ) -> int:
     artifacts = _interactive_failure_artifacts()
-    with session_file_logging(artifacts.runtime_log_path, level=logging.INFO):
+    with session_file_logging(
+        artifacts.runtime_log_path,
+        level=logging.INFO,
+        run_id=artifacts.session_id,
+        verbose=False,
+    ):
         LOGGER.error("NavMin interactive input loading failed: %s", error)
         print(f"INPUT ERROR: {error}", file=sys.stderr)
         should_recover = False

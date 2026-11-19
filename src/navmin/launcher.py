@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import logging
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -12,9 +14,11 @@ from navmin.calibration import (
     StereoCalibration,
     load_overview_calibration,
     load_stereo_calibration,
+    stereo_left_horizontal_fov_deg,
 )
 from navmin.config import AppConfig, ConfigManager, config_to_mapping, load_config
 from navmin.contracts import CameraRole
+from navmin.diagnostic_logging import diagnostic_events_enabled, emit_event
 from navmin.imu import ImuCalibration
 from navmin.logging_setup import session_file_logging
 from navmin.session_artifacts import SourceInputPaths
@@ -53,6 +57,111 @@ class LoadedApplicationInputs:
 
 RuntimeBuilder = Callable[..., "ApplicationRuntime"]
 UiRunner = Callable[..., int]
+
+
+
+
+def _sha256_or_none(path: Path | None) -> str | None:
+    if path is None:
+        return None
+    digest = hashlib.sha256()
+    try:
+        with Path(path).open("rb") as stream:
+            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(chunk)
+    except OSError:
+        return None
+    return digest.hexdigest()
+
+
+def _redacted_serial_port(port: object) -> str | None:
+    if not isinstance(port, str):
+        return None
+    normalized = port.replace("\\", "/")
+    return normalized.rsplit("/", 1)[-1] or "serial"
+
+
+def emit_config_snapshot(
+    inputs: LoadedApplicationInputs,
+    *,
+    overview_backend: str | None,
+    stereo_left_backend: str | None,
+    stereo_right_backend: str | None,
+    turret_backend: str | None,
+) -> None:
+    """Emit one redacted effective runtime configuration snapshot in VERBOSE."""
+    if not diagnostic_events_enabled():
+        return
+    mapping = config_to_mapping(inputs.config)
+    vision = mapping["vision"]
+    cameras = vision["cameras"]
+    source_paths = inputs.source_paths
+    stereo = inputs.stereo_calibration
+    nominal_hfov = stereo_left_horizontal_fov_deg(stereo)
+    camera_backends = {
+        "overview": overview_backend,
+        "stereo-left": stereo_left_backend,
+        "stereo-right": stereo_right_backend,
+    }
+    camera_summary = {}
+    for role, camera in cameras.items():
+        source = camera.get("source", {})
+        camera_summary[role] = {
+            "backend": camera_backends.get(role),
+            "working_resolution": (
+                [
+                    inputs.overview_calibration.image_width,
+                    inputs.overview_calibration.image_height,
+                ]
+                if role == "overview"
+                else [stereo.image_width, stereo.image_height]
+            ),
+            "processing_enabled": camera.get("processing-enabled"),
+            "processor_class": camera.get("vision-processor-class"),
+            "processor_profile": camera.get("vision-processor-profile"),
+            "endpoint_identity": {
+                "type": source.get("type"),
+                "port": source.get("port"),
+            },
+        }
+    tracking = mapping["tracking-control"]
+    turret = mapping["turret"]
+    source_config = None if source_paths is None else source_paths.config
+    source_overview = (
+        None if source_paths is None else source_paths.overview_calibration
+    )
+    source_stereo = None if source_paths is None else source_paths.stereo_calibration
+    emit_event(
+        logging.getLogger(__name__),
+        "CONFIG_SNAPSHOT",
+        source_instance="launcher:config",
+        config_schema_version=mapping["schema-version"],
+        config_sha256=_sha256_or_none(source_config),
+        overview_calibration_sha256=_sha256_or_none(source_overview),
+        stereo_calibration_sha256=_sha256_or_none(source_stereo),
+        cameras=camera_summary,
+        tracking={
+            "pid": turret["controller"],
+            "feed_forward": tracking["feed-forward"],
+            "prediction": tracking["prediction"],
+            "velocity_estimator": tracking["velocity-estimator"],
+            "platform_motion": tracking["platform-motion"],
+            "stereo_left_nominal_hfov_deg": nominal_hfov,
+            "stereo_left_effective_hfov_deg": nominal_hfov,
+            "stereo_left_fx_px": float(stereo.P1[0][0]),
+            "stereo_left_fy_px": float(stereo.P1[1][1]),
+        },
+        turret={
+            "backend": turret_backend,
+            "stm32": turret["stm32"],
+            "axes": turret["axes"],
+        },
+        serial={
+            **{key: value for key, value in turret["serial"].items() if key != "port"},
+            "port_redacted": _redacted_serial_port(turret["serial"].get("port")),
+        },
+        imu=mapping.get("imu"),
+    )
 
 
 class ApplicationInputError(ValueError):
@@ -431,6 +540,7 @@ __all__ = [
     "ApplicationInputError",
     "LauncherPaths",
     "LoadedApplicationInputs",
+    "emit_config_snapshot",
     "load_application_inputs",
     "resolve_application_source_paths",
     "resolve_imu_calibration_path",

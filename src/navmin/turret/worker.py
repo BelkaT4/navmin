@@ -25,6 +25,7 @@ from navmin.contracts import (
     TurretControlMode,
     TurretState,
 )
+from navmin.diagnostic_logging import emit_event
 from navmin.lifecycle import StopToken, stop_and_join
 
 from .controller import ControllerError, TurretController
@@ -150,6 +151,7 @@ class TurretWorker:
         self._last_known_port: str | None = None
         self._last_known_baud: int | None = None
         self._next_request_id = 0
+        self._connection_epoch = 0
 
         self._motion_inputs: InvalidatableLatest[MotionInput] = InvalidatableLatest()
         self._control_mailbox: deque[_ControlIntent] = deque()
@@ -504,6 +506,17 @@ class TurretWorker:
                                 self._normal_ingress_open = True
                     if not pending_emergency:
                         _LOGGER.info("Turret READY")
+                        emit_event(
+                            _LOGGER,
+                            "UART_CONNECTION",
+                            source_instance=f"uart:connection_epoch:{self._connection_epoch}",
+                            connection_epoch=self._connection_epoch,
+                            state="ready",
+                            port_redacted=self._redacted_serial_port(serial.port),
+                            baud=self._transport_required().baudrate,
+                            reason=None,
+                            retry_index=None,
+                        )
                         return True
                     if not self._complete_recovery_emergency_boundary():
                         self._close_transport()
@@ -827,6 +840,19 @@ class TurretWorker:
         self._last_known_port = self._desired_config.serial.port
         self._last_known_baud = desired
         _LOGGER.info("Turret baud transitioned to %d", desired)
+        emit_event(
+            _LOGGER,
+            "UART_CONNECTION",
+            source_instance=f"uart:connection_epoch:{self._connection_epoch}",
+            connection_epoch=self._connection_epoch,
+            state="baud_transition",
+            port_redacted=self._redacted_serial_port(
+                self._desired_config.serial.port
+            ),
+            baud=desired,
+            reason=None,
+            retry_index=None,
+        )
         return True
 
     def _begin_recovery(self, reason: str) -> None:
@@ -836,6 +862,18 @@ class TurretWorker:
         ):
             return
         _LOGGER.info("Turret entering recovery: %s", reason)
+        if self._connection_epoch > 0:
+            emit_event(
+                _LOGGER,
+                "UART_CONNECTION",
+                source_instance=f"uart:connection_epoch:{self._connection_epoch}",
+                connection_epoch=self._connection_epoch,
+                state="lost",
+                port_redacted=self._redacted_serial_port(self._desired_config.serial.port),
+                baud=(None if self._transport is None else self._transport.baudrate),
+                reason=reason,
+                retry_index=None,
+            )
         self._discard_normal_ingress()
         self._ready = False
         controller = self._controller
@@ -890,16 +928,34 @@ class TurretWorker:
         self, transport: PhysicalTransport, config: TurretConfig
     ) -> TurretSession:
         timeout_s, retries, delay_s = _session_settings(config.serial)
+        self._connection_epoch += 1
         session = TurretSession(
             transport,
             response_timeout_s=timeout_s,
             max_retries=retries,
             inter_request_delay_s=delay_s,
             initial_request_id=self._next_request_id,
+            connection_epoch=self._connection_epoch,
+        )
+        emit_event(
+            _LOGGER,
+            "UART_CONNECTION",
+            source_instance=f"uart:connection_epoch:{self._connection_epoch}",
+            connection_epoch=self._connection_epoch,
+            state="open",
+            port_redacted=self._redacted_serial_port(config.serial.port),
+            baud=transport.baudrate,
+            reason=None,
+            retry_index=None,
         )
         # Store the serial/session snapshot used by this concrete boundary.
         self._session_config = config
         return session
+
+    @staticmethod
+    def _redacted_serial_port(port: str) -> str:
+        normalized = str(port).replace("\\", "/")
+        return normalized.rsplit("/", 1)[-1] or "serial"
 
     def _latest_config_update(self) -> ConfigUpdate[TurretConfig]:
         update = self._config_updates.get()
@@ -960,6 +1016,19 @@ class TurretWorker:
         self._session = None
         if transport is None:
             return
+        emit_event(
+            _LOGGER,
+            "UART_CONNECTION",
+            source_instance=f"uart:connection_epoch:{self._connection_epoch}",
+            connection_epoch=self._connection_epoch,
+            state="close",
+            port_redacted=self._redacted_serial_port(
+                self._desired_config.serial.port
+            ),
+            baud=transport.baudrate,
+            reason=None,
+            retry_index=None,
+        )
         try:
             transport.close()
         except TransportError as exc:

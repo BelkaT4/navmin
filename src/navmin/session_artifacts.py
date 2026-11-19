@@ -8,6 +8,7 @@ import os
 import platform
 import subprocess
 import tempfile
+from collections.abc import Mapping
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime, timedelta
 from enum import Enum, StrEnum
@@ -19,6 +20,7 @@ if TYPE_CHECKING:
 
 from navmin.calibration import OverviewCalibration, StereoCalibration
 from navmin.config import AppConfig, config_to_mapping
+from navmin.diagnostic_logging import record_run_outcome
 
 _MANIFEST_SCHEMA_VERSION = 1
 _JSON_INDENT = 2
@@ -64,11 +66,14 @@ class SessionArtifacts:
         stereo_left_backend: str,
         turret_backend: str,
         input_mode: str,
+        logging_mode: str = "normal",
         now: datetime | None = None,
         git_root: Path | None = None,
     ) -> SessionArtifacts:
         if mode not in {"normal", "diagnostic"}:
             raise ValueError("mode must be 'normal' or 'diagnostic'")
+        if logging_mode not in {"normal", "verbose"}:
+            raise ValueError("logging_mode must be 'normal' or 'verbose'")
         started = _utc_datetime(now)
         session_dir, session_id = _create_unique_session_dir(
             Path(parent_dir),
@@ -85,6 +90,7 @@ class SessionArtifacts:
             "schema_version": _MANIFEST_SCHEMA_VERSION,
             "session_id": session_id,
             "mode": mode,
+            "logging_mode": logging_mode,
             "started_at_utc": _iso_utc(started),
             "finished_at_utc": None,
             "status": SessionStatus.STARTING.value,
@@ -120,6 +126,11 @@ class SessionArtifacts:
 
     def write_manifest(self) -> None:
         _atomic_write_json(self.manifest_path, self._manifest)
+
+    def update_logging_integrity(self, summary: Mapping[str, object]) -> None:
+        """Persist the final VERBOSE logging/integrity summary after queue drain."""
+        self._manifest["logging_integrity"] = _json_normalize(dict(summary))
+        self.write_manifest()
 
     def write_preflight(self, report: StartupPreflightReport) -> None:
         """Persist one typed startup preflight report atomically."""
@@ -181,6 +192,19 @@ class SessionArtifacts:
         if cleanup_failure is not None:
             self._manifest["cleanup_failure_type"] = type(cleanup_failure).__name__
             self._manifest["cleanup_failure_message"] = str(cleanup_failure)
+        record_run_outcome(
+            status=status.value,
+            exit_code=int(exit_code),
+            completed=status is SessionStatus.COMPLETED,
+            failure_type=(None if failure is None else type(failure).__name__),
+            failure_message=(None if failure is None else str(failure)),
+            cleanup_failure_type=(
+                None if cleanup_failure is None else type(cleanup_failure).__name__
+            ),
+            cleanup_failure_message=(
+                None if cleanup_failure is None else str(cleanup_failure)
+            ),
+        )
         self.write_manifest()
 
 

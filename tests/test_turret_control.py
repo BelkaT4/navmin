@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 from dataclasses import replace
 from pathlib import Path
@@ -25,6 +26,7 @@ from navmin.contracts import (
     TrackingControlSample,
     TurretControlMode,
 )
+from navmin.logging_setup import session_file_logging
 from navmin.turret.controller import TurretController
 from navmin.turret.hal import (
     RelativeMoveLimitError,
@@ -678,7 +680,7 @@ def test_controller_tracking_pending_is_latest_and_revision_processed_once() -> 
     assert controller.last_processed_revision == 2
 
 
-def test_controller_applies_valid_prediction_and_velocity_feed_forward(caplog) -> None:
+def test_controller_applies_valid_prediction_and_velocity_feed_forward() -> None:
     tracking = _tracking_control_config()
     tracking = replace(
         tracking,
@@ -703,7 +705,6 @@ def test_controller_applies_valid_prediction_and_velocity_feed_forward(caplog) -
         tracking_control_config=tracking,
     )
     _enter_tracking_off(controller, transport)
-    caplog.set_level(logging.DEBUG, logger="navmin.turret.controller")
 
     controller.submit_tracking_control(
         1,
@@ -727,14 +728,6 @@ def test_controller_applies_valid_prediction_and_velocity_feed_forward(caplog) -
     assert controller.pid_x.last_step.output == pytest.approx(5.0)
     assert controller.pid_y.last_step is not None
     assert controller.pid_y.last_step.feed_forward == pytest.approx(-2.0)
-    messages = [
-        record.getMessage()
-        for record in caplog.records
-        if record.name == "navmin.turret.controller"
-    ]
-    assert any("ff_output_x_deg_s=2.000000" in message for message in messages)
-    assert any("p_x_deg_s=3.000000" in message for message in messages)
-    assert any("final_output_y_deg_s=-4.500000" in message for message in messages)
 
 
 def test_invalid_axis_suppresses_prediction_and_ff_but_keeps_pid() -> None:
@@ -1237,3 +1230,58 @@ def test_disabled_prediction_and_ff_ignore_valid_rate_after_time_compensation() 
     assert controller.pid_x.last_step is not None
     assert controller.pid_x.last_step.proportional_offset == 0.0
     assert controller.pid_x.last_step.feed_forward == 0.0
+
+
+def test_verbose_tracking_control_correlates_control_id_to_uart_tx(tmp_path) -> None:
+    runtime_log = tmp_path / "runtime.log"
+    with session_file_logging(
+        runtime_log,
+        level=logging.DEBUG,
+        run_id="verbose-control-test",
+        verbose=True,
+    ):
+        controller, _, _, transport, _ = _stack()
+        _enter_tracking_off(controller, transport)
+        sample = replace(
+            _tracking_error(
+                _target(),
+                1.0,
+                target_rate_x=2.0,
+                target_rate_y=0.0,
+                valid_x=True,
+                valid_y=True,
+            ),
+            frame_id=42,
+        )
+        assert controller.submit_tracking_control(1, sample)
+        controller.flush_pending_motion()
+
+    events: dict[str, list[dict[str, object]]] = {}
+    for line in runtime_log.read_text(encoding="utf-8").splitlines():
+        for event_name in ("TRACK_CONTROL", "CONTROL_DECISION", "UART_TX", "UART_RX"):
+            marker = f"{event_name} "
+            if marker in line:
+                events.setdefault(event_name, []).append(
+                    json.loads(line.split(marker, 1)[1])
+                )
+                break
+
+    control = events["TRACK_CONTROL"][-1]
+    assert control["frame_id"] == 42
+    control_id = control["control_id"]
+    decision = events["CONTROL_DECISION"][-1]
+    assert decision["control_id"] == control_id
+    tx = next(
+        event
+        for event in reversed(events["UART_TX"])
+        if event["command_type"] == "SET_VELOCITY"
+    )
+    assert tx["control_id"] == control_id
+    assert tx["protocol_payload"]["velocity_x_steps_s"] != 0
+    rx = next(
+        event
+        for event in reversed(events["UART_RX"])
+        if event["command_type"] == "SET_VELOCITY"
+    )
+    assert rx["control_id"] == control_id
+    assert rx["transaction_result"] == "ok"

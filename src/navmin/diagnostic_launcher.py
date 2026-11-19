@@ -50,6 +50,7 @@ from navmin.diagnostics.synthetic_stereo import rectified_synthetic_calibration
 from navmin.launcher import (
     LauncherPaths,
     LoadedApplicationInputs,
+    emit_config_snapshot,
     load_application_inputs,
     run_loaded_application,
     session_file_logging,
@@ -560,8 +561,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         stereo_left_backend=selection.stereo_left.value,
         turret_backend=selection.turret.value,
         input_mode="synthetic" if args.synthetic_inputs else "files",
+        logging_mode="verbose",
     )
-    with session_file_logging(artifacts.runtime_log_path, level=logging.DEBUG):
+    with session_file_logging(
+        artifacts.runtime_log_path,
+        level=logging.DEBUG,
+        run_id=artifacts.session_id,
+        verbose=True,
+        integrity_callback=artifacts.update_logging_integrity,
+    ):
         LOGGER.info(
             "Diagnostic launcher selected overview=%s stereo_left=%s "
             "stereo_right=%s turret=%s; inputs=%s config=%s "
@@ -650,6 +658,17 @@ def main(argv: Sequence[str] | None = None) -> int:
                 overview_calibration=effective_inputs.overview_calibration,
                 stereo_calibration=effective_inputs.stereo_calibration,
                 source_paths=effective_inputs.source_paths,
+            )
+            emit_config_snapshot(
+                effective_inputs,
+                overview_backend=selection.overview.value,
+                stereo_left_backend=selection.stereo_left.value,
+                stereo_right_backend=(
+                    None
+                    if selection.stereo_right is None
+                    else selection.stereo_right.value
+                ),
+                turret_backend=selection.turret.value,
             )
             exit_code = run_loaded_application(
                 effective_inputs,

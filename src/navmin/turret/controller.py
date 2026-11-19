@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 from math import isfinite
-from time import monotonic
+from time import monotonic, monotonic_ns
 from typing import Protocol
 
 from navmin.config.models import (
@@ -21,6 +21,7 @@ from navmin.contracts import (
     TrackingControlSample,
     TurretControlMode,
 )
+from navmin.diagnostic_logging import emit_event
 
 from .hal import TurretHal
 from .pid import AxisPid, PidGains
@@ -76,6 +77,7 @@ class TurretController:
         self._last_processed_revision: int | None = None
         self._target: TargetRef | None = None
         self._last_tracking_time_s: float | None = None
+        self._next_control_id = 1
         self._pid_x = AxisPid(
             self._x_gains(config.controller),
             output_limit=config.stm32.max_speed_x_deg_s,
@@ -140,7 +142,12 @@ class TurretController:
             and now - self._last_tracking_time_s
             > self._config.stm32.velocity_watchdog_timeout_ms / 1000.0
         )
-        if target_changed or gap_exceeded:
+        reset_reason = None
+        if target_changed:
+            reset_reason = "target_changed"
+        elif gap_exceeded:
+            reset_reason = "tracking_gap_exceeded"
+        if reset_reason is not None:
             self._reset_pid()
 
         prediction = self._tracking_control_config.prediction
@@ -175,11 +182,43 @@ class TurretController:
                 else 0.0
             ),
         )
-        self._log_tracking_control(sample, x_usable=x_usable, y_usable=y_usable)
+        control_id = self._next_control_id
+        self._next_control_id += 1
+        self._log_tracking_control(
+            control_id,
+            sample,
+            now_s=now,
+            x_usable=x_usable,
+            y_usable=y_usable,
+            integrator_reset_reason=reset_reason,
+        )
+        previous_pending = self._pending_motion
         self._pending_motion = AxisVelocitySetpoint(
             velocity_x_deg_s=velocity_x,
             velocity_y_deg_s=velocity_y,
             timestamp_ns=sample.observation_timestamp_ns,
+            control_id=control_id,
+        )
+        emit_event(
+            _LOGGER,
+            "CONTROL_DECISION",
+            source_instance="turret:controller",
+            control_id=control_id,
+            decision=(
+                "replace"
+                if isinstance(previous_pending, AxisVelocitySetpoint)
+                else "send"
+            ),
+            command_type="SET_VELOCITY",
+            logical_velocity_x_deg_s=velocity_x,
+            logical_velocity_y_deg_s=velocity_y,
+            replaced_control_id=(
+                previous_pending.control_id
+                if isinstance(previous_pending, AxisVelocitySetpoint)
+                else None
+            ),
+            reason=None,
+            pending_revision=revision,
         )
         self._target = sample.target
         self._last_tracking_time_s = now
@@ -188,10 +227,13 @@ class TurretController:
 
     def _log_tracking_control(
         self,
+        control_id: int,
         sample: TrackingControlSample,
         *,
+        now_s: float,
         x_usable: bool,
         y_usable: bool,
+        integrator_reset_reason: str | None,
     ) -> None:
         if not _LOGGER.isEnabledFor(logging.DEBUG):
             return
@@ -199,56 +241,79 @@ class TurretController:
         y_step = self._pid_y.last_step
         if x_step is None or y_step is None:
             return
-        prediction = self._tracking_control_config.prediction
         feed_forward = self._tracking_control_config.feed_forward
-        _LOGGER.debug(
-            "tracking-control "
-            "target=%s camera=%s generation=%d track_id=%d "
-            "observation_timestamp_ns=%d "
-            "real_error_x_deg=%.6f real_error_y_deg=%.6f "
-            "target_rate_x_deg_s=%s target_rate_y_deg_s=%s "
-            "rate_valid_x=%s rate_valid_y=%s "
-            "prediction_enabled=%s prediction_horizon_ms=%d "
-            "prediction_applied_x_deg=%.6f prediction_applied_y_deg=%.6f "
-            "ff_enabled=%s ff_gain_x=%.6f ff_gain_y=%.6f "
-            "ff_output_x_deg_s=%.6f ff_output_y_deg_s=%.6f "
-            "p_x_deg_s=%.6f i_x_deg_s=%.6f d_x_deg_s=%.6f "
-            "p_y_deg_s=%.6f i_y_deg_s=%.6f d_y_deg_s=%.6f "
-            "final_unclamped_x_deg_s=%.6f final_unclamped_y_deg_s=%.6f "
-            "final_output_x_deg_s=%.6f final_output_y_deg_s=%.6f "
-            "final_clamped_x=%s final_clamped_y=%s",
-            sample.target,
-            sample.target.camera.value,
-            sample.target.generation,
-            sample.target.track_id,
-            sample.observation_timestamp_ns,
-            sample.real_error_x_deg,
-            sample.real_error_y_deg,
-            sample.target_rate_x_deg_s,
-            sample.target_rate_y_deg_s,
-            sample.rate_valid_x,
-            sample.rate_valid_y,
-            prediction.enabled,
-            prediction.horizon_ms,
-            x_step.proportional_offset if x_usable else 0.0,
-            y_step.proportional_offset if y_usable else 0.0,
-            feed_forward.enabled,
-            feed_forward.gain_x,
-            feed_forward.gain_y,
-            x_step.feed_forward,
-            y_step.feed_forward,
-            x_step.p_term,
-            x_step.i_term,
-            x_step.d_term,
-            y_step.p_term,
-            y_step.i_term,
-            y_step.d_term,
-            x_step.unclamped_output,
-            y_step.unclamped_output,
-            x_step.output,
-            y_step.output,
-            x_step.clamped,
-            y_step.clamped,
+        dt_ms = (
+            None
+            if self._last_tracking_time_s is None
+            else max(0.0, (now_s - self._last_tracking_time_s) * 1000.0)
+        )
+        observation_age_ms = max(
+            0.0, (monotonic_ns() - sample.observation_timestamp_ns) / 1_000_000.0
+        )
+        emit_event(
+            _LOGGER,
+            "TRACK_CONTROL",
+            source_instance="turret:controller",
+            control_id=control_id,
+            camera=sample.target.camera.value,
+            generation=sample.target.generation,
+            frame_id=sample.frame_id,
+            target_id=sample.target.track_id,
+            control_timestamp_ns=monotonic_ns(),
+            dt_ms=dt_ms,
+            observation_age_ms=observation_age_ms,
+            rate_valid_x=sample.rate_valid_x,
+            rate_valid_y=sample.rate_valid_y,
+            x={
+                "real_error_deg": sample.real_error_x_deg,
+                "prediction_offset_deg": (
+                    x_step.proportional_offset if x_usable else 0.0
+                ),
+                "p_error_deg": (
+                    sample.real_error_x_deg
+                    + (x_step.proportional_offset if x_usable else 0.0)
+                ),
+                "p_term_deg_s": x_step.p_term,
+                "i_term_deg_s": x_step.i_term,
+                "d_term_deg_s": x_step.d_term,
+                "ff_term_deg_s": x_step.feed_forward,
+                "ff_gain": feed_forward.gain_x,
+                "target_rate_deg_s": sample.target_rate_x_deg_s,
+                "i_state_deg_s": self._pid_x.i_term,
+                "integrator_updated": x_step.integrator_updated,
+                "integrator_reset": integrator_reset_reason is not None,
+                "integrator_reset_reason": integrator_reset_reason,
+            },
+            y={
+                "real_error_deg": sample.real_error_y_deg,
+                "prediction_offset_deg": (
+                    y_step.proportional_offset if y_usable else 0.0
+                ),
+                "p_error_deg": (
+                    sample.real_error_y_deg
+                    + (y_step.proportional_offset if y_usable else 0.0)
+                ),
+                "p_term_deg_s": y_step.p_term,
+                "i_term_deg_s": y_step.i_term,
+                "d_term_deg_s": y_step.d_term,
+                "ff_term_deg_s": y_step.feed_forward,
+                "ff_gain": feed_forward.gain_y,
+                "target_rate_deg_s": sample.target_rate_y_deg_s,
+                "i_state_deg_s": self._pid_y.i_term,
+                "integrator_updated": y_step.integrator_updated,
+                "integrator_reset": integrator_reset_reason is not None,
+                "integrator_reset_reason": integrator_reset_reason,
+            },
+            raw_velocity_x_deg_s=x_step.unclamped_output,
+            raw_velocity_y_deg_s=y_step.unclamped_output,
+            limited_velocity_x_deg_s=x_step.output,
+            limited_velocity_y_deg_s=y_step.output,
+            clamp_x_active=x_step.clamped,
+            clamp_y_active=y_step.clamped,
+            anti_windup_x_active=x_step.anti_windup_active,
+            anti_windup_y_active=y_step.anti_windup_active,
+            max_velocity_x_deg_s=self._pid_x.output_limit,
+            max_velocity_y_deg_s=self._pid_y.output_limit,
         )
 
     def apply_tracking_control_config(self, config: TrackingControlConfig) -> None:
@@ -264,7 +329,22 @@ class TurretController:
             and revision <= self._last_processed_revision
         ):
             return False
+        pending = self._pending_motion
         self._pending_motion = None
+        if isinstance(pending, AxisVelocitySetpoint) and pending.control_id is not None:
+            emit_event(
+                _LOGGER,
+                "CONTROL_DECISION",
+                source_instance="turret:controller",
+                control_id=pending.control_id,
+                decision="cancel",
+                command_type="SET_VELOCITY",
+                logical_velocity_x_deg_s=pending.velocity_x_deg_s,
+                logical_velocity_y_deg_s=pending.velocity_y_deg_s,
+                replaced_control_id=None,
+                reason="tracking_control_invalidated",
+                pending_revision=revision,
+            )
         self._reset_pid()
         self._last_processed_revision = revision
         return True

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from math import isfinite
 from typing import Protocol
@@ -226,6 +226,7 @@ class TrackingControlSample:
     rate_valid_x: bool
     rate_valid_y: bool
     observation_timestamp_ns: int
+    frame_id: int | None = field(default=None, compare=False)
 
 
 @dataclass(frozen=True)
@@ -399,6 +400,7 @@ class AxisVelocitySetpoint:
     velocity_x_deg_s: float
     velocity_y_deg_s: float
     timestamp_ns: int
+    control_id: int | None = field(default=None, compare=False)
 
 
 class TurretConnectionState(Enum):

@@ -267,22 +267,7 @@ def _motion_state_at(time_s: float) -> _MotionState:
     return _MotionState("STATIC_END", 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
 
 
-
-def _validated_horizontal_fov(value: float) -> float:
-    fov = float(value)
-    if not 0.0 < fov < 180.0:
-        raise ValueError("horizontal FOV must be in (0, 180) degrees")
-    return fov
-
-
-def _linear_vertical_fov(horizontal_fov_deg: float) -> float:
-    return (
-        _validated_horizontal_fov(horizontal_fov_deg)
-        * SYNTHETIC_TRACKING_HEIGHT
-        / SYNTHETIC_TRACKING_WIDTH
-    )
-
-def stereo_fov_deg(reference: StereoCalibration) -> tuple[float, float]:
+def _stereo_fov(reference: StereoCalibration) -> tuple[float, float]:
     fx = float(reference.P1[0][0])
     fy = float(reference.P1[1][1])
     if fx <= 0.0 or fy <= 0.0:
@@ -313,7 +298,6 @@ class SyntheticTrackingWorld:
         *,
         fps: int = SYNTHETIC_TRACKING_FPS,
         target_distance_m: float = SYNTHETIC_TRACKING_DISTANCE_M,
-        stereo_true_hfov_deg: float | None = None,
     ) -> None:
         if fps <= 0:
             raise ValueError("fps must be > 0")
@@ -325,13 +309,7 @@ class SyntheticTrackingWorld:
         self.stereo_calibration = stereo_calibration
         self.fps = fps
         self.target_distance_m = target_distance_m
-        calibration_hfov, calibration_vfov = stereo_fov_deg(stereo_calibration)
-        if stereo_true_hfov_deg is None:
-            stereo_hfov = calibration_hfov
-            stereo_vfov = calibration_vfov
-        else:
-            stereo_hfov = _validated_horizontal_fov(stereo_true_hfov_deg)
-            stereo_vfov = _linear_vertical_fov(stereo_hfov)
+        stereo_hfov, stereo_vfov = _stereo_fov(stereo_calibration)
         disparity_px = _stereo_disparity_px(
             stereo_calibration,
             distance_m=target_distance_m,
@@ -535,5 +513,4 @@ __all__ = [
     "SyntheticTrackingProjection",
     "SyntheticTrackingTruth",
     "SyntheticTrackingWorld",
-    "stereo_fov_deg",
 ]

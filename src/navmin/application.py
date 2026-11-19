@@ -34,6 +34,7 @@ from navmin.contracts import (
     TurretState,
 )
 from navmin.core import DistanceMeasurementMode, Mediator
+from navmin.diagnostic_logging import emit_event
 from navmin.diagnostics.live_video_latency_calibration import (
     InRuntimeVideoLatencyCalibration,
     LiveVideoLatencyCalibrationResult,
@@ -231,6 +232,8 @@ class ApplicationRuntime:
         self._pre_calibration_turret_config: TurretConfig | None = None
         self._runtime_tracking_control_config = tracking_control_config
         self._tracking_tuning_revision = 0
+        self._aiming_tuning_revision = 0
+        self._vision_processor_revision = 0
 
         camera_workers = {
             CameraRole.OVERVIEW: overview_worker,
@@ -356,8 +359,22 @@ class ApplicationRuntime:
         """Apply one dynamic aiming snapshot without restarting camera workers."""
         if not isinstance(config, AimingConfig):
             raise TypeError("config must be AimingConfig")
+        old_config = self.mediator.aiming.config
         self.mediator.aiming.replace_config(config)
+        self._aiming_tuning_revision += 1
         LOGGER.info("Aiming runtime update applied")
+        emit_event(
+            LOGGER,
+            "CONFIG_CHANGE",
+            source_instance="application:runtime_config",
+            revision=self._aiming_tuning_revision,
+            owner="core.aiming",
+            parameter="aiming",
+            old_value=old_config,
+            new_value=config,
+            apply_result="applied",
+            reason=None,
+        )
 
     def apply_motion_limits_tuning(self, config: Stm32Config) -> None:
         """Queue a temporary speed/acceleration-only Turret config update."""
@@ -385,6 +402,7 @@ class ApplicationRuntime:
             if not math.isfinite(numeric) or numeric <= 0.0:
                 raise ValueError(f"{name} must be finite and > 0")
         next_revision = self._turret_config_revision + 1
+        old_config = self._runtime_turret_config.stm32
         next_turret_config = replace(self._runtime_turret_config, stm32=config)
         self.turret_worker.submit_config_update(
             ConfigUpdate(revision=next_revision, config=next_turret_config)
@@ -398,6 +416,18 @@ class ApplicationRuntime:
             config.max_speed_y_deg_s,
             config.acceleration_x_deg_s2,
             config.acceleration_y_deg_s2,
+        )
+        emit_event(
+            LOGGER,
+            "CONFIG_CHANGE",
+            source_instance="application:runtime_config",
+            revision=next_revision,
+            owner="turret.stm32",
+            parameter="turret.stm32.motion_limits",
+            old_value=old_config,
+            new_value=config,
+            apply_result="queued",
+            reason=None,
         )
 
     def apply_vision_processor_selection(
@@ -413,13 +443,27 @@ class ApplicationRuntime:
         worker = self._camera_workers.get(camera)
         if worker is None:
             raise ValueError(f"camera is not enabled: {camera.value}")
+        old_selection = self._runtime_vision_processor_selections.get(camera)
         worker.submit_processor_selection(selection)
         self._runtime_vision_processor_selections[camera] = selection
+        self._vision_processor_revision += 1
         LOGGER.info(
             "Vision processor update queued camera=%s class=%s profile=%s",
             camera.value,
             selection.class_name,
             selection.profile_name,
+        )
+        emit_event(
+            LOGGER,
+            "CONFIG_CHANGE",
+            source_instance="application:runtime_config",
+            revision=self._vision_processor_revision,
+            owner=f"vision.{camera.value}",
+            parameter="vision.processor_selection",
+            old_value=old_selection,
+            new_value=selection,
+            apply_result="queued",
+            reason=None,
         )
 
     def apply_pid_tuning(self, config: PidControllerConfig) -> None:
@@ -432,6 +476,7 @@ class ApplicationRuntime:
             raise RuntimeError("PID tuning is unavailable during motion calibration")
         self._validate_pid_tuning(config)
         next_revision = self._turret_config_revision + 1
+        old_config = self._runtime_turret_config.controller
         next_turret_config = replace(self._runtime_turret_config, controller=config)
         self.turret_worker.submit_config_update(
             ConfigUpdate(revision=next_revision, config=next_turret_config)
@@ -451,6 +496,18 @@ class ApplicationRuntime:
             config.pid_ki_y,
             config.pid_kd_y,
             config.pid_integral_limit_y_deg_s,
+        )
+        emit_event(
+            LOGGER,
+            "CONFIG_CHANGE",
+            source_instance="application:runtime_config",
+            revision=next_revision,
+            owner="turret.controller",
+            parameter="turret.controller.pid",
+            old_value=old_config,
+            new_value=config,
+            apply_result="queued",
+            reason=None,
         )
 
     def begin_motion_calibration_profile(self, profile: MotionProfile) -> None:
@@ -540,6 +597,7 @@ class ApplicationRuntime:
                 "tracking tuning is unavailable during video latency calibration"
             )
         self._validate_tracking_control_tuning(config)
+        old_config = self._runtime_tracking_control_config
         next_revision = self._tracking_tuning_revision + 1
         update = ConfigUpdate(revision=next_revision, config=config)
         self.mediator.apply_tracking_control_config_update(update)
@@ -557,6 +615,18 @@ class ApplicationRuntime:
             config.prediction.enabled,
             config.prediction.horizon_ms,
             config.velocity_estimator.window_ms,
+        )
+        emit_event(
+            LOGGER,
+            "CONFIG_CHANGE",
+            source_instance="application:runtime_config",
+            revision=next_revision,
+            owner="tracking_control",
+            parameter="tracking_control",
+            old_value=old_config,
+            new_value=config,
+            apply_result="queued",
+            reason=None,
         )
 
     @staticmethod

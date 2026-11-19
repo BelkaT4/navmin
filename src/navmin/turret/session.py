@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Callable
 from dataclasses import dataclass
 from math import isfinite
 from threading import Event, Lock
-from time import monotonic, sleep
+from time import monotonic, monotonic_ns, sleep
+
+from navmin.diagnostic_logging import emit_event
 
 from .protocol import (
     SUPPORTED_BAUDRATES,
@@ -30,6 +33,7 @@ from .transport import (
     TransportTimeoutError,
 )
 
+_LOGGER = logging.getLogger(__name__)
 
 class SessionError(RuntimeError):
     """Base class for Turret protocol-session failures."""
@@ -94,6 +98,8 @@ class SessionResult:
 class _Transaction:
     request: ProtocolRequest
     raw_request: bytes
+    control_id: int | None = None
+    logical_command: object | None = None
 
 
 @dataclass(frozen=True)
@@ -155,6 +161,7 @@ class TurretSession:
         max_retries: int,
         inter_request_delay_s: float,
         initial_request_id: int = 0,
+        connection_epoch: int = 0,
         clock: Clock = monotonic,
         wait_hook: WaitHook = sleep,
     ) -> None:
@@ -171,6 +178,11 @@ class TurretSession:
         self._next_request_id = require_uint16(
             initial_request_id, name="initial_request_id"
         )
+        if isinstance(connection_epoch, bool) or not isinstance(connection_epoch, int):
+            raise TypeError("connection_epoch must be an integer")
+        if connection_epoch < 0:
+            raise ValueError("connection_epoch must be >= 0")
+        self._connection_epoch = connection_epoch
         self._clock = clock
         self._wait_hook = wait_hook
         self._transaction_active = False
@@ -202,6 +214,9 @@ class TurretSession:
         self,
         command: CommandCode,
         payload: RequestPayload = None,
+        *,
+        control_id: int | None = None,
+        logical_command: object | None = None,
     ) -> SessionResult:
         """Execute one ordinary transaction with bounded exact retries."""
         if command is CommandCode.EMERGENCY_STOP:
@@ -209,14 +224,19 @@ class TurretSession:
         if command is CommandCode.SET_BAUDRATE:
             raise ValueError("use set_baudrate() for controlled SET_BAUDRATE")
         self._require_normal_available()
-        transaction = self._new_transaction(command, payload)
+        transaction = self._new_transaction(
+            command,
+            payload,
+            control_id=control_id,
+            logical_command=logical_command,
+        )
 
         self._transaction_active = True
         try:
             attempts = self._max_retries + 1
-            for _ in range(attempts):
+            for attempt in range(1, attempts + 1):
                 outcome = self._physical_attempt(
-                    transaction, allow_emergency_preemption=True
+                    transaction, attempt=attempt, allow_emergency_preemption=True
                 )
                 response = outcome.response
                 if not outcome.transmitted and self._emergency_requested.is_set():
@@ -233,6 +253,19 @@ class TurretSession:
                 if self._emergency_requested.is_set():
                     emergency = self._run_emergency_transaction()
                     return SessionResult(None, emergency, True)
+                if attempt < attempts:
+                    emit_event(
+                        _LOGGER,
+                        "UART_RETRY",
+                        source_instance=f"uart:connection_epoch:{self._connection_epoch}",
+                        connection_epoch=self._connection_epoch,
+                        request_id=transaction.request.request_id,
+                        control_id=transaction.control_id,
+                        completed_attempt=attempt,
+                        next_attempt=attempt + 1,
+                        reason="no_matching_response",
+                        backoff_ms=self._inter_request_delay_s * 1000.0,
+                    )
 
             self._normal_traffic_blocked = True
             raise SessionRetryExhaustedError(transaction.request, attempts)
@@ -287,7 +320,7 @@ class TurretSession:
         self._transaction_active = True
         try:
             outcome = self._physical_attempt(
-                transaction, allow_emergency_preemption=True
+                transaction, attempt=1, allow_emergency_preemption=True
             )
             if not outcome.transmitted and self._emergency_requested.is_set():
                 emergency = self._run_emergency_transaction()
@@ -300,7 +333,7 @@ class TurretSession:
                     CommandCode.SET_BAUDRATE, SetBaudratePayload(baudrate)
                 )
                 outcome = self._physical_attempt(
-                    transaction, allow_emergency_preemption=False
+                    transaction, attempt=1, allow_emergency_preemption=False
                 )
 
             response = outcome.response
@@ -310,11 +343,26 @@ class TurretSession:
             candidates = _deduplicate_baud_candidates(
                 baudrate, old_baudrate, 9600
             )
-            for candidate in candidates:
+            for recovery_attempt, candidate in enumerate(candidates, start=2):
+                emit_event(
+                    _LOGGER,
+                    "UART_RETRY",
+                    source_instance=f"uart:connection_epoch:{self._connection_epoch}",
+                    connection_epoch=self._connection_epoch,
+                    request_id=transaction.request.request_id,
+                    control_id=transaction.control_id,
+                    completed_attempt=recovery_attempt - 1,
+                    next_attempt=recovery_attempt,
+                    reason="baud_recovery_probe",
+                    backoff_ms=None,
+                    candidate_baud=candidate,
+                )
                 try:
                     self._transport.set_baudrate(candidate)
                     response = self._physical_attempt(
-                        transaction, allow_emergency_preemption=False
+                        transaction,
+                        attempt=recovery_attempt,
+                        allow_emergency_preemption=False,
                     ).response
                 except (
                     SessionTransportError,
@@ -376,11 +424,28 @@ class TurretSession:
             transaction = self._new_transaction(CommandCode.EMERGENCY_STOP, None)
             attempts = self._max_retries + 1
 
-            for _ in range(attempts):
+            for attempt in range(1, attempts + 1):
                 response = self._physical_attempt(
-                    transaction, allow_emergency_preemption=False
+                    transaction,
+                    attempt=attempt,
+                    allow_emergency_preemption=False,
                 ).response
                 if response is None:
+                    if attempt < attempts:
+                        emit_event(
+                            _LOGGER,
+                            "UART_RETRY",
+                            source_instance=(
+                                f"uart:connection_epoch:{self._connection_epoch}"
+                            ),
+                            connection_epoch=self._connection_epoch,
+                            request_id=transaction.request.request_id,
+                            control_id=transaction.control_id,
+                            completed_attempt=attempt,
+                            next_attempt=attempt + 1,
+                            reason="emergency_no_matching_response",
+                            backoff_ms=self._inter_request_delay_s * 1000.0,
+                        )
                     continue
                 if response.result is ResultCode.OK:
                     self._next_request_id = (
@@ -405,12 +470,31 @@ class TurretSession:
         self,
         transaction: _Transaction,
         *,
+        attempt: int,
         allow_emergency_preemption: bool,
     ) -> _AttemptOutcome:
         self._consume_inter_request_delay()
         if allow_emergency_preemption and self._emergency_requested.is_set():
             return _AttemptOutcome(response=None, transmitted=False)
 
+        source_instance = f"uart:connection_epoch:{self._connection_epoch}"
+        request = transaction.request
+        tx_ns = monotonic_ns()
+        emit_event(
+            _LOGGER,
+            "UART_TX",
+            source_instance=source_instance,
+            event_monotonic_ns=tx_ns,
+            connection_epoch=self._connection_epoch,
+            request_id=request.request_id,
+            attempt=attempt,
+            control_id=transaction.control_id,
+            command_type=request.command.name,
+            logical_command=transaction.logical_command,
+            protocol_payload=request.payload,
+            payload_bytes=len(transaction.raw_request),
+            tx_monotonic_ns=tx_ns,
+        )
         self._attempt_in_flight = True
         try:
             try:
@@ -418,8 +502,26 @@ class TurretSession:
                     transaction.raw_request, self._response_timeout_s
                 )
             except TransportTimeoutError:
+                rx_ns = monotonic_ns()
+                self._log_uart_terminal(
+                    transaction,
+                    attempt=attempt,
+                    tx_ns=tx_ns,
+                    rx_ns=rx_ns,
+                    transaction_result="timeout",
+                    error_reason="write_timeout",
+                )
                 return _AttemptOutcome(response=None, transmitted=True)
             except (TransportDisconnectedError, TransportIOError) as exc:
+                rx_ns = monotonic_ns()
+                self._log_uart_terminal(
+                    transaction,
+                    attempt=attempt,
+                    tx_ns=tx_ns,
+                    rx_ns=rx_ns,
+                    transaction_result="io_error",
+                    error_reason=type(exc).__name__,
+                )
                 self._normal_traffic_blocked = True
                 raise SessionTransportError(str(exc)) from exc
 
@@ -427,39 +529,136 @@ class TurretSession:
             while True:
                 remaining = deadline - self._clock()
                 if remaining <= 0:
+                    rx_ns = monotonic_ns()
+                    self._log_uart_terminal(
+                        transaction,
+                        attempt=attempt,
+                        tx_ns=tx_ns,
+                        rx_ns=rx_ns,
+                        transaction_result="timeout",
+                        error_reason="response_timeout",
+                    )
                     return _AttemptOutcome(response=None, transmitted=True)
                 try:
                     raw_response = self._transport.read_frame(remaining)
                 except TransportTimeoutError:
+                    rx_ns = monotonic_ns()
+                    self._log_uart_terminal(
+                        transaction,
+                        attempt=attempt,
+                        tx_ns=tx_ns,
+                        rx_ns=rx_ns,
+                        transaction_result="timeout",
+                        error_reason="response_timeout",
+                    )
                     return _AttemptOutcome(response=None, transmitted=True)
                 except (TransportDisconnectedError, TransportIOError) as exc:
+                    rx_ns = monotonic_ns()
+                    self._log_uart_terminal(
+                        transaction,
+                        attempt=attempt,
+                        tx_ns=tx_ns,
+                        rx_ns=rx_ns,
+                        transaction_result="io_error",
+                        error_reason=type(exc).__name__,
+                    )
                     self._normal_traffic_blocked = True
                     raise SessionTransportError(str(exc)) from exc
 
+                rx_ns = monotonic_ns()
                 try:
                     response = decode_response(raw_response)
-                except ProtocolError:
+                except ProtocolError as exc:
+                    self._log_uart_terminal(
+                        transaction,
+                        attempt=attempt,
+                        tx_ns=tx_ns,
+                        rx_ns=rx_ns,
+                        transaction_result="protocol_error",
+                        error_reason=type(exc).__name__,
+                        crc_valid=False,
+                    )
                     return _AttemptOutcome(response=None, transmitted=True)
 
                 if (
-                    response.request_id != transaction.request.request_id
-                    or response.command is not transaction.request.command
+                    response.request_id != request.request_id
+                    or response.command is not request.command
                 ):
+                    self._log_uart_terminal(
+                        transaction,
+                        attempt=attempt,
+                        tx_ns=tx_ns,
+                        rx_ns=rx_ns,
+                        transaction_result="request_mismatch",
+                        error_reason="response_identity_mismatch",
+                        response=response,
+                    )
                     continue
 
                 self._inter_request_delay_pending = True
+                self._log_uart_terminal(
+                    transaction,
+                    attempt=attempt,
+                    tx_ns=tx_ns,
+                    rx_ns=rx_ns,
+                    transaction_result="ok",
+                    error_reason=None,
+                    response=response,
+                    crc_valid=True,
+                )
                 return _AttemptOutcome(response=response, transmitted=True)
         finally:
             self._attempt_in_flight = False
 
+    def _log_uart_terminal(
+        self,
+        transaction: _Transaction,
+        *,
+        attempt: int,
+        tx_ns: int,
+        rx_ns: int,
+        transaction_result: str,
+        error_reason: str | None,
+        response: ProtocolResponse | None = None,
+        crc_valid: bool | None = None,
+    ) -> None:
+        emit_event(
+            _LOGGER,
+            "UART_RX",
+            source_instance=f"uart:connection_epoch:{self._connection_epoch}",
+            event_monotonic_ns=rx_ns,
+            connection_epoch=self._connection_epoch,
+            request_id=transaction.request.request_id,
+            attempt=attempt,
+            control_id=transaction.control_id,
+            command_type=transaction.request.command.name,
+            rx_monotonic_ns=rx_ns,
+            response_code=None if response is None else response.result.name,
+            response_payload=None,
+            crc_valid=crc_valid,
+            transaction_result=transaction_result,
+            round_trip_ms=max(0.0, (rx_ns - tx_ns) / 1_000_000.0),
+            error_reason=error_reason,
+        )
+
     def _new_transaction(
-        self, command: CommandCode, payload: RequestPayload
+        self,
+        command: CommandCode,
+        payload: RequestPayload,
+        *,
+        control_id: int | None = None,
+        logical_command: object | None = None,
     ) -> _Transaction:
         request_id = self._next_request_id
         request = ProtocolRequest(request_id, command, payload)
         raw_request = encode_request(request)
         self._next_request_id = (request_id + 1) & UINT16_MAX
-        return _Transaction(request=request, raw_request=raw_request)
+        return _Transaction(
+            request=request,
+            raw_request=raw_request,
+            control_id=control_id,
+            logical_command=logical_command,
+        )
 
     def _consume_inter_request_delay(self) -> None:
         if not self._inter_request_delay_pending:

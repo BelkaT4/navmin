@@ -40,6 +40,7 @@ from navmin.contracts import (
     TargetTrackingEnded,
     VisionResult,
 )
+from navmin.diagnostic_logging import emit_event
 
 from .processor import (
     VisionProcessor,
@@ -667,6 +668,8 @@ class VisionPipeline:
         snapshot = self._pending.snapshot()
         if snapshot.value is None or snapshot.revision <= self._last_processed_revision:
             return None
+        previous_revision = self._last_processed_revision
+        skipped_pending = max(0, snapshot.revision - previous_revision - 1)
         self._last_processed_revision = snapshot.revision
         pending = snapshot.value
         with self._state_lock:
@@ -674,8 +677,54 @@ class VisionPipeline:
                 return None
             frame_id = self._frame_id
 
+        source_instance = f"camera:{self.camera.value}:generation:{pending.generation}"
+        if skipped_pending:
+            emit_event(
+                LOGGER,
+                "FRAME_DROP",
+                source_instance=source_instance,
+                camera=self.camera.value,
+                generation=pending.generation,
+                frame_id=None,
+                boundary="vision_pending_latest_only",
+                reason="overwritten_before_processing",
+                count=skipped_pending,
+                queue_depth=1,
+                queue_capacity=1,
+                last_good_frame_id=max(-1, frame_id - 1),
+                next_good_frame_id=frame_id,
+            )
+        source_timestamp = pending.source_timestamp
+        emit_event(
+            LOGGER,
+            "FRAME_INGRESS",
+            source_instance=source_instance,
+            camera=self.camera.value,
+            generation=pending.generation,
+            frame_id=frame_id,
+            source_frame_id=None,
+            capture_id=pending.capture_id,
+            capture_timestamp_ns=None,
+            capture_time_domain=None,
+            pts_ns=(
+                source_timestamp.timestamp_ns
+                if source_timestamp.source is FrameTimestampSource.SENSOR_RTP_PTS
+                else None
+            ),
+            source_timestamp_ns=source_timestamp.timestamp_ns,
+            source_timestamp_type=source_timestamp.source.value,
+            receive_timestamp_ns=pending.receive_timestamp_ns,
+            source_resolution_width_px=int(pending.image.shape[1]),
+            source_resolution_height_px=int(pending.image.shape[0]),
+            payload_bytes=int(pending.image.nbytes),
+            source_drop_counter=None,
+            transport_state="decoded",
+        )
+        processing_start_ns = monotonic_ns()
+        correction_start_ns = processing_start_ns
         try:
             image = self._corrector.correct(pending.image)
+            correction_end_ns = monotonic_ns()
             packet = FramePacket(
                 camera=self.camera,
                 generation=pending.generation,
@@ -695,10 +744,12 @@ class VisionPipeline:
                     if pending.generation != self._generation:
                         return None
                     self._corrected_frame_sink.on_corrected_frame(packet)
+            vision_start_ns = monotonic_ns()
             processor_output = self._processor.process(
                 packet,
                 processing_enabled=self._processing_enabled,
             )
+            vision_end_ns = monotonic_ns()
             result = processor_output.result
         except Exception as exc:
             with self._state_lock:
@@ -721,8 +772,24 @@ class VisionPipeline:
                     pending.generation,
                     exc,
                 )
+                emit_event(
+                    LOGGER,
+                    "FRAME_DROP",
+                    source_instance=source_instance,
+                    camera=self.camera.value,
+                    generation=pending.generation,
+                    frame_id=frame_id,
+                    boundary="vision_processing",
+                    reason=type(exc).__name__,
+                    count=1,
+                    queue_depth=None,
+                    queue_capacity=None,
+                    last_good_frame_id=max(-1, frame_id - 1),
+                    next_good_frame_id=None,
+                )
             raise
 
+        publish_start_ns = monotonic_ns()
         with self._state_lock:
             if pending.generation != self._generation:
                 return None
@@ -744,6 +811,133 @@ class VisionPipeline:
                     last_receive_timestamp_ns=pending.receive_timestamp_ns,
                 )
             )
+        processing_end_ns = monotonic_ns()
+        profile = getattr(getattr(self._processor, "settings_snapshot", None), "profile", None)
+        identity_map = getattr(self._corrector, "_identity_map", None)
+        emit_event(
+            LOGGER,
+            "FRAME_PROCESS",
+            source_instance=source_instance,
+            camera=self.camera.value,
+            generation=pending.generation,
+            frame_id=result.frame.frame_id,
+            processing_start_ns=processing_start_ns,
+            processing_end_ns=processing_end_ns,
+            processing_duration_ms=(processing_end_ns - processing_start_ns) / 1_000_000.0,
+            correction_applied=None if identity_map is None else not bool(identity_map),
+            processor_class=type(self._processor).__name__,
+            processor_profile=profile,
+            processing_enabled=self._processing_enabled,
+            result_delivered=True,
+            result_drop_reason=None,
+            output_resolution_width_px=int(result.frame.image.shape[1]),
+            output_resolution_height_px=int(result.frame.image.shape[0]),
+            correction_duration_ms=(correction_end_ns - correction_start_ns) / 1_000_000.0,
+            vision_duration_ms=(vision_end_ns - vision_start_ns) / 1_000_000.0,
+            publish_duration_ms=(processing_end_ns - publish_start_ns) / 1_000_000.0,
+        )
+        diagnostics = processor_output.tracking_diagnostics
+        tracked = result.tracked_objects[0] if result.tracked_objects else None
+        best_bbox = None if diagnostics is None else diagnostics.best_candidate_bbox
+        best_center = None if diagnostics is None else diagnostics.best_candidate_center
+        transition = None
+        transition_reason = None
+        if processor_output.target_events:
+            lifecycle = processor_output.target_events[-1]
+            if isinstance(lifecycle, TargetAcquired):
+                transition = "acquired"
+            elif isinstance(lifecycle, TargetAcquisitionFailed):
+                transition = "acquisition_failed"
+                transition_reason = lifecycle.reason.value
+            elif isinstance(lifecycle, TargetTrackingEnded):
+                transition = "tracking_ended"
+                transition_reason = lifecycle.reason.value
+        emit_event(
+            LOGGER,
+            "VISION_TRACKING_FRAME",
+            source_instance=source_instance,
+            camera=self.camera.value,
+            generation=pending.generation,
+            frame_id=result.frame.frame_id,
+            track_state=(
+                "discovery"
+                if diagnostics is None
+                else f"{diagnostics.phase.lower()}:{diagnostics.status.lower()}"
+            ),
+            track_id=None if tracked is None else tracked.track_id,
+            selected_target_id=None if tracked is None else tracked.track_id,
+            candidate_count=(
+                len(result.tracked_objects)
+                if diagnostics is None
+                else diagnostics.candidate_count
+            ),
+            candidates=(
+                []
+                if diagnostics is None or diagnostics.candidate_count == 0
+                else None
+            ),
+            selected_center_x_px=(
+                None
+                if tracked is None
+                else tracked.bbox.x + tracked.bbox.width / 2.0
+            ),
+            selected_center_y_px=(
+                None
+                if tracked is None
+                else tracked.bbox.y + tracked.bbox.height / 2.0
+            ),
+            selected_bbox=(
+                None
+                if tracked is None
+                else {
+                    "x_px": tracked.bbox.x,
+                    "y_px": tracked.bbox.y,
+                    "width_px": tracked.bbox.width,
+                    "height_px": tracked.bbox.height,
+                }
+            ),
+            search_region=(
+                None
+                if diagnostics is None
+                else {
+                    "predicted_x_px": diagnostics.predicted_xy[0],
+                    "predicted_y_px": diagnostics.predicted_xy[1],
+                    "radius_px": diagnostics.search_radius_px,
+                    "mode": diagnostics.search_mode,
+                }
+            ),
+            full_frame_search=False if diagnostics is None else diagnostics.full_frame_search,
+            best_candidate=(
+                None
+                if diagnostics is None or best_center is None
+                else {
+                    "center_x_px": best_center[0],
+                    "center_y_px": best_center[1],
+                    "bbox": (
+                        None
+                        if best_bbox is None
+                        else {
+                            "x_px": best_bbox.x,
+                            "y_px": best_bbox.y,
+                            "width_px": best_bbox.width,
+                            "height_px": best_bbox.height,
+                        }
+                    ),
+                    "confidence": diagnostics.confidence,
+                    "prediction_error_px": diagnostics.prediction_error_px,
+                }
+            ),
+            confidence=None if diagnostics is None else diagnostics.confidence,
+            transition=transition,
+            transition_reason=transition_reason,
+            no_detection_reason=(
+                None
+                if tracked is not None
+                else "no_tracking_diagnostics"
+                if diagnostics is None
+                else diagnostics.diagnostic_reason
+            ),
+        )
         return result
 
     def _reset_diagnostics_locked(self) -> None:

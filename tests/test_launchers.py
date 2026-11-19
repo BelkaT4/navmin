@@ -2943,8 +2943,15 @@ def test_verbose_flag_selects_debug_session_file_logging(monkeypatch, tmp_path) 
     levels = []
 
     @contextmanager
-    def capture_logging(_path, *, level):
-        levels.append(level)
+    def capture_logging(
+        _path,
+        *,
+        level,
+        run_id=None,
+        verbose=None,
+        integrity_callback=None,
+    ):
+        levels.append((level, run_id, verbose, integrity_callback is not None))
         yield _path
 
     monkeypatch.setattr("navmin.__main__.session_file_logging", capture_logging)
@@ -2958,4 +2965,6 @@ def test_verbose_flag_selects_debug_session_file_logging(monkeypatch, tmp_path) 
     monkeypatch.setattr("navmin.__main__._DEFAULT_LOG_DIR", tmp_path / "verbose")
     assert normal_main(["--config", "missing-b.json", "-v"]) == 2
 
-    assert levels == [logging.INFO, logging.DEBUG]
+    assert [item[0] for item in levels] == [logging.INFO, logging.DEBUG]
+    assert [item[2] for item in levels] == [False, True]
+    assert all(item[1] for item in levels)

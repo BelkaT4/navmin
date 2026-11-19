@@ -19,8 +19,6 @@ def main() -> int:
     parser.add_argument("--frames", type=int, default=None)
     parser.add_argument("--selection-frame", type=int, default=8)
     parser.add_argument("--sample-stride", type=int, default=1)
-    parser.add_argument("--true-stereo-hfov-deg", type=float, default=None)
-    parser.add_argument("--tracking-stereo-hfov-deg", type=float, default=None)
     parser.add_argument("--json", type=Path, default=None)
     args = parser.parse_args()
 
@@ -30,14 +28,10 @@ def main() -> int:
         frame_count=args.frames,
         selection_frame=args.selection_frame,
         sample_stride=args.sample_stride,
-        true_stereo_hfov_deg=args.true_stereo_hfov_deg,
-        tracking_stereo_hfov_deg=args.tracking_stereo_hfov_deg,
     )
     print(
         "SYNTHETIC CLOSED LOOP "
         f"status={result.status} frames={result.frames} "
-        f"true_hfov={result.true_stereo_hfov_deg:.3f}deg "
-        f"tracking_hfov={result.tracking_stereo_hfov_deg:.3f}deg "
         f"acquired={result.target_acquired_frame} ended={result.target_end_frame} "
         f"missing={result.missing_tracking_frames} "
         f"rate_valid_x={result.rate_valid_x_frames}"

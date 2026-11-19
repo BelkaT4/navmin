@@ -329,6 +329,17 @@ class TurretHal:
         result = self._ordinary(
             CommandCode.SET_VELOCITY,
             payload,
+            control_id=setpoint.control_id,
+            logical_command={
+                "requested_velocity_x_deg_s": setpoint.velocity_x_deg_s,
+                "requested_velocity_y_deg_s": setpoint.velocity_y_deg_s,
+                "effective_velocity_x_deg_s": self._logical_velocity_from_steps_s(
+                    "x", payload.velocity_x_steps_s
+                ),
+                "effective_velocity_y_deg_s": self._logical_velocity_from_steps_s(
+                    "y", payload.velocity_y_steps_s
+                ),
+            },
             drain_pending_config=False,
         )
         if self._response_ok(result):
@@ -497,11 +508,18 @@ class TurretHal:
         command: CommandCode,
         payload=None,
         *,
+        control_id: int | None = None,
+        logical_command: object | None = None,
         drain_pending_config: bool = True,
     ) -> SessionResult:
         self._operation_active = True
         try:
-            result = self._session.transact(command, payload)
+            result = self._session.transact(
+                command,
+                payload,
+                control_id=control_id,
+                logical_command=logical_command,
+            )
         finally:
             self._operation_active = False
         if command is not CommandCode.SET_VELOCITY:

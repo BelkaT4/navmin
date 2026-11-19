@@ -6,7 +6,7 @@ import logging
 import os
 from dataclasses import replace
 from datetime import UTC, datetime
-from logging.handlers import RotatingFileHandler
+from logging.handlers import QueueHandler, RotatingFileHandler
 from pathlib import Path
 
 import navmin.session_artifacts as session_artifacts_module
@@ -16,10 +16,15 @@ from navmin.config.models import (
     RtspSourceConfig,
 )
 from navmin.diagnostic_launcher import _synthetic_diagnostic_inputs
+from navmin.diagnostic_logging import emit_event
 from navmin.logging_setup import (
     SESSION_LOG_BACKUP_COUNT,
     SESSION_LOG_MAX_BYTES,
+    VERBOSE_LOG_QUEUE_CAPACITY,
+    VERBOSE_SESSION_LOG_BACKUP_COUNT,
+    VERBOSE_SESSION_LOG_MAX_BYTES,
     session_file_logging,
+    verbose_logging_health,
 )
 from navmin.preflight import (
     PreflightStatus,
@@ -37,6 +42,7 @@ def _artifacts(
     tmp_path: Path,
     *,
     mode: str = "normal",
+    logging_mode: str = "normal",
     now: datetime | None = None,
 ) -> SessionArtifacts:
     return SessionArtifacts.create(
@@ -46,6 +52,7 @@ def _artifacts(
         stereo_left_backend="real" if mode == "normal" else "localhost",
         turret_backend="real" if mode == "normal" else "pty",
         input_mode="files" if mode == "normal" else "synthetic",
+        logging_mode=logging_mode,
         now=now,
         git_root=tmp_path / "not-a-repository",
     )
@@ -76,6 +83,7 @@ def test_session_directories_are_unique_and_have_expected_initial_layout(tmp_pat
     assert manifest["schema_version"] == 1
     assert manifest["session_id"] == first.session_id
     assert manifest["mode"] == "normal"
+    assert manifest["logging_mode"] == "normal"
     assert manifest["status"] == "starting"
     assert manifest["finished_at_utc"] is None
     assert manifest["exit_code"] is None
@@ -130,20 +138,31 @@ def test_session_file_logging_is_bounded_rotating_and_preserves_console(tmp_path
     artifacts = _artifacts(tmp_path, mode="diagnostic")
     logger = logging.getLogger("navmin.session-test")
 
-    with session_file_logging(artifacts.runtime_log_path, level=logging.DEBUG):
+    with session_file_logging(
+        artifacts.runtime_log_path,
+        level=logging.DEBUG,
+        run_id=artifacts.session_id,
+        verbose=True,
+    ):
         navmin_logger = logging.getLogger("navmin")
-        rotating = [
+        queued = [item for item in navmin_logger.handlers if isinstance(item, QueueHandler)]
+        assert len(queued) == 1
+        assert not [
             item for item in navmin_logger.handlers if isinstance(item, RotatingFileHandler)
         ]
-        assert len(rotating) == 1
-        assert rotating[0].maxBytes == SESSION_LOG_MAX_BYTES == 10 * 1024 * 1024
-        assert rotating[0].backupCount == SESSION_LOG_BACKUP_COUNT == 5
-        console = [item for item in navmin_logger.handlers if item not in rotating]
+        health = verbose_logging_health()
+        assert health is not None
+        assert health.queue_capacity_records == VERBOSE_LOG_QUEUE_CAPACITY == 8192
+        assert VERBOSE_SESSION_LOG_MAX_BYTES == 100 * 1024 * 1024
+        assert VERBOSE_SESSION_LOG_BACKUP_COUNT == 10
+        console = [item for item in navmin_logger.handlers if item not in queued]
         assert console
         assert any(item.level == logging.INFO for item in console)
         logger.debug("diagnostic detail")
 
-    assert "diagnostic detail" in artifacts.runtime_log_path.read_text(encoding="utf-8")
+    text = artifacts.runtime_log_path.read_text(encoding="utf-8")
+    assert "LOGGING_SESSION_START" in text
+    assert "diagnostic detail" in text
 
     normal = _artifacts(tmp_path)
     with session_file_logging(normal.runtime_log_path, level=logging.INFO):
@@ -154,6 +173,8 @@ def test_session_file_logging_is_bounded_rotating_and_preserves_console(tmp_path
         ]
         assert len(rotating) == 1
         assert rotating[0].level == logging.INFO
+        assert rotating[0].maxBytes == SESSION_LOG_MAX_BYTES == 10 * 1024 * 1024
+        assert rotating[0].backupCount == SESSION_LOG_BACKUP_COUNT == 5
 
 
 def test_small_injected_rotation_keeps_runtime_log_bounded(tmp_path) -> None:
@@ -336,3 +357,97 @@ def test_preflight_report_is_written_atomically_and_failure_status_is_supported(
     assert source.parent == artifacts.session_dir
     assert destination == artifacts.preflight_path
     assert not source.exists()
+
+
+def test_verbose_structured_event_has_run_source_sequence_and_monotonic_time(tmp_path) -> None:
+    artifacts = _artifacts(tmp_path, mode="diagnostic")
+    logger = logging.getLogger("navmin.structured-test")
+
+    with session_file_logging(
+        artifacts.runtime_log_path,
+        level=logging.DEBUG,
+        run_id=artifacts.session_id,
+        verbose=True,
+    ):
+        emit_event(
+            logger,
+            "TEST_EVENT",
+            source_instance="test:source",
+            value=1,
+        )
+        emit_event(
+            logger,
+            "TEST_EVENT",
+            source_instance="test:source",
+            value=2,
+        )
+
+    payloads = []
+    for line in artifacts.runtime_log_path.read_text(encoding="utf-8").splitlines():
+        marker = "TEST_EVENT "
+        if marker not in line:
+            continue
+        payloads.append(json.loads(line.split(marker, 1)[1]))
+
+    assert [item["sequence"] for item in payloads] == [1, 2]
+    assert [item["value"] for item in payloads] == [1, 2]
+    assert all(item["run_id"] == artifacts.session_id for item in payloads)
+    assert all(item["source_instance"] == "test:source" for item in payloads)
+    assert all(item["schema_version"] == 1 for item in payloads)
+    assert all(item["event_monotonic_ns"] > 0 for item in payloads)
+
+
+def test_verbose_integrity_is_logged_and_persisted_in_manifest(tmp_path) -> None:
+    artifacts = _artifacts(
+        tmp_path,
+        mode="diagnostic",
+        logging_mode="verbose",
+    )
+    logger = logging.getLogger("navmin.integrity-test")
+
+    with session_file_logging(
+        artifacts.runtime_log_path,
+        level=logging.DEBUG,
+        run_id=artifacts.session_id,
+        verbose=True,
+        integrity_callback=artifacts.update_logging_integrity,
+    ):
+        emit_event(
+            logger,
+            "FRAME_INGRESS",
+            source_instance="camera:stereo_left:generation:1",
+            camera="stereo_left",
+            generation=1,
+            frame_id=12,
+        )
+        emit_event(
+            logger,
+            "TRACK_CONTROL",
+            source_instance="turret:controller",
+            control_id=7,
+            dt_ms=50.0,
+        )
+        artifacts.finalize(status=SessionStatus.COMPLETED, exit_code=0)
+
+    text = artifacts.runtime_log_path.read_text(encoding="utf-8")
+    assert "RUN_INTEGRITY" in text
+    integrity_line = next(
+        line for line in text.splitlines() if "RUN_INTEGRITY " in line
+    )
+    payload = json.loads(integrity_line.split("RUN_INTEGRITY ", 1)[1])
+    assert payload["completed"] is True
+    assert payload["status"] == "completed"
+    assert payload["logging_dropped_total"] == 0
+    assert payload["logging_undrained_total"] == 0
+    assert payload["last_control_id"] == 7
+    assert payload["last_frame_keys"]["stereo_left"] == {
+        "camera": "stereo_left",
+        "generation": 1,
+        "frame_id": 12,
+    }
+
+    manifest = _read_json(artifacts.manifest_path)
+    assert manifest["logging_mode"] == "verbose"
+    assert manifest["logging_integrity"]["completed"] is True
+    assert manifest["logging_integrity"]["logging_dropped_total"] == 0
+    assert manifest["logging_integrity"]["last_control_id"] == 7

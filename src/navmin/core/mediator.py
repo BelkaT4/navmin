@@ -48,6 +48,7 @@ from navmin.contracts import (
     TurretState,
     VisionResult,
 )
+from navmin.diagnostic_logging import emit_event
 from navmin.time_sync import ClockMappingState, ClockSampleOutcome
 from navmin.vision.stereo_target_join import StereoPairingKind
 
@@ -277,6 +278,9 @@ class Mediator:
         }
         self._distance_stale_invalidations = 0
         self._next_selection_id = 1
+        self._next_operator_action_id = 1
+        self._tracking_hfov_revision = 0
+        self._tracking_estimator_reset_reason: str | None = None
         self._latest_results: dict[CameraRole, VisionResult | None] = {
             camera: None for camera in _OBSERVABLE_CAMERAS
         }
@@ -308,6 +312,7 @@ class Mediator:
         self._tracking_time_basis = None
         self._tracking_time_fallback_reason = None
         self._tracking_estimator.reset_history()
+        self._tracking_estimator_reset_reason = "camera_time_mode_changed"
         self._tracking_control_visualization = None
         self._turret.invalidate_tracking_control()
         _LOGGER.info(
@@ -346,8 +351,11 @@ class Mediator:
         value = self._validate_tracking_hfov(hfov_deg)
         if value == self._tracking_stereo_left_hfov_deg:
             return
+        old_value = self._tracking_stereo_left_hfov_deg
         self._tracking_stereo_left_hfov_deg = value
+        self._tracking_hfov_revision += 1
         self._tracking_estimator.reset_history()
+        self._tracking_estimator_reset_reason = "tracking_hfov_changed"
         self._tracking_control_visualization = None
         self._turret.invalidate_tracking_control()
         _LOGGER.info(
@@ -356,6 +364,25 @@ class Mediator:
             nominal,
             value,
             self._tracking_stereo_left_focal_scale(),
+        )
+        emit_event(
+            _LOGGER,
+            "CONFIG_CHANGE",
+            source_instance="core:mediator",
+            revision=self._tracking_hfov_revision,
+            owner="core.aiming",
+            parameter="tracking.stereo_left_hfov_deg",
+            old_value={
+                "nominal_hfov_deg": nominal,
+                "effective_hfov_deg": old_value,
+            },
+            new_value={
+                "nominal_hfov_deg": nominal,
+                "effective_hfov_deg": value,
+                "focal_scale": self._tracking_stereo_left_focal_scale(),
+            },
+            apply_result="applied",
+            reason=None,
         )
 
     def tracking_camera_model(
@@ -619,22 +646,78 @@ class Mediator:
             self._invalidate_target_intent(stop_motion=False)
             self._publish_clear(cameras)
 
+    def _emit_operator_action(
+        self,
+        action: str,
+        *,
+        accepted: bool,
+        reason: str | None = None,
+        camera: CameraRole | None = None,
+        generation: int | None = None,
+        frame_id: int | None = None,
+        image_x_px: float | None = None,
+        image_y_px: float | None = None,
+        requested: object | None = None,
+        resulting_target_id: int | None = None,
+        resulting_control_mode: TurretControlMode | None = None,
+    ) -> None:
+        action_id = self._next_operator_action_id
+        self._next_operator_action_id += 1
+        emit_event(
+            _LOGGER,
+            "OPERATOR_ACTION",
+            source_instance="core:operator",
+            action=action,
+            action_id=action_id,
+            camera=None if camera is None else camera.value,
+            generation=generation,
+            frame_id=frame_id,
+            image_x_px=image_x_px,
+            image_y_px=image_y_px,
+            requested=requested,
+            accepted=accepted,
+            reason=reason,
+            resulting_target_id=resulting_target_id,
+            resulting_control_mode=(
+                None if resulting_control_mode is None else resulting_control_mode.value
+            ),
+        )
+
     def handle_relative_click(
         self,
         vision_result: VisionResult,
         x_px: float,
         y_px: float,
     ) -> bool:
-        if self._turret_state.control_mode is not TurretControlMode.RELATIVE:
-            return False
-        if self._pending_control_mode is not None:
-            return False
         frame = vision_result.frame
-        if frame.camera is not self._main_camera:
+        reason: str | None = None
+        if self._turret_state.control_mode is not TurretControlMode.RELATIVE:
+            reason = "control_mode_not_relative"
+        elif self._pending_control_mode is not None:
+            reason = "control_mode_transition_pending"
+        elif frame.camera is not self._main_camera:
+            reason = "camera_not_main"
+        else:
+            model = self._session_gate.camera_model(frame.camera, frame.generation)
+            if model is None:
+                reason = "generation_not_accepted"
+            elif not self._pixel_in_frame(frame, x_px, y_px):
+                reason = "pixel_out_of_frame"
+        if reason is not None:
+            self._emit_operator_action(
+                "move_relative",
+                accepted=False,
+                reason=reason,
+                camera=frame.camera,
+                generation=frame.generation,
+                frame_id=frame.frame_id,
+                image_x_px=float(x_px),
+                image_y_px=float(y_px),
+            )
             return False
         model = self._session_gate.camera_model(frame.camera, frame.generation)
-        if model is None or not self._pixel_in_frame(frame, x_px, y_px):
-            return False
+        if model is None:
+            raise RuntimeError("accepted relative click lost camera model")
         command = self._aiming.relative_command(
             camera_model=model,
             frame=frame,
@@ -644,6 +727,17 @@ class Mediator:
         if self._motion_calibration is not None:
             command = self._motion_calibration.correct(frame.camera, command)
         self._turret.submit_move_relative(command)
+        self._emit_operator_action(
+            "move_relative",
+            accepted=True,
+            camera=frame.camera,
+            generation=frame.generation,
+            frame_id=frame.frame_id,
+            image_x_px=float(x_px),
+            image_y_px=float(y_px),
+            requested=command,
+            resulting_control_mode=self._turret_state.control_mode,
+        )
         return True
 
     def submit_calibration_move(
@@ -677,22 +771,35 @@ class Mediator:
         """Publish a backend-neutral request for the exact displayed frame."""
         if not isinstance(vision_result, VisionResult):
             raise TypeError("vision_result must be VisionResult")
-        if self._turret_state.control_mode is not TurretControlMode.TRACKING:
-            return False
-        if self._pending_control_mode is not None:
-            return False
-        if self._turret_state.connection_state is not TurretConnectionState.READY:
-            return False
-        if self._turret_state.motor_state is not MotorState.ON:
-            return False
         frame = vision_result.frame
-        if frame.camera is not self._main_camera:
-            return False
-        if not self._session_gate.accepts(frame.camera, frame.generation):
-            return False
-        if not self._vision_processing_enabled[frame.camera]:
-            return False
-        if not self._pixel_in_frame(frame, x_px, y_px):
+        reason: str | None = None
+        if self._turret_state.control_mode is not TurretControlMode.TRACKING:
+            reason = "control_mode_not_tracking"
+        elif self._pending_control_mode is not None:
+            reason = "control_mode_transition_pending"
+        elif self._turret_state.connection_state is not TurretConnectionState.READY:
+            reason = "turret_not_ready"
+        elif self._turret_state.motor_state is not MotorState.ON:
+            reason = "motor_not_on"
+        elif frame.camera is not self._main_camera:
+            reason = "camera_not_main"
+        elif not self._session_gate.accepts(frame.camera, frame.generation):
+            reason = "generation_not_accepted"
+        elif not self._vision_processing_enabled[frame.camera]:
+            reason = "vision_processing_disabled"
+        elif not self._pixel_in_frame(frame, x_px, y_px):
+            reason = "pixel_out_of_frame"
+        if reason is not None:
+            self._emit_operator_action(
+                "target_select",
+                accepted=False,
+                reason=reason,
+                camera=frame.camera,
+                generation=frame.generation,
+                frame_id=frame.frame_id,
+                image_x_px=float(x_px),
+                image_y_px=float(y_px),
+            )
             return False
 
         selection_id = self._next_selection_id
@@ -706,27 +813,46 @@ class Mediator:
             y_px=float(y_px),
         )
 
-        # A new SELECT is itself the target-episode boundary. Do not publish a
-        # mandatory CLEAR first: only the newest operator intent may reach worker.
         had_selected_target = self._selected_target is not None
         self._pending_selection = request
         self._selected_target = None
         self._invalidate_distance_intent()
         self._refresh_stereo_join_target()
         self._tracking_estimator.reset()
+        self._tracking_estimator_reset_reason = "target_selection"
         self._tracking_control_visualization = None
         self._turret.invalidate_tracking_control()
         if had_selected_target:
             self._turret.stop_motion()
         self._target_controls[frame.camera].publish(request)
+        self._emit_operator_action(
+            "target_select",
+            accepted=True,
+            camera=frame.camera,
+            generation=frame.generation,
+            frame_id=frame.frame_id,
+            image_x_px=float(x_px),
+            image_y_px=float(y_px),
+            requested={"selection_id": selection_id},
+            resulting_target_id=None,
+            resulting_control_mode=self._turret_state.control_mode,
+        )
         return True
 
     def deselect_target(self) -> bool:
         if self._turret_state.control_mode is not TurretControlMode.TRACKING:
+            self._emit_operator_action(
+                "target_clear", accepted=False, reason="control_mode_not_tracking"
+            )
             return False
         cameras = self._target_intent_cameras(default=self._main_camera)
         self._invalidate_target_intent(stop_motion=True)
         self._publish_clear(cameras)
+        self._emit_operator_action(
+            "target_clear",
+            accepted=True,
+            resulting_control_mode=self._turret_state.control_mode,
+        )
         return True
 
     def swap_main_preview(self) -> CameraRole:
@@ -745,12 +871,26 @@ class Mediator:
             self._invalidate_target_intent(stop_motion=True)
             self._publish_clear((old_main, self._main_camera))
         self._refresh_manual_distance()
+        self._emit_operator_action(
+            "camera_swap",
+            accepted=True,
+            requested={"old_main_camera": old_main.value, "new_main_camera": self._main_camera.value},
+            camera=self._main_camera,
+            resulting_control_mode=self._turret_state.control_mode,
+        )
         return self._main_camera
 
     def request_control_mode(self, mode: TurretControlMode) -> bool:
         if not isinstance(mode, TurretControlMode):
             raise TypeError("mode must be TurretControlMode")
         if not self._turret.set_control_mode(mode):
+            self._emit_operator_action(
+                "control_mode_request",
+                accepted=False,
+                reason="turret_ingress_rejected",
+                requested={"mode": mode.value},
+                resulting_control_mode=self._turret_state.control_mode,
+            )
             return False
         if (
             self._turret_state.control_mode is TurretControlMode.TRACKING
@@ -760,6 +900,12 @@ class Mediator:
             self._invalidate_target_intent(stop_motion=False)
             self._publish_clear(cameras)
         self._pending_control_mode = mode
+        self._emit_operator_action(
+            "control_mode_request",
+            accepted=True,
+            requested={"mode": mode.value},
+            resulting_control_mode=self._turret_state.control_mode,
+        )
         return True
 
     def stop_motion(self) -> bool:
@@ -767,24 +913,54 @@ class Mediator:
             cameras = self._target_intent_cameras(default=self._main_camera)
             self._invalidate_target_intent(stop_motion=False)
             self._publish_clear(cameras)
-        return self._turret.stop_motion()
+        accepted = self._turret.stop_motion()
+        self._emit_operator_action(
+            "stop_motion",
+            accepted=accepted,
+            reason=None if accepted else "turret_ingress_rejected",
+            resulting_control_mode=self._turret_state.control_mode,
+        )
+        return accepted
 
     def emergency_stop(self) -> None:
         cameras = self._target_intent_cameras(default=self._main_camera)
         self._invalidate_target_intent(stop_motion=False)
         self._publish_clear(cameras)
         self._turret.request_emergency()
+        self._emit_operator_action(
+            "emergency",
+            accepted=True,
+            resulting_control_mode=self._turret_state.control_mode,
+        )
 
     def motor_on(self) -> bool:
-        # MOTOR_ON intentionally restores neither pending nor selected targets.
-        return self._turret.motor_on()
+        accepted = self._turret.motor_on()
+        self._emit_operator_action(
+            "motor_on",
+            accepted=accepted,
+            reason=None if accepted else "turret_ingress_rejected",
+            resulting_control_mode=self._turret_state.control_mode,
+        )
+        return accepted
 
     def motor_off(self) -> bool:
-        if not self._turret.motor_off():
+        accepted = self._turret.motor_off()
+        if not accepted:
+            self._emit_operator_action(
+                "motor_off",
+                accepted=False,
+                reason="turret_ingress_rejected",
+                resulting_control_mode=self._turret_state.control_mode,
+            )
             return False
         cameras = self._target_intent_cameras(default=self._main_camera)
         self._invalidate_target_intent(stop_motion=False)
         self._publish_clear(cameras)
+        self._emit_operator_action(
+            "motor_off",
+            accepted=True,
+            resulting_control_mode=self._turret_state.control_mode,
+        )
         return True
 
     def _accept_target_acquired(self, event: TargetAcquired) -> bool:
@@ -812,6 +988,7 @@ class Mediator:
         self._refresh_stereo_join_target()
         self._refresh_manual_distance()
         self._tracking_estimator.reset()
+        self._tracking_estimator_reset_reason = "target_acquired"
         self._tracking_control_visualization = None
         result = self._latest_results.get(target.camera)
         if result is not None:
@@ -837,6 +1014,7 @@ class Mediator:
         self._invalidate_distance_intent()
         self._refresh_stereo_join_target()
         self._tracking_estimator.reset()
+        self._tracking_estimator_reset_reason = "acquisition_failed"
         self._tracking_control_visualization = None
         self._turret.invalidate_tracking_control()
         return True
@@ -854,6 +1032,7 @@ class Mediator:
         self._invalidate_distance_intent()
         self._refresh_stereo_join_target()
         self._tracking_estimator.reset()
+        self._tracking_estimator_reset_reason = "tracking_ended"
         self._tracking_control_visualization = None
         self._turret.invalidate_tracking_control()
         self._turret.stop_motion()
@@ -990,6 +1169,36 @@ class Mediator:
             diagnostics.fit_rms_ns,
             diagnostics.median_uncertainty_ns,
         )
+        emit_event(
+            _LOGGER,
+            "CLOCK_SNAPSHOT",
+            source_instance=f"clock:camera:{camera.value}",
+            time_source=observation.source.value,
+            camera=camera.value,
+            generation=observation.generation,
+            state=diagnostics.state.value,
+            sample_count=diagnostics.sample_count,
+            span_ns=diagnostics.device_span_ns,
+            offset_ns=diagnostics.offset_ns,
+            drift_ppm=diagnostics.drift_ppm,
+            rms_ns=diagnostics.fit_rms_ns,
+            valid_from_source_timestamp=None,
+            valid_to_source_timestamp=None,
+            reset_count=diagnostics.reset_count,
+            wrap_count=0,
+            uncertainty_ns=diagnostics.median_uncertainty_ns,
+            reason=invalid_reason,
+            submitted_sample_count=diagnostics.submitted_sample_count,
+            rejected_outlier_count=diagnostics.rejected_outlier_count,
+            rejected_out_of_order_count=diagnostics.rejected_out_of_order_count,
+            source_timestamp_ns=observation.source_timestamp_ns,
+            receive_timestamp_ns=receive_ns,
+            mapped_timestamp_ns=mapped_timestamp_ns,
+            mapped_minus_receive_ns=mapped_minus_receive_ns,
+            estimated_error_ns=mapped_error_ns,
+            age_ns=diagnostics.age_ns,
+            slope=diagnostics.slope,
+        )
 
     def _tracking_observation_timestamp(
         self, frame: FramePacket
@@ -1072,6 +1281,7 @@ class Mediator:
         if previous is None or previous is basis:
             return
         self._tracking_estimator.reset_history()
+        self._tracking_estimator_reset_reason = "tracking_time_basis_changed"
         self._tracking_control_visualization = None
         self._turret.invalidate_tracking_control()
 
@@ -1090,6 +1300,7 @@ class Mediator:
         tracked = self._find_track(result, target.track_id)
         if tracked is None:
             self._tracking_estimator.reset_history()
+            self._tracking_estimator_reset_reason = "track_missing"
             self._tracking_control_visualization = None
             self._turret.invalidate_tracking_control()
             return
@@ -1104,6 +1315,7 @@ class Mediator:
         model = self.tracking_camera_model(target.camera, target.generation)
         if model is None:
             self._tracking_estimator.reset_history()
+            self._tracking_estimator_reset_reason = "camera_model_unavailable"
             self._tracking_control_visualization = None
             self._turret.invalidate_tracking_control()
             return
@@ -1124,6 +1336,57 @@ class Mediator:
             target=target,
             observation_timestamp_ns=observation_timestamp_ns,
         )
+        aim_x_px, aim_y_px = self._aiming.aim_point(result.frame.camera, result.frame)
+        target_x_px, target_y_px = self._aiming.tracked_center(tracked)
+        projection = getattr(model, "projection_matrix", None)
+        fx_px = None if projection is None else float(projection[0][0])
+        fy_px = None if projection is None else float(projection[1][1])
+        cx_px = None if projection is None else float(projection[0][2])
+        cy_px = None if projection is None else float(projection[1][2])
+        nominal_hfov = (
+            self._tracking_stereo_left_nominal_hfov_deg
+            if result.frame.camera is CameraRole.STEREO_LEFT
+            else None
+        )
+        effective_hfov = (
+            self._tracking_stereo_left_hfov_deg
+            if result.frame.camera is CameraRole.STEREO_LEFT
+            else None
+        )
+        emit_event(
+            _LOGGER,
+            "AIMING_SAMPLE",
+            source_instance=f"core:aiming:{result.frame.camera.value}",
+            camera=result.frame.camera.value,
+            generation=result.frame.generation,
+            frame_id=result.frame.frame_id,
+            target_id=target.track_id,
+            observation_monotonic_ns=error.timestamp_ns,
+            observation_age_ms=max(0.0, (monotonic_ns() - error.timestamp_ns) / 1_000_000.0),
+            camera_model_source=(
+                "tracking_hfov_override"
+                if nominal_hfov is not None
+                and effective_hfov is not None
+                and effective_hfov != nominal_hfov
+                else "calibration"
+            ),
+            nominal_hfov_deg=nominal_hfov,
+            effective_hfov_deg=effective_hfov,
+            fx_px=fx_px,
+            fy_px=fy_px,
+            cx_px=cx_px,
+            cy_px=cy_px,
+            aim_x_px=aim_x_px,
+            aim_y_px=aim_y_px,
+            target_x_px=target_x_px,
+            target_y_px=target_y_px,
+            error_x_px=target_x_px - aim_x_px,
+            error_y_px=target_y_px - aim_y_px,
+            error_x_deg=error.error_x_deg,
+            error_y_deg=error.error_y_deg,
+            valid=True,
+            invalid_reason=None,
+        )
         previous_timestamp = self._tracking_estimator.diagnostics.observation_timestamp_ns
         if (
             previous_timestamp is not None
@@ -1132,8 +1395,76 @@ class Mediator:
             > self._tracking_gap_timeout_ns
         ):
             self._tracking_estimator.reset_history()
+            self._tracking_estimator_reset_reason = "observation_gap"
         platform_motion = self._turret.platform_motion_snapshot()
         diagnostics = self._tracking_estimator.observe(error, platform_motion)
+        estimator_config = self._tracking_estimator.config.velocity_estimator
+        emit_event(
+            _LOGGER,
+            "ESTIMATOR_SAMPLE",
+            source_instance="core:tracking_estimator",
+            camera=result.frame.camera.value,
+            generation=result.frame.generation,
+            frame_id=result.frame.frame_id,
+            target_id=target.track_id,
+            estimator_revision=self._tracking_control_config_revision,
+            window_ms=estimator_config.window_ms,
+            min_span_ms=estimator_config.min_span_ms,
+            min_samples=estimator_config.min_samples,
+            max_samples=estimator_config.max_samples,
+            max_fit_rms_deg=estimator_config.max_fit_rms_deg,
+            max_target_rate_x_deg_s=estimator_config.max_target_rate_x_deg_s,
+            max_target_rate_y_deg_s=estimator_config.max_target_rate_y_deg_s,
+            platform_motion_source=diagnostics.platform_source.value,
+            history_reset_reason=self._tracking_estimator_reset_reason,
+            x={
+                "sample_count": diagnostics.x.sample_count,
+                "actual_span_ms": diagnostics.x.actual_span_ms,
+                "relative_rate_deg_s": diagnostics.x.relative_rate_deg_s,
+                "platform_rate_deg_s": diagnostics.x.platform_rate_deg_s,
+                "target_rate_deg_s": diagnostics.x.target_rate_deg_s,
+                "fit_rms_deg": diagnostics.x.fit_rms_deg,
+                "rate_valid": diagnostics.x.valid,
+                "invalid_reason": None if diagnostics.x.invalid_reason is None else diagnostics.x.invalid_reason.value,
+                "prediction_offset_deg": diagnostics.x.prediction_offset_deg,
+            },
+            y={
+                "sample_count": diagnostics.y.sample_count,
+                "actual_span_ms": diagnostics.y.actual_span_ms,
+                "relative_rate_deg_s": diagnostics.y.relative_rate_deg_s,
+                "platform_rate_deg_s": diagnostics.y.platform_rate_deg_s,
+                "target_rate_deg_s": diagnostics.y.target_rate_deg_s,
+                "fit_rms_deg": diagnostics.y.fit_rms_deg,
+                "rate_valid": diagnostics.y.valid,
+                "invalid_reason": None if diagnostics.y.invalid_reason is None else diagnostics.y.invalid_reason.value,
+                "prediction_offset_deg": diagnostics.y.prediction_offset_deg,
+            },
+        )
+        self._tracking_estimator_reset_reason = None
+        platform_rate = (
+            platform_motion.rate_at(error.timestamp_ns)
+            if platform_motion.valid
+            else None
+        )
+        last_anchor = platform_motion.anchors[-1] if platform_motion.anchors else None
+        emit_event(
+            _LOGGER,
+            "PLATFORM_MODEL_SAMPLE",
+            source_instance="core:platform_model",
+            camera=result.frame.camera.value,
+            generation=result.frame.generation,
+            frame_id=result.frame.frame_id,
+            target_id=target.track_id,
+            logical_command_target_x_deg_s=None if last_anchor is None else last_anchor.commanded_rate_x_deg_s,
+            logical_command_target_y_deg_s=None if last_anchor is None else last_anchor.commanded_rate_y_deg_s,
+            logical_effective_velocity_x_deg_s=None if platform_rate is None else platform_rate.rate_x_deg_s,
+            logical_effective_velocity_y_deg_s=None if platform_rate is None else platform_rate.rate_y_deg_s,
+            configured_acceleration_x_deg_s2=None if last_anchor is None else last_anchor.acceleration_x_deg_s2,
+            configured_acceleration_y_deg_s2=None if last_anchor is None else last_anchor.acceleration_y_deg_s2,
+            anchor_timestamp_ns=None if last_anchor is None else last_anchor.timestamp_ns,
+            valid=platform_motion.valid and platform_rate is not None,
+            invalid_reason=None if platform_motion.valid and platform_rate is not None else "platform_rate_unavailable",
+        )
         self._log_tracking_observation(
             result,
             error,
@@ -1173,6 +1504,7 @@ class Mediator:
                 rate_valid_x=diagnostics.x.valid,
                 rate_valid_y=diagnostics.y.valid,
                 observation_timestamp_ns=error.timestamp_ns,
+                frame_id=result.frame.frame_id,
             )
         )
 
@@ -1303,6 +1635,7 @@ class Mediator:
         self._invalidate_distance_intent()
         self._refresh_stereo_join_target()
         self._tracking_estimator.reset()
+        self._tracking_estimator_reset_reason = "target_intent_invalidated"
         self._tracking_control_visualization = None
         self._turret.invalidate_tracking_control()
         if stop_motion:
