@@ -661,6 +661,151 @@ def test_relative_to_tracking_recovers_command_model_after_zero_settle() -> None
     assert controller.pending_motion is not None
 
 
+def test_relative_to_tracking_uses_confirmed_relative_speed_bound(
+    tmp_path: Path,
+) -> None:
+    config = _config(
+        max_speed_x=90.0,
+        max_speed_y=45.0,
+        acceleration_x=180.0,
+        acceleration_y=90.0,
+    )
+    clock = _Clock()
+    command_clock = _NsClock(1_000_000_000)
+    controller, hal, _, transport, _ = _stack(
+        config,
+        clock=clock,
+        command_clock=command_clock,
+    )
+    controller.motor_off()
+    assert hal.sync_stm32_config() is not None
+    controller.motor_on()
+    controller.submit_move_relative(MoveRelativeCommand(1.0, 0.0))
+    controller.flush_pending_motion()
+
+    transport.raw_write_history.clear()
+    command_clock.now = 2_000_000_000
+    runtime_log = tmp_path / "runtime.log"
+    with session_file_logging(
+        runtime_log,
+        level=logging.DEBUG,
+        run_id="relative-zero-settle-test",
+        verbose=True,
+    ):
+        result = controller.set_control_mode(TurretControlMode.TRACKING)
+
+        assert result is not None and result.response is not None
+        assert result.response.result is ResultCode.OK
+        assert hal.platform_motion_zero_settling
+        assert not hal.platform_motion_snapshot.valid
+
+        clock.now = 0.1
+        assert not controller.submit_tracking_control(
+            1, _tracking_error(_target(), 2.0)
+        )
+        assert controller.pending_motion is None
+
+        command_clock.now = 2_367_260_393
+        assert hal.platform_motion_zero_settling
+        command_clock.now = 2_367_260_394
+        assert not hal.platform_motion_zero_settling
+        assert hal.platform_motion_snapshot.valid
+
+    messages = runtime_log.read_text(encoding="utf-8")
+    assert "PLATFORM_ZERO_SETTLE_START" in messages
+    assert '"bound_source":"relative_motion_bound"' in messages
+    assert '"settle_duration_ms":367.260394' in messages
+    assert "PLATFORM_ZERO_SETTLE_END" in messages
+
+    clock.now = 0.5
+    assert controller.submit_tracking_control(
+        2, _tracking_error(_target(), 2.0)
+    )
+    assert controller.pending_motion is not None
+
+
+def test_relative_speed_bound_falls_back_after_live_stm32_config_change(
+) -> None:
+    config = _config(
+        max_speed_x=90.0,
+        max_speed_y=45.0,
+        acceleration_x=180.0,
+        acceleration_y=90.0,
+    )
+    command_clock = _NsClock(1_000_000_000)
+    controller, hal, _, _, _ = _stack(config, command_clock=command_clock)
+    controller.motor_off()
+    assert hal.sync_stm32_config() is not None
+    controller.motor_on()
+    controller.submit_move_relative(MoveRelativeCommand(1.0, 0.0))
+    controller.flush_pending_motion()
+
+    changed = replace(
+        config,
+        stm32=replace(
+            config.stm32,
+            max_speed_x_deg_s=120.0,
+            acceleration_x_deg_s2=120.0,
+        ),
+    )
+    command_clock.now = 1_500_000_000
+    result = hal.apply_config_update(ConfigUpdate(1, changed))
+    assert result is not None and result.response is not None
+    assert result.response.result is ResultCode.OK
+
+    command_clock.now = 2_000_000_000
+    result = controller.set_control_mode(TurretControlMode.TRACKING)
+    assert result is not None and result.response is not None
+    assert result.response.result is ResultCode.OK
+
+    command_clock.now = 3_249_999_999
+    assert hal.platform_motion_zero_settling
+    command_clock.now = 3_250_000_000
+    assert not hal.platform_motion_zero_settling
+    assert hal.platform_motion_snapshot.valid
+
+
+def test_relative_speed_bound_accumulates_across_small_relative_sequence() -> None:
+    config = _config(
+        invert_x=False,
+        full_steps_x=4000,
+        full_steps_y=4000,
+        microstep_x=1,
+        microstep_y=1,
+        max_speed_x=800.0,
+        max_speed_y=800.0,
+        acceleration_x=150.0,
+        acceleration_y=150.0,
+    )
+    command_clock = _NsClock(1_000_000_000)
+    controller, hal, _, _, _ = _stack(config, command_clock=command_clock)
+    controller.motor_off()
+    assert hal.sync_stm32_config() is not None
+    controller.motor_on()
+
+    # Matches the small relative sequence observed in the reproduced runtime log:
+    # (3, 33), (2, 42), (1, 42) physical steps with 4000 STEP/rev mechanics.
+    controller.submit_move_relative(MoveRelativeCommand(0.27, 2.97))
+    controller.flush_pending_motion()
+    controller.submit_move_relative(MoveRelativeCommand(0.18, 3.78))
+    controller.flush_pending_motion()
+    controller.submit_move_relative(MoveRelativeCommand(0.09, 3.78))
+    controller.flush_pending_motion()
+
+    command_clock.now = 2_000_000_000
+    result = controller.set_control_mode(TurretControlMode.TRACKING)
+    assert result is not None and result.response is not None
+    assert result.response.result is ResultCode.OK
+
+    # Old Vmax/a recovery would wait ~5.58 s. The accumulated conservative
+    # relative-motion bound needs only ~0.634 s including the 250 ms margin.
+    command_clock.now = 2_634_149_041
+    assert hal.platform_motion_zero_settling
+    command_clock.now = 2_634_149_042
+    assert not hal.platform_motion_zero_settling
+    assert hal.platform_motion_snapshot.valid
+
+
 def test_controller_tracking_pending_is_latest_and_revision_processed_once() -> None:
     controller, _, _, transport, clock = _stack()
     _enter_tracking_off(controller, transport)
