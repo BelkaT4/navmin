@@ -45,6 +45,7 @@ _SMOKE = runpy.run_path(str(_SMOKE_TOOL), run_name="navmin_software_smoke")
 FRAME_HEIGHT = _SMOKE["FRAME_HEIGHT"]
 FRAME_WIDTH = _SMOKE["FRAME_WIDTH"]
 SoftwareSmokeRuntime = _SMOKE["SoftwareSmokeRuntime"]
+_run_qt_smoke = _SMOKE["_run_qt_smoke"]
 SyntheticFrameProducer = _SMOKE["SyntheticFrameProducer"]
 _overview_frame = _SMOKE["_overview_frame"]
 _stereo_left_frame = _SMOKE["_stereo_left_frame"]
@@ -200,6 +201,34 @@ def test_runtime_starts_real_vision_and_turret_and_shuts_down_cleanly() -> None:
     assert not runtime.overview_worker.is_alive()
     assert not runtime.stereo_left_worker.is_alive()
     assert not runtime.turret_worker.is_alive()
+
+
+def test_software_smoke_ui_wires_vt11_runtime_controls(monkeypatch) -> None:
+    os.environ["QT_QPA_PLATFORM"] = "offscreen"
+
+    from PyQt6.QtWidgets import QApplication
+
+    import navmin.ui.app as ui_app
+
+    runtime = SoftwareSmokeRuntime()
+    application = QApplication.instance() or QApplication([])
+    captured: dict[str, object] = {}
+
+    def fake_run_ui(**kwargs) -> int:
+        captured.update(kwargs)
+        return 0
+
+    monkeypatch.setattr(ui_app, "run_ui", fake_run_ui)
+
+    assert _run_qt_smoke(runtime, None) == 0
+    ui = runtime.application.ui_dependencies
+    assert captured["apply_vt11_ui_config"] == ui.apply_vt11_ui_config
+    assert captured["vision_processor_selections"] is ui.vision_processor_selections
+    assert (
+        captured["apply_vision_processor_selection"]
+        == ui.apply_vision_processor_selection
+    )
+    application.processEvents()
 
 
 def test_offscreen_ui_process_smoke_exits_cleanly() -> None:
