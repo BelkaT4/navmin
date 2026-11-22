@@ -382,6 +382,179 @@ def test_synthetic_tracking_simulation_moves_world_opposite_turret_rotation() ->
     assert not np.array_equal(before.frame_set.stereo_left, after.frame_set.stereo_left)
 
 
+
+
+def test_synthetic_turret_relative_move_reaches_quantized_target_and_moves_world() -> None:
+    from navmin.contracts import MoveRelativeCommand
+    from navmin.diagnostics.synthetic_tracking_turret import SyntheticTrackingSimulation
+    from navmin.turret.hal import preview_move_relative
+
+    config, plant, _, _, _, hal = _synthetic_turret_stack()
+    world = _world()
+    simulation = SyntheticTrackingSimulation(world, plant)
+    before = simulation.capture().frame_set.projection(CameraRole.STEREO_LEFT)
+    command = MoveRelativeCommand(4.0, -2.0)
+    preview = preview_move_relative(config, command)
+
+    result = hal.move_relative(command)
+    assert result.response is not None
+    plant.advance(1.5)
+    state = plant.state
+    after = simulation.capture().frame_set.projection(CameraRole.STEREO_LEFT)
+
+    assert state.yaw_deg == pytest.approx(preview.quantized_delta_x_deg, abs=1e-9)
+    assert state.pitch_deg == pytest.approx(preview.quantized_delta_y_deg, abs=1e-9)
+    assert state.yaw_rate_deg_s == 0.0
+    assert state.pitch_rate_deg_s == 0.0
+    assert state.requested_yaw_rate_deg_s == 0.0
+    assert state.requested_pitch_rate_deg_s == 0.0
+    assert state.velocity_command_age_s is None
+    assert after.center_x_px < before.center_x_px
+
+
+def test_synthetic_turret_relative_replacement_rebases_current_pose_and_preserves_rate() -> None:
+    from navmin.contracts import MoveRelativeCommand
+    from navmin.turret.hal import preview_move_relative
+
+    config, plant, _, _, _, hal = _synthetic_turret_stack()
+    hal.move_relative(MoveRelativeCommand(20.0, 0.0))
+    plant.advance(0.5)
+    base = plant.state.yaw_deg
+    rate_before = plant.state.yaw_rate_deg_s
+    replacement = MoveRelativeCommand(-2.0, 0.0)
+    preview = preview_move_relative(config, replacement)
+
+    hal.move_relative(replacement)
+    assert plant.state.yaw_rate_deg_s == pytest.approx(rate_before)
+
+    plant.advance(2.0)
+    state = plant.state
+    assert state.yaw_deg == pytest.approx(
+        base + preview.quantized_delta_x_deg,
+        abs=1e-9,
+    )
+    assert state.yaw_rate_deg_s == 0.0
+
+
+def test_synthetic_turret_zero_relative_move_brakes_and_returns_to_acceptance_pose() -> None:
+    from navmin.contracts import AxisVelocitySetpoint, MoveRelativeCommand
+
+    _, plant, _, _, _, hal = _synthetic_turret_stack()
+    hal.set_velocity(AxisVelocitySetpoint(20.0, 0.0, 0))
+    plant.advance(0.2)
+    acceptance_pose = plant.state.yaw_deg
+    rate_before = plant.state.yaw_rate_deg_s
+    assert rate_before > 0.0
+
+    hal.move_relative(MoveRelativeCommand(0.0, 0.0))
+    assert plant.state.yaw_rate_deg_s == pytest.approx(rate_before)
+    plant.advance(2.0)
+
+    state = plant.state
+    assert state.yaw_deg == pytest.approx(acceptance_pose, abs=1e-9)
+    assert state.yaw_rate_deg_s == 0.0
+    assert state.requested_yaw_rate_deg_s == 0.0
+    assert state.velocity_command_age_s is None
+
+
+def test_synthetic_turret_relative_uses_logical_direction_with_inverted_axis() -> None:
+    from navmin.contracts import MoveRelativeCommand
+    from navmin.turret.hal import preview_move_relative
+    from navmin.turret.protocol import CommandCode
+
+    config, plant, endpoint, _, _, hal = _synthetic_turret_stack(invert_x=True)
+    command = MoveRelativeCommand(4.0, 0.0)
+    preview = preview_move_relative(config, command)
+    hal.move_relative(command)
+
+    request = endpoint.executed_request_history[-1]
+    assert request.command is CommandCode.MOVE_RELATIVE
+    assert request.payload == preview.payload
+    assert preview.payload.delta_x_steps < 0
+
+    plant.advance(1.5)
+    assert plant.state.yaw_deg == pytest.approx(preview.quantized_delta_x_deg, abs=1e-9)
+    assert plant.state.yaw_deg > 0.0
+
+
+def test_synthetic_turret_relative_disarms_watchdog_and_velocity_replaces_target() -> None:
+    from navmin.contracts import AxisVelocitySetpoint, MoveRelativeCommand
+
+    _, plant, _, _, _, hal = _synthetic_turret_stack(watchdog_ms=100)
+    hal.set_velocity(AxisVelocitySetpoint(20.0, 0.0, 0))
+    plant.advance(0.05)
+    assert plant.state.velocity_command_age_s == pytest.approx(0.05)
+
+    hal.move_relative(MoveRelativeCommand(10.0, 0.0))
+    assert plant.state.velocity_command_age_s is None
+    plant.advance(0.2)
+    assert plant.state.requested_yaw_rate_deg_s > 0.0
+    assert plant.state.velocity_command_age_s is None
+
+    position_before_velocity = plant.state.yaw_deg
+    hal.set_velocity(AxisVelocitySetpoint(-5.0, 0.0, 1))
+    assert plant.state.velocity_command_age_s == 0.0
+    plant.advance(0.2)
+    assert plant.state.yaw_deg != pytest.approx(position_before_velocity + 10.0)
+    assert plant.state.velocity_command_age_s == pytest.approx(0.2)
+
+
+def test_synthetic_turret_relative_dynamic_config_changes_active_limits() -> None:
+    from dataclasses import replace
+
+    from navmin.contracts import ConfigUpdate, MoveRelativeCommand
+
+    config, plant, _, _, _, hal = _synthetic_turret_stack()
+    hal.move_relative(MoveRelativeCommand(20.0, 0.0))
+    plant.advance(0.5)
+    rate_before = plant.state.yaw_rate_deg_s
+    assert rate_before > 5.0
+
+    slower = replace(
+        config,
+        stm32=replace(
+            config.stm32,
+            max_speed_x_deg_s=5.0,
+            acceleration_x_deg_s2=10.0,
+        ),
+    )
+    result = hal.apply_config_update(ConfigUpdate(revision=1, config=slower))
+    assert result is not None and result.response is not None
+    assert plant.state.yaw_rate_deg_s == pytest.approx(rate_before)
+
+    plant.advance(0.5)
+    state = plant.state
+    assert state.max_speed_yaw_deg_s == pytest.approx(5.04, abs=0.02)
+    assert state.acceleration_yaw_deg_s2 == pytest.approx(9.99, abs=0.02)
+    assert state.yaw_rate_deg_s <= rate_before
+
+
+def test_synthetic_turret_relative_target_is_cleared_by_motor_off_and_emergency() -> None:
+    from navmin.contracts import MoveRelativeCommand
+
+    _, plant, _, _, _, hal = _synthetic_turret_stack()
+    hal.move_relative(MoveRelativeCommand(10.0, 0.0))
+    plant.advance(0.2)
+    before_off = plant.state.yaw_deg
+    assert plant.state.yaw_rate_deg_s > 0.0
+
+    hal.motor_off()
+    assert plant.state.yaw_rate_deg_s == 0.0
+    hal.motor_on()
+    plant.advance(1.0)
+    assert plant.state.yaw_deg == pytest.approx(before_off)
+
+    hal.move_relative(MoveRelativeCommand(-10.0, 0.0))
+    plant.advance(0.2)
+    before_emergency = plant.state.yaw_deg
+    assert plant.state.yaw_rate_deg_s < 0.0
+    hal.emergency_stop()
+    assert plant.state.motors_on is True
+    assert plant.state.yaw_rate_deg_s == 0.0
+    plant.advance(1.0)
+    assert plant.state.yaw_deg == pytest.approx(before_emergency)
+
+
 def test_synthetic_turret_velocity_watchdog_returns_target_to_zero() -> None:
     from navmin.contracts import AxisVelocitySetpoint
 

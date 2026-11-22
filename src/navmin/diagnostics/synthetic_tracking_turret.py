@@ -18,6 +18,7 @@ from navmin.config.models import AxisMechanicsConfig, TurretConfig
 from navmin.contracts import CameraRole
 from navmin.turret.protocol import (
     CommandCode,
+    MoveRelativePayload,
     ProtocolRequest,
     ProtocolResponse,
     ResultCode,
@@ -28,6 +29,9 @@ from navmin.turret.simulator import FakeStm32Endpoint
 from navmin.vision.pipeline import DecodedFrame
 
 from .synthetic_tracking_world import SyntheticTrackingFrameSet, SyntheticTrackingWorld
+
+_RELATIVE_CONTROL_RATE_HZ = 20_000
+_RELATIVE_CONTROL_TICK_S = 1.0 / _RELATIVE_CONTROL_RATE_HZ
 
 
 @dataclass(frozen=True, slots=True)
@@ -71,6 +75,8 @@ class SyntheticTurretPlant:
         self._acceleration_pitch_deg_s2 = 0.0
         self._velocity_watchdog_timeout_s = 0.0
         self._velocity_command_age_s: float | None = None
+        self._relative_target_yaw_deg: float | None = None
+        self._relative_target_pitch_deg: float | None = None
 
     @property
     def state(self) -> SyntheticTurretPlantState:
@@ -99,18 +105,45 @@ class SyntheticTurretPlant:
             if request.command is CommandCode.EMERGENCY_STOP:
                 self._hard_stop_locked()
                 return
+            if request.command is CommandCode.MOVE_RELATIVE:
+                payload = request.payload
+                if not isinstance(payload, MoveRelativePayload):
+                    raise TypeError("MOVE_RELATIVE requires MoveRelativePayload")
+                if not self._configured or not self._motors_on:
+                    return
+                self._relative_target_yaw_deg = self._yaw_deg + self._logical_degrees_from_steps(
+                    payload.delta_x_steps,
+                    self._mechanics_x,
+                )
+                self._relative_target_pitch_deg = (
+                    self._pitch_deg
+                    + self._logical_degrees_from_steps(
+                        payload.delta_y_steps,
+                        self._mechanics_y,
+                    )
+                )
+                # Firmware relative ownership disarms the velocity watchdog.  The
+                # current physical rate is deliberately preserved and the planner
+                # brakes/reverses from that state on subsequent control ticks.
+                self._velocity_command_age_s = None
+                return
             if request.command is CommandCode.SET_VELOCITY:
                 payload = request.payload
                 if not isinstance(payload, SetVelocityPayload):
                     raise TypeError("SET_VELOCITY requires SetVelocityPayload")
                 if not self._configured or not self._motors_on:
                     return
+                self._clear_relative_target_locked()
                 self._requested_yaw_rate_deg_s = self._clamp(
-                    self._logical_rate_from_steps_s(payload.velocity_x_steps_s, self._mechanics_x),
+                    self._logical_rate_from_steps_s(
+                        payload.velocity_x_steps_s, self._mechanics_x
+                    ),
                     self._max_speed_yaw_deg_s,
                 )
                 self._requested_pitch_rate_deg_s = self._clamp(
-                    self._logical_rate_from_steps_s(payload.velocity_y_steps_s, self._mechanics_y),
+                    self._logical_rate_from_steps_s(
+                        payload.velocity_y_steps_s, self._mechanics_y
+                    ),
                     self._max_speed_pitch_deg_s,
                 )
                 self._velocity_command_age_s = 0.0
@@ -121,6 +154,10 @@ class SyntheticTurretPlant:
             raise ValueError("dt_s must be finite and >= 0")
         with self._lock:
             if dt_s == 0.0 or not self._configured or not self._motors_on:
+                return self._state_locked()
+
+            if self._relative_target_yaw_deg is not None:
+                self._advance_relative_motion_locked(dt_s)
                 return self._state_locked()
 
             remaining_s = dt_s
@@ -160,6 +197,137 @@ class SyntheticTurretPlant:
             dt_s=dt_s,
         )
 
+    def _advance_relative_motion_locked(self, dt_s: float) -> None:
+        target_yaw = self._relative_target_yaw_deg
+        target_pitch = self._relative_target_pitch_deg
+        if target_yaw is None or target_pitch is None:
+            raise RuntimeError("relative target must be complete")
+
+        remaining_s = dt_s
+        yaw_settled = False
+        pitch_settled = False
+        while remaining_s > 0.0:
+            tick_s = min(remaining_s, _RELATIVE_CONTROL_TICK_S)
+            (
+                self._yaw_deg,
+                self._yaw_rate_deg_s,
+                self._requested_yaw_rate_deg_s,
+                yaw_settled,
+            ) = self._advance_relative_axis_tick(
+                position_deg=self._yaw_deg,
+                rate_deg_s=self._yaw_rate_deg_s,
+                target_position_deg=target_yaw,
+                max_speed_deg_s=self._max_speed_yaw_deg_s,
+                acceleration_deg_s2=self._acceleration_yaw_deg_s2,
+                mechanics=self._mechanics_x,
+                dt_s=tick_s,
+            )
+            (
+                self._pitch_deg,
+                self._pitch_rate_deg_s,
+                self._requested_pitch_rate_deg_s,
+                pitch_settled,
+            ) = self._advance_relative_axis_tick(
+                position_deg=self._pitch_deg,
+                rate_deg_s=self._pitch_rate_deg_s,
+                target_position_deg=target_pitch,
+                max_speed_deg_s=self._max_speed_pitch_deg_s,
+                acceleration_deg_s2=self._acceleration_pitch_deg_s2,
+                mechanics=self._mechanics_y,
+                dt_s=tick_s,
+            )
+            remaining_s -= tick_s
+            if yaw_settled and pitch_settled:
+                self._clear_relative_target_locked()
+                self._requested_yaw_rate_deg_s = 0.0
+                self._requested_pitch_rate_deg_s = 0.0
+                return
+
+    @classmethod
+    def _advance_relative_axis_tick(
+        cls,
+        *,
+        position_deg: float,
+        rate_deg_s: float,
+        target_position_deg: float,
+        max_speed_deg_s: float,
+        acceleration_deg_s2: float,
+        mechanics: AxisMechanicsConfig,
+        dt_s: float,
+    ) -> tuple[float, float, float, bool]:
+        step_deg = 360.0 / cls._effective_steps_per_revolution(mechanics)
+        settle_tolerance_deg = 0.5 * step_deg
+        remaining_deg = target_position_deg - position_deg
+
+        if abs(remaining_deg) <= settle_tolerance_deg and rate_deg_s == 0.0:
+            return target_position_deg, 0.0, 0.0, True
+
+        if acceleration_deg_s2 <= 0.0:
+            raise RuntimeError("configured acceleration must be > 0")
+
+        if remaining_deg > 0.0:
+            direction = 1.0
+        elif remaining_deg < 0.0:
+            direction = -1.0
+        else:
+            direction = 0.0
+
+        if direction == 0.0:
+            target_rate_deg_s = 0.0
+        elif rate_deg_s * direction < 0.0:
+            # Match firmware: when motion is away from the new target, request
+            # full speed toward it and let the acceleration limiter brake
+            # through exact zero before opposite acceleration begins.
+            target_rate_deg_s = direction * max_speed_deg_s
+        else:
+            braking_distance_deg = (
+                rate_deg_s * rate_deg_s / (2.0 * acceleration_deg_s2)
+            )
+            target_rate_deg_s = (
+                0.0
+                if braking_distance_deg >= abs(remaining_deg)
+                else direction * max_speed_deg_s
+            )
+
+        next_rate = cls._advance_relative_rate(
+            rate_deg_s=rate_deg_s,
+            target_rate_deg_s=target_rate_deg_s,
+            acceleration_deg_s2=acceleration_deg_s2,
+            dt_s=dt_s,
+        )
+        next_position = position_deg + next_rate * dt_s
+
+        if (
+            next_rate == 0.0
+            and abs(target_position_deg - next_position) <= settle_tolerance_deg
+        ):
+            return target_position_deg, 0.0, 0.0, True
+        return next_position, next_rate, target_rate_deg_s, False
+
+    @staticmethod
+    def _advance_relative_rate(
+        *,
+        rate_deg_s: float,
+        target_rate_deg_s: float,
+        acceleration_deg_s2: float,
+        dt_s: float,
+    ) -> float:
+        delta = acceleration_deg_s2 * dt_s
+        if rate_deg_s == target_rate_deg_s:
+            return rate_deg_s
+
+        # Firmware discards unused acceleration budget on a sign reversal.
+        if (rate_deg_s > 0.0 > target_rate_deg_s) or (
+            rate_deg_s < 0.0 < target_rate_deg_s
+        ):
+            if rate_deg_s > 0.0:
+                return 0.0 if rate_deg_s <= delta else rate_deg_s - delta
+            return 0.0 if rate_deg_s >= -delta else rate_deg_s + delta
+
+        if rate_deg_s < target_rate_deg_s:
+            return min(target_rate_deg_s, rate_deg_s + delta)
+        return max(target_rate_deg_s, rate_deg_s - delta)
+
     def _apply_config_locked(self, payload: SetConfigPayload) -> None:
         self._max_speed_yaw_deg_s = self._magnitude_from_steps(
             payload.max_speed_x_steps_s,
@@ -189,11 +357,16 @@ class SyntheticTurretPlant:
         self._configured = True
 
     def _hard_stop_locked(self) -> None:
+        self._clear_relative_target_locked()
         self._yaw_rate_deg_s = 0.0
         self._pitch_rate_deg_s = 0.0
         self._requested_yaw_rate_deg_s = 0.0
         self._requested_pitch_rate_deg_s = 0.0
         self._velocity_command_age_s = None
+
+    def _clear_relative_target_locked(self) -> None:
+        self._relative_target_yaw_deg = None
+        self._relative_target_pitch_deg = None
 
     def _state_locked(self) -> SyntheticTurretPlantState:
         return SyntheticTurretPlantState(
@@ -225,6 +398,15 @@ class SyntheticTurretPlant:
     ) -> float:
         logical_steps_s = -physical_steps_s if mechanics.invert else physical_steps_s
         return logical_steps_s * 360.0 / cls._effective_steps_per_revolution(mechanics)
+
+    @classmethod
+    def _logical_degrees_from_steps(
+        cls,
+        physical_steps: int,
+        mechanics: AxisMechanicsConfig,
+    ) -> float:
+        logical_steps = -physical_steps if mechanics.invert else physical_steps
+        return logical_steps * 360.0 / cls._effective_steps_per_revolution(mechanics)
 
     @classmethod
     def _magnitude_from_steps(
