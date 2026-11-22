@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import socket
+import sys
 import tempfile
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -329,7 +330,7 @@ def run_startup_preflight(
                 _result_check(
                     "Serial device",
                     serial_path_check(inputs.config.turret.serial.port),
-                    success_detail=f"accessible: {inputs.config.turret.serial.port}",
+                    success_detail=f"static check passed: {inputs.config.turret.serial.port}",
                 )
             )
             checks.append(
@@ -518,7 +519,42 @@ def _duplicate_endpoint_detail(endpoints: list[tuple[str, str, int]]) -> str | N
     return None
 
 
-def _check_serial_device(port: str) -> str | None:
+def _windows_serial_ports() -> tuple[str, ...]:
+    """Enumerate Windows COM devices without opening them."""
+    from serial.tools import list_ports
+
+    return tuple(
+        str(info.device)
+        for info in list_ports.comports()
+        if getattr(info, "device", None)
+    )
+
+
+def _normalize_windows_serial_port(port: str) -> str:
+    normalized = port.strip().removeprefix("\\\\.\\")
+    return normalized.casefold()
+
+
+def _check_serial_device(
+    port: str,
+    *,
+    platform_name: str | None = None,
+    windows_port_enumerator: Callable[[], tuple[str, ...]] | None = None,
+) -> str | None:
+    platform_value = sys.platform if platform_name is None else platform_name
+    if platform_value.startswith("win"):
+        enumerate_ports = windows_port_enumerator or _windows_serial_ports
+        try:
+            available = tuple(enumerate_ports())
+        except (AttributeError, ImportError, OSError) as exc:
+            return f"cannot enumerate Windows serial ports: {type(exc).__name__}: {exc}"
+
+        expected = _normalize_windows_serial_port(port)
+        if any(_normalize_windows_serial_port(device) == expected for device in available):
+            return None
+        detected = ", ".join(sorted(available, key=str.casefold)) or "none"
+        return f"{port} is not detected; detected serial ports: {detected}"
+
     path = Path(port)
     if not path.exists():
         return f"{port} does not exist"

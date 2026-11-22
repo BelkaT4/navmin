@@ -796,6 +796,108 @@ def test_serial_device_check_requires_exists_readable_and_writable(
     )
 
 
+def test_real_turret_default_preflight_accepts_detected_windows_com_port(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    monkeypatch.setattr(preflight_module.sys, "platform", "win32")
+    monkeypatch.setattr(preflight_module, "_windows_serial_ports", lambda: ("COM8",))
+
+    report = run_startup_preflight(
+        _inputs(18_930, 18_931, serial_port="COM8"),
+        selection=StartupBackendSelection("sim", "sim", "real"),
+        session_dir=tmp_path,
+        session_directory_check=lambda _path: None,
+        qt_check=lambda: None,
+        pyserial_check=lambda: None,
+    )
+
+    assert report.ok
+    serial_check = next(check for check in report.checks if check.name == "Serial device")
+    assert serial_check.status is PreflightStatus.PASS
+    assert serial_check.detail == "static check passed: COM8"
+
+
+def test_real_turret_default_preflight_rejects_missing_windows_com_port(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    monkeypatch.setattr(preflight_module.sys, "platform", "win32")
+    monkeypatch.setattr(preflight_module, "_windows_serial_ports", lambda: ("COM3",))
+
+    report = run_startup_preflight(
+        _inputs(18_932, 18_933, serial_port="COM8"),
+        selection=StartupBackendSelection("sim", "sim", "real"),
+        session_dir=tmp_path,
+        session_directory_check=lambda _path: None,
+        qt_check=lambda: None,
+        pyserial_check=lambda: None,
+    )
+
+    assert report.overall_status is PreflightStatus.FAIL
+    serial_check = next(check for check in report.checks if check.name == "Serial device")
+    assert serial_check.detail == (
+        "COM8 is not detected; detected serial ports: COM3"
+    )
+
+
+def test_windows_serial_device_check_enumerates_without_opening() -> None:
+    calls = 0
+
+    def enumerate_ports() -> tuple[str, ...]:
+        nonlocal calls
+        calls += 1
+        return ("COM7", "COM3")
+
+    assert (
+        preflight_module._check_serial_device(
+            "com7",
+            platform_name="win32",
+            windows_port_enumerator=enumerate_ports,
+        )
+        is None
+    )
+    assert calls == 1
+
+
+def test_windows_serial_device_check_accepts_extended_com_name() -> None:
+    assert (
+        preflight_module._check_serial_device(
+            r"\\.\COM12",
+            platform_name="win32",
+            windows_port_enumerator=lambda: ("COM12",),
+        )
+        is None
+    )
+
+
+def test_windows_serial_device_check_reports_detected_ports() -> None:
+    assert preflight_module._check_serial_device(
+        "COM5",
+        platform_name="win32",
+        windows_port_enumerator=lambda: ("COM7", "COM3"),
+    ) == "COM5 is not detected; detected serial ports: COM3, COM7"
+
+
+def test_windows_serial_device_check_handles_empty_enumeration() -> None:
+    assert preflight_module._check_serial_device(
+        "COM5",
+        platform_name="win32",
+        windows_port_enumerator=lambda: (),
+    ) == "COM5 is not detected; detected serial ports: none"
+
+
+def test_windows_serial_device_check_surfaces_enumeration_failure() -> None:
+    def fail() -> tuple[str, ...]:
+        raise OSError("registry unavailable")
+
+    assert preflight_module._check_serial_device(
+        "COM5",
+        platform_name="win32",
+        windows_port_enumerator=fail,
+    ) == "cannot enumerate Windows serial ports: OSError: registry unavailable"
+
+
 def test_session_directory_probe_is_removed(tmp_path) -> None:
     before = set(tmp_path.iterdir())
     assert preflight_module._check_session_directory(tmp_path) is None

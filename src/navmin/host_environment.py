@@ -14,6 +14,9 @@ from pathlib import Path
 LOGGER = logging.getLogger(__name__)
 
 CommandRunner = Callable[[Sequence[str], Path, Mapping[str, str]], int]
+HookCommandBuilder = Callable[[Path], Sequence[str]]
+
+_CAMERA_NETWORK_REQUIRED_ENV = "NAVMIN_CAMERA_NETWORK_REQUIRED"
 
 
 class HostEnvironmentError(RuntimeError):
@@ -95,8 +98,101 @@ class HostEnvironment:
             self.restore()
 
 
-class LinuxHostEnvironment(HostEnvironment):
-    """Linux camera-network preparation backed by existing shell helpers."""
+class ScriptHostEnvironment(HostEnvironment):
+    """Common platform-hook runner used by launcher host backends."""
+
+    def __init__(
+        self,
+        repo_root: Path,
+        *,
+        prepare_script: Path,
+        restore_script: Path,
+        command_builder: HookCommandBuilder,
+        environ: Mapping[str, str] | None = None,
+        command_runner: CommandRunner = _subprocess_runner,
+    ) -> None:
+        self._repo_root = repo_root.resolve()
+        self._prepare_script = prepare_script
+        self._restore_script = restore_script
+        self._build_command = command_builder
+        self._environ = dict(os.environ if environ is None else environ)
+        self._run_command = command_runner
+        self._hook_prepared = False
+        self._camera_network_required = False
+
+    def _require_script(self, path: Path) -> None:
+        if not path.is_file():
+            raise HostEnvironmentError(f"host hook not found: {path}")
+
+    def _hook_environment(self, *, camera_network_required: bool) -> dict[str, str]:
+        environ = dict(self._environ)
+        environ[_CAMERA_NETWORK_REQUIRED_ENV] = (
+            "1" if camera_network_required else "0"
+        )
+        return environ
+
+    def _run_hook(
+        self,
+        path: Path,
+        *,
+        action: str,
+        camera_network_required: bool,
+    ) -> None:
+        self._require_script(path)
+        command = tuple(self._build_command(path))
+        LOGGER.info("Host %s hook starting: %s", action, path.name)
+        returncode = self._run_command(
+            command,
+            self._repo_root,
+            self._hook_environment(
+                camera_network_required=camera_network_required
+            ),
+        )
+        if returncode != 0:
+            LOGGER.error(
+                "Host %s hook failed helper=%s exit_status=%d",
+                action,
+                path.name,
+                returncode,
+            )
+            raise HostCommandError(command, returncode)
+        LOGGER.info("Host %s hook complete: %s", action, path.name)
+
+    def prepare(self, *, camera_network_required: bool) -> None:
+        if self._hook_prepared:
+            return
+        self._run_hook(
+            self._prepare_script,
+            action="prepare",
+            camera_network_required=camera_network_required,
+        )
+        self._camera_network_required = camera_network_required
+        self._hook_prepared = True
+
+    def restore(self) -> None:
+        if not self._hook_prepared:
+            return
+        try:
+            self._run_hook(
+                self._restore_script,
+                action="restore",
+                camera_network_required=self._camera_network_required,
+            )
+        finally:
+            self._hook_prepared = False
+            self._camera_network_required = False
+
+
+def _direct_hook_command(path: Path) -> Sequence[str]:
+    return (str(path),)
+
+
+def _python_hook_command(path: Path) -> Sequence[str]:
+    return (sys.executable, str(path))
+
+
+class LinuxHostEnvironment(ScriptHostEnvironment):
+    """Linux host hooks with the existing camera-network lifecycle lock."""
 
     def __init__(
         self,
@@ -105,9 +201,16 @@ class LinuxHostEnvironment(HostEnvironment):
         environ: Mapping[str, str] | None = None,
         command_runner: CommandRunner = _subprocess_runner,
     ) -> None:
-        self._repo_root = repo_root.resolve()
-        self._environ = dict(os.environ if environ is None else environ)
-        self._run_command = command_runner
+        repo_root = repo_root.resolve()
+        linux_tools = repo_root / "tools" / "platform" / "linux"
+        super().__init__(
+            repo_root,
+            prepare_script=linux_tools / "host_prepare.sh",
+            restore_script=linux_tools / "host_restore.sh",
+            command_builder=_direct_hook_command,
+            environ=environ,
+            command_runner=command_runner,
+        )
         self._network_prepared = False
         self._network_lock_file = None
 
@@ -132,6 +235,11 @@ class LinuxHostEnvironment(HostEnvironment):
         return self._linux_tools / "host_config.sh"
 
     def _require_helpers(self) -> None:
+        for path in (self._prepare_script, self._restore_script):
+            if not path.is_file() or not os.access(path, os.X_OK):
+                raise HostEnvironmentError(
+                    f"host hook is not executable: {path}"
+                )
         for path in (self._network_up, self._network_down):
             if not path.is_file() or not os.access(path, os.X_OK):
                 raise HostEnvironmentError(
@@ -166,7 +274,6 @@ class LinuxHostEnvironment(HostEnvironment):
         host_config.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(default, host_config)
         raise HostConfigurationCreated(host_config)
-
 
     def _network_state_path(self) -> Path:
         explicit = self._environ.get("NAVMIN_NETWORK_STATE_FILE", "")
@@ -209,58 +316,55 @@ class LinuxHostEnvironment(HostEnvironment):
             self._network_lock_file = None
         LOGGER.info("Camera network lifecycle lock released")
 
-    def _run_network_helper(self, path: Path, *, action: str) -> None:
-        command = (str(path),)
-        LOGGER.info("Camera network %s starting: %s", action, path.name)
-        returncode = self._run_command(command, self._repo_root, self._environ)
-        if returncode != 0:
-            LOGGER.error(
-                "Camera network %s failed helper=%s exit_status=%d",
-                action,
-                path.name,
-                returncode,
-            )
-            raise HostCommandError(command, returncode)
-        LOGGER.info("Camera network %s complete: %s", action, path.name)
-
     def prepare(self, *, camera_network_required: bool) -> None:
-        if not camera_network_required or self._network_prepared:
+        if self._hook_prepared:
             return
-        self._require_helpers()
-        self._ensure_host_config()
-        self._acquire_network_lock()
+        if camera_network_required:
+            self._require_helpers()
+            self._ensure_host_config()
+            self._acquire_network_lock()
+        else:
+            for path in (self._prepare_script, self._restore_script):
+                if not path.is_file() or not os.access(path, os.X_OK):
+                    raise HostEnvironmentError(
+                        f"host hook is not executable: {path}"
+                    )
         try:
-            # Recover stale state left by a crashed/aborted previous invocation.
-            # The process-wide lock makes this safe: a live NavMin owner cannot
-            # have its camera network torn down by a second instance.
-            self._run_network_helper(self._network_down, action="pre-start recovery")
-            self._run_network_helper(self._network_up, action="activation")
+            super().prepare(camera_network_required=camera_network_required)
         except HostEnvironmentError:
-            self._release_network_lock()
+            if camera_network_required:
+                self._release_network_lock()
             raise
-        self._network_prepared = True
+        self._network_prepared = camera_network_required
 
     def restore(self) -> None:
-        if not self._network_prepared:
-            self._release_network_lock()
-            return
         try:
-            self._run_network_helper(self._network_down, action="restore")
+            super().restore()
         finally:
             self._network_prepared = False
             self._release_network_lock()
 
 
-class WindowsHostEnvironment(HostEnvironment):
-    """Current Windows host backend intentionally performs no network setup."""
+class WindowsHostEnvironment(ScriptHostEnvironment):
+    """Windows host lifecycle backed by platform scripts."""
 
-
-    def prepare(self, *, camera_network_required: bool) -> None:
-        del camera_network_required
-
-    def restore(self) -> None:
-        return
-
+    def __init__(
+        self,
+        repo_root: Path | None = None,
+        *,
+        environ: Mapping[str, str] | None = None,
+        command_runner: CommandRunner = _subprocess_runner,
+    ) -> None:
+        repo_root = Path.cwd() if repo_root is None else repo_root.resolve()
+        windows_tools = repo_root / "tools" / "platform" / "windows"
+        super().__init__(
+            repo_root,
+            prepare_script=windows_tools / "host_prepare.py",
+            restore_script=windows_tools / "host_restore.py",
+            command_builder=_python_hook_command,
+            environ=environ,
+            command_runner=command_runner,
+        )
 
 def create_host_environment(
     repo_root: Path,
@@ -278,7 +382,11 @@ def create_host_environment(
             command_runner=command_runner,
         )
     if platform_value.startswith("win"):
-        return WindowsHostEnvironment()
+        return WindowsHostEnvironment(
+            repo_root,
+            environ=environ,
+            command_runner=command_runner,
+        )
     raise HostEnvironmentError(f"unsupported host platform: {platform_value}")
 
 

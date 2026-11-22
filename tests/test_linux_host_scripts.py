@@ -13,6 +13,8 @@ EXECUTABLE_SHELL_SCRIPTS = (
     LINUX_TOOLS / "setup_camera_network.sh",
     LINUX_TOOLS / "camera_network_up.sh",
     LINUX_TOOLS / "camera_network_down.sh",
+    LINUX_TOOLS / "host_prepare.sh",
+    LINUX_TOOLS / "host_restore.sh",
 )
 SHELL_FILES = (*EXECUTABLE_SHELL_SCRIPTS, LINUX_TOOLS / "host_config.sh")
 
@@ -204,6 +206,55 @@ def test_linux_host_shell_files_are_posix_syntax_valid() -> None:
 
     for script in EXECUTABLE_SHELL_SCRIPTS:
         assert script.stat().st_mode & 0o111
+
+
+def test_linux_host_hooks_are_noop_without_camera_network() -> None:
+    env = os.environ.copy()
+    env["NAVMIN_CAMERA_NETWORK_REQUIRED"] = "0"
+
+    for script in (
+        LINUX_TOOLS / "host_prepare.sh",
+        LINUX_TOOLS / "host_restore.sh",
+    ):
+        result = subprocess.run(
+            [str(script)],
+            cwd=REPO_ROOT,
+            env=env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert result.returncode == 0, result.stderr
+
+
+def test_linux_host_hooks_delegate_camera_network_lifecycle(tmp_path: Path) -> None:
+    env, nm_state = _write_fake_nmcli(tmp_path, active="previous-uuid")
+    env["NAVMIN_CAMERA_NETWORK_REQUIRED"] = "1"
+    restore_state = Path(env["NAVMIN_NETWORK_STATE_FILE"])
+
+    prepare = subprocess.run(
+        [str(LINUX_TOOLS / "host_prepare.sh")],
+        cwd=REPO_ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert prepare.returncode == 0, prepare.stderr
+    assert _read_state(nm_state)["active"] == "target-uuid"
+    assert restore_state.is_file()
+
+    restore = subprocess.run(
+        [str(LINUX_TOOLS / "host_restore.sh")],
+        cwd=REPO_ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert restore.returncode == 0, restore.stderr
+    assert _read_state(nm_state)["active"] == "previous-uuid"
+    assert not restore_state.exists()
 
 
 def test_default_host_config_is_safe_and_working_inputs_are_tracked() -> None:

@@ -107,7 +107,7 @@
   },
   "turret": {
     "serial": {
-      "port": "/dev/navmin-configure-serial-port",
+      "port": "navmin-configure-serial-port",
       "baudrate": 9600,
       "response-timeout-ms": 100,
       "max-retries": 2,

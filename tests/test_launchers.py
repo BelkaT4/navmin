@@ -1861,7 +1861,7 @@ def test_input_recovery_creates_valid_safe_defaults_without_existing_files(
     overview = load_overview_calibration(paths.overview_calibration)
     stereo = load_stereo_calibration(paths.stereo_calibration)
     imu = ImuCalibration.load(imu_path)
-    assert config.turret.serial.port == "/dev/navmin-configure-serial-port"
+    assert config.turret.serial.port == "navmin-configure-serial-port"
     assert config.schema_version == 8
     assert config.vision.cameras.overview.calibration_file == "calibration/overview.json"
     assert config.vision.distance.stereo.calibration_file == "calibration/stereo.json"
