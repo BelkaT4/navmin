@@ -4,20 +4,18 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 
-from navmin.calibration import StereoCalibration
 from navmin.contracts import CameraRole
-from navmin.diagnostics.localhost_rtp import (
-    diagnostic_overview_calibration,
-    diagnostic_stereo_calibration,
+from navmin.diagnostics.synthetic_tracking_calibration import (
+    mixed_stereo_calibration,
+    synthetic_tracking_overview_calibration,
+    synthetic_tracking_stereo_calibration,
 )
-from navmin.diagnostics.synthetic_stereo import (
-    DEFAULT_SYNTHETIC_HEIGHT,
-    DEFAULT_SYNTHETIC_WIDTH,
-    rectified_synthetic_side_calibration,
+from navmin.diagnostics.synthetic_tracking_transport import (
+    SyntheticTrackingRtpJpegSource,
+    synthetic_tracking_rtp_source_config,
 )
 from navmin.diagnostics.synthetic_tracking_turret import (
     RealtimeSyntheticTrackingRig,
-    SyntheticTrackingFrameSource,
     SyntheticTrackingStm32Endpoint,
     SyntheticTurretPlant,
 )
@@ -72,34 +70,7 @@ class SimulationContext:
     stm32_endpoint: SyntheticTrackingStm32Endpoint | None
 
 
-def _fallback_tracking_world_calibration() -> StereoCalibration:
-    """Build internal world geometry when only Overview is synthetic.
-
-    This is not exposed as the launch's effective stereo calibration.  It only
-    gives ``SyntheticTrackingWorld`` a valid non-zero stereo baseline while the
-    real/disabled stereo side keeps its loaded calibration unchanged.
-    """
-    calibration = diagnostic_stereo_calibration(
-        width=DEFAULT_SYNTHETIC_WIDTH,
-        height=DEFAULT_SYNTHETIC_HEIGHT,
-    )
-    fx = float(calibration.P1[0][0])
-    baseline_native = abs(float(calibration.T[0]))
-    p2 = (
-        (
-            float(calibration.P2[0][0]),
-            float(calibration.P2[0][1]),
-            float(calibration.P2[0][2]),
-            -fx * baseline_native,
-        ),
-        calibration.P2[1],
-        calibration.P2[2],
-    )
-    return replace(calibration, P2=p2)
-
-
 def _build_simulation_context(
-    inputs: LoadedApplicationInputs,
     selection: EffectiveLaunchSelection,
 ) -> SimulationContext | None:
     simulated_cameras = selection.simulated_camera_roles
@@ -111,25 +82,7 @@ def _build_simulation_context(
     world = None
     rig = None
     if simulated_cameras:
-        reference = inputs.stereo_calibration
-        stereo_simulated = (
-            selection.options.stereo_left is CameraSourceMode.SIM
-            or selection.options.stereo_right is StereoRightMode.SIM
-        )
-        reference_matches_world = (
-            reference.image_width == DEFAULT_SYNTHETIC_WIDTH
-            and reference.image_height == DEFAULT_SYNTHETIC_HEIGHT
-        )
-        if stereo_simulated and not reference_matches_world:
-            raise LaunchRuntimeBindingError(
-                "synthetic stereo requires a 1296x976 reference stereo calibration"
-            )
-        world_reference = (
-            reference
-            if reference_matches_world
-            else _fallback_tracking_world_calibration()
-        )
-        world = SyntheticTrackingWorld(world_reference)
+        world = SyntheticTrackingWorld()
         rig = RealtimeSyntheticTrackingRig(
             world,
             plant,
@@ -167,8 +120,14 @@ def _synthetic_camera_factory(
             "synthetic camera source requires a shared synthetic tracking rig"
         )
 
-    def factory(_config):
-        return SyntheticTrackingFrameSource(rig, camera)
+    def factory(config):
+        source = config.source
+        expected = synthetic_tracking_rtp_source_config(camera)
+        if source != expected:
+            raise LaunchRuntimeBindingError(
+                "synthetic camera factory received non-canonical RTP/JPEG config"
+            )
+        return SyntheticTrackingRtpJpegSource(rig, camera, expected)
 
     return factory
 
@@ -192,8 +151,38 @@ def build_launch_runtime_bindings(
     inputs: LoadedApplicationInputs,
     options: LaunchOptions,
 ) -> LaunchRuntimeBindings:
-    """Resolve in-process synthetic bindings without mutating loaded inputs."""
+    """Resolve production-like operator SIM bindings without mutating inputs."""
     selection = apply_launch_options(inputs.config, options)
+    effective_cameras = selection.config.vision.cameras
+    if options.overview is CameraSourceMode.SIM:
+        effective_cameras = replace(
+            effective_cameras,
+            overview=replace(
+                effective_cameras.overview,
+                source=synthetic_tracking_rtp_source_config(CameraRole.OVERVIEW),
+            ),
+        )
+    if options.stereo_left is CameraSourceMode.SIM:
+        effective_cameras = replace(
+            effective_cameras,
+            stereo_left=replace(
+                effective_cameras.stereo_left,
+                source=synthetic_tracking_rtp_source_config(CameraRole.STEREO_LEFT),
+            ),
+        )
+    if options.stereo_right is StereoRightMode.SIM:
+        effective_cameras = replace(
+            effective_cameras,
+            stereo_right=replace(
+                effective_cameras.stereo_right,
+                source=synthetic_tracking_rtp_source_config(CameraRole.STEREO_RIGHT),
+            ),
+        )
+    effective_config = replace(
+        selection.config,
+        vision=replace(selection.config.vision, cameras=effective_cameras),
+    )
+    selection = replace(selection, config=effective_config)
     overview_calibration = inputs.overview_calibration
     stereo_calibration = inputs.stereo_calibration
 
@@ -201,27 +190,31 @@ def build_launch_runtime_bindings(
     left_factory = create_camera_source
     right_factory = create_camera_source
     turret_transport_factory: TransportFactory | None = None
-    simulation = _build_simulation_context(inputs, selection)
+    simulation = _build_simulation_context(selection)
 
     if options.overview is CameraSourceMode.SIM:
         assert simulation is not None
         overview_factory = _synthetic_camera_factory(
             simulation, CameraRole.OVERVIEW
         )
-        overview_calibration = diagnostic_overview_calibration(
-            width=DEFAULT_SYNTHETIC_WIDTH,
-            height=DEFAULT_SYNTHETIC_HEIGHT,
-        )
+        overview_calibration = synthetic_tracking_overview_calibration()
 
     left_sim = options.stereo_left is CameraSourceMode.SIM
     right_sim = options.stereo_right is StereoRightMode.SIM
     if left_sim or right_sim:
         assert simulation is not None
-        reference = inputs.stereo_calibration
-        stereo_calibration = rectified_synthetic_side_calibration(
-            reference,
-            left_synthetic=left_sim,
-            right_synthetic=right_sim,
+        any_real_stereo = (
+            options.stereo_left is CameraSourceMode.ON
+            or options.stereo_right is StereoRightMode.ON
+        )
+        stereo_calibration = (
+            mixed_stereo_calibration(
+                inputs.stereo_calibration,
+                left_synthetic=left_sim,
+                right_synthetic=right_sim,
+            )
+            if any_real_stereo
+            else synthetic_tracking_stereo_calibration()
         )
         if left_sim:
             left_factory = _synthetic_camera_factory(

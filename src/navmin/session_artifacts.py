@@ -40,8 +40,8 @@ class SessionStatus(StrEnum):
 @dataclass(frozen=True)
 class SourceInputPaths:
     config: Path
-    overview_calibration: Path
-    stereo_calibration: Path
+    overview_calibration: Path | None
+    stereo_calibration: Path | None
 
 
 @dataclass
@@ -252,7 +252,9 @@ def _json_normalize(value: Any) -> Any:
     return value
 
 
-def _file_source(path: Path) -> dict[str, str | None]:
+def _file_source(path: Path | None) -> dict[str, str | None]:
+    if path is None:
+        return _synthetic_source()
     input_path = Path(path)
     digest = hashlib.sha256()
     with input_path.open("rb") as stream:

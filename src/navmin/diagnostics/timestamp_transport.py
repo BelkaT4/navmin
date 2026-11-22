@@ -13,6 +13,9 @@ from typing import Any
 import cv2
 import numpy as np
 
+from navmin.diagnostics.rtp_jpeg_appsrc import (
+    build_appsrc_rtp_jpeg_sender_pipeline_description,
+)
 from navmin.vision.gstreamer_source import RTP_JPEG_CAPS
 
 DEFAULT_WIDTH = 320
@@ -228,13 +231,9 @@ class TimestampTransportLifecycleProofResult:
 
 
 def build_timestamp_sender_pipeline_description(*, host: str, port: int, fps: int) -> str:
-    """Build the colleague-style appsrc JPEG -> RTP/JPEG sender pipeline."""
-    return (
-        "appsrc name=source is-live=true format=time do-timestamp=false "
-        f"caps=image/jpeg,framerate={fps}/1 "
-        "! jpegparse "
-        "! rtpjpegpay pt=26 "
-        f"! udpsink host={host} port={port} sync=false async=false"
+    """Build the established appsrc JPEG -> RTP/JPEG sender pipeline."""
+    return build_appsrc_rtp_jpeg_sender_pipeline_description(
+        host=host, port=port, fps=fps
     )
 
 

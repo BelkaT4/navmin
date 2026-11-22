@@ -5,23 +5,31 @@ from itertools import pairwise
 import numpy as np
 import pytest
 
-from navmin.calibration import load_stereo_calibration
+from navmin.calibration import overview_camera_model, stereo_camera_models
 from navmin.contracts import CameraRole
+from navmin.diagnostics.synthetic_tracking_calibration import (
+    SYNTHETIC_TRACKING_OVERVIEW_HFOV_DEG,
+    SYNTHETIC_TRACKING_STEREO_BASELINE_M,
+    SYNTHETIC_TRACKING_STEREO_HFOV_DEG,
+    synthetic_tracking_overview_calibration,
+    synthetic_tracking_stereo_calibration,
+)
 from navmin.diagnostics.synthetic_tracking_world import (
     SYNTHETIC_TRACKING_INITIAL_STATIC_S,
     SYNTHETIC_TRACKING_INITIAL_YAW_ACCEL_DEG_S2,
-    SYNTHETIC_TRACKING_OVERVIEW_HFOV_DEG,
-    SYNTHETIC_TRACKING_OVERVIEW_VFOV_DEG,
     SYNTHETIC_TRACKING_TARGET_SIZE_PX,
     SYNTHETIC_TRACKING_WORLD_LIMIT_DEG,
     SyntheticTrackingWorld,
 )
+from navmin.vision.pipeline import (
+    overview_corrector,
+    stereo_left_corrector,
+    stereo_right_corrector,
+)
 
 
 def _world() -> SyntheticTrackingWorld:
-    return SyntheticTrackingWorld(
-        load_stereo_calibration("config/defaults/calibration/stereo.json")
-    )
+    return SyntheticTrackingWorld()
 
 
 def test_tracking_world_geometry_matches_diagnostic_contract() -> None:
@@ -30,12 +38,40 @@ def test_tracking_world_geometry_matches_diagnostic_contract() -> None:
     left = world.geometries[CameraRole.STEREO_LEFT]
     right = world.geometries[CameraRole.STEREO_RIGHT]
 
-    assert overview.horizontal_fov_deg == pytest.approx(SYNTHETIC_TRACKING_OVERVIEW_HFOV_DEG)
-    assert overview.vertical_fov_deg == pytest.approx(SYNTHETIC_TRACKING_OVERVIEW_VFOV_DEG)
-    assert left.horizontal_fov_deg == pytest.approx(6.296, abs=0.01)
-    assert left.vertical_fov_deg == pytest.approx(4.742, abs=0.01)
+    assert overview.horizontal_fov_deg == pytest.approx(
+        SYNTHETIC_TRACKING_OVERVIEW_HFOV_DEG, abs=0.1
+    )
+    assert overview.vertical_fov_deg == pytest.approx(73.9, abs=0.2)
+    assert left.horizontal_fov_deg == pytest.approx(
+        SYNTHETIC_TRACKING_STEREO_HFOV_DEG, abs=0.01
+    )
+    assert left.vertical_fov_deg == pytest.approx(4.74, abs=0.02)
     assert left.stereo_offset_px == pytest.approx(-right.stereo_offset_px)
     assert 30.0 < world.disparity_px < 45.0
+
+
+def test_canonical_simulation_frames_survive_production_correction_geometry() -> None:
+    world = _world()
+    rendered = world.render(220, turret_yaw_deg=0.25, turret_pitch_deg=-0.1)
+    correctors = {
+        CameraRole.OVERVIEW: overview_corrector(
+            synthetic_tracking_overview_calibration()
+        ),
+        CameraRole.STEREO_LEFT: stereo_left_corrector(
+            synthetic_tracking_stereo_calibration()
+        ),
+        CameraRole.STEREO_RIGHT: stereo_right_corrector(
+            synthetic_tracking_stereo_calibration()
+        ),
+    }
+
+    for role, corrector in correctors.items():
+        corrected = corrector.correct(rendered.image(role))
+        ys, xs = np.where(corrected[:, :, 0] > 200)
+        projection = rendered.projection(role)
+        assert xs.size > 0
+        assert float(xs.mean()) == pytest.approx(projection.center_x_px, abs=1.0)
+        assert float(ys.mean()) == pytest.approx(projection.center_y_px, abs=1.0)
 
 
 def test_tracking_world_target_motion_is_continuous_bounded_and_repeats() -> None:
@@ -120,8 +156,9 @@ def test_tracking_world_explicit_turret_pose_moves_background_and_relative_targe
 
     p0 = stationary.projection(CameraRole.STEREO_LEFT)
     p1 = turned.projection(CameraRole.STEREO_LEFT)
-    px_per_degree = world.geometries[CameraRole.STEREO_LEFT].pixels_per_degree_x
-    assert p1.center_x_px - p0.center_x_px == pytest.approx(-px_per_degree)
+    geometry = world.geometries[CameraRole.STEREO_LEFT]
+    expected_shift = geometry.focal_x_px * np.tan(np.radians(-1.0))
+    assert p1.center_x_px - p0.center_x_px == pytest.approx(expected_shift)
     assert not np.array_equal(stationary.stereo_left, turned.stereo_left)
 
 
@@ -345,6 +382,179 @@ def test_synthetic_tracking_simulation_moves_world_opposite_turret_rotation() ->
     assert not np.array_equal(before.frame_set.stereo_left, after.frame_set.stereo_left)
 
 
+
+
+def test_synthetic_turret_relative_move_reaches_quantized_target_and_moves_world() -> None:
+    from navmin.contracts import MoveRelativeCommand
+    from navmin.diagnostics.synthetic_tracking_turret import SyntheticTrackingSimulation
+    from navmin.turret.hal import preview_move_relative
+
+    config, plant, _, _, _, hal = _synthetic_turret_stack()
+    world = _world()
+    simulation = SyntheticTrackingSimulation(world, plant)
+    before = simulation.capture().frame_set.projection(CameraRole.STEREO_LEFT)
+    command = MoveRelativeCommand(4.0, -2.0)
+    preview = preview_move_relative(config, command)
+
+    result = hal.move_relative(command)
+    assert result.response is not None
+    plant.advance(1.5)
+    state = plant.state
+    after = simulation.capture().frame_set.projection(CameraRole.STEREO_LEFT)
+
+    assert state.yaw_deg == pytest.approx(preview.quantized_delta_x_deg, abs=1e-9)
+    assert state.pitch_deg == pytest.approx(preview.quantized_delta_y_deg, abs=1e-9)
+    assert state.yaw_rate_deg_s == 0.0
+    assert state.pitch_rate_deg_s == 0.0
+    assert state.requested_yaw_rate_deg_s == 0.0
+    assert state.requested_pitch_rate_deg_s == 0.0
+    assert state.velocity_command_age_s is None
+    assert after.center_x_px < before.center_x_px
+
+
+def test_synthetic_turret_relative_replacement_rebases_current_pose_and_preserves_rate() -> None:
+    from navmin.contracts import MoveRelativeCommand
+    from navmin.turret.hal import preview_move_relative
+
+    config, plant, _, _, _, hal = _synthetic_turret_stack()
+    hal.move_relative(MoveRelativeCommand(20.0, 0.0))
+    plant.advance(0.5)
+    base = plant.state.yaw_deg
+    rate_before = plant.state.yaw_rate_deg_s
+    replacement = MoveRelativeCommand(-2.0, 0.0)
+    preview = preview_move_relative(config, replacement)
+
+    hal.move_relative(replacement)
+    assert plant.state.yaw_rate_deg_s == pytest.approx(rate_before)
+
+    plant.advance(2.0)
+    state = plant.state
+    assert state.yaw_deg == pytest.approx(
+        base + preview.quantized_delta_x_deg,
+        abs=1e-9,
+    )
+    assert state.yaw_rate_deg_s == 0.0
+
+
+def test_synthetic_turret_zero_relative_move_brakes_and_returns_to_acceptance_pose() -> None:
+    from navmin.contracts import AxisVelocitySetpoint, MoveRelativeCommand
+
+    _, plant, _, _, _, hal = _synthetic_turret_stack()
+    hal.set_velocity(AxisVelocitySetpoint(20.0, 0.0, 0))
+    plant.advance(0.2)
+    acceptance_pose = plant.state.yaw_deg
+    rate_before = plant.state.yaw_rate_deg_s
+    assert rate_before > 0.0
+
+    hal.move_relative(MoveRelativeCommand(0.0, 0.0))
+    assert plant.state.yaw_rate_deg_s == pytest.approx(rate_before)
+    plant.advance(2.0)
+
+    state = plant.state
+    assert state.yaw_deg == pytest.approx(acceptance_pose, abs=1e-9)
+    assert state.yaw_rate_deg_s == 0.0
+    assert state.requested_yaw_rate_deg_s == 0.0
+    assert state.velocity_command_age_s is None
+
+
+def test_synthetic_turret_relative_uses_logical_direction_with_inverted_axis() -> None:
+    from navmin.contracts import MoveRelativeCommand
+    from navmin.turret.hal import preview_move_relative
+    from navmin.turret.protocol import CommandCode
+
+    config, plant, endpoint, _, _, hal = _synthetic_turret_stack(invert_x=True)
+    command = MoveRelativeCommand(4.0, 0.0)
+    preview = preview_move_relative(config, command)
+    hal.move_relative(command)
+
+    request = endpoint.executed_request_history[-1]
+    assert request.command is CommandCode.MOVE_RELATIVE
+    assert request.payload == preview.payload
+    assert preview.payload.delta_x_steps < 0
+
+    plant.advance(1.5)
+    assert plant.state.yaw_deg == pytest.approx(preview.quantized_delta_x_deg, abs=1e-9)
+    assert plant.state.yaw_deg > 0.0
+
+
+def test_synthetic_turret_relative_disarms_watchdog_and_velocity_replaces_target() -> None:
+    from navmin.contracts import AxisVelocitySetpoint, MoveRelativeCommand
+
+    _, plant, _, _, _, hal = _synthetic_turret_stack(watchdog_ms=100)
+    hal.set_velocity(AxisVelocitySetpoint(20.0, 0.0, 0))
+    plant.advance(0.05)
+    assert plant.state.velocity_command_age_s == pytest.approx(0.05)
+
+    hal.move_relative(MoveRelativeCommand(10.0, 0.0))
+    assert plant.state.velocity_command_age_s is None
+    plant.advance(0.2)
+    assert plant.state.requested_yaw_rate_deg_s > 0.0
+    assert plant.state.velocity_command_age_s is None
+
+    position_before_velocity = plant.state.yaw_deg
+    hal.set_velocity(AxisVelocitySetpoint(-5.0, 0.0, 1))
+    assert plant.state.velocity_command_age_s == 0.0
+    plant.advance(0.2)
+    assert plant.state.yaw_deg != pytest.approx(position_before_velocity + 10.0)
+    assert plant.state.velocity_command_age_s == pytest.approx(0.2)
+
+
+def test_synthetic_turret_relative_dynamic_config_changes_active_limits() -> None:
+    from dataclasses import replace
+
+    from navmin.contracts import ConfigUpdate, MoveRelativeCommand
+
+    config, plant, _, _, _, hal = _synthetic_turret_stack()
+    hal.move_relative(MoveRelativeCommand(20.0, 0.0))
+    plant.advance(0.5)
+    rate_before = plant.state.yaw_rate_deg_s
+    assert rate_before > 5.0
+
+    slower = replace(
+        config,
+        stm32=replace(
+            config.stm32,
+            max_speed_x_deg_s=5.0,
+            acceleration_x_deg_s2=10.0,
+        ),
+    )
+    result = hal.apply_config_update(ConfigUpdate(revision=1, config=slower))
+    assert result is not None and result.response is not None
+    assert plant.state.yaw_rate_deg_s == pytest.approx(rate_before)
+
+    plant.advance(0.5)
+    state = plant.state
+    assert state.max_speed_yaw_deg_s == pytest.approx(5.04, abs=0.02)
+    assert state.acceleration_yaw_deg_s2 == pytest.approx(9.99, abs=0.02)
+    assert state.yaw_rate_deg_s <= rate_before
+
+
+def test_synthetic_turret_relative_target_is_cleared_by_motor_off_and_emergency() -> None:
+    from navmin.contracts import MoveRelativeCommand
+
+    _, plant, _, _, _, hal = _synthetic_turret_stack()
+    hal.move_relative(MoveRelativeCommand(10.0, 0.0))
+    plant.advance(0.2)
+    before_off = plant.state.yaw_deg
+    assert plant.state.yaw_rate_deg_s > 0.0
+
+    hal.motor_off()
+    assert plant.state.yaw_rate_deg_s == 0.0
+    hal.motor_on()
+    plant.advance(1.0)
+    assert plant.state.yaw_deg == pytest.approx(before_off)
+
+    hal.move_relative(MoveRelativeCommand(-10.0, 0.0))
+    plant.advance(0.2)
+    before_emergency = plant.state.yaw_deg
+    assert plant.state.yaw_rate_deg_s < 0.0
+    hal.emergency_stop()
+    assert plant.state.motors_on is True
+    assert plant.state.yaw_rate_deg_s == 0.0
+    plant.advance(1.0)
+    assert plant.state.yaw_deg == pytest.approx(before_emergency)
+
+
 def test_synthetic_turret_velocity_watchdog_returns_target_to_zero() -> None:
     from navmin.contracts import AxisVelocitySetpoint
 
@@ -363,22 +573,42 @@ def test_synthetic_turret_velocity_watchdog_returns_target_to_zero() -> None:
     assert state.yaw_rate_deg_s > 0.0
 
 
-def test_synthetic_angular_camera_model_matches_linear_world_projection() -> None:
-    from navmin.diagnostics.synthetic_tracking_closed_loop import (
-        SyntheticAngularCameraModel,
+def test_synthetic_world_projection_matches_production_camera_models() -> None:
+    world = _world()
+    overview_model = overview_camera_model(synthetic_tracking_overview_calibration())
+    left_model, right_model = stereo_camera_models(
+        synthetic_tracking_stereo_calibration()
+    )
+    rendered = world.render(220, turret_yaw_deg=0.25, turret_pitch_deg=-0.1)
+    truth = rendered.truth
+
+    overview_projection = rendered.projection(CameraRole.OVERVIEW)
+    overview_ray = overview_model.pixel_to_ray(
+        overview_projection.center_x_px, overview_projection.center_y_px
+    )
+    assert overview_ray.x / overview_ray.z == pytest.approx(
+        np.tan(np.radians(truth.true_error_yaw_deg)), abs=1e-9
+    )
+    assert overview_ray.y / overview_ray.z == pytest.approx(
+        -np.tan(np.radians(truth.true_error_pitch_deg)), abs=1e-9
     )
 
-    world = _world()
-    geometry = world.geometries[CameraRole.STEREO_LEFT]
-    model = SyntheticAngularCameraModel(geometry)
-    rendered = world.render(60, turret_yaw_deg=0.25, turret_pitch_deg=-0.1)
-    projection = rendered.projection(CameraRole.STEREO_LEFT)
-
-    ray = model.pixel_to_ray(projection.center_x_px, projection.center_y_px)
-    roundtrip = model.ray_to_pixel(ray)
-
-    assert roundtrip[0] == pytest.approx(projection.center_x_px)
-    assert roundtrip[1] == pytest.approx(projection.center_y_px)
+    parallax = SYNTHETIC_TRACKING_STEREO_BASELINE_M / (
+        2.0 * world.target_distance_m
+    )
+    for role, model, sign in (
+        (CameraRole.STEREO_LEFT, left_model, +1.0),
+        (CameraRole.STEREO_RIGHT, right_model, -1.0),
+    ):
+        projection = rendered.projection(role)
+        ray = model.pixel_to_ray(projection.center_x_px, projection.center_y_px)
+        assert ray.x / ray.z == pytest.approx(
+            np.tan(np.radians(truth.true_error_yaw_deg)) + sign * parallax,
+            abs=1e-9,
+        )
+        assert ray.y / ray.z == pytest.approx(
+            -np.tan(np.radians(truth.true_error_pitch_deg)), abs=1e-9
+        )
 
 
 def test_synthetic_closed_loop_runs_real_vt11_aiming_estimator_and_turret_chain() -> None:
@@ -388,7 +618,6 @@ def test_synthetic_closed_loop_runs_real_vt11_aiming_estimator_and_turret_chain(
 
     result = run_synthetic_tracking_closed_loop(
         config_path="config/navmin.json",
-        stereo_calibration_path="config/defaults/calibration/stereo.json",
         frame_count=300,
         sample_stride=2,
     )
@@ -434,7 +663,11 @@ def test_synthetic_tracking_stereo_exact_pair_join_and_distance_path() -> None:
     assert result.max_abs_distance_error_m is not None
     assert result.max_abs_distance_error_m < 5.0
     assert all(sample.capture_id == sample.frame_index for sample in result.samples)
-    assert all(sample.measured_disparity_px == pytest.approx(36.0) for sample in result.samples)
+    expected_disparity = SyntheticTrackingWorld().disparity_px
+    assert all(
+        sample.measured_disparity_px == pytest.approx(expected_disparity, abs=2.0)
+        for sample in result.samples
+    )
 
 
 def test_synthetic_tracking_stereo_world_keeps_common_capture_and_constant_disparity() -> None:

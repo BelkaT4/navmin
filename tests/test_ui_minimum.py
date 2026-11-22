@@ -252,6 +252,7 @@ def _mediator(
     stereo_target_joiner: StereoTargetJoiner | None = None,
     stereo_distance_results: LatestValue[StereoDistanceCandidate] | None = None,
     imu_states: LatestValue[ImuRuntimeState] | None = None,
+    camera_motion_control_roles: frozenset[CameraRole] | None = None,
 ) -> tuple[Mediator, _FakeTurret]:
     turret = _FakeTurret(_turret_state(mode=mode, motor=motor))
     mediator_type = _CountingMediator if counting else Mediator
@@ -281,6 +282,7 @@ def _mediator(
         stereo_target_joiner=stereo_target_joiner,
         stereo_distance_results=stereo_distance_results,
         tracking_stereo_left_nominal_hfov_deg=6.3,
+        camera_motion_control_roles=camera_motion_control_roles,
     )
     return mediator, turret
 
@@ -470,6 +472,7 @@ def _window(
     motion_calibration_runtime: MotionCalibrationRuntime | None = None,
     begin_motion_calibration_profile: Callable[[MotionProfile], None] | None = None,
     restore_motion_calibration_profile: Callable[[], None] | None = None,
+    camera_motion_control_roles: frozenset[CameraRole] | None = None,
 ) -> tuple[
     MainWindow,
     Mediator,
@@ -483,6 +486,7 @@ def _window(
         aim_points=aim_points,
         stereo_target_joiner=stereo_target_joiner,
         stereo_distance_results=stereo_distance_results,
+        camera_motion_control_roles=camera_motion_control_roles,
     )
     bindings = _bindings(include_right=include_right)
     defaults = load_config(
@@ -702,6 +706,52 @@ def test_motion_calibration_preflight_blocks_unmeasurable_real_stereo_plan_befor
     assert "+8°" in messages[-1]
     assert "X ≈" in messages[-1]
     assert "Y ≈" in messages[-1]
+    window.close()
+    qt_application.processEvents()
+
+
+def test_motion_calibration_rejects_camera_without_motion_control_before_profile(
+    qt_application: QApplication,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    axis = AxisMechanicsConfig(False, 200, 16, 45.0)
+    runtime = MotionCalibrationRuntime(
+        path=tmp_path / "motion.json",
+        axes=AxesConfig(axis, axis),
+        camera_identities={
+            CameraRole.OVERVIEW: "sha256:overview",
+            CameraRole.STEREO_LEFT: "sha256:stereo",
+        },
+    )
+    begun: list[MotionProfile] = []
+    restored: list[bool] = []
+    window, mediator, turret, _bindings_value, _turret_states_value = _window(
+        qt_application,
+        motion_calibration_runtime=runtime,
+        begin_motion_calibration_profile=begun.append,
+        restore_motion_calibration_profile=lambda: restored.append(True),
+        camera_motion_control_roles=frozenset({CameraRole.STEREO_LEFT}),
+    )
+    assert mediator.accept_camera_session(_session(CameraRole.OVERVIEW, 1))
+    calibration = window.motion_calibration_window
+    assert calibration is not None
+    calibration.accept_vision_result(_result(CameraRole.OVERVIEW, 1))
+    messages: list[str] = []
+    monkeypatch.setattr(
+        QMessageBox,
+        "warning",
+        lambda _owner, _title, message: messages.append(str(message)),
+    )
+
+    calibration._start()
+
+    assert begun == []
+    assert restored == []
+    assert turret.relative_commands == []
+    assert not calibration.calibration_active
+    assert messages
+    assert "запрещает использовать её для управления турелью" in messages[-1]
     window.close()
     qt_application.processEvents()
 

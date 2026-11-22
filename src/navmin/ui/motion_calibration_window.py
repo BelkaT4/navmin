@@ -311,6 +311,12 @@ class MotionCalibrationWindow(QWidget):
         if camera is not self._mediator.main_camera:
             self._show_error("Сначала сделайте выбранную камеру основной.")
             return
+        if not self._mediator.camera_motion_control_allowed(camera):
+            self._show_error(
+                "Калибровка движения недоступна для выбранной камеры: "
+                "текущая конфигурация запрещает использовать её для управления турелью."
+            )
+            return
         if (
             state.connection_state is not TurretConnectionState.READY
             or state.motor_state is not MotorState.ON

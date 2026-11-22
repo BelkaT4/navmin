@@ -20,11 +20,18 @@ from navmin.config.models import (
     RtspProtocol,
     RtspSourceConfig,
 )
+from navmin.contracts import CameraRole
 from navmin.diagnostics.localhost_rtp import (
     PreflightResult,
     check_gstreamer_sender_runtime,
 )
 from navmin.diagnostics.pty_stm32 import PtyPreflightResult, check_pty_preflight
+from navmin.diagnostics.rtp_jpeg_appsrc import (
+    check_appsrc_rtp_jpeg_sender_runtime,
+)
+from navmin.diagnostics.synthetic_tracking_transport import (
+    synthetic_tracking_rtp_source_config,
+)
 from navmin.launcher import LoadedApplicationInputs
 from navmin.vision.gstreamer_source import (
     RTP_JPEG_GSTREAMER_ELEMENTS,
@@ -124,6 +131,7 @@ def run_startup_preflight(
     qt_check: StringCheck | None = None,
     receiver_check: ReceiverCheck | None = None,
     sender_check: SenderCheck | None = None,
+    synthetic_sender_check: StringCheck | None = None,
     pyserial_check: StringCheck | None = None,
     pty_check: PtyCheck | None = None,
     udp_check: UdpCheck | None = None,
@@ -135,6 +143,9 @@ def run_startup_preflight(
     qt_check = qt_check or _check_pyqt6
     receiver_check = receiver_check or _check_gstreamer_receiver
     sender_check = sender_check or check_gstreamer_sender_runtime
+    synthetic_sender_check = (
+        synthetic_sender_check or check_appsrc_rtp_jpeg_sender_runtime
+    )
     pyserial_check = pyserial_check or _check_pyserial
     pty_check = pty_check or check_pty_preflight
     udp_check = udp_check or _check_udp_bind
@@ -146,6 +157,7 @@ def run_startup_preflight(
 
     camera_specs = [
         (
+            CameraRole.OVERVIEW,
             "Overview",
             selection.overview,
             inputs.config.vision.cameras.overview,
@@ -153,6 +165,7 @@ def run_startup_preflight(
             inputs.overview_calibration.image_height,
         ),
         (
+            CameraRole.STEREO_LEFT,
             "Stereo Left",
             selection.stereo_left,
             inputs.config.vision.cameras.stereo_left,
@@ -164,6 +177,7 @@ def run_startup_preflight(
     if stereo_right.enabled and selection.stereo_right is not None:
         camera_specs.append(
             (
+                CameraRole.STEREO_RIGHT,
                 "Stereo Right",
                 selection.stereo_right,
                 stereo_right,
@@ -175,9 +189,11 @@ def run_startup_preflight(
     endpoints: list[tuple[str, str, int]] = []
     receiver_elements: list[str] = []
     localhost_selected = False
+    synthetic_selected = False
     real_camera_selected = False
-    for label, backend, camera, width, height in camera_specs:
+    for role, label, backend, camera, width, height in camera_specs:
         localhost_selected = localhost_selected or backend == "localhost"
+        synthetic_selected = synthetic_selected or backend == "sim"
         real_camera_selected = real_camera_selected or backend == "real"
         checks.append(
             StartupPreflightCheck(
@@ -192,12 +208,15 @@ def run_startup_preflight(
                 StartupPreflightCheck(
                     name=f"{label} synthetic source",
                     status=PreflightStatus.PASS,
-                    detail="in-process synthetic source selected",
+                    detail="canonical localhost RTP/JPEG synthetic source selected",
                 )
             )
-            continue
 
-        source = camera.source
+        source = (
+            synthetic_tracking_rtp_source_config(role)
+            if backend == "sim"
+            else camera.source
+        )
         if isinstance(source, RtpJpegSourceConfig):
             receiver_elements.extend(RTP_JPEG_GSTREAMER_ELEMENTS)
             if source.timestamp_mode is RtpJpegTimestampMode.SENSOR_RTP_PTS:
@@ -277,6 +296,15 @@ def run_startup_preflight(
                 f"{label} UDP endpoint",
                 udp_check(address, port),
                 success_detail=f"bind available at {address}:{port}",
+            )
+        )
+
+    if synthetic_selected:
+        checks.append(
+            _result_check(
+                "GStreamer synthetic RTP/JPEG sender",
+                synthetic_sender_check(),
+                success_detail="PyGObject appsrc/jpegparse/rtpjpegpay/udpsink available",
             )
         )
 
