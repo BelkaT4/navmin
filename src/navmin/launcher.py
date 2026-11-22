@@ -314,6 +314,7 @@ def run_loaded_application(
     stereo_left_source_factory: SourceFactory | None = None,
     stereo_right_source_factory: SourceFactory | None = None,
     turret_transport_factory: TransportFactory | None = None,
+    camera_motion_control_roles: frozenset[CameraRole] | None = None,
     video_latency_calibration_result_writer: (
         Callable[[LiveVideoLatencyCalibrationResult], None] | None
     ) = None,
@@ -335,6 +336,8 @@ def run_loaded_application(
         "stereo_calibration": inputs.stereo_calibration,
         "imu_calibration": inputs.imu_calibration,
     }
+    if camera_motion_control_roles is not None:
+        runtime_kwargs["camera_motion_control_roles"] = camera_motion_control_roles
     if using_default_runtime_builder and inputs.source_paths is not None:
         runtime_kwargs["motion_calibration_path"] = (
             inputs.source_paths.config.parent / "calibration" / "motion.json"

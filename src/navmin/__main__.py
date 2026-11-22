@@ -297,6 +297,9 @@ def _run_noninteractive(
                     turret_transport_factory=(
                         bindings.factories.turret_transport_factory
                     ),
+                    camera_motion_control_roles=(
+                        selection.camera_motion_control_roles
+                    ),
                     video_latency_calibration_result_writer=(
                         persist_video_latency_calibration
                     ),

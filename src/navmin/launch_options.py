@@ -83,6 +83,23 @@ class EffectiveLaunchSelection:
     def requires_camera_network(self) -> bool:
         return bool(self.real_camera_roles)
 
+    @property
+    def camera_motion_control_roles(self) -> frozenset[CameraRole]:
+        """Cameras allowed to originate motion for this launch.
+
+        With a simulated STM32 all camera-derived motion remains software-only,
+        so both normal control cameras are allowed.  With a real STM32, only
+        real cameras may originate motion; synthetic imagery remains available
+        for observation/vision diagnostics but cannot drive physical hardware.
+        """
+        if self.options.stm32 is Stm32Mode.SIM:
+            return frozenset((CameraRole.OVERVIEW, CameraRole.STEREO_LEFT))
+        return frozenset(
+            role
+            for role in self.real_camera_roles
+            if role in (CameraRole.OVERVIEW, CameraRole.STEREO_LEFT)
+        )
+
 
 def default_launch_options(
     config: AppConfig,
@@ -217,6 +234,23 @@ def apply_launch_options(
         cameras=effective_cameras,
         distance=replace(config.vision.distance, stereo=effective_stereo),
     )
+    if options.stm32 is Stm32Mode.ON and (
+        options.overview is CameraSourceMode.SIM
+        or options.stereo_left is CameraSourceMode.SIM
+    ):
+        warnings.append(
+            "Synthetic camera processing is enabled with a real STM32; "
+            "camera-derived motion from simulated cameras is blocked."
+        )
+    if options.stm32 is Stm32Mode.SIM and (
+        options.overview is CameraSourceMode.ON
+        or options.stereo_left is CameraSourceMode.ON
+    ):
+        warnings.append(
+            "Real camera input with a simulated STM32 is a mixed open-loop "
+            "diagnostic; real images do not react to simulated turret motion."
+        )
+
     effective_config = replace(
         config,
         vision=effective_vision,

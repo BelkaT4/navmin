@@ -262,6 +262,7 @@ def _mediator(
     clock_ns=monotonic_ns,
     motion_calibration=None,
     tracking_stereo_left_nominal_hfov_deg: float | None = None,
+    camera_motion_control_roles: frozenset[CameraRole] | None = None,
 ) -> tuple[Mediator, _FakeTurret, dict[CameraRole, TargetControlChannel]]:
     turret = _FakeTurret(_turret_state(mode=mode, motor=motor))
     controls = _controls()
@@ -281,6 +282,7 @@ def _mediator(
         tracking_stereo_left_nominal_hfov_deg=(
             tracking_stereo_left_nominal_hfov_deg
         ),
+        camera_motion_control_roles=camera_motion_control_roles,
     )
     return mediator, turret, controls
 
@@ -386,6 +388,30 @@ def test_relative_click_applies_camera_correction_at_mediator_boundary() -> None
     )
 
 
+def test_relative_click_from_blocked_camera_cannot_drive_turret() -> None:
+    mediator, turret, _ = _mediator(
+        camera_motion_control_roles=frozenset({CameraRole.STEREO_LEFT})
+    )
+    result = _accept_main(mediator)
+
+    assert not mediator.handle_relative_click(result, 60, 40)
+    assert turret.relative_commands == []
+
+
+def test_tracking_from_blocked_camera_keeps_vision_target_but_submits_no_motion() -> None:
+    mediator, turret, _ = _mediator(
+        mode=TurretControlMode.TRACKING,
+        camera_motion_control_roles=frozenset({CameraRole.STEREO_LEFT}),
+    )
+    result = _accept_main(mediator)
+    request = _request(mediator, result)
+
+    assert mediator.accept_target_lifecycle_event(_acquired(request))
+    assert mediator.selected_target == TargetRef(CameraRole.OVERVIEW, 1, 7)
+    assert mediator.tracking_control_visualization is not None
+    assert turret.tracking_controls == []
+
+
 def test_calibration_move_bypasses_camera_correction_and_requires_safe_state() -> None:
     correction = _CameraCorrection()
     mediator, turret, _ = _mediator(motion_calibration=correction)
@@ -405,6 +431,18 @@ def test_calibration_move_bypasses_camera_correction_and_requires_safe_state() -
     assert not mediator.submit_calibration_move(
         CameraRole.STEREO_LEFT, 1, command
     )
+
+
+def test_calibration_move_from_blocked_camera_cannot_drive_turret() -> None:
+    mediator, turret, _ = _mediator(
+        camera_motion_control_roles=frozenset({CameraRole.STEREO_LEFT})
+    )
+    _accept_main(mediator)
+
+    assert not mediator.submit_calibration_move(
+        CameraRole.OVERVIEW, 1, MoveRelativeCommand(4.0, 0.0)
+    )
+    assert turret.relative_commands == []
 
 
 def test_tracking_selection_rejected_in_relative_and_during_mode_transition() -> None:

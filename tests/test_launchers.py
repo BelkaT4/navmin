@@ -6,6 +6,7 @@ import shutil
 from contextlib import contextmanager
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
+from itertools import product
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -101,6 +102,7 @@ from navmin.preflight import (
     StartupPreflightReport,
 )
 from navmin.session_artifacts import SessionArtifacts, SourceInputPaths
+from navmin.vision.camera_source import create_camera_source
 from navmin.vision.gstreamer_source import GStreamerRtpJpegSource
 from navmin.vision.processor import VisionProcessorSelection
 
@@ -364,7 +366,11 @@ def test_apply_launch_options_keeps_compatible_stereo_enabled(
     effective = apply_launch_options(config, options)
 
     assert effective.config.vision.distance.stereo.stereo_enabled is True
-    assert effective.warnings == ()
+    if left_mode is CameraSourceMode.SIM:
+        assert len(effective.warnings) == 1
+        assert "camera-derived motion" in effective.warnings[0]
+    else:
+        assert effective.warnings == ()
     expected_real_roles = [CameraRole.OVERVIEW]
     if left_mode is CameraSourceMode.ON:
         expected_real_roles.extend((CameraRole.STEREO_LEFT, CameraRole.STEREO_RIGHT))
@@ -409,8 +415,12 @@ def test_apply_launch_options_disables_mixed_stereo_pairing(
     assert effective.config.vision.cameras.stereo_left.enabled is True
     assert effective.config.vision.cameras.stereo_right.enabled is True
     assert effective.config.vision.distance.stereo.stereo_enabled is False
-    assert len(effective.warnings) == 1
     assert "mixed real/sim" in effective.warnings[0]
+    if left_mode is CameraSourceMode.SIM:
+        assert len(effective.warnings) == 2
+        assert "camera-derived motion" in effective.warnings[1]
+    else:
+        assert len(effective.warnings) == 1
 
 
 def test_apply_launch_options_right_off_disables_only_optional_stereo_feature() -> None:
@@ -496,29 +506,8 @@ def test_launch_runtime_bindings_all_sim_are_in_process_and_show_clock() -> None
     assert right_source.read() is None
 
 
-def test_launch_runtime_bindings_shared_stereo_scene_is_used_by_both_factories(
-    monkeypatch,
-) -> None:
+def test_launch_runtime_bindings_shared_simulation_context_is_used_by_stereo_pair() -> None:
     inputs = _inputs_with_working_range_stereo()
-    instances = []
-
-    class FakeSharedStereo:
-        def __init__(self, calibration) -> None:
-            self.calibration = calibration
-            self.calls = []
-            instances.append(self)
-
-        def next_frame(self, camera: CameraRole) -> np.ndarray:
-            self.calls.append(camera)
-            return np.zeros(
-                (self.calibration.image_height, self.calibration.image_width, 3),
-                dtype=np.uint8,
-            )
-
-    monkeypatch.setattr(
-        "navmin.launch_runtime.SynchronizedSyntheticStereoSource",
-        FakeSharedStereo,
-    )
     bindings = build_launch_runtime_bindings(
         inputs,
         LaunchOptions(
@@ -528,19 +517,27 @@ def test_launch_runtime_bindings_shared_stereo_scene_is_used_by_both_factories(
             stm32=Stm32Mode.ON,
         ),
     )
+
+    assert bindings.simulation is not None
+    assert bindings.simulation.rig is not None
+    assert bindings.simulation.stm32_endpoint is None
     left = bindings.factories.stereo_left_source_factory(
         bindings.inputs.config.vision.cameras.stereo_left
     )
     right = bindings.factories.stereo_right_source_factory(
         bindings.inputs.config.vision.cameras.stereo_right
     )
+    assert isinstance(left, SyntheticTrackingFrameSource)
+    assert isinstance(right, SyntheticTrackingFrameSource)
+
     left.start()
     right.start()
-    assert left.read() is not None
-    assert right.read() is not None
-
-    assert len(instances) == 1
-    assert instances[0].calls == [CameraRole.STEREO_LEFT, CameraRole.STEREO_RIGHT]
+    left_frame = left.read()
+    right_frame = right.read()
+    assert left_frame is not None
+    assert right_frame is not None
+    assert left_frame.capture_id == right_frame.capture_id
+    assert left_frame.receive_timestamp_ns == right_frame.receive_timestamp_ns
 
 
 @pytest.mark.parametrize(
@@ -569,7 +566,11 @@ def test_launch_runtime_bindings_mixed_stereo_keep_real_side_calibration(
     effective = bindings.inputs.stereo_calibration
 
     assert bindings.inputs.config.vision.distance.stereo.stereo_enabled is False
-    assert len(bindings.selection.warnings) == 1
+    if synthetic_side == "left":
+        assert len(bindings.selection.warnings) == 2
+        assert "camera-derived motion" in bindings.selection.warnings[1]
+    else:
+        assert len(bindings.selection.warnings) == 1
     if synthetic_side == "left":
         assert effective.K_left == tuple(tuple(row[:3]) for row in reference.P1)
         assert effective.D_left == (0.0, 0.0, 0.0, 0.0, 0.0)
@@ -583,6 +584,98 @@ def test_launch_runtime_bindings_mixed_stereo_keep_real_side_calibration(
         assert effective.D_left == reference.D_left
         assert effective.R1 == reference.R1
 
+
+
+@pytest.mark.parametrize(
+    ("overview_mode", "left_mode", "right_mode", "stm32_mode"),
+    tuple(
+        product(
+            tuple(CameraSourceMode),
+            tuple(CameraSourceMode),
+            tuple(StereoRightMode),
+            tuple(Stm32Mode),
+        )
+    ),
+)
+def test_launch_runtime_bindings_support_every_source_combination(
+    overview_mode: CameraSourceMode,
+    left_mode: CameraSourceMode,
+    right_mode: StereoRightMode,
+    stm32_mode: Stm32Mode,
+) -> None:
+    inputs = _inputs_with_working_range_stereo()
+    bindings = build_launch_runtime_bindings(
+        inputs,
+        LaunchOptions(
+            overview=overview_mode,
+            stereo_left=left_mode,
+            stereo_right=right_mode,
+            stm32=stm32_mode,
+        ),
+    )
+
+    any_sim_camera = (
+        overview_mode is CameraSourceMode.SIM
+        or left_mode is CameraSourceMode.SIM
+        or right_mode is StereoRightMode.SIM
+    )
+    any_sim_component = any_sim_camera or stm32_mode is Stm32Mode.SIM
+    assert (bindings.simulation is not None) is any_sim_component
+    if bindings.simulation is not None:
+        assert (bindings.simulation.rig is not None) is any_sim_camera
+        assert (bindings.simulation.stm32_endpoint is not None) is (
+            stm32_mode is Stm32Mode.SIM
+        )
+        if bindings.simulation.rig is not None:
+            assert bindings.simulation.rig.plant is bindings.simulation.plant
+        if bindings.simulation.stm32_endpoint is not None:
+            assert (
+                bindings.simulation.stm32_endpoint.plant
+                is bindings.simulation.plant
+            )
+
+    factories = bindings.factories
+    if overview_mode is CameraSourceMode.SIM:
+        source = factories.overview_source_factory(
+            bindings.inputs.config.vision.cameras.overview
+        )
+        assert isinstance(source, SyntheticTrackingFrameSource)
+    else:
+        assert factories.overview_source_factory is create_camera_source
+
+    if left_mode is CameraSourceMode.SIM:
+        source = factories.stereo_left_source_factory(
+            bindings.inputs.config.vision.cameras.stereo_left
+        )
+        assert isinstance(source, SyntheticTrackingFrameSource)
+    else:
+        assert factories.stereo_left_source_factory is create_camera_source
+
+    if right_mode is StereoRightMode.SIM:
+        source = factories.stereo_right_source_factory(
+            bindings.inputs.config.vision.cameras.stereo_right
+        )
+        assert isinstance(source, SyntheticTrackingFrameSource)
+    else:
+        assert factories.stereo_right_source_factory is create_camera_source
+
+    assert (factories.turret_transport_factory is not None) is (
+        stm32_mode is Stm32Mode.SIM
+    )
+
+    expected_motion_roles = (
+        frozenset((CameraRole.OVERVIEW, CameraRole.STEREO_LEFT))
+        if stm32_mode is Stm32Mode.SIM
+        else frozenset(
+            camera
+            for camera, mode in (
+                (CameraRole.OVERVIEW, overview_mode),
+                (CameraRole.STEREO_LEFT, left_mode),
+            )
+            if mode is CameraSourceMode.ON
+        )
+    )
+    assert bindings.selection.camera_motion_control_roles == expected_motion_roles
 
 def test_launch_runtime_bindings_real_sources_preserve_production_factories() -> None:
     inputs = _inputs_with_working_range_stereo()
@@ -877,12 +970,15 @@ def test_run_loaded_application_uses_shared_runtime_ui_surface_and_shutdown() ->
         def shutdown(self) -> None:
             events.append("shutdown")
 
+    motion_roles = frozenset({CameraRole.STEREO_LEFT})
+
     def builder(**kwargs) -> FakeRuntime:
         assert kwargs == {
             "config": inputs.config,
             "overview_calibration": inputs.overview_calibration,
             "stereo_calibration": inputs.stereo_calibration,
             "imu_calibration": inputs.imu_calibration,
+            "camera_motion_control_roles": motion_roles,
         }
         return FakeRuntime()
 
@@ -920,6 +1016,7 @@ def test_run_loaded_application_uses_shared_runtime_ui_surface_and_shutdown() ->
             qt_argv=("--qt-test",),
             runtime_builder=builder,
             ui_runner=ui_runner,
+            camera_motion_control_roles=motion_roles,
         )
         == 7
     )

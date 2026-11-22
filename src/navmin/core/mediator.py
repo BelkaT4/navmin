@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Collection, Mapping
 from dataclasses import dataclass
 from enum import Enum
 from math import isfinite, radians, tan
@@ -186,6 +186,7 @@ class Mediator:
         clock_ns: Callable[[], int] = monotonic_ns,
         motion_calibration: MotionCalibrationCorrectionPort | None = None,
         tracking_stereo_left_nominal_hfov_deg: float | None = None,
+        camera_motion_control_roles: Collection[CameraRole] | None = None,
     ) -> None:
         if ui_config.default_camera not in _NORMAL_CAMERAS:
             raise ValueError("ui.default_camera must be Overview or Stereo Left")
@@ -222,10 +223,20 @@ class Mediator:
             raise TypeError("clock_ns must be callable")
         if tracking_stereo_left_nominal_hfov_deg is not None:
             self._validate_tracking_hfov(tracking_stereo_left_nominal_hfov_deg)
+        motion_roles = (
+            frozenset(_NORMAL_CAMERAS)
+            if camera_motion_control_roles is None
+            else frozenset(camera_motion_control_roles)
+        )
+        if not motion_roles.issubset(_NORMAL_CAMERAS):
+            raise ValueError(
+                "camera_motion_control_roles may contain only Overview and Stereo Left"
+            )
 
         self._turret = turret
         self._target_controls = dict(target_controls)
         self._vision_processing_enabled = enabled
+        self._camera_motion_control_roles = motion_roles
         self._session_gate = session_gate or CameraSessionGate()
         self._stereo_target_joiner = stereo_target_joiner
         self._stereo_distance_results = stereo_distance_results
@@ -296,6 +307,15 @@ class Mediator:
     @property
     def aiming(self) -> Aiming:
         return self._aiming
+
+    @property
+    def camera_motion_control_roles(self) -> frozenset[CameraRole]:
+        return self._camera_motion_control_roles
+
+    def camera_motion_control_allowed(self, camera: CameraRole) -> bool:
+        if not isinstance(camera, CameraRole):
+            raise TypeError("camera must be CameraRole")
+        return camera in self._camera_motion_control_roles
 
     @property
     def tracking_estimator(self) -> TrackingEstimator:
@@ -699,6 +719,8 @@ class Mediator:
             reason = "control_mode_transition_pending"
         elif frame.camera is not self._main_camera:
             reason = "camera_not_main"
+        elif frame.camera not in self._camera_motion_control_roles:
+            reason = "camera_motion_control_blocked"
         else:
             model = self._session_gate.camera_model(frame.camera, frame.generation)
             if model is None:
@@ -754,6 +776,7 @@ class Mediator:
         state = self._turret_state
         if (
             camera is not self._main_camera
+            or camera not in self._camera_motion_control_roles
             or not self._session_gate.accepts(camera, generation)
             or state.connection_state is not TurretConnectionState.READY
             or state.motor_state is not MotorState.ON
@@ -1594,6 +1617,8 @@ class Mediator:
                 diagnostics.y.applied_prediction_offset_deg
             ),
         )
+        if result.frame.camera not in self._camera_motion_control_roles:
+            return
         self._turret.submit_tracking_control(
             TrackingControlSample(
                 target=error.target,

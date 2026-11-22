@@ -263,7 +263,11 @@ class ApplicationRuntime:
                 tracking_control_config.platform_motion.video_latency_ms
             ),
         )
-        calibration_available = not turret_config.emulate_stm32
+        calibration_available = (
+            not turret_config.emulate_stm32
+            and mediator.camera_motion_control_allowed(CameraRole.OVERVIEW)
+        )
+        self._video_latency_calibration_available = calibration_available
         self._ui_dependencies = UiRuntimeDependencies(
             mediator=mediator,
             camera_bindings=self._camera_bindings,
@@ -593,6 +597,8 @@ class ApplicationRuntime:
 
     def start_video_latency_calibration(self) -> bool:
         """Start in-runtime Overview latency calibration without restarting workers."""
+        if not self._video_latency_calibration_available:
+            return False
         if self._pre_calibration_turret_config is not None:
             raise RuntimeError(
                 "video latency calibration is unavailable during motion calibration"
@@ -956,6 +962,7 @@ def build_application_runtime(
     imu_calibration: ImuCalibration | None = None,
     factories: ApplicationFactories | None = None,
     motion_calibration_path: Path = Path("config/calibration/motion.json"),
+    camera_motion_control_roles: frozenset[CameraRole] | None = None,
 ) -> ApplicationRuntime:
     """Compose the production NavMin runtime from already-loaded typed inputs."""
     if not isinstance(config, AppConfig):
@@ -1072,6 +1079,7 @@ def build_application_runtime(
         tracking_stereo_left_nominal_hfov_deg=(
             stereo_left_horizontal_fov_deg(stereo_calibration)
         ),
+        camera_motion_control_roles=camera_motion_control_roles,
     )
     if stereo_frame_sink is not None:
         def active_pairing_kind() -> StereoPairingKind | None:

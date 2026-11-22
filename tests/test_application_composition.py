@@ -265,6 +265,7 @@ def _injected_runtime(
     stereo_enabled: bool = False,
     imu_enabled: bool = False,
     imu_runtime_factory=ImuRuntime,
+    camera_motion_control_roles: frozenset[CameraRole] | None = None,
 ):
     sources = {
         CameraRole.OVERVIEW: InMemoryFrameSource(),
@@ -306,6 +307,7 @@ def _injected_runtime(
             turret_transport_factory=transport_factory,
             imu_runtime_factory=imu_runtime_factory,
         ),
+        camera_motion_control_roles=camera_motion_control_roles,
     )
     return runtime, sources, endpoint
 
@@ -451,6 +453,20 @@ def test_imu_enabled_follows_startup_and_shutdown_lifecycle(monkeypatch) -> None
         "stop-imu",
         "stop-turret",
     ]
+
+
+def test_blocked_overview_hides_camera_driven_video_latency_calibration() -> None:
+    runtime, _sources, _endpoint = _injected_runtime(
+        camera_motion_control_roles=frozenset({CameraRole.STEREO_LEFT})
+    )
+
+    assert runtime.mediator.camera_motion_control_roles == frozenset(
+        {CameraRole.STEREO_LEFT}
+    )
+    assert runtime.ui_dependencies.video_latency_calibration_states is None
+    assert runtime.ui_dependencies.start_video_latency_calibration is None
+    assert runtime.ui_dependencies.cancel_video_latency_calibration is None
+    assert runtime.start_video_latency_calibration() is False
 
 
 def test_imu_bind_failure_rolls_back_already_started_turret(monkeypatch) -> None:

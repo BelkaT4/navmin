@@ -318,6 +318,7 @@ class RealtimeSyntheticTrackingRig:
         plant: SyntheticTurretPlant,
         *,
         clock: Callable[[], float] = monotonic,
+        synchronize_stereo_pair: bool = True,
     ) -> None:
         if not isinstance(world, SyntheticTrackingWorld):
             raise TypeError("world must be SyntheticTrackingWorld")
@@ -325,7 +326,10 @@ class RealtimeSyntheticTrackingRig:
             raise TypeError("plant must be SyntheticTurretPlant")
         self.world = world
         self.plant = plant
+        if type(synchronize_stereo_pair) is not bool:
+            raise TypeError("synchronize_stereo_pair must be bool")
         self._clock = clock
+        self._synchronize_stereo_pair = synchronize_stereo_pair
         self._lock = Lock()
         self._started_at_s: float | None = None
         self._last_sync_s: float | None = None
@@ -361,7 +365,10 @@ class RealtimeSyntheticTrackingRig:
         with self._lock:
             now_s = self._clock()
             self._sync_locked(now_s)
-            if camera in (CameraRole.STEREO_LEFT, CameraRole.STEREO_RIGHT):
+            if (
+                self._synchronize_stereo_pair
+                and camera in (CameraRole.STEREO_LEFT, CameraRole.STEREO_RIGHT)
+            ):
                 return self._capture_stereo_locked(camera, now_s)
             return self._capture_current_locked(now_s)
 

@@ -469,6 +469,33 @@ def test_synthetic_tracking_background_uses_expected_turret_image_shift() -> Non
     assert np.array_equal(moved.overview[:100, :100], expected[:100, :100])
 
 
+def test_realtime_tracking_rig_single_stereo_side_does_not_wait_for_peer() -> None:
+    from navmin.diagnostics.synthetic_tracking_turret import (
+        RealtimeSyntheticTrackingRig,
+        SyntheticTrackingFrameSource,
+        SyntheticTurretPlant,
+    )
+
+    now = [0.0]
+    world = _world()
+    rig = RealtimeSyntheticTrackingRig(
+        world,
+        SyntheticTurretPlant(_turret_config()),
+        clock=lambda: now[0],
+        synchronize_stereo_pair=False,
+    )
+    left = SyntheticTrackingFrameSource(rig, CameraRole.STEREO_LEFT)
+    left.start()
+
+    first = left.read()
+    assert first is not None
+    assert first.capture_id == 0
+    now[0] = 1.0 / world.fps
+    second = left.read()
+    assert second is not None
+    assert second.capture_id == 1
+
+
 def test_realtime_tracking_rig_syncs_command_boundary_and_shared_stereo_tick() -> None:
     from navmin.contracts import AxisVelocitySetpoint
     from navmin.diagnostics.synthetic_tracking_turret import (
