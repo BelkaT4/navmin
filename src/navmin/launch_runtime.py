@@ -10,9 +10,12 @@ from navmin.diagnostics.synthetic_tracking_calibration import (
     synthetic_tracking_overview_calibration,
     synthetic_tracking_stereo_calibration,
 )
+from navmin.diagnostics.synthetic_tracking_transport import (
+    SyntheticTrackingRtpJpegSource,
+    synthetic_tracking_rtp_source_config,
+)
 from navmin.diagnostics.synthetic_tracking_turret import (
     RealtimeSyntheticTrackingRig,
-    SyntheticTrackingFrameSource,
     SyntheticTrackingStm32Endpoint,
     SyntheticTurretPlant,
 )
@@ -117,8 +120,14 @@ def _synthetic_camera_factory(
             "synthetic camera source requires a shared synthetic tracking rig"
         )
 
-    def factory(_config):
-        return SyntheticTrackingFrameSource(rig, camera)
+    def factory(config):
+        source = config.source
+        expected = synthetic_tracking_rtp_source_config(camera)
+        if source != expected:
+            raise LaunchRuntimeBindingError(
+                "synthetic camera factory received non-canonical RTP/JPEG config"
+            )
+        return SyntheticTrackingRtpJpegSource(rig, camera, expected)
 
     return factory
 
@@ -142,8 +151,38 @@ def build_launch_runtime_bindings(
     inputs: LoadedApplicationInputs,
     options: LaunchOptions,
 ) -> LaunchRuntimeBindings:
-    """Resolve in-process synthetic bindings without mutating loaded inputs."""
+    """Resolve production-like operator SIM bindings without mutating inputs."""
     selection = apply_launch_options(inputs.config, options)
+    effective_cameras = selection.config.vision.cameras
+    if options.overview is CameraSourceMode.SIM:
+        effective_cameras = replace(
+            effective_cameras,
+            overview=replace(
+                effective_cameras.overview,
+                source=synthetic_tracking_rtp_source_config(CameraRole.OVERVIEW),
+            ),
+        )
+    if options.stereo_left is CameraSourceMode.SIM:
+        effective_cameras = replace(
+            effective_cameras,
+            stereo_left=replace(
+                effective_cameras.stereo_left,
+                source=synthetic_tracking_rtp_source_config(CameraRole.STEREO_LEFT),
+            ),
+        )
+    if options.stereo_right is StereoRightMode.SIM:
+        effective_cameras = replace(
+            effective_cameras,
+            stereo_right=replace(
+                effective_cameras.stereo_right,
+                source=synthetic_tracking_rtp_source_config(CameraRole.STEREO_RIGHT),
+            ),
+        )
+    effective_config = replace(
+        selection.config,
+        vision=replace(selection.config.vision, cameras=effective_cameras),
+    )
+    selection = replace(selection, config=effective_config)
     overview_calibration = inputs.overview_calibration
     stereo_calibration = inputs.stereo_calibration
 

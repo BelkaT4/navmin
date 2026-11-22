@@ -54,6 +54,9 @@ from navmin.contracts import (
     VisionResult,
 )
 from navmin.core import Mediator
+from navmin.diagnostics.rtp_jpeg_appsrc import (
+    build_appsrc_rtp_jpeg_sender_pipeline_description,
+)
 from navmin.time_sync import ClockMappingState
 from navmin.vision.gstreamer_source import (
     CameraSourceError,
@@ -645,11 +648,8 @@ def _jpeg_payload(frame_id: int) -> bytes:
 
 
 def _sender_pipeline_description(*, port: int, fps: int) -> str:
-    return (
-        "appsrc name=source is-live=true format=time do-timestamp=false "
-        f"caps=image/jpeg,framerate={fps}/1 "
-        "! jpegparse ! rtpjpegpay pt=26 "
-        f"! udpsink host=127.0.0.1 port={port} sync=false async=false"
+    return build_appsrc_rtp_jpeg_sender_pipeline_description(
+        host="127.0.0.1", port=port, fps=fps
     )
 
 

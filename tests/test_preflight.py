@@ -263,6 +263,7 @@ def _run(
         "qt_check": lambda: None,
         "receiver_check": lambda _elements: None,
         "sender_check": lambda: _sender_result(),
+        "synthetic_sender_check": lambda: None,
         "pyserial_check": lambda: None,
         "pty_check": lambda: PtyPreflightResult(True, True, True),
         "udp_check": lambda _address, _port: None,
@@ -809,6 +810,9 @@ def test_real_turret_default_preflight_accepts_detected_windows_com_port(
         session_dir=tmp_path,
         session_directory_check=lambda _path: None,
         qt_check=lambda: None,
+        receiver_check=lambda _elements: None,
+        synthetic_sender_check=lambda: None,
+        udp_check=lambda _address, _port: None,
         pyserial_check=lambda: None,
     )
 
@@ -831,6 +835,9 @@ def test_real_turret_default_preflight_rejects_missing_windows_com_port(
         session_dir=tmp_path,
         session_directory_check=lambda _path: None,
         qt_check=lambda: None,
+        receiver_check=lambda _elements: None,
+        synthetic_sender_check=lambda: None,
+        udp_check=lambda _address, _port: None,
         pyserial_check=lambda: None,
     )
 
@@ -904,8 +911,12 @@ def test_session_directory_probe_is_removed(tmp_path) -> None:
     assert set(tmp_path.iterdir()) == before
 
 
-def test_all_sim_preflight_skips_gstreamer_udp_serial_and_pty(tmp_path) -> None:
+def test_all_sim_preflight_requires_localhost_rtp_runtime_but_not_hardware(
+    tmp_path,
+) -> None:
     inputs = _inputs(8888, 8889)
+    receiver_calls: list[tuple[str, ...]] = []
+    udp_calls: list[tuple[str, int]] = []
 
     def must_not_run(*_args, **_kwargs):
         raise AssertionError("hardware-specific preflight check must not run")
@@ -916,11 +927,12 @@ def test_all_sim_preflight_skips_gstreamer_udp_serial_and_pty(tmp_path) -> None:
         session_dir=tmp_path,
         session_directory_check=lambda _path: None,
         qt_check=lambda: None,
-        receiver_check=must_not_run,
+        receiver_check=lambda elements: receiver_calls.append(elements) or None,
         sender_check=must_not_run,
+        synthetic_sender_check=lambda: None,
         pyserial_check=must_not_run,
         pty_check=must_not_run,
-        udp_check=must_not_run,
+        udp_check=lambda address, port: udp_calls.append((address, port)) or None,
         serial_path_check=must_not_run,
     )
 
@@ -930,10 +942,20 @@ def test_all_sim_preflight_skips_gstreamer_udp_serial_and_pty(tmp_path) -> None:
     assert "Stereo Left synthetic source" in names
     assert "Stereo Right synthetic source" in names
     assert "STM32 simulation" in names
-    assert "GStreamer receiver" not in names
+    assert "GStreamer receiver" in names
+    assert "GStreamer synthetic RTP/JPEG sender" in names
     assert "pyserial" not in names
     assert "PTY capability" not in names
-    assert all("UDP endpoint" not in name for name in names)
+    assert len(receiver_calls) == 1
+    assert "rtpjpegdepay" in receiver_calls[0]
+    assert set(udp_calls) == {
+        ("127.0.0.1", 18_888),
+        ("127.0.0.1", 18_889),
+        ("127.0.0.1", 18_890),
+    }
+    assert "Overview UDP endpoint" in names
+    assert "Stereo Left UDP endpoint" in names
+    assert "Stereo Right UDP endpoint" in names
 
 
 def test_right_off_is_not_required_by_preflight(tmp_path) -> None:
