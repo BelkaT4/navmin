@@ -1,4 +1,4 @@
-"""Strict parser and serializer for NavMin config schema v7."""
+"""Strict parser and serializer for NavMin config schema v8."""
 
 from __future__ import annotations
 
@@ -43,12 +43,14 @@ from .models import (
     VelocityEstimatorConfig,
     VisionConfig,
     VisionDistanceConfig,
+    Vt11UiConfig,
 )
 
-SUPPORTED_SCHEMA_VERSION = 7
-PREVIOUS_MIGRATABLE_SCHEMA_VERSION = 6
-MIGRATABLE_SCHEMA_VERSION = 5
-LEGACY_MIGRATABLE_SCHEMA_VERSION = 4
+SUPPORTED_SCHEMA_VERSION = 8
+PREVIOUS_MIGRATABLE_SCHEMA_VERSION = 7
+MIGRATABLE_SCHEMA_VERSION = 6
+LEGACY_MIGRATABLE_SCHEMA_VERSION = 5
+EARLIEST_MIGRATABLE_SCHEMA_VERSION = 4
 SUPPORTED_BAUDRATES = frozenset({9600, 19200, 38400, 57600, 115200})
 
 
@@ -899,7 +901,12 @@ def _parse_recording(value: Any) -> RecordingConfig:
         directory=_nonempty_string(obj["directory"], f"{path}.directory")
     )
 
-def _parse_ui(value: Any, *, allow_missing_show_right: bool = False) -> UiConfig:
+def _parse_ui(
+    value: Any,
+    *,
+    allow_missing_show_right: bool = False,
+    allow_missing_vt11: bool = False,
+) -> UiConfig:
     path = "ui"
     required = {"default-camera", "show-fps", "show-stereo-right-diagnostics"}
     optional: set[str] = set()
@@ -907,6 +914,10 @@ def _parse_ui(value: Any, *, allow_missing_show_right: bool = False) -> UiConfig
         optional.add("show-stereo-right-camera")
     else:
         required.add("show-stereo-right-camera")
+    if allow_missing_vt11:
+        optional.add("vt11")
+    else:
+        required.add("vt11")
     obj = _fields(value, path, required=required, optional=optional)
     default_camera = _enum_string(
         obj["default-camera"],
@@ -916,6 +927,41 @@ def _parse_ui(value: Any, *, allow_missing_show_right: bool = False) -> UiConfig
     camera_role = (
         CameraRole.OVERVIEW if default_camera == "overview" else CameraRole.STEREO_LEFT
     )
+
+    vt11 = Vt11UiConfig()
+    if "vt11" in obj:
+        vt11_path = f"{path}.vt11"
+        vt11_obj = _fields(
+            obj["vt11"],
+            vt11_path,
+            required={
+                "low-light-blur-mode",
+                "auto-select-candidate-on-first-click",
+                "candidate-click-tolerance-px",
+            },
+        )
+        tolerance_px = _int(
+            vt11_obj["candidate-click-tolerance-px"],
+            f"{vt11_path}.candidate-click-tolerance-px",
+            minimum=0,
+        )
+        if tolerance_px > 50:
+            _validation(
+                f"{vt11_path}.candidate-click-tolerance-px",
+                "must be <= 50",
+            )
+        vt11 = Vt11UiConfig(
+            low_light_blur_mode=_bool(
+                vt11_obj["low-light-blur-mode"],
+                f"{vt11_path}.low-light-blur-mode",
+            ),
+            auto_select_candidate_on_first_click=_bool(
+                vt11_obj["auto-select-candidate-on-first-click"],
+                f"{vt11_path}.auto-select-candidate-on-first-click",
+            ),
+            candidate_click_tolerance_px=tolerance_px,
+        )
+
     return UiConfig(
         default_camera=camera_role,
         show_fps=_bool(obj["show-fps"], f"{path}.show-fps"),
@@ -931,22 +977,23 @@ def _parse_ui(value: Any, *, allow_missing_show_right: bool = False) -> UiConfig
                 f"{path}.show-stereo-right-camera",
             )
         ),
+        vt11=vt11,
     )
 
 
 def parse_config(data: Any) -> AppConfig:
-    """Validate JSON and return the current schema-v7 snapshot.
+    """Validate JSON and return the current schema-v8 snapshot.
 
-    Schemas v4-v6 are migrated in memory. Schema v7 adds explicit Vision
-    processor profiles, a Right-camera aim point, and the Right-camera display
-    preference while keeping existing files loadable.
+    Schemas v4-v7 are migrated in memory. Schema v8 adds persisted VT11
+    operator preferences under ``ui.vt11`` while keeping existing files
+    loadable.
     """
     raw = _object(data, "")
     if "schema-version" not in raw:
         _validation("schema-version", "missing required field")
     schema_version = _int(raw["schema-version"], "schema-version")
 
-    if schema_version == LEGACY_MIGRATABLE_SCHEMA_VERSION:
+    if schema_version == EARLIEST_MIGRATABLE_SCHEMA_VERSION:
         obj = _fields(
             raw,
             "",
@@ -966,7 +1013,7 @@ def parse_config(data: Any) -> AppConfig:
             show_control_prediction=False,
         )
         recording = RecordingConfig(directory="recordings")
-    elif schema_version == MIGRATABLE_SCHEMA_VERSION:
+    elif schema_version == LEGACY_MIGRATABLE_SCHEMA_VERSION:
         obj = _fields(
             raw,
             "",
@@ -985,7 +1032,11 @@ def parse_config(data: Any) -> AppConfig:
             obj["tracking-visualization"]
         )
         recording = RecordingConfig(directory="recordings")
-    elif schema_version in {PREVIOUS_MIGRATABLE_SCHEMA_VERSION, SUPPORTED_SCHEMA_VERSION}:
+    elif schema_version in {
+        MIGRATABLE_SCHEMA_VERSION,
+        PREVIOUS_MIGRATABLE_SCHEMA_VERSION,
+        SUPPORTED_SCHEMA_VERSION,
+    }:
         obj = _fields(
             raw,
             "",
@@ -1008,7 +1059,8 @@ def parse_config(data: Any) -> AppConfig:
     else:
         raise UnsupportedConfigSchemaError(schema_version)
 
-    legacy_v7_fields = schema_version < SUPPORTED_SCHEMA_VERSION
+    legacy_v7_fields = schema_version < PREVIOUS_MIGRATABLE_SCHEMA_VERSION
+    legacy_v8_ui = schema_version < SUPPORTED_SCHEMA_VERSION
     return AppConfig(
         schema_version=SUPPORTED_SCHEMA_VERSION,
         vision=_parse_vision(
@@ -1023,7 +1075,9 @@ def parse_config(data: Any) -> AppConfig:
         imu=_parse_imu(obj["imu"]),
         turret=_parse_turret(obj["turret"]),
         ui=_parse_ui(
-            obj["ui"], allow_missing_show_right=legacy_v7_fields
+            obj["ui"],
+            allow_missing_show_right=legacy_v7_fields,
+            allow_missing_vt11=legacy_v8_ui,
         ),
     )
 
@@ -1117,7 +1171,7 @@ def _pid_controller_to_mapping(config: PidControllerConfig) -> dict[str, Any]:
 
 
 def config_to_mapping(config: AppConfig) -> dict[str, Any]:
-    """Convert a typed schema-v7 snapshot to its persisted JSON structure."""
+    """Convert a typed schema-v8 snapshot to its persisted JSON structure."""
     return {
         "schema-version": SUPPORTED_SCHEMA_VERSION,
         "vision": {
@@ -1254,6 +1308,15 @@ def config_to_mapping(config: AppConfig) -> dict[str, Any]:
             "show-fps": config.ui.show_fps,
             "show-stereo-right-diagnostics": config.ui.show_stereo_right_diagnostics,
             "show-stereo-right-camera": config.ui.show_stereo_right_camera,
+            "vt11": {
+                "low-light-blur-mode": config.ui.vt11.low_light_blur_mode,
+                "auto-select-candidate-on-first-click": (
+                    config.ui.vt11.auto_select_candidate_on_first_click
+                ),
+                "candidate-click-tolerance-px": (
+                    config.ui.vt11.candidate_click_tolerance_px
+                ),
+            },
         },
     }
 

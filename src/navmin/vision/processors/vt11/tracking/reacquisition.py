@@ -11,7 +11,7 @@ from __future__ import annotations
 from collections import deque
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from itertools import pairwise
 from math import hypot, sqrt
 from statistics import mean
@@ -26,6 +26,7 @@ from navmin.vision.processors.vt11.acquisition.candidate_detector import (
 )
 from navmin.vision.processors.vt11.acquisition.roi import make_operator_selection
 from navmin.vision.processors.vt11.identity.reference_bank import ReferenceBank
+from navmin.vision.processors.vt11.live_features import Vt11LiveFeatures
 from navmin.vision.processors.vt11.thermal.processing import (
     ThermalProfile,
     preprocess_frame,
@@ -387,6 +388,9 @@ class ReacqFrameResult:
     active_tracklets: int = 0
     reacq_mode: str = "LOCAL_CONSERVATIVE"
     candidate_channel: str = "NONE"
+    candidate_separated_from_line: bool = False
+    line_recovery_hits: int = 0
+    blur_variant: str | None = None
     anchor_distance_px: float = 0.0
     anchor_distance_norm: float = 0.0
     anchor_age_frames: int = 0
@@ -468,6 +472,7 @@ class ReacquisitionContinuitySnapshot:
     auto_promoted: bool
     scale_model: ScaleStabilityModel | None
     reliable_scale_anchor: ReliableScaleAnchor | None
+    memory_freeze_until_frame: int
 
 
 @dataclass
@@ -482,6 +487,7 @@ class _ReacquisitionContinuityState:
     auto_promoted: bool = False
     scale_model: ScaleStabilityModel | None = None
     reliable_scale_anchor: ReliableScaleAnchor | None = None
+    memory_freeze_until_frame: int = -1
 
 
 def _radius_for_frame(*, cfg: ReacquisitionConfig, elapsed_frames: int, speed_px_per_frame: float, uncertainty_px: float) -> int:
@@ -586,6 +592,8 @@ def _reacquisition_incremental_engine(
     motion_broken: bool = False,
     scale_model: ScaleStabilityModel | None = None,
     reliable_scale_anchor: ReliableScaleAnchor | None = None,
+    initial_memory_freeze_until_frame: int = -1,
+    live_features: Vt11LiveFeatures | None = None,
     continuity_state: _ReacquisitionContinuityState | None = None,
 ) -> Iterator[ReacqFrameResult]:
     """Attempt reacquisition; use robust visual tracklets after MOTION_BREAK."""
@@ -632,6 +640,7 @@ def _reacquisition_incremental_engine(
             )
         )
     runtime_detector = runtime_detector_config(detector_config, thermal_profile)
+    live_feature_revision = -1
     start_frame = lost_frame + 1
     if start_frame >= frame_count:
         return
@@ -730,6 +739,9 @@ def _reacquisition_incremental_engine(
         continuity_state.auto_promoted = bool(auto_promoted)
         continuity_state.scale_model = scale_model
         continuity_state.reliable_scale_anchor = reliable_scale_anchor
+        continuity_state.memory_freeze_until_frame = int(
+            initial_memory_freeze_until_frame
+        )
 
     def thermal_profile_score(sim) -> float:
         vals = [
@@ -762,6 +774,23 @@ def _reacquisition_incremental_engine(
     for frame_index in range(start_frame, max_frame_exclusive):
         frame_t0 = perf_counter()
         _idx, frame = frame_reader(frame_index)
+        live_snapshot = None if live_features is None else live_features.snapshot
+        if live_snapshot is not None and live_snapshot.revision != live_feature_revision:
+            if live_feature_revision >= 0:
+                confirmation_window.clear()
+                confirmation_area_window.clear()
+                promotion_window.clear()
+                if broken:
+                    tracklets = make_tracklets()
+            live_feature_revision = live_snapshot.revision
+        effective_detector = runtime_detector
+        if live_snapshot is not None:
+            effective_detector = replace(
+                runtime_detector,
+                visible_line_recovery_enabled=(
+                    live_snapshot.visible_line_recovery_enabled
+                ),
+            )
         analysis_frame = preprocess_frame(frame, thermal_profile)
         frame_quality = estimate_frame_reliability(quality_reference_frame, frame, config=quality_cfg)
         if quality_cfg.enabled and frame_quality.valid:
@@ -852,7 +881,7 @@ def _reacquisition_incremental_engine(
             and thermal_profile is not None and thermal_profile.is_thermal
         )
         detection = detect_local_candidates(
-            analysis_frame, selection, top_k=config.top_k, config=runtime_detector,
+            analysis_frame, selection, top_k=config.top_k, config=effective_detector,
             expected_area_px=float(expected_area_px), include_micro=micro_enabled_now,
             global_search=full_frame, diversity_min_distance_px=config.global_diversity_min_distance_px,
         )
@@ -881,7 +910,9 @@ def _reacquisition_incremental_engine(
                 promotion_evidence_hits=sum(promotion_window), promotion_reason=promotion_reason,
                 active_tracklets=len(tracklets.tracklets) if tracklets is not None else 0,
                 reacq_mode=("GLOBAL_EMERGENCY_SCAN" if full_frame else ("ROBUST_LOCAL" if broken else "LOCAL_CONSERVATIVE")),
-                candidate_channel="NONE", anchor_distance_px=0.0, anchor_distance_norm=0.0,
+                candidate_channel="NONE", candidate_separated_from_line=False,
+                line_recovery_hits=0, blur_variant=None,
+                anchor_distance_px=0.0, anchor_distance_norm=0.0,
                 anchor_age_frames=max(0, frame_index - reliable_anchor_frame), anchor_allowed_distance_px=0.0,
                 reliable_area_anchor_px=(float(reliable_scale_anchor.reliable_area_px) if reliable_scale_anchor is not None else 0.0),
                 scale_anchor_age_frames=(max(0, int(frame_index - reliable_scale_anchor.reliable_frame)) if reliable_scale_anchor is not None else 0),
@@ -1133,10 +1164,19 @@ def _reacquisition_incremental_engine(
             # redefine the session-wide ReliableAreaAnchor after a large change.
             # Ordinary confirmations only follow it slowly when trusted.
             trusted_scale = (
-                (float(selected_tracklet_identity) if selected_tracklet_identity > 0 else float(best.similarity.total)) >= config.size_update_min_identity
+                frame_index > initial_memory_freeze_until_frame
+                and (float(selected_tracklet_identity) if selected_tracklet_identity > 0 else float(best.similarity.total)) >= config.size_update_min_identity
                 and (float(selected_tracklet_gap) if selected_tracklet_identity > 0 else float(evidence_gap)) >= config.size_update_min_gap
+                and not selected.separated_from_line
+                and selected.detection_channel != "LINE_RECOVERY"
             )
-            if reliable_scale_anchor is not None and reliable_scale_anchor.config.enabled:
+            if (
+                reliable_scale_anchor is not None
+                and reliable_scale_anchor.config.enabled
+                and frame_index > initial_memory_freeze_until_frame
+                and not selected.separated_from_line
+                and selected.detection_channel != "LINE_RECOVERY"
+            ):
                 if selected_scale_confirmed:
                     reliable_scale_anchor.commit_confirmed_transition(
                         confirmed_scale_areas or [float(max(1, selected.area_px))], frame_index
@@ -1196,7 +1236,33 @@ def _reacquisition_incremental_engine(
             tracklet_id=tracklet_id,
             active_tracklets=len(tracklets.tracklets) if tracklets is not None else 0,
             reacq_mode=("GLOBAL_EMERGENCY_SCAN" if full_frame else ("ROBUST_LOCAL" if broken else "LOCAL_CONSERVATIVE")),
-            candidate_channel=getattr(best.candidate, "detection_channel", "NORMAL"),
+            candidate_channel=str(
+                getattr(
+                    selected if selected is not None else best.candidate,
+                    "detection_channel",
+                    "NORMAL",
+                )
+            ),
+            candidate_separated_from_line=bool(
+                getattr(
+                    selected if selected is not None else best.candidate,
+                    "separated_from_line",
+                    False,
+                )
+            ),
+            line_recovery_hits=(
+                int(hits)
+                if str(
+                    getattr(
+                        selected if selected is not None else best.candidate,
+                        "detection_channel",
+                        "NORMAL",
+                    )
+                )
+                == "LINE_RECOVERY"
+                else 0
+            ),
+            blur_variant=best.similarity.blur_variant,
             anchor_distance_px=float(hypot(best.candidate.center_x - visual_anchor[0], best.candidate.center_y - visual_anchor[1])),
             anchor_distance_norm=float(hypot(best.candidate.center_x - visual_anchor[0], best.candidate.center_y - visual_anchor[1]) / max(1e-9, anchor_allowance(frame_index, speed, uncertainty)[1])),
             anchor_age_frames=int(anchor_allowance(frame_index, speed, uncertainty)[0]),
@@ -1275,6 +1341,8 @@ class ReacquisitionRuntime:
         motion_broken: bool = False,
         scale_model: ScaleStabilityModel | None = None,
         reliable_scale_anchor: ReliableScaleAnchor | None = None,
+        initial_memory_freeze_until_frame: int = -1,
+        live_features: Vt11LiveFeatures | None = None,
         frame_count: int | None = None,
     ) -> None:
         config.validate()
@@ -1338,6 +1406,8 @@ class ReacquisitionRuntime:
             motion_broken=motion_broken,
             scale_model=scale_model,
             reliable_scale_anchor=reliable_scale_anchor,
+            initial_memory_freeze_until_frame=initial_memory_freeze_until_frame,
+            live_features=live_features,
             continuity_state=self._continuity_state,
         )
 
@@ -1383,6 +1453,7 @@ class ReacquisitionRuntime:
             auto_promoted=bool(state.auto_promoted),
             scale_model=state.scale_model,
             reliable_scale_anchor=state.reliable_scale_anchor,
+            memory_freeze_until_frame=int(state.memory_freeze_until_frame),
         )
 
     def collection_state_sizes(self) -> dict[str, int]:
@@ -1426,6 +1497,7 @@ def run_reacquisition(
     motion_broken: bool = False,
     scale_model: ScaleStabilityModel | None = None,
     reliable_scale_anchor: ReliableScaleAnchor | None = None,
+    initial_memory_freeze_until_frame: int = -1,
 ) -> ReacquisitionResult:
     """Compatibility batch wrapper over :class:`ReacquisitionRuntime`."""
     config.validate()
@@ -1475,6 +1547,7 @@ def run_reacquisition(
         motion_broken=motion_broken,
         scale_model=scale_model,
         reliable_scale_anchor=reliable_scale_anchor,
+        initial_memory_freeze_until_frame=initial_memory_freeze_until_frame,
     )
     results: list[ReacqFrameResult] = []
     stopped = False

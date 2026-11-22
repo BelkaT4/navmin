@@ -36,6 +36,7 @@ from navmin.contracts import (
     FrameTimestampSource,
     TargetAcquired,
     TargetAcquisitionFailed,
+    TargetCandidateSet,
     TargetLifecycleEvent,
     TargetTrackingEnded,
     VisionResult,
@@ -44,6 +45,7 @@ from navmin.diagnostic_logging import emit_event
 
 from .processor import (
     VisionProcessor,
+    VisionRuntimeSettings,
     VisionTrackingDiagnostics,
     create_vision_processor,
 )
@@ -339,6 +341,9 @@ class VisionPipeline:
         latest_tracking_diagnostics: (
             InvalidatableLatest[VisionTrackingDiagnostics] | None
         ) = None,
+        latest_acquisition_candidates: (
+            InvalidatableLatest[TargetCandidateSet] | None
+        ) = None,
         status: LatestValue[CameraStatus] | None = None,
         timestamp_clock_ns: Callable[[], int] = monotonic_ns,
         processing_enabled: bool = True,
@@ -362,6 +367,9 @@ class VisionPipeline:
         self.latest_tracking_diagnostics = (
             latest_tracking_diagnostics or InvalidatableLatest()
         )
+        self.latest_acquisition_candidates = (
+            latest_acquisition_candidates or InvalidatableLatest()
+        )
         self.status = status or LatestValue()
         self._timestamp_clock_ns = timestamp_clock_ns
         self._processing_enabled = processing_enabled
@@ -383,6 +391,14 @@ class VisionPipeline:
         if processor is None:
             raise TypeError("processor must not be None")
         self._processor = processor
+
+    def apply_processor_runtime_settings(self, settings: VisionRuntimeSettings) -> None:
+        """Apply runtime Vision settings on the processor-owner thread."""
+        if not isinstance(settings, VisionRuntimeSettings):
+            raise TypeError("settings must be VisionRuntimeSettings")
+        apply_settings = getattr(self._processor, "apply_runtime_settings", None)
+        if apply_settings is not None:
+            apply_settings(settings)
 
     @property
     def generation(self) -> int:
@@ -431,6 +447,7 @@ class VisionPipeline:
             self._processor.reset()
             self.latest_result.invalidate()
             self.latest_tracking_diagnostics.invalidate()
+            self.latest_acquisition_candidates.invalidate()
             self._reset_diagnostics_locked()
             timestamp_ns = self._timestamp_clock_ns()
             self.status.publish(
@@ -521,6 +538,34 @@ class VisionPipeline:
             )
             return
         self.latest_tracking_diagnostics.publish(diagnostics)
+
+    def _publish_acquisition_candidates(
+        self,
+        candidates: TargetCandidateSet | None,
+        *,
+        frame: FramePacket,
+    ) -> None:
+        if candidates is None:
+            self.latest_acquisition_candidates.invalidate()
+            return
+        if (
+            candidates.camera is not frame.camera
+            or candidates.generation != frame.generation
+            or candidates.frame_id != frame.frame_id
+        ):
+            self.latest_acquisition_candidates.invalidate()
+            LOGGER.warning(
+                "Vision acquisition candidates rejected camera=%s generation=%d "
+                "frame_id=%d candidates=(%s,%d,%d)",
+                frame.camera.value,
+                frame.generation,
+                frame.frame_id,
+                candidates.camera.value,
+                candidates.generation,
+                candidates.frame_id,
+            )
+            return
+        self.latest_acquisition_candidates.publish(candidates)
 
     def stop(self) -> None:
         with self._state_lock:
@@ -802,6 +847,10 @@ class VisionPipeline:
                 processor_output.tracking_diagnostics,
                 frame=result.frame,
             )
+            self._publish_acquisition_candidates(
+                processor_output.acquisition_candidates,
+                frame=result.frame,
+            )
             self.latest_result.publish(result)
             self.status.publish(
                 CameraStatus(
@@ -928,6 +977,31 @@ class VisionPipeline:
                 }
             ),
             confidence=None if diagnostics is None else diagnostics.confidence,
+            detection_channel=(
+                None if diagnostics is None else diagnostics.detection_channel
+            ),
+            separated_from_line=(
+                False if diagnostics is None else diagnostics.separated_from_line
+            ),
+            blur_robust_enabled=(
+                False if diagnostics is None else diagnostics.blur_robust_enabled
+            ),
+            blur_variant=None if diagnostics is None else diagnostics.blur_variant,
+            maneuver_state=(
+                None if diagnostics is None else diagnostics.maneuver_state
+            ),
+            maneuver_hits=0 if diagnostics is None else diagnostics.maneuver_hits,
+            line_recovery_hits=(
+                0 if diagnostics is None else diagnostics.line_recovery_hits
+            ),
+            decision_reason=(
+                None if diagnostics is None else diagnostics.diagnostic_reason
+            ),
+            adaptation_block_reason=(
+                None
+                if diagnostics is None
+                else diagnostics.adaptation_block_reason
+            ),
             transition=transition,
             transition_reason=transition_reason,
             no_detection_reason=(

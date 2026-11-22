@@ -25,6 +25,7 @@ from navmin.config.models import (
     TrackingVisualizationConfig,
     TurretConfig,
     UiConfig,
+    Vt11UiConfig,
 )
 from navmin.contracts import (
     CameraRole,
@@ -75,7 +76,7 @@ from navmin.vision.pipeline import (
     stereo_left_corrector,
     stereo_right_corrector,
 )
-from navmin.vision.processor import VisionProcessorSelection
+from navmin.vision.processor import VisionProcessorSelection, VisionRuntimeSettings
 from navmin.vision.stereo_distance_worker import StereoDistanceWorker
 from navmin.vision.stereo_pairing import StereoPairer
 from navmin.vision.stereo_target_join import (
@@ -130,6 +131,7 @@ class UiRuntimeDependencies:
     apply_tracking_control_tuning: Callable[[TrackingControlConfig], None]
     tracking_visualization_config: TrackingVisualizationConfig
     ui_config: UiConfig
+    apply_vt11_ui_config: Callable[[Vt11UiConfig], None]
     tracking_stereo_left_hfov_deg: float | None = None
     apply_tracking_stereo_left_hfov_deg: Callable[[float], None] | None = None
     vision_processor_selections: Mapping[CameraRole, VisionProcessorSelection] | None = None
@@ -234,6 +236,8 @@ class ApplicationRuntime:
         self._tracking_tuning_revision = 0
         self._aiming_tuning_revision = 0
         self._vision_processor_revision = 0
+        self._runtime_vt11_ui_config = ui_config.vt11
+        self._vision_runtime_revision = 0
 
         camera_workers = {
             CameraRole.OVERVIEW: overview_worker,
@@ -283,6 +287,7 @@ class ApplicationRuntime:
             ),
             tracking_visualization_config=tracking_visualization_config,
             ui_config=ui_config,
+            apply_vt11_ui_config=self.apply_vt11_ui_config,
             vision_processor_selections=self._vision_processor_selections,
             apply_vision_processor_selection=self.apply_vision_processor_selection,
             recording_runtime=self.recording_runtime,
@@ -464,6 +469,29 @@ class ApplicationRuntime:
             new_value=selection,
             apply_result="queued",
             reason=None,
+        )
+
+    def apply_vt11_ui_config(self, config: Vt11UiConfig) -> None:
+        """Apply the persisted VT11 observation-condition setting without reset."""
+        if not isinstance(config, Vt11UiConfig):
+            raise TypeError("config must be Vt11UiConfig")
+        previous = self._runtime_vt11_ui_config
+        self._runtime_vt11_ui_config = config
+        if config.low_light_blur_mode == previous.low_light_blur_mode:
+            return
+        self._vision_runtime_revision += 1
+        update = ConfigUpdate(
+            revision=self._vision_runtime_revision,
+            config=VisionRuntimeSettings(
+                low_light_blur_mode=config.low_light_blur_mode
+            ),
+        )
+        for worker in self._camera_workers.values():
+            worker.submit_runtime_settings(update)
+        LOGGER.info(
+            "VT11 low-light/blur update queued revision=%d enabled=%s",
+            self._vision_runtime_revision,
+            config.low_light_blur_mode,
         )
 
     def apply_pid_tuning(self, config: PidControllerConfig) -> None:
@@ -906,6 +934,7 @@ class ApplicationRuntime:
             target_events=pipeline.target_events,
             latest_result=pipeline.latest_result,
             tracking_diagnostics=pipeline.latest_tracking_diagnostics,
+            acquisition_candidates=pipeline.latest_acquisition_candidates,
             status=pipeline.status,
         )
 
@@ -978,6 +1007,9 @@ def build_application_runtime(
         config=config.vision.cameras.overview,
         corrector=overview_corrector(overview_calibration),
         source_factory=selected_factories.overview_source_factory,
+        runtime_settings=VisionRuntimeSettings(
+            low_light_blur_mode=config.ui.vt11.low_light_blur_mode
+        ),
     )
     stereo_left_worker = build_camera_worker(
         camera=CameraRole.STEREO_LEFT,
@@ -985,6 +1017,9 @@ def build_application_runtime(
         corrector=stereo_left_corrector(stereo_calibration),
         source_factory=selected_factories.stereo_left_source_factory,
         corrected_frame_sink=stereo_frame_sink,
+        runtime_settings=VisionRuntimeSettings(
+            low_light_blur_mode=config.ui.vt11.low_light_blur_mode
+        ),
     )
     stereo_right_worker = None
     if config.vision.cameras.stereo_right.enabled:
@@ -994,6 +1029,9 @@ def build_application_runtime(
             corrector=stereo_right_corrector(stereo_calibration),
             source_factory=selected_factories.stereo_right_source_factory,
             corrected_frame_sink=stereo_frame_sink,
+            runtime_settings=VisionRuntimeSettings(
+                low_light_blur_mode=config.ui.vt11.low_light_blur_mode
+            ),
         )
     turret_worker = TurretWorker(
         config.turret,

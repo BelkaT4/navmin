@@ -27,7 +27,7 @@ from navmin.contracts import CameraRole, DistanceSource
 
 def _valid_config() -> dict:
     return {
-        "schema-version": 7,
+        "schema-version": 8,
         "vision": {
             "processing-scope": "main-only",
             "cameras": {
@@ -171,6 +171,11 @@ def _valid_config() -> dict:
             "show-fps": True,
             "show-stereo-right-diagnostics": False,
             "show-stereo-right-camera": True,
+            "vt11": {
+                "low-light-blur-mode": False,
+                "auto-select-candidate-on-first-click": False,
+                "candidate-click-tolerance-px": 15,
+            },
         },
     }
 
@@ -179,10 +184,10 @@ def _write_json(path, data) -> None:
     path.write_text(json.dumps(data), encoding="utf-8")
 
 
-def test_valid_schema_v7_builds_typed_immutable_snapshot() -> None:
+def test_valid_schema_v8_builds_typed_immutable_snapshot() -> None:
     config = parse_config(_valid_config())
 
-    assert config.schema_version == 7
+    assert config.schema_version == 8
     assert (
         config.vision.cameras.overview.calibration_file == "calibration/overview.json"
     )
@@ -191,6 +196,9 @@ def test_valid_schema_v7_builds_typed_immutable_snapshot() -> None:
     assert config.vision.distance.source is DistanceSource.MANUAL
     assert config.ui.default_camera is CameraRole.OVERVIEW
     assert config.ui.show_stereo_right_camera
+    assert not config.ui.vt11.low_light_blur_mode
+    assert not config.ui.vt11.auto_select_candidate_on_first_click
+    assert config.ui.vt11.candidate_click_tolerance_px == 15
     assert config.aiming.aim_points.stereo_right.x_px is None
     assert config.vision.cameras.overview.vision_processor_profile == "default"
     assert config.turret.serial.baudrate == 115200
@@ -212,7 +220,7 @@ def test_tracking_control_round_trips_through_mapping() -> None:
     assert parse_config(config_to_mapping(config)) == config
 
 
-def test_schema_v7_requires_tracking_control_and_rejects_old_pixel_lead() -> None:
+def test_schema_v8_requires_tracking_control_and_rejects_old_pixel_lead() -> None:
     missing = _valid_config()
     missing.pop("tracking-control")
     with pytest.raises(ConfigValidationError) as exc_info:
@@ -402,12 +410,13 @@ def test_schema_v4_migrates_tracking_visualization_defaults_in_memory() -> None:
         camera.pop("vision-processor-profile")
     data["aiming"]["aim-points"].pop("stereo-right")
     data["ui"].pop("show-stereo-right-camera")
+    data["ui"].pop("vt11")
     data["tracking-control"]["prediction"]["max-angle-x-deg"] = 1.0
     data["tracking-control"]["prediction"]["max-angle-y-deg"] = 1.0
 
     config = parse_config(data)
 
-    assert config.schema_version == 7
+    assert config.schema_version == 8
     assert not config.tracking_visualization.show_search_region
     assert not config.tracking_visualization.show_best_candidate
     assert not config.tracking_visualization.show_control_prediction
@@ -422,16 +431,68 @@ def test_schema_v6_migrates_ui_profiles_and_right_aim_point_in_memory() -> None:
         camera.pop("vision-processor-profile")
     data["aiming"]["aim-points"].pop("stereo-right")
     data["ui"].pop("show-stereo-right-camera")
+    data["ui"].pop("vt11")
 
     config = parse_config(data)
 
-    assert config.schema_version == 7
+    assert config.schema_version == 8
     assert config.vision.cameras.overview.vision_processor_profile == "default"
     assert config.aiming.aim_points.stereo_right == AimPointConfig(None, None)
     assert config.ui.show_stereo_right_camera
 
 
-def test_schema_v7_requires_tracking_visualization_section() -> None:
+def test_schema_v7_migrates_vt11_ui_defaults_in_memory() -> None:
+    data = _valid_config()
+    data["schema-version"] = 7
+    data["ui"].pop("vt11")
+
+    config = parse_config(data)
+
+    assert config.schema_version == 8
+    assert not config.ui.vt11.low_light_blur_mode
+    assert not config.ui.vt11.auto_select_candidate_on_first_click
+    assert config.ui.vt11.candidate_click_tolerance_px == 15
+
+
+def test_schema_v8_requires_vt11_ui_preferences() -> None:
+    data = _valid_config()
+    data["ui"].pop("vt11")
+
+    with pytest.raises(ConfigValidationError) as exc_info:
+        parse_config(data)
+
+    assert exc_info.value.path == "ui.vt11"
+
+
+@pytest.mark.parametrize("value", [-1, 51, True, 3.5])
+def test_schema_v8_validates_vt11_candidate_click_tolerance(value) -> None:
+    data = _valid_config()
+    data["ui"]["vt11"]["candidate-click-tolerance-px"] = value
+
+    with pytest.raises(ConfigValidationError) as exc_info:
+        parse_config(data)
+
+    assert exc_info.value.path == "ui.vt11.candidate-click-tolerance-px"
+
+
+def test_schema_v8_vt11_ui_preferences_round_trip() -> None:
+    data = _valid_config()
+    data["ui"]["vt11"] = {
+        "low-light-blur-mode": True,
+        "auto-select-candidate-on-first-click": True,
+        "candidate-click-tolerance-px": 27,
+    }
+
+    config = parse_config(data)
+    mapped = config_to_mapping(config)
+
+    assert config.ui.vt11.low_light_blur_mode
+    assert config.ui.vt11.auto_select_candidate_on_first_click
+    assert config.ui.vt11.candidate_click_tolerance_px == 27
+    assert mapped["ui"]["vt11"] == data["ui"]["vt11"]
+
+
+def test_schema_v8_requires_tracking_visualization_section() -> None:
     data = _valid_config()
     data.pop("tracking-visualization")
 
@@ -449,14 +510,15 @@ def test_schema_v5_migrates_recording_default_in_memory() -> None:
         camera.pop("vision-processor-profile")
     data["aiming"]["aim-points"].pop("stereo-right")
     data["ui"].pop("show-stereo-right-camera")
+    data["ui"].pop("vt11")
 
     config = parse_config(data)
 
-    assert config.schema_version == 7
+    assert config.schema_version == 8
     assert config.recording.directory == "recordings"
 
 
-def test_schema_v7_requires_recording_section() -> None:
+def test_schema_v8_requires_recording_section() -> None:
     data = _valid_config()
     data.pop("recording")
 
@@ -577,7 +639,7 @@ def test_missing_or_invalid_schema_version_is_validation_error(mutation, path) -
     assert not isinstance(exc_info.value, UnsupportedConfigSchemaError)
 
 
-@pytest.mark.parametrize("unsupported", [1, 2, 3, 8])
+@pytest.mark.parametrize("unsupported", [1, 2, 3, 9])
 def test_unsupported_schema_is_distinct_error(unsupported: int) -> None:
     data = _valid_config()
     data["schema-version"] = unsupported
@@ -587,7 +649,7 @@ def test_unsupported_schema_is_distinct_error(unsupported: int) -> None:
 
     assert exc_info.value.path == "schema-version"
     assert exc_info.value.actual == unsupported
-    assert "expected 7" in str(exc_info.value)
+    assert "expected 8" in str(exc_info.value)
 
 
 @pytest.mark.parametrize(
@@ -745,7 +807,7 @@ def test_repository_defaults_parse_with_production_loaders() -> None:
     stereo = load_stereo_calibration(defaults / "calibration" / "stereo.json")
     imu = ImuCalibration.load(defaults / "calibration" / "imu.json")
 
-    assert config.schema_version == 7
+    assert config.schema_version == 8
     assert (
         config.vision.cameras.overview.calibration_file == "calibration/overview.json"
     )
@@ -951,7 +1013,7 @@ def test_config_manager_publishes_but_does_not_own_restart_reconnect_actions(
     assert not hasattr(manager, "reconnect")
 
 
-def test_rtp_timestamp_mode_defaults_to_receive_time_for_existing_schema_v7() -> None:
+def test_rtp_timestamp_mode_defaults_to_receive_time_for_schema_v8() -> None:
     config = parse_config(_valid_config())
 
     assert (
@@ -1033,7 +1095,7 @@ def test_rtsp_config_round_trip_preserves_source_specific_fields(tmp_path) -> No
     save_config(path, config)
 
     saved = json.loads(path.read_text(encoding="utf-8"))
-    assert saved["schema-version"] == 7
+    assert saved["schema-version"] == 8
     assert (
         saved["vision"]["cameras"]["overview"]["source"]
         == data["vision"]["cameras"]["overview"]["source"]
@@ -1174,6 +1236,9 @@ def test_change_metadata_reports_only_fixed_architecture_classification() -> Non
         "aiming.aim-points.stereo-right.x-px",
         "aiming.aim-points.stereo-right.y-px",
         "ui.show-stereo-right-camera",
+        "ui.vt11.low-light-blur-mode",
+        "ui.vt11.auto-select-candidate-on-first-click",
+        "ui.vt11.candidate-click-tolerance-px",
     ],
 )
 def test_tracking_control_runtime_fields_are_dynamic(path: str) -> None:

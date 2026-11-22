@@ -36,6 +36,8 @@ from navmin.contracts import (
     PlatformMotionSnapshot,
     TargetAcquired,
     TargetAcquisitionFailed,
+    TargetCandidateSelectionRequest,
+    TargetCandidateSet,
     TargetLifecycleEvent,
     TargetRef,
     TargetSelectionRequest,
@@ -767,8 +769,20 @@ class Mediator:
         vision_result: VisionResult,
         x_px: float,
         y_px: float,
+        *,
+        auto_select_candidate_on_first_click: bool = False,
+        candidate_click_tolerance_px: int = 15,
     ) -> bool:
         """Publish a backend-neutral request for the exact displayed frame."""
+        if not isinstance(auto_select_candidate_on_first_click, bool):
+            raise TypeError("auto_select_candidate_on_first_click must be bool")
+        if (
+            isinstance(candidate_click_tolerance_px, bool)
+            or not isinstance(candidate_click_tolerance_px, int)
+        ):
+            raise TypeError("candidate_click_tolerance_px must be int")
+        if not 0 <= candidate_click_tolerance_px <= 50:
+            raise ValueError("candidate_click_tolerance_px must be in [0, 50]")
         if not isinstance(vision_result, VisionResult):
             raise TypeError("vision_result must be VisionResult")
         frame = vision_result.frame
@@ -811,6 +825,9 @@ class Mediator:
             frame_id=frame.frame_id,
             x_px=float(x_px),
             y_px=float(y_px),
+            candidate_selection_enabled=True,
+            auto_select_candidate_on_first_click=auto_select_candidate_on_first_click,
+            candidate_click_tolerance_px=candidate_click_tolerance_px,
         )
 
         had_selected_target = self._selected_target is not None
@@ -833,7 +850,92 @@ class Mediator:
             frame_id=frame.frame_id,
             image_x_px=float(x_px),
             image_y_px=float(y_px),
-            requested={"selection_id": selection_id},
+            requested={
+                "selection_id": selection_id,
+                "candidate_selection_enabled": True,
+                "auto_select_candidate_on_first_click": (
+                    auto_select_candidate_on_first_click
+                ),
+                "candidate_click_tolerance_px": candidate_click_tolerance_px,
+            },
+            resulting_target_id=None,
+            resulting_control_mode=self._turret_state.control_mode,
+        )
+        return True
+
+    def request_target_candidate_selection(
+        self,
+        candidates: TargetCandidateSet,
+        candidate_id: int,
+        x_px: float,
+        y_px: float,
+    ) -> bool:
+        """Confirm one proposal for the current pending target selection."""
+        if not isinstance(candidates, TargetCandidateSet):
+            raise TypeError("candidates must be TargetCandidateSet")
+        if isinstance(candidate_id, bool) or not isinstance(candidate_id, int):
+            raise TypeError("candidate_id must be int")
+        pending = self._pending_selection
+        latest = self._latest_results.get(candidates.camera)
+        reason: str | None = None
+        if pending is None:
+            reason = "no_pending_selection"
+        elif candidates.selection_id != pending.selection_id:
+            reason = "selection_id_mismatch"
+        elif candidates.camera is not pending.camera:
+            reason = "camera_mismatch"
+        elif candidates.generation != pending.generation:
+            reason = "generation_mismatch"
+        elif candidates.camera is not self._main_camera:
+            reason = "camera_not_main"
+        elif not self._session_gate.accepts(candidates.camera, candidates.generation):
+            reason = "generation_not_accepted"
+        elif (
+            latest is None
+            or latest.frame.generation != candidates.generation
+            or latest.frame.frame_id != candidates.frame_id
+        ):
+            reason = "candidate_frame_stale"
+        elif not any(
+            item.candidate_id == candidate_id for item in candidates.candidates
+        ):
+            reason = "candidate_not_present"
+        if reason is not None:
+            self._emit_operator_action(
+                "target_candidate_select",
+                accepted=False,
+                reason=reason,
+                camera=candidates.camera,
+                generation=candidates.generation,
+                frame_id=candidates.frame_id,
+                image_x_px=float(x_px),
+                image_y_px=float(y_px),
+                requested={"candidate_id": candidate_id},
+            )
+            return False
+        assert pending is not None
+        command = TargetCandidateSelectionRequest(
+            selection_id=pending.selection_id,
+            camera=pending.camera,
+            generation=pending.generation,
+            frame_id=candidates.frame_id,
+            candidate_id=candidate_id,
+            x_px=float(x_px),
+            y_px=float(y_px),
+        )
+        self._target_controls[pending.camera].publish(command)
+        self._emit_operator_action(
+            "target_candidate_select",
+            accepted=True,
+            camera=pending.camera,
+            generation=pending.generation,
+            frame_id=candidates.frame_id,
+            image_x_px=float(x_px),
+            image_y_px=float(y_px),
+            requested={
+                "selection_id": pending.selection_id,
+                "candidate_id": candidate_id,
+            },
             resulting_target_id=None,
             resulting_control_mode=self._turret_state.control_mode,
         )

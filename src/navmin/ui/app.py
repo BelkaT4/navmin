@@ -14,6 +14,7 @@ from navmin.config.models import (
     TrackingControlConfig,
     TrackingVisualizationConfig,
     UiConfig,
+    Vt11UiConfig,
 )
 from navmin.contracts import CameraRole, TurretState
 from navmin.core import Mediator
@@ -48,6 +49,7 @@ def run_ui(
     tracking_stereo_left_hfov_deg: float | None = None,
     apply_tracking_stereo_left_hfov_deg: Callable[[float], None] | None = None,
     persist_ui_config: Callable[[UiConfig], None] | None = None,
+    apply_vt11_ui_config: Callable[[Vt11UiConfig], None] | None = None,
     vision_processor_selections: Mapping[CameraRole, VisionProcessorSelection] | None = None,
     apply_vision_processor_selection: (
         Callable[[CameraRole, VisionProcessorSelection], None] | None
@@ -92,6 +94,7 @@ def run_ui(
         tracking_visualization_config=tracking_visualization_config,
         ui_config=ui_config,
         persist_ui_config=persist_ui_config,
+        apply_vt11_ui_config=apply_vt11_ui_config,
         vision_processor_selections=vision_processor_selections,
         apply_vision_processor_selection=apply_vision_processor_selection,
         recording_runtime=recording_runtime,

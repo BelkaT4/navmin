@@ -23,6 +23,7 @@ acquire:
   - 40
   - 50
   candidate_detector:
+    reject_line_components: true
     method: local_contrast_components
     blur_sigma_px: 3.0
     threshold_sigma: 2.5
@@ -143,7 +144,7 @@ tracking:
   lost_after_misses: 3
   dynamic_search_enabled: true
   min_search_radius_px: 50
-  max_search_radius_px: 240
+  max_search_radius_px: 180
   speed_radius_gain: 0.5
   uncertainty_radius_gain: 2.0
   miss_radius_growth_px: 25.0
@@ -222,7 +223,7 @@ tracking:
   motion_break_visual_gap_min: 0.06
   motion_break_visual_size_min: 0.03
   motion_relock_frames: 3
-  global_shift_enabled: true
+  global_shift_enabled: false
   global_shift_trigger_error_px: 45.0
   global_shift_downscale: 0.5
   global_shift_max_dimension_px: 320
@@ -327,7 +328,7 @@ reacquisition:
   size_update_min_gap: 0.06
   size_update_max_step_ratio: 1.25
   global_emergency_after_frames: 15
-  global_shift_enabled: true
+  global_shift_enabled: false
   global_shift_downscale: 0.5
   global_shift_max_dimension_px: 320
   global_shift_phase_min_response: 0.08
@@ -500,6 +501,7 @@ profiles:
       acquire:
         candidate_detector:
           method: local_contrast_components
+          visible_line_recovery_enabled: false
           micro_enabled: false
           adaptive_min_area_ratio: 0.12
           adaptive_max_area_ratio: 4.5
@@ -511,6 +513,7 @@ profiles:
           bank_update_min_score: 0.62
       tracking:
         identity_weight: 0.6
+        day_maneuver_search_enabled: false
         motion_weight: 0.3
         size_weight: 0.1
         min_track_score: 0.48

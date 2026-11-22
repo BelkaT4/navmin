@@ -10,6 +10,7 @@ import numpy as np
 from navmin.vision.processors.vt11.acquisition.candidate_detector import CandidateDetectorConfig
 from navmin.vision.processors.vt11.adaptation.ema import EMAConfig, EMAReferenceAdapter, EMAUpdateEvent
 from navmin.vision.processors.vt11.identity.reference_bank import ReferenceBank
+from navmin.vision.processors.vt11.live_features import Vt11LiveFeatures
 from navmin.vision.processors.vt11.tracking.motion_model import MotionPoint
 from navmin.vision.processors.vt11.tracking.live_events import (
     LiveFrameEvent,
@@ -136,6 +137,7 @@ class Vt11TargetSession:
         identity_weights: Mapping[str, float] | None = None,
         adaptation_config: EMAConfig | None = None,
         thermal_profile: ThermalProfile | None = None,
+        live_features: Vt11LiveFeatures | None = None,
         frame_count: int | None = None,
         max_reacq_cycles: int | None = None,
         _collect_compatibility_history: bool = False,
@@ -161,6 +163,7 @@ class Vt11TargetSession:
         self.reacquisition_config = reacquisition_config
         self.identity_weights = identity_weights
         self.thermal_profile = thermal_profile
+        self.live_features = live_features
         self.max_reacq_cycles = max_reacq_cycles
         self._collect_compatibility_history = bool(_collect_compatibility_history)
 
@@ -188,6 +191,7 @@ class Vt11TargetSession:
         self.expected_area_px = float(self.reference_bank.expected_size_px())
         self.scale_model: ScaleStabilityModel | None = None
         self.reliable_scale_anchor: ReliableScaleAnchor | None = None
+        self._memory_freeze_until_frame = -1
         self._initialize_scale_continuity()
 
         self.phase = "TRACK"
@@ -271,6 +275,8 @@ class Vt11TargetSession:
             thermal_profile=self.thermal_profile,
             scale_model=self.scale_model,
             reliable_scale_anchor=self.reliable_scale_anchor,
+            initial_memory_freeze_until_frame=self._memory_freeze_until_frame,
+            live_features=self.live_features,
             _adaptation_event_history_limit=(
                 None
                 if self._collect_compatibility_history
@@ -303,6 +309,8 @@ class Vt11TargetSession:
             motion_broken=snapshot.motion_broken_at_lost,
             scale_model=self.scale_model,
             reliable_scale_anchor=self.reliable_scale_anchor,
+            initial_memory_freeze_until_frame=snapshot.memory_freeze_until_frame,
+            live_features=self.live_features,
         )
         self._tracking_runtime = None
         self.next_frame_index = lost_frame + 1
@@ -338,6 +346,9 @@ class Vt11TargetSession:
                 self.expected_area_px = float(snapshot.expected_area_px)
                 self.scale_model = snapshot.scale_model
                 self.reliable_scale_anchor = snapshot.reliable_scale_anchor
+                self._memory_freeze_until_frame = int(
+                    snapshot.memory_freeze_until_frame
+                )
                 self.motion_break_events += int(snapshot.motion_break_events)
                 self.lost_events += 1
                 if (
@@ -376,6 +387,9 @@ class Vt11TargetSession:
             self.expected_area_px = float(snapshot.expected_area_px)
             self.scale_model = snapshot.scale_model
             self.reliable_scale_anchor = snapshot.reliable_scale_anchor
+            self._memory_freeze_until_frame = int(
+                snapshot.memory_freeze_until_frame
+            )
             if snapshot.motion_relocked and snapshot.confirmation_points:
                 self.motion_history = list(snapshot.confirmation_points)
             else:
@@ -407,6 +421,9 @@ class Vt11TargetSession:
             )
             self.scale_model = snapshot.scale_model
             self.reliable_scale_anchor = snapshot.reliable_scale_anchor
+            self._memory_freeze_until_frame = int(
+                snapshot.memory_freeze_until_frame
+            )
             finite_eof = (
                 self.frame_count is not None
                 and runtime.end_frame_exclusive >= self.frame_count

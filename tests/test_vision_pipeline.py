@@ -8,6 +8,7 @@ import cv2
 import numpy as np
 import pytest
 
+import navmin.vision.pipeline as pipeline_module
 from navmin.calibration import (
     OverviewCalibration,
     StereoCalibration,
@@ -22,6 +23,8 @@ from navmin.contracts import (
     FramePacket,
     FrameSourceTimestamp,
     FrameTimestampSource,
+    TargetCandidateProposal,
+    TargetCandidateSet,
     VisionResult,
 )
 from navmin.vision.pipeline import (
@@ -144,7 +147,42 @@ class _DiagnosticsProcessor(_RecordingProcessor):
                 best_candidate_bbox=BBox(8, 9, 10, 11),
                 confidence=0.8,
                 prediction_error_px=1.5,
-                diagnostic_reason="OK",
+                diagnostic_reason="ACCEPTED_DAY_MANEUVER_RELOCK",
+                detection_channel="LINE_RECOVERY",
+                separated_from_line=True,
+                blur_robust_enabled=True,
+                blur_variant="5-horizontal",
+                maneuver_state="CONFIRMED",
+                maneuver_hits=2,
+                line_recovery_hits=2,
+                adaptation_block_reason="BLOCKED_DAY_MANEUVER_RELOCK",
+            ),
+        )
+
+
+class _CandidateProcessor(_RecordingProcessor):
+    def __init__(self) -> None:
+        super().__init__()
+        self.frame_id_offset = 0
+
+    def process(
+        self,
+        frame: FramePacket,
+        *,
+        processing_enabled: bool = True,
+    ) -> VisionProcessorOutput:
+        self.frames.append(frame)
+        self.processing_flags.append(processing_enabled)
+        return VisionProcessorOutput(
+            result=VisionResult(frame=frame, tracked_objects=(), processing_time_ns=0),
+            acquisition_candidates=TargetCandidateSet(
+                selection_id=3,
+                camera=frame.camera,
+                generation=frame.generation,
+                frame_id=frame.frame_id + self.frame_id_offset,
+                candidates=(
+                    TargetCandidateProposal(7, BBox(5, 6, 7, 8), 0.9, 1),
+                ),
             ),
         )
 
@@ -482,6 +520,36 @@ def test_tracking_diagnostics_are_latest_only_exact_frame_bound_and_reset() -> N
 
     pipeline.start()
     assert pipeline.latest_tracking_diagnostics.get() is None
+
+
+def test_verbose_tracking_event_includes_rev5_diagnostics(monkeypatch) -> None:
+    events: list[tuple[str, dict[str, object]]] = []
+
+    def capture_event(_logger, event_name: str, **fields) -> None:
+        events.append((event_name, fields))
+
+    monkeypatch.setattr(pipeline_module, "emit_event", capture_event)
+    pipeline = VisionPipeline(
+        camera=CameraRole.OVERVIEW,
+        corrector=overview_corrector(overview_calibration()),
+        processor=_DiagnosticsProcessor(),
+        timestamp_clock_ns=_Clock(),
+    )
+    pipeline.start()
+    pipeline.submit_decoded_frame(source_frame(1))
+    result = pipeline.process_latest()
+    assert result is not None
+
+    payload = next(fields for name, fields in events if name == "VISION_TRACKING_FRAME")
+    assert payload["detection_channel"] == "LINE_RECOVERY"
+    assert payload["separated_from_line"] is True
+    assert payload["blur_robust_enabled"] is True
+    assert payload["blur_variant"] == "5-horizontal"
+    assert payload["maneuver_state"] == "CONFIRMED"
+    assert payload["maneuver_hits"] == 2
+    assert payload["line_recovery_hits"] == 2
+    assert payload["decision_reason"] == "ACCEPTED_DAY_MANEUVER_RELOCK"
+    assert payload["adaptation_block_reason"] == "BLOCKED_DAY_MANEUVER_RELOCK"
 
 
 def test_stereo_right_session_barrier_and_generation_are_role_correct() -> None:
@@ -884,3 +952,32 @@ def test_camera_diagnostics_log_once_per_generation_and_measure_fps(
             f"decoded_resolution={WIDTH}x{HEIGHT}"
         ),
     ]
+
+
+def test_acquisition_candidates_are_latest_only_exact_frame_bound_and_reset() -> None:
+    processor = _CandidateProcessor()
+    pipeline = VisionPipeline(
+        camera=CameraRole.OVERVIEW,
+        corrector=overview_corrector(overview_calibration()),
+        processor=processor,
+        timestamp_clock_ns=_Clock(),
+    )
+
+    pipeline.start()
+    pipeline.submit_decoded_frame(source_frame(1))
+    first = pipeline.process_latest()
+    assert first is not None
+    candidates = pipeline.latest_acquisition_candidates.get()
+    assert candidates is not None
+    assert candidates.camera is first.frame.camera
+    assert candidates.generation == first.frame.generation
+    assert candidates.frame_id == first.frame.frame_id
+
+    processor.frame_id_offset = -1
+    pipeline.submit_decoded_frame(source_frame(2))
+    second = pipeline.process_latest()
+    assert second is not None
+    assert pipeline.latest_acquisition_candidates.get() is None
+
+    pipeline.start()
+    assert pipeline.latest_acquisition_candidates.get() is None

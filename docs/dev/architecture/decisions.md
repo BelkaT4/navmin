@@ -878,6 +878,44 @@ Backoff совпадает с уже принятым для Turret recovery п�
 
 ---
 
+## 35. VT11 REV5 operator preferences persist в `ui.vt11`, а не в processor profile YAML
+
+### Решение
+
+Schema v8 добавляет persisted UI-owned группу:
+
+```text
+ui.vt11.low-light-blur-mode
+ui.vt11.auto-select-candidate-on-first-click
+ui.vt11.candidate-click-tolerance-px
+```
+
+Defaults: `false`, `false`, `15 px`; допустимый click tolerance — `0..50 px`.
+Старые schema v4–v7 мигрируются в памяти с этими defaults. Поля dynamic и
+описывают операторскую политику, а не внутренние threshold'ы конкретного detector.
+
+Параллельно принятая REV5 baseline-policy меняет только три прежних VT11 defaults:
+`tracking.max_search_radius_px = 180`, а `global_shift_enabled = false` и в TRACK,
+и в REACQ. DAY/THERMAL profile overrides целиком не копируются поверх текущего
+NavMin; новые algorithm-specific fields добавляются только вместе с механизмом,
+которым они управляют.
+
+### Почему
+
+Оператор должен сохранять выбранное поведение между запусками NavMin, но эти
+предпочтения не являются частью исследовательского DAY/THERMAL tuning profile.
+Разделение не позволяет случайно превратить UI-policy в скрытый processor default и
+сохраняет strict Config Manager как единственного владельца persisted application
+configuration.
+
+### Отвергнутые альтернативы
+
+- **Хранить эти три значения в `day_profile.yaml` / `thermal_profile.yaml`.** Отклонено: это operator preferences, а не detector tuning, и автоселект/допуск применимы к обоим observation profiles.
+- **Использовать отдельный QSettings/второй settings-файл.** Отклонено: создаёт второй persisted source of truth рядом с уже существующим `UiConfig`/Config Manager.
+- **Скопировать весь REV5 `default.yaml` поверх текущего VT11.** Отклонено: перенос должен сохранять более новую NavMin lifecycle-архитектуру и принимать новые поля только вместе с их functional owner.
+
+---
+
 ## Как использовать этот документ при реализации
 
 При разработке нового модуля сначала нужно следовать нормативным контрактам соответствующего документа. Если возникает желание вернуть ранее удалённый механизм, полезно проверить этот журнал: часто механизм был удалён не случайно, а потому что более простой инвариант закрывает тот же failure case.

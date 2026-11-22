@@ -506,6 +506,7 @@ def run_loaded_application(
             tracking_visualization_config=ui.tracking_visualization_config,
             ui_config=ui.ui_config,
             persist_ui_config=persist_ui_config,
+            apply_vt11_ui_config=getattr(ui, "apply_vt11_ui_config", None),
             vision_processor_selections=ui.vision_processor_selections,
             apply_vision_processor_selection=apply_vision_processor_selection,
             recording_runtime=getattr(ui, "recording_runtime", None),

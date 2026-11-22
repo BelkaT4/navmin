@@ -7,7 +7,7 @@ from __future__ import annotations
 
 from collections import deque
 from collections.abc import Callable, Iterator, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from itertools import pairwise
 from math import exp, hypot, sqrt
 from statistics import median
@@ -31,6 +31,7 @@ from navmin.vision.processors.vt11.identity.descriptor import (
     descriptor_from_candidate,
 )
 from navmin.vision.processors.vt11.identity.reference_bank import ReferenceBank
+from navmin.vision.processors.vt11.live_features import Vt11LiveFeatures
 from navmin.vision.processors.vt11.thermal.processing import (
     ThermalProfile,
     hud_evidence,
@@ -52,6 +53,10 @@ from navmin.vision.processors.vt11.tracking.live_events import (
     LiveFrameEvent,
     LiveProgressCallback,
     StopRequested,
+)
+from navmin.vision.processors.vt11.tracking.maneuver import (
+    ManeuverEvidence,
+    confirms_maneuver,
 )
 from navmin.vision.processors.vt11.tracking.motion_model import (
     MotionPoint,
@@ -81,6 +86,7 @@ class TrackingConfig:
     min_identity_similarity: float = 0.42
     min_confidence_gap: float = 0.02
     lost_after_misses: int = 3
+    day_maneuver_search_enabled: bool = False
 
     # VT-7 dynamic motion/confidence parameters.
     dynamic_search_enabled: bool = True
@@ -461,6 +467,12 @@ class TrackFrameResult:
     prediction_error_px: float | None = None
     confidence: float = 0.0
     diagnostic_reason: str = ""
+    maneuver_hypothesis_xy: tuple[float, float] | None = None
+    maneuver_hits: int = 0
+    line_recovery_hits: int = 0
+    candidate_channel: str = "NONE"
+    candidate_separated_from_line: bool = False
+    blur_variant: str | None = None
     # HOTFIX-2: retain diagnostics for the best evaluated candidate even when
     # it is rejected by gates. This is essential for distinguishing detector
     # failure from identity/threshold failure.
@@ -596,6 +608,7 @@ class TrackingContinuitySnapshot:
     scale_model: ScaleStabilityModel | None
     reliable_scale_anchor: ReliableScaleAnchor | None
     motion_break_events: int
+    memory_freeze_until_frame: int
 
 
 @dataclass
@@ -608,6 +621,7 @@ class _TrackingContinuityState:
     scale_model: ScaleStabilityModel | None = None
     reliable_scale_anchor: ReliableScaleAnchor | None = None
     motion_break_events: int = 0
+    memory_freeze_until_frame: int = -1
 
 
 FrameReader = Callable[[int], tuple[int, np.ndarray]]
@@ -809,6 +823,8 @@ def _tracking_incremental_engine(
     thermal_profile: ThermalProfile | None = None,
     scale_model: ScaleStabilityModel | None = None,
     reliable_scale_anchor: ReliableScaleAnchor | None = None,
+    initial_memory_freeze_until_frame: int = -1,
+    live_features: Vt11LiveFeatures | None = None,
     continuity_state: _TrackingContinuityState | None = None,
 ) -> Iterator[TrackFrameResult]:
     """Track until EOF/LOST with event-driven HOTFIX-6 motion recovery.
@@ -875,6 +891,7 @@ def _tracking_incremental_engine(
             ),
         )
     runtime_detector = runtime_detector_config(detector_config, thermal_profile)
+    live_feature_revision = -1
     warmup_points: list[MotionPoint] = []
     drift_rescue_streak = 0
 
@@ -886,6 +903,9 @@ def _tracking_incremental_engine(
     prev_raw_frame: np.ndarray | None = None
     previous_global_shift_xy: tuple[float, float] | None = None
     previous_global_shift_frame: int | None = None
+    memory_freeze_until_frame = int(initial_memory_freeze_until_frame)
+    maneuver_evidence: ManeuverEvidence | None = None
+    line_evidence: deque[tuple[int, Candidate, float, float]] = deque(maxlen=2)
 
     # HOTFIX-2 reliable spatial anchor: unlike normal motion history this is
     # changed only by a trusted observation or a temporally confirmed jump.
@@ -944,6 +964,7 @@ def _tracking_incremental_engine(
         continuity_state.scale_model = scale_model
         continuity_state.reliable_scale_anchor = reliable_scale_anchor
         continuity_state.motion_break_events = int(motion_break_events)
+        continuity_state.memory_freeze_until_frame = int(memory_freeze_until_frame)
 
     def clipped(xy: tuple[float, float]) -> tuple[float, float]:
         return (
@@ -954,6 +975,22 @@ def _tracking_incremental_engine(
     for frame_index in range(start_frame, frame_count):
         frame_t0 = perf_counter()
         _idx, frame = frame_reader(frame_index)
+        live_snapshot = None if live_features is None else live_features.snapshot
+        if live_snapshot is not None and live_snapshot.revision != live_feature_revision:
+            if live_feature_revision >= 0:
+                maneuver_evidence = None
+                line_evidence.clear()
+            live_feature_revision = live_snapshot.revision
+        effective_detector = runtime_detector
+        maneuver_search_enabled = config.day_maneuver_search_enabled
+        if live_snapshot is not None:
+            effective_detector = replace(
+                runtime_detector,
+                visible_line_recovery_enabled=(
+                    live_snapshot.visible_line_recovery_enabled
+                ),
+            )
+            maneuver_search_enabled = live_snapshot.day_maneuver_search_enabled
         analysis_frame = preprocess_frame(frame, thermal_profile)
         warmup = (frame_index - start_frame) < config.track_warmup_frames
 
@@ -1039,12 +1076,17 @@ def _tracking_incremental_engine(
         if config.motion_break_enabled and (motion_break_active or miss_count > 0 or prior_high >= 1):
             try_global_shift()
 
-        def evaluate_at_prediction(pred_xy: tuple[float, float]):
+        def evaluate_at_prediction(
+            pred_xy: tuple[float, float],
+            *,
+            motion_sigma_override: float | None = None,
+            radius_override: int | None = None,
+        ):
             nonlocal detector_time_ms, identity_time_ms
             selection = make_operator_selection(
                 frame_index=frame_index,
                 click_xy=pred_xy,
-                radius_px=radius,
+                radius_px=radius if radius_override is None else radius_override,
                 frame_width=frame_width,
                 frame_height=frame_height,
             )
@@ -1059,7 +1101,7 @@ def _tracking_incremental_engine(
                 )
             )
             detection = detect_local_candidates(
-                analysis_frame, selection, top_k=config.top_k, config=runtime_detector,
+                analysis_frame, selection, top_k=config.top_k, config=effective_detector,
                 expected_area_px=float(expected_area_px), include_micro=include_micro,
             )
             detector_time_ms += (perf_counter() - td) * 1000.0
@@ -1078,7 +1120,11 @@ def _tracking_incremental_engine(
                     expected_area_px=float(expected_area_px),
                     motion_weight=config.warmup_motion_weight if warmup else None,
                     size_weight=config.warmup_size_weight if warmup else None,
-                    motion_sigma_px=config.warmup_motion_sigma_px if warmup else None,
+                    motion_sigma_px=(
+                        motion_sigma_override
+                        if motion_sigma_override is not None
+                        else (config.warmup_motion_sigma_px if warmup else None)
+                    ),
                     reliable_scale_anchor=reliable_scale_anchor,
                     frame_index=frame_index,
                 )
@@ -1090,6 +1136,91 @@ def _tracking_incremental_engine(
         # on this same frame before declaring a miss.
         if not ranked and try_global_shift():
             detection, ranked = evaluate_at_prediction(predicted)
+
+        maneuver_relocked = False
+        maneuver_pair: tuple[ManeuverEvidence, ManeuverEvidence] | None = None
+        maneuver_xy: tuple[float, float] | None = None
+        maneuver_hits = 0
+        if (
+            maneuver_search_enabled
+            and thermal_profile is not None
+            and not thermal_profile.is_thermal
+            and not warmup
+            and not frame_degraded_active
+        ):
+            primary_gap = (
+                ranked[0].total_score - ranked[1].total_score
+                if len(ranked) > 1
+                else (ranked[0].total_score if ranked else 0.0)
+            )
+            primary_failed = not ranked or bool(
+                _gate_reasons(ranked[0], primary_gap, config, warmup=False)
+            )
+            if primary_failed:
+                origin = timed_history[-1].xy
+                center = origin
+                if (
+                    maneuver_evidence is not None
+                    and maneuver_evidence.frame == frame_index - 1
+                ):
+                    center = maneuver_evidence.center
+                else:
+                    maneuver_evidence = None
+                alternate_radius = max(180, radius)
+                alternate_detection, alternate = evaluate_at_prediction(
+                    center,
+                    motion_sigma_override=float(alternate_radius),
+                    radius_override=alternate_radius,
+                )
+                alternative_gap = (
+                    alternate[0].total_score - alternate[1].total_score
+                    if len(alternate) > 1
+                    else (alternate[0].total_score if alternate else 0.0)
+                )
+                if (
+                    alternate
+                    and alternative_gap >= max(0.08, config.min_confidence_gap)
+                    and not _gate_reasons(
+                        alternate[0], alternative_gap, config, warmup=False
+                    )
+                    and alternate[0].similarity.total >= 0.50
+                    and not bool(
+                        getattr(alternate[0].candidate, "separated_from_line", False)
+                    )
+                    and alternate[0].candidate.detection_channel != "BLUR_REGION"
+                    and 0.4
+                    <= alternate[0].candidate.area_px / max(1, expected_area_px)
+                    <= 2.5
+                ):
+                    proposal = alternate[0]
+                    evidence = ManeuverEvidence(
+                        frame_index,
+                        proposal.candidate.center,
+                        proposal.candidate.area_px,
+                        proposal.similarity.total,
+                    )
+                    maneuver_xy = evidence.center
+                    maneuver_hits = 1
+                    if (
+                        maneuver_evidence is not None
+                        and confirms_maneuver(maneuver_evidence, evidence, origin)
+                    ):
+                        maneuver_relocked = True
+                        maneuver_pair = (maneuver_evidence, evidence)
+                        maneuver_hits = 2
+                        predicted = center
+                        radius = alternate_radius
+                        detection, ranked = alternate_detection, alternate
+                        memory_freeze_until_frame = max(
+                            memory_freeze_until_frame, frame_index + 3
+                        )
+                    maneuver_evidence = None if maneuver_relocked else evidence
+                else:
+                    maneuver_evidence = None
+            else:
+                maneuver_evidence = None
+        else:
+            maneuver_evidence = None
 
         phase = (
             "TRACK_DEGRADED" if frame_degraded_active
@@ -1105,6 +1236,8 @@ def _tracking_incremental_engine(
             motion_uncertainty_px=estimate.uncertainty_px,
             search_radius_px=radius,
             tracking_phase=phase,
+            maneuver_hypothesis_xy=maneuver_xy,
+            maneuver_hits=maneuver_hits,
             frame_reliability_score=float(frame_quality.score),
             frame_reliability_residual=float(frame_quality.residual),
             frame_reliability_phase_response=float(frame_quality.phase_response),
@@ -1183,6 +1316,9 @@ def _tracking_incremental_engine(
                 adaptation_drift_reason=adapt_event.drift_reason if adapt_event is not None else "",
                 adaptation_recent_count=adapt_event.recent_count if adapt_event is not None else 0,
                 adaptation_fast_remaining=adapt_event.fast_remaining if adapt_event is not None else 0,
+                candidate_channel="NONE",
+                candidate_separated_from_line=False,
+                blur_variant=None,
                 motion_break_active=motion_break_active,
                 motion_break_triggered=False,
                 motion_break_reason="ACTIVE_NO_CANDIDATE" if motion_break_active else "",
@@ -1541,6 +1677,7 @@ def _tracking_incremental_engine(
             and (not jump_suspicious or jump_quarantine_confirmed)
             and (not scale_suspicious or scale_quarantine_confirmed)
         )
+        visual_break = visual_break or maneuver_relocked
         if jump_quarantine_confirmed and not frame_degraded_active:
             reasons = [r for r in reasons if r.startswith("SCALE_") or r.startswith("HUD_") or r.startswith("FRAME_")]
             visual_break = bool(not scale_suspicious or scale_quarantine_confirmed)
@@ -1557,6 +1694,38 @@ def _tracking_incremental_engine(
         # drift rescue or visual motion-break logic.
         if hud_hard_reject:
             reasons.append("HUD_HARD_REJECT")
+
+        line_recovery_hits = 0
+        if best.candidate.detection_channel == "LINE_RECOVERY":
+            line_evidence.append((frame_index, best.candidate, best.similarity.total, gap))
+            confirmed_line = False
+            if len(line_evidence) == 2:
+                first_line, second_line = line_evidence
+                confirmed_line = bool(
+                    second_line[0] == first_line[0] + 1
+                    and min(first_line[2], second_line[2])
+                    >= max(0.50, config.min_identity_similarity)
+                    and min(first_line[3], second_line[3])
+                    >= max(0.08, config.min_confidence_gap)
+                    and hypot(
+                        first_line[1].center_x - second_line[1].center_x,
+                        first_line[1].center_y - second_line[1].center_y,
+                    )
+                    <= 90
+                    and abs(
+                        np.log(
+                            max(1, first_line[1].area_px)
+                            / max(1, second_line[1].area_px)
+                        )
+                    )
+                    <= 0.5
+                )
+            if not confirmed_line:
+                reasons.append("LINE_RECOVERY_PENDING_OR_INCONSISTENT")
+            line_recovery_hits = 2 if confirmed_line else 1
+        else:
+            line_evidence.clear()
+
         if reticle_occlusion_active and hud_exit_candidate and not reticle_exit_confirmed:
             reasons.append(f"HUD_EXIT_CONFIRM_{reticle_exit_hits}_OF_{config.hud_exit_confirm_hits}")
         if reticle_exit_confirmed:
@@ -1617,8 +1786,12 @@ def _tracking_incremental_engine(
                     "JUMP_QUARANTINE_CONFIRMED" if jump_quarantine_confirmed
                     else ("VISUAL_JUMP" if visual_break else "PREDICTION_ERROR_WINDOW")
                 )
-                relock_points = [point]
-                timed_history = [point]
+                relock_points = (
+                    [MotionPoint(e.frame, *e.center) for e in maneuver_pair]
+                    if maneuver_pair is not None
+                    else [point]
+                )
+                timed_history = list(relock_points)
                 recent_prediction_errors.clear()
             elif motion_break_active:
                 relock_points.append(point)
@@ -1642,6 +1815,7 @@ def _tracking_incremental_engine(
                     del warmup_points[:-warmup_limit]
             trusted_scale = (
                 float(best.similarity.total) >= config.size_update_min_identity
+                and frame_index > memory_freeze_until_frame
                 and float(gap) >= config.size_update_min_gap
                 and prediction_error <= config.size_update_max_prediction_error_px
                 and not motion_break_triggered
@@ -1649,22 +1823,40 @@ def _tracking_incremental_engine(
                 and best_hud_probability <= config.hud_soft_probability_threshold
                 and (not warmup or prediction_error <= config.warmup_max_unexplained_jump_px)
                 and (not scale_suspicious or scale_quarantine_confirmed)
+                and not selected.separated_from_line
             )
             trusted_anchor = bool(
-                jump_quarantine_confirmed
-                or (
-                    prediction_error <= config.reliable_anchor_update_max_prediction_error_px
-                    and float(best.similarity.total) >= config.size_update_min_identity
-                    and ((has_competitor and gap >= config.min_confidence_gap)
-                         or ((not has_competitor) and float(best.motion_score) >= 0.75))
-                    and not best_hud_hard
-                    and best_hud_probability <= config.hud_soft_probability_threshold
+                frame_index > memory_freeze_until_frame
+                and (
+                    jump_quarantine_confirmed
+                    or (
+                        prediction_error
+                        <= config.reliable_anchor_update_max_prediction_error_px
+                        and float(best.similarity.total)
+                        >= config.size_update_min_identity
+                        and (
+                            (has_competitor and gap >= config.min_confidence_gap)
+                            or (
+                                (not has_competitor)
+                                and float(best.motion_score) >= 0.75
+                            )
+                        )
+                        and not best_hud_hard
+                        and best_hud_probability
+                        <= config.hud_soft_probability_threshold
+                        and not selected.separated_from_line
+                    )
                 )
             )
             if trusted_anchor:
                 reliable_anchor_xy = (float(selected.center_x), float(selected.center_y))
                 reliable_anchor_frame = int(frame_index)
-            if reliable_scale_anchor is not None and reliable_scale_anchor.config.enabled:
+            if (
+                reliable_scale_anchor is not None
+                and reliable_scale_anchor.config.enabled
+                and frame_index > memory_freeze_until_frame
+                and not selected.separated_from_line
+            ):
                 if scale_quarantine_confirmed:
                     recent_areas = [float(e["area"]) for e in list(scale_evidence)[-max(1, scale_quarantine_required_hits):]]
                     if bool(getattr(best, "scale_is_expansion", False)) and recent_areas:
@@ -1691,7 +1883,9 @@ def _tracking_incremental_engine(
                 step = float(config.size_update_max_step_ratio)
                 expected_area_px = min(expected_area_px * step, max(expected_area_px / step, proposed_area))
             status = "TRACK"
-            if accepted_after_hud_occlusion:
+            if maneuver_relocked:
+                reason = "ACCEPTED_DAY_MANEUVER_RELOCK"
+            elif accepted_after_hud_occlusion:
                 reason = "ACCEPTED_HUD_EXIT_REACQ"
             elif scale_quarantine_confirmed:
                 reason = "ACCEPTED_SCALE_QUARANTINE_CONFIRMED"
@@ -1709,12 +1903,22 @@ def _tracking_incremental_engine(
                 reason = "ACCEPTED_DRIFT_RESCUE"
             elif anchor_continuity_override:
                 reason = "ACCEPTED_ANCHOR_CONTINUITY"
+            elif selected.detection_channel == "LINE_RECOVERY":
+                reason = "ACCEPTED_LINE_RECOVERY_CONFIRMED"
+            elif selected.separated_from_line:
+                reason = "ACCEPTED_LINE_SEPARATED_CORE"
             elif warmup:
                 reason = "ACCEPTED_TRACK_WARMUP"
             else:
                 reason = "ACCEPTED" if prediction_error <= config.prediction_error_warn_px else "ACCEPTED_PREDICTION_ERROR_HIGH"
             if adaptation_adapter is not None and adaptation_adapter.enabled:
-                if best_hud_probability >= config.hud_soft_probability_threshold:
+                if frame_index <= memory_freeze_until_frame:
+                    adapt_event = adaptation_adapter.blocked_event(
+                        frame_index, "BLOCKED_DAY_MANEUVER_RELOCK"
+                    )
+                elif selected.separated_from_line:
+                    adapt_event = adaptation_adapter.blocked_event(frame_index, "BLOCKED_LINE_OVERLAP")
+                elif best_hud_probability >= config.hud_soft_probability_threshold:
                     adapt_event = adaptation_adapter.blocked_event(frame_index, "BLOCKED_HUD_NEGATIVE")
                 elif scale_expansion_uncertain and not scale_quarantine_confirmed:
                     adapt_event = adaptation_adapter.blocked_event(frame_index, "BLOCKED_SCALE_EXPANSION_UNCERTAIN")
@@ -1769,6 +1973,12 @@ def _tracking_incremental_engine(
             motion_score=float(best.motion_score), size_score=float(best.size_score), status=status,
             miss_count=((frame_index - start_frame) + 1) if warmup and selected is None else miss_count,
             prediction_error_px=prediction_error, confidence=confidence, diagnostic_reason=reason,
+            line_recovery_hits=line_recovery_hits,
+            candidate_channel=str(getattr(best.candidate, "detection_channel", "NORMAL")),
+            candidate_separated_from_line=bool(
+                getattr(best.candidate, "separated_from_line", False)
+            ),
+            blur_variant=best.similarity.blur_variant,
             best_candidate_center=(float(best.candidate.center_x), float(best.candidate.center_y)),
             best_candidate_bbox=(int(best.candidate.bbox.x), int(best.candidate.bbox.y), int(best.candidate.bbox.width), int(best.candidate.bbox.height)),
             best_candidate_area_px=int(best.candidate.area_px), best_candidate_mean_response=float(best.candidate.mean_response),
@@ -1887,6 +2097,8 @@ class TrackingRuntime:
         thermal_profile: ThermalProfile | None = None,
         scale_model: ScaleStabilityModel | None = None,
         reliable_scale_anchor: ReliableScaleAnchor | None = None,
+        initial_memory_freeze_until_frame: int = -1,
+        live_features: Vt11LiveFeatures | None = None,
         frame_count: int | None = None,
         _adaptation_event_history_limit: int | None = DEFAULT_ADAPTATION_EVENT_HISTORY,
     ) -> None:
@@ -1952,6 +2164,8 @@ class TrackingRuntime:
             thermal_profile=thermal_profile,
             scale_model=scale_model,
             reliable_scale_anchor=reliable_scale_anchor,
+            initial_memory_freeze_until_frame=initial_memory_freeze_until_frame,
+            live_features=live_features,
             continuity_state=self._continuity_state,
         )
 
@@ -2011,6 +2225,7 @@ class TrackingRuntime:
             scale_model=state.scale_model,
             reliable_scale_anchor=state.reliable_scale_anchor,
             motion_break_events=int(state.motion_break_events),
+            memory_freeze_until_frame=int(state.memory_freeze_until_frame),
         )
 
     def collection_state_sizes(self) -> dict[str, int]:
@@ -2050,6 +2265,7 @@ def run_tracking(
     thermal_profile: ThermalProfile | None = None,
     scale_model: ScaleStabilityModel | None = None,
     reliable_scale_anchor: ReliableScaleAnchor | None = None,
+    initial_memory_freeze_until_frame: int = -1,
 ) -> TrackingResult:
     """Compatibility batch wrapper over :class:`TrackingRuntime`."""
     adapt_event_start = len(adaptation_adapter.events) if adaptation_adapter is not None else 0
@@ -2070,6 +2286,7 @@ def run_tracking(
         thermal_profile=thermal_profile,
         scale_model=scale_model,
         reliable_scale_anchor=reliable_scale_anchor,
+        initial_memory_freeze_until_frame=initial_memory_freeze_until_frame,
         _adaptation_event_history_limit=None,
     )
     results: list[TrackFrameResult] = []

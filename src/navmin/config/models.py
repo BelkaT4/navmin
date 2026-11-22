@@ -239,11 +239,19 @@ class TurretConfig:
 
 
 @dataclass(frozen=True)
+class Vt11UiConfig:
+    low_light_blur_mode: bool = False
+    auto_select_candidate_on_first_click: bool = False
+    candidate_click_tolerance_px: int = 15
+
+
+@dataclass(frozen=True)
 class UiConfig:
     default_camera: CameraRole
     show_fps: bool
     show_stereo_right_diagnostics: bool
     show_stereo_right_camera: bool
+    vt11: Vt11UiConfig = Vt11UiConfig()
 
 
 @dataclass(frozen=True)
@@ -283,6 +291,9 @@ _DYNAMIC_EXACT_PATHS = frozenset(
         "ui.show-fps",
         "ui.show-stereo-right-diagnostics",
         "ui.show-stereo-right-camera",
+        "ui.vt11.low-light-blur-mode",
+        "ui.vt11.auto-select-candidate-on-first-click",
+        "ui.vt11.candidate-click-tolerance-px",
     }
 )
 
@@ -423,6 +434,7 @@ __all__ = [
     "VelocityEstimatorConfig",
     "VisionConfig",
     "VisionDistanceConfig",
+    "Vt11UiConfig",
     "changed_config_paths",
     "config_apply_policy",
 ]

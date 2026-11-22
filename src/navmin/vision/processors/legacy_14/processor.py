@@ -22,7 +22,7 @@ from navmin.contracts import (
     VisionResult,
     VisionTargetControlCommand,
 )
-from navmin.vision.processor import VisionProcessorOutput
+from navmin.vision.processor import VisionProcessorOutput, VisionRuntimeSettings
 from navmin.vision.tracking import PublicTrackIdAllocator, SimpleTracker
 
 from .detector import Legacy14Detector
@@ -69,6 +69,10 @@ class Legacy14VisionProcessor:
             maxlen=_HISTORY_MAX_FRAMES
         )
         self._selected_target: TargetRef | None = None
+
+    def apply_runtime_settings(self, settings: VisionRuntimeSettings) -> None:
+        if not isinstance(settings, VisionRuntimeSettings):
+            raise TypeError("settings must be VisionRuntimeSettings")
 
     def reset(self) -> None:
         self._detector.reset()

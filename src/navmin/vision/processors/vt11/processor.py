@@ -23,6 +23,9 @@ from navmin.contracts import (
     TargetAcquired,
     TargetAcquisitionFailed,
     TargetAcquisitionFailureReason,
+    TargetCandidateProposal,
+    TargetCandidateSelectionRequest,
+    TargetCandidateSet,
     TargetLifecycleEvent,
     TargetRef,
     TargetSelectionRequest,
@@ -32,14 +35,25 @@ from navmin.contracts import (
     VisionResult,
     VisionTargetControlCommand,
 )
-from navmin.vision.processor import VisionProcessorOutput, VisionTrackingDiagnostics
+from navmin.vision.candidate_selection import auto_select_candidate_at_point
+from navmin.vision.processor import (
+    VisionProcessorOutput,
+    VisionRuntimeSettings,
+    VisionTrackingDiagnostics,
+)
 from navmin.vision.tracking import PublicTrackIdAllocator
 
 from ..legacy_14 import Legacy14VisionProcessor
-from .acquisition.acquire import Vt11AcquisitionAttempt, Vt11AcquisitionResult
+from .acquisition.acquire import (
+    Vt11AcquireCandidates,
+    Vt11AcquisitionAttempt,
+    Vt11AcquisitionResult,
+    discover_acquire_candidates,
+)
 from .acquisition.candidate_detector import Candidate
 from .config.loader import DEFAULT_CONFIG, load_config
 from .frame_history import FramePacketHistory
+from .live_features import Vt11LiveFeatureSnapshot, Vt11LiveFeatures
 from .profiles import effective_config
 from .runtime_config import Vt11ResolvedConfig, Vt11RuntimeSettings
 from .tracking.reacquisition import ReacqFrameResult
@@ -56,6 +70,7 @@ class Vt11ProcessorState(Enum):
     """Only the integration states owned by the composite adapter."""
 
     DISCOVERY = "discovery"
+    CANDIDATES = "candidates"
     ACQUIRING = "acquiring"
     TARGET = "target"
 
@@ -81,6 +96,12 @@ class Vt11ProcessorSettingsSnapshot:
     source_config_sha256: str
     effective_config: Mapping[str, object]
     integration_settings: Mapping[str, object]
+
+
+@dataclass
+class _CandidateSelectionContext:
+    request: TargetSelectionRequest
+    latest_candidates: TargetCandidateSet | None = None
 
 
 @dataclass
@@ -123,6 +144,8 @@ class Vt11VisionProcessor:
             profile,
             effective,
         )
+        self._live_features = Vt11LiveFeatures(profile)
+        self._target_identity_weights = dict(self._resolved_config.identity_weights)
         self._duration_clock_ns = duration_clock_ns
         self._history_clock_ns = history_clock_ns
         self._public_track_ids = PublicTrackIdAllocator()
@@ -136,6 +159,7 @@ class Vt11VisionProcessor:
         self._state = Vt11ProcessorState.DISCOVERY
         self._camera: CameraRole | None = None
         self._generation: int | None = None
+        self._candidate_selection: _CandidateSelectionContext | None = None
         self._acquisition: _AcquisitionContext | None = None
         self._target_session: Vt11TargetSession | None = None
         self._current_target: TargetRef | None = None
@@ -185,6 +209,19 @@ class Vt11VisionProcessor:
     def settings_snapshot(self) -> Vt11ProcessorSettingsSnapshot:
         return self._settings_snapshot
 
+    @property
+    def live_feature_snapshot(self) -> Vt11LiveFeatureSnapshot:
+        return self._live_features.snapshot
+
+    def apply_runtime_settings(self, settings: VisionRuntimeSettings) -> None:
+        if not isinstance(settings, VisionRuntimeSettings):
+            raise TypeError("settings must be VisionRuntimeSettings")
+        self._live_features.set_low_light_blur_mode(settings.low_light_blur_mode)
+        if self._live_features.snapshot.visible_blur_robust:
+            self._target_identity_weights["_visible_blur_robust"] = 1.0
+        else:
+            self._target_identity_weights.pop("_visible_blur_robust", None)
+
     def reset(self) -> None:
         """Clear every generation-local component while preserving configuration."""
         if self._target_session is not None:
@@ -196,6 +233,7 @@ class Vt11VisionProcessor:
         self._state = Vt11ProcessorState.DISCOVERY
         self._camera = None
         self._generation = None
+        self._candidate_selection = None
         self._acquisition = None
         self._target_session = None
         self._current_target = None
@@ -215,7 +253,7 @@ class Vt11VisionProcessor:
 
     def _selection_sequence(
         self,
-        command: TargetSelectionRequest,
+        command: TargetSelectionRequest | TargetCandidateSelectionRequest,
     ) -> tuple[FramePacket, ...]:
         return self._frame_history.sequence_from_exact(
             camera=command.camera,
@@ -227,6 +265,7 @@ class Vt11VisionProcessor:
     def _discard_active_episode(self, *, reset_legacy: bool) -> None:
         if self._target_session is not None:
             self._target_session.close()
+        self._candidate_selection = None
         self._acquisition = None
         self._target_session = None
         self._current_target = None
@@ -235,6 +274,151 @@ class Vt11VisionProcessor:
         self._state = Vt11ProcessorState.DISCOVERY
         if reset_legacy:
             self._legacy.reset()
+
+    @staticmethod
+    def _public_candidate_set(
+        request: TargetSelectionRequest,
+        frame: FramePacket,
+        scoring,
+    ) -> TargetCandidateSet:
+        proposals = tuple(
+            TargetCandidateProposal(
+                candidate_id=int(item.candidate.candidate_id),
+                bbox=Vt11VisionProcessor._public_bbox(item.candidate),
+                score=float(item.final_score),
+                rank=int(item.final_rank),
+            )
+            for item in scoring.candidates
+        )
+        return TargetCandidateSet(
+            selection_id=request.selection_id,
+            camera=request.camera,
+            generation=request.generation,
+            frame_id=frame.frame_id,
+            candidates=proposals,
+        )
+
+    def _discover_candidates_for_frame(
+        self,
+        request: TargetSelectionRequest,
+        frame: FramePacket,
+    ) -> tuple[TargetCandidateSet, Vt11AcquireCandidates]:
+        discovered = discover_acquire_candidates(
+            frame_index=frame.frame_id,
+            frame_bgr=frame.image,
+            click_xy=(request.x_px, request.y_px),
+            frame_width=frame.image.shape[1],
+            frame_height=frame.image.shape[0],
+            resolved_config=self._resolved_config,
+        )
+        return self._public_candidate_set(request, frame, discovered.scoring), discovered
+
+    def _start_acquisition_from_candidate(
+        self,
+        *,
+        request: TargetSelectionRequest,
+        candidate_id: int,
+        sequence: Sequence[FramePacket],
+        train_click_xy: tuple[float, float] | None = None,
+    ) -> tuple[TargetLifecycleEvent, ...]:
+        if not sequence:
+            return (
+                TargetAcquisitionFailed(
+                    selection_id=request.selection_id,
+                    camera=request.camera,
+                    generation=request.generation,
+                    request_frame_id=request.frame_id,
+                    reason=TargetAcquisitionFailureReason.STALE_SELECTION,
+                    decision_frame_id=None,
+                    decision_frame_timestamp_ns=None,
+                ),
+            )
+        selection_frame = sequence[0]
+        attempt = Vt11AcquisitionAttempt(
+            frame_index=selection_frame.frame_id,
+            frame_bgr=selection_frame.image,
+            click_xy=(request.x_px, request.y_px),
+            frame_width=selection_frame.image.shape[1],
+            frame_height=selection_frame.image.shape[0],
+            resolved_config=self._resolved_config,
+            runtime_settings=self._runtime_settings,
+            live_features=self._live_features,
+            target_identity_weights=self._target_identity_weights,
+            candidate_id=candidate_id,
+            train_click_xy=train_click_xy,
+        )
+        self._candidate_selection = None
+        self._acquisition = _AcquisitionContext(
+            request=request,
+            attempt=attempt,
+            receive_timestamps_ns={
+                selection_frame.frame_id: selection_frame.receive_timestamp_ns
+            },
+        )
+        self._state = Vt11ProcessorState.ACQUIRING
+        return self._advance_acquisition(sequence[1:])
+
+    def _candidate_selection_failure(
+        self,
+        reason: TargetAcquisitionFailureReason,
+        *,
+        decision_identity: tuple[int, int] | None,
+    ) -> tuple[TargetLifecycleEvent, ...]:
+        context = self._candidate_selection
+        if context is None:
+            raise RuntimeError("VT11 candidate-selection context is missing")
+        request = context.request
+        event = TargetAcquisitionFailed(
+            selection_id=request.selection_id,
+            camera=request.camera,
+            generation=request.generation,
+            request_frame_id=request.frame_id,
+            reason=reason,
+            decision_frame_id=(
+                None if decision_identity is None else decision_identity[0]
+            ),
+            decision_frame_timestamp_ns=(
+                None if decision_identity is None else decision_identity[1]
+            ),
+        )
+        self._discard_active_episode(reset_legacy=True)
+        return (event,)
+
+    def _retry_candidate_selection(
+        self,
+        result: Vt11AcquisitionResult | None = None,
+    ) -> tuple[TargetLifecycleEvent, ...]:
+        context = self._acquisition
+        if context is None:
+            raise RuntimeError("VT11 acquisition context is missing")
+        if result is not None and result.target_session is not None:
+            result.target_session.close()
+        request = context.request
+        self._acquisition = None
+        self._target_session = None
+        self._current_target = None
+        self._current_public_target_id = None
+        self._initial_acquisition_decision_frame_id = None
+        self._candidate_selection = _CandidateSelectionContext(request=request)
+        self._state = Vt11ProcessorState.CANDIDATES
+        return ()
+
+    def _reject_or_retry_acquisition(
+        self,
+        reason: TargetAcquisitionFailureReason,
+        *,
+        result: Vt11AcquisitionResult | None,
+        decision_identity: tuple[int, int] | None,
+    ) -> tuple[TargetLifecycleEvent, ...]:
+        context = self._acquisition
+        if context is None:
+            raise RuntimeError("VT11 acquisition context is missing")
+        if context.request.candidate_selection_enabled:
+            return self._retry_candidate_selection(result)
+        return self._acquisition_failure(
+            reason,
+            decision_identity=decision_identity,
+        )
 
     def _acquisition_failure(
         self,
@@ -273,7 +457,7 @@ class Vt11VisionProcessor:
             raise RuntimeError("VT11 acquisition context is missing")
         train = result.train_result
         frame_id = (
-            context.request.frame_id
+            context.attempt.start_frame
             if train is None
             else train.frames[-1].frame_index
         )
@@ -296,23 +480,27 @@ class Vt11VisionProcessor:
         decision_identity = self._acquisition_decision_identity(result)
 
         if result.scoring.best is None:
-            return self._acquisition_failure(
+            return self._reject_or_retry_acquisition(
                 TargetAcquisitionFailureReason.NO_TARGET_AT_POINT,
+                result=result,
                 decision_identity=decision_identity,
             )
         if result.decision == "AMBIGUOUS":
-            return self._acquisition_failure(
+            return self._reject_or_retry_acquisition(
                 TargetAcquisitionFailureReason.AMBIGUOUS,
+                result=result,
                 decision_identity=decision_identity,
             )
         if result.decision == "OBSERVE_MORE":
-            return self._acquisition_failure(
+            return self._reject_or_retry_acquisition(
                 TargetAcquisitionFailureReason.INSUFFICIENT_EVIDENCE,
+                result=result,
                 decision_identity=decision_identity,
             )
         if result.decision != "CONFIRMED" or result.target_session is None:
-            return self._acquisition_failure(
+            return self._reject_or_retry_acquisition(
                 TargetAcquisitionFailureReason.ACQUISITION_FAILED,
+                result=result,
                 decision_identity=decision_identity,
             )
 
@@ -326,6 +514,8 @@ class Vt11VisionProcessor:
                     remaining_frames[-1].receive_timestamp_ns,
                 )
             )
+            if context.request.candidate_selection_enabled:
+                return self._retry_candidate_selection(result)
             result.target_session.close()
             return self._acquisition_failure(
                 TargetAcquisitionFailureReason.ACQUISITION_FAILED,
@@ -338,6 +528,8 @@ class Vt11VisionProcessor:
                 frame.receive_timestamp_ns
             )
             if frame.frame_id != session.next_frame_index:
+                if context.request.candidate_selection_enabled:
+                    return self._retry_candidate_selection(result)
                 session.close()
                 return self._acquisition_failure(
                     TargetAcquisitionFailureReason.ACQUISITION_FAILED,
@@ -348,6 +540,8 @@ class Vt11VisionProcessor:
                 )
             session.step(frame.frame_id, frame.image)
             if session.terminal_status is not None:
+                if context.request.candidate_selection_enabled:
+                    return self._retry_candidate_selection(result)
                 session.close()
                 return self._acquisition_failure(
                     TargetAcquisitionFailureReason.ACQUISITION_FAILED,
@@ -485,14 +679,32 @@ class Vt11VisionProcessor:
         self._discard_active_episode(reset_legacy=True)
         return (event,)
 
-    @staticmethod
     def _tracking_diagnostics(
+        self,
         frame: FramePacket,
         result: TrackFrameResult | ReacqFrameResult,
         *,
         phase: str,
     ) -> VisionTrackingDiagnostics:
         best_bbox = result.best_candidate_bbox
+        live = self._live_features.snapshot
+        if isinstance(result, TrackFrameResult):
+            if not live.day_maneuver_search_enabled:
+                maneuver_state = "DISABLED"
+            elif result.maneuver_hits >= 2:
+                maneuver_state = "CONFIRMED"
+            elif result.maneuver_hits == 1:
+                maneuver_state = "PENDING"
+            else:
+                maneuver_state = "IDLE"
+            maneuver_hits = int(result.maneuver_hits)
+        else:
+            maneuver_state = "NOT_APPLICABLE"
+            maneuver_hits = 0
+        adaptation_reason = str(getattr(result, "adaptation_reason", ""))
+        adaptation_block_reason = (
+            adaptation_reason if adaptation_reason.startswith("BLOCKED_") else None
+        )
         return VisionTrackingDiagnostics(
             camera=frame.camera,
             generation=frame.generation,
@@ -539,6 +751,16 @@ class Vt11VisionProcessor:
                 else float(result.prediction_error_px)
             ),
             diagnostic_reason=result.diagnostic_reason,
+            detection_channel=str(getattr(result, "candidate_channel", "NONE")),
+            separated_from_line=bool(
+                getattr(result, "candidate_separated_from_line", False)
+            ),
+            blur_robust_enabled=bool(live.visible_blur_robust),
+            blur_variant=getattr(result, "blur_variant", None),
+            maneuver_state=maneuver_state,
+            maneuver_hits=maneuver_hits,
+            line_recovery_hits=int(getattr(result, "line_recovery_hits", 0)),
+            adaptation_block_reason=adaptation_block_reason,
         )
 
     def _process_target_frame(
@@ -606,8 +828,48 @@ class Vt11VisionProcessor:
                 return ()
             self._discard_active_episode(reset_legacy=True)
             return ()
+
+        if isinstance(command, TargetCandidateSelectionRequest):
+            context = self._candidate_selection
+            if (
+                self._state is not Vt11ProcessorState.CANDIDATES
+                or context is None
+                or context.request.selection_id != command.selection_id
+                or context.request.camera is not command.camera
+                or context.request.generation != command.generation
+            ):
+                return ()
+            latest = context.latest_candidates
+            if (
+                latest is None
+                or latest.frame_id != command.frame_id
+                or not any(
+                    item.candidate_id == command.candidate_id
+                    for item in latest.candidates
+                )
+            ):
+                return ()
+            sequence = self._selection_sequence(command)
+            if not sequence:
+                return self._candidate_selection_failure(
+                    TargetAcquisitionFailureReason.STALE_SELECTION,
+                    decision_identity=None,
+                )
+            return self._start_acquisition_from_candidate(
+                request=context.request,
+                candidate_id=command.candidate_id,
+                sequence=sequence,
+                train_click_xy=(command.x_px, command.y_px),
+            )
+
         if not isinstance(command, TargetSelectionRequest):
             raise TypeError("unsupported target-control command")
+        if (
+            isinstance(command.candidate_click_tolerance_px, bool)
+            or not isinstance(command.candidate_click_tolerance_px, int)
+            or not 0 <= command.candidate_click_tolerance_px <= 50
+        ):
+            raise ValueError("candidate_click_tolerance_px must be in [0, 50]")
 
         was_active = self._state is not Vt11ProcessorState.DISCOVERY
         sequence = self._selection_sequence(command)
@@ -629,24 +891,63 @@ class Vt11VisionProcessor:
         if not was_active:
             self._legacy.reset()
         selection_frame = sequence[0]
-        attempt = Vt11AcquisitionAttempt(
-            frame_index=selection_frame.frame_id,
-            frame_bgr=selection_frame.image,
-            click_xy=(command.x_px, command.y_px),
-            frame_width=selection_frame.image.shape[1],
-            frame_height=selection_frame.image.shape[0],
-            resolved_config=self._resolved_config,
-            runtime_settings=self._runtime_settings,
+        if not command.candidate_selection_enabled:
+            attempt = Vt11AcquisitionAttempt(
+                frame_index=selection_frame.frame_id,
+                frame_bgr=selection_frame.image,
+                click_xy=(command.x_px, command.y_px),
+                frame_width=selection_frame.image.shape[1],
+                frame_height=selection_frame.image.shape[0],
+                resolved_config=self._resolved_config,
+                runtime_settings=self._runtime_settings,
+                live_features=self._live_features,
+                target_identity_weights=self._target_identity_weights,
+            )
+            self._acquisition = _AcquisitionContext(
+                request=command,
+                attempt=attempt,
+                receive_timestamps_ns={
+                    selection_frame.frame_id: selection_frame.receive_timestamp_ns
+                },
+            )
+            self._state = Vt11ProcessorState.ACQUIRING
+            return self._advance_acquisition(sequence[1:])
+
+        candidate_set, _discovered = self._discover_candidates_for_frame(
+            command,
+            selection_frame,
         )
-        self._acquisition = _AcquisitionContext(
-            request=command,
-            attempt=attempt,
-            receive_timestamps_ns={
-                selection_frame.frame_id: selection_frame.receive_timestamp_ns
-            },
-        )
-        self._state = Vt11ProcessorState.ACQUIRING
-        return self._advance_acquisition(sequence[1:])
+        if not candidate_set.candidates:
+            self._state = Vt11ProcessorState.DISCOVERY
+            return (
+                TargetAcquisitionFailed(
+                    selection_id=command.selection_id,
+                    camera=command.camera,
+                    generation=command.generation,
+                    request_frame_id=command.frame_id,
+                    reason=TargetAcquisitionFailureReason.NO_TARGET_AT_POINT,
+                    decision_frame_id=selection_frame.frame_id,
+                    decision_frame_timestamp_ns=selection_frame.receive_timestamp_ns,
+                ),
+            )
+
+        if command.auto_select_candidate_on_first_click:
+            selected = auto_select_candidate_at_point(
+                candidate_set.candidates,
+                command.x_px,
+                command.y_px,
+                tolerance_px=command.candidate_click_tolerance_px,
+            )
+            if selected is not None:
+                return self._start_acquisition_from_candidate(
+                    request=command,
+                    candidate_id=selected.candidate_id,
+                    sequence=sequence,
+                )
+
+        self._candidate_selection = _CandidateSelectionContext(request=command)
+        self._state = Vt11ProcessorState.CANDIDATES
+        return ()
 
     def process(
         self,
@@ -668,7 +969,17 @@ class Vt11VisionProcessor:
         target_events: tuple[TargetLifecycleEvent, ...] = ()
         tracked_objects: tuple[TrackedObject, ...] = ()
         tracking_diagnostics: VisionTrackingDiagnostics | None = None
-        if self._state is Vt11ProcessorState.ACQUIRING:
+        acquisition_candidates: TargetCandidateSet | None = None
+        if self._state is Vt11ProcessorState.CANDIDATES:
+            context = self._candidate_selection
+            if context is None:
+                raise RuntimeError("CANDIDATES state has no selection context")
+            acquisition_candidates, _discovered = self._discover_candidates_for_frame(
+                context.request,
+                frame,
+            )
+            context.latest_candidates = acquisition_candidates
+        elif self._state is Vt11ProcessorState.ACQUIRING:
             target_events = self._advance_acquisition((frame,))
         elif self._state is Vt11ProcessorState.TARGET:
             (
@@ -686,6 +997,7 @@ class Vt11VisionProcessor:
             ),
             target_events=target_events,
             tracking_diagnostics=tracking_diagnostics,
+            acquisition_candidates=acquisition_candidates,
         )
 
 

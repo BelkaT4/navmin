@@ -563,6 +563,9 @@ def _run_qt_smoke(runtime: SoftwareSmokeRuntime, auto_close_seconds: float | Non
         apply_tracking_control_tuning=ui.apply_tracking_control_tuning,
         tracking_visualization_config=ui.tracking_visualization_config,
         ui_config=ui.ui_config,
+        apply_vt11_ui_config=ui.apply_vt11_ui_config,
+        vision_processor_selections=ui.vision_processor_selections,
+        apply_vision_processor_selection=ui.apply_vision_processor_selection,
     )
 
 

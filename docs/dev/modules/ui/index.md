@@ -236,7 +236,7 @@ UI может редактировать:
 - optional per-camera `processing-enabled` master switch;
 - `vision-processor-class`.
 
-В v1 внутренние detector/tracker tuning constants конкретного `VisionProcessor` в UI не редактируются и не являются полями `config.json`.
+Внутренние detector/tracker tuning constants конкретного `VisionProcessor` в UI не редактируются и не являются полями общего `config.json`. Отдельно от них schema v8 хранит в `ui.vt11` три операторских preference: DAY-режим слабого освещения/смаза, разрешение автовыбора кандидата по первому клику и допуск клика к рамке кандидата. Это UI/operator policy, а не профильные detector thresholds; controls и runtime-consumer подключаются по этапам VT11 REV5.
 
 Calibration data не является обычной UI-настройкой `config.json`; она хранится отдельными calibration files.
 

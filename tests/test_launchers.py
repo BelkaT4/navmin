@@ -1862,7 +1862,7 @@ def test_input_recovery_creates_valid_safe_defaults_without_existing_files(
     stereo = load_stereo_calibration(paths.stereo_calibration)
     imu = ImuCalibration.load(imu_path)
     assert config.turret.serial.port == "/dev/navmin-configure-serial-port"
-    assert config.schema_version == 7
+    assert config.schema_version == 8
     assert config.vision.cameras.overview.calibration_file == "calibration/overview.json"
     assert config.vision.distance.stereo.calibration_file == "calibration/stereo.json"
     assert config.imu.calibration_file == "calibration/imu.json"
@@ -1903,7 +1903,7 @@ def test_input_recovery_replaces_malformed_root_and_invalid_canonical_calibratio
 
     assert len(result.backups) == 3
     recovered = load_config(paths.config)
-    assert recovered.schema_version == 7
+    assert recovered.schema_version == 8
     assert recovered.vision.cameras.overview.calibration_file == "calibration/overview.json"
     assert recovered.vision.distance.stereo.calibration_file == "calibration/stereo.json"
     assert load_overview_calibration(paths.overview_calibration).schema_version == 1

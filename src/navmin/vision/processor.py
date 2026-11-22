@@ -10,6 +10,7 @@ from navmin.contracts import (
     BBox,
     CameraRole,
     FramePacket,
+    TargetCandidateSet,
     TargetLifecycleEvent,
     VisionResult,
     VisionTargetControlCommand,
@@ -46,6 +47,13 @@ class VisionProcessorSelection:
 
 
 @dataclass(frozen=True, slots=True)
+class VisionRuntimeSettings:
+    """Owner-thread runtime observation settings shared by Vision backends."""
+
+    low_light_blur_mode: bool = False
+
+
+@dataclass(frozen=True, slots=True)
 class VisionTrackingDiagnostics:
     """Backend-neutral read-only tracking diagnostics for one exact frame."""
 
@@ -64,6 +72,14 @@ class VisionTrackingDiagnostics:
     confidence: float
     prediction_error_px: float | None
     diagnostic_reason: str
+    detection_channel: str = "NONE"
+    separated_from_line: bool = False
+    blur_robust_enabled: bool = False
+    blur_variant: str | None = None
+    maneuver_state: str = "NOT_APPLICABLE"
+    maneuver_hits: int = 0
+    line_recovery_hits: int = 0
+    adaptation_block_reason: str | None = None
 
 
 @dataclass(frozen=True)
@@ -73,6 +89,7 @@ class VisionProcessorOutput:
     result: VisionResult
     target_events: tuple[TargetLifecycleEvent, ...] = ()
     tracking_diagnostics: VisionTrackingDiagnostics | None = None
+    acquisition_candidates: TargetCandidateSet | None = None
 
 
 class VisionProcessor(Protocol):
@@ -80,6 +97,10 @@ class VisionProcessor(Protocol):
 
     def reset(self) -> None:
         """Clear all generation-local processing state."""
+        ...
+
+    def apply_runtime_settings(self, settings: VisionRuntimeSettings) -> None:
+        """Apply owner-thread runtime observation settings without resetting state."""
         ...
 
     def apply_target_control(
@@ -165,6 +186,7 @@ __all__ = [
     "VisionProcessor",
     "VisionProcessorOutput",
     "VisionProcessorSelection",
+    "VisionRuntimeSettings",
     "VisionTrackingDiagnostics",
     "create_selected_vision_processor",
     "create_vision_processor",

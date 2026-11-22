@@ -29,6 +29,7 @@ from navmin.config.models import (
     Stm32Config,
     TrackingControlConfig,
     TrackingVisualizationConfig,
+    Vt11UiConfig,
 )
 from navmin.contracts import CameraRole, CameraStatus, TurretControlMode, TurretState
 from navmin.core import AxisTrackingEstimate, TrackingEstimatorDiagnostics
@@ -77,6 +78,8 @@ class OperatorWindow(QWidget):
         on_apply_tracking_control_tuning: Callable[[TrackingControlConfig], None],
         tracking_visualization_config: TrackingVisualizationConfig,
         on_tracking_visualization_changed: Callable[[TrackingVisualizationConfig], None],
+        vt11_ui_config: Vt11UiConfig,
+        on_vt11_ui_config_changed: Callable[[Vt11UiConfig], None],
         use_camera_time_for_tracking: bool,
         on_use_camera_time_for_tracking_changed: Callable[[bool], None],
         tracking_stereo_left_hfov_deg: float | None = None,
@@ -111,6 +114,9 @@ class OperatorWindow(QWidget):
         )
         self._tracking_visualization_config = tracking_visualization_config
         self._on_tracking_visualization_changed = on_tracking_visualization_changed
+        self._vt11_ui_config = vt11_ui_config
+        self._on_vt11_ui_config_changed = on_vt11_ui_config_changed
+        self._syncing_vt11_ui = False
         self._on_use_camera_time_for_tracking_changed = (
             on_use_camera_time_for_tracking_changed
         )
@@ -171,6 +177,7 @@ class OperatorWindow(QWidget):
         self._build_tracking_controls(tracking_control_config)
         self._build_visualization_controls(tracking_visualization_config)
         self._build_detector_controls()
+        self._build_vt11_controls(vt11_ui_config)
         self._build_diagnostics_controls()
         self._build_action_controls()
         self._build_layout()
@@ -376,6 +383,102 @@ class OperatorWindow(QWidget):
                     profile.setCurrentIndex(index)
         finally:
             profile.blockSignals(False)
+
+    def _build_vt11_controls(self, config: Vt11UiConfig) -> None:
+        self.vt11_auto_select_checkbox = QCheckBox(
+            "Автовыбор кандидата по первому клику"
+        )
+        self.vt11_auto_select_checkbox.setToolTip(
+            "Первый клик автоматически выбирает кандидата только при однозначной "
+            "геометрической связи. При неоднозначности VT11 ждёт второй клик."
+        )
+        self.vt11_candidate_tolerance_input = QSpinBox()
+        self.vt11_candidate_tolerance_input.setRange(0, 50)
+        self.vt11_candidate_tolerance_input.setSuffix(" px")
+        self.vt11_candidate_tolerance_input.setMaximumWidth(120)
+        self.vt11_candidate_tolerance_input.setToolTip(
+            "Максимальное расстояние от клика до рамки кандидата при выборе цели."
+        )
+        self.vt11_low_light_blur_checkbox = QCheckBox("Слабое освещение / смаз")
+        self.vt11_low_light_blur_checkbox.setToolTip(
+            "Только VT11 DAY: на лету одновременно включает blur-aware identity, "
+            "maneuver relock и LINE_RECOVERY. Цель и generation не сбрасываются."
+        )
+        self.vt11_low_light_note_label = QLabel("")
+        self.vt11_low_light_note_label.setWordWrap(True)
+        self._sync_vt11_controls(config)
+        self.vt11_auto_select_checkbox.stateChanged.connect(
+            self._apply_vt11_ui_config
+        )
+        self.vt11_candidate_tolerance_input.valueChanged.connect(
+            self._apply_vt11_ui_config
+        )
+        self.vt11_low_light_blur_checkbox.stateChanged.connect(
+            self._apply_vt11_ui_config
+        )
+        self._sync_vt11_low_light_availability()
+
+    def _sync_vt11_controls(self, config: Vt11UiConfig) -> None:
+        self._syncing_vt11_ui = True
+        try:
+            self.vt11_auto_select_checkbox.setChecked(
+                config.auto_select_candidate_on_first_click
+            )
+            self.vt11_candidate_tolerance_input.setValue(
+                config.candidate_click_tolerance_px
+            )
+            self.vt11_low_light_blur_checkbox.setChecked(
+                config.low_light_blur_mode
+            )
+        finally:
+            self._syncing_vt11_ui = False
+
+    def _sync_vt11_low_light_availability(self) -> None:
+        vt11_profiles = [
+            selection.profile_name
+            for camera, selection in self._vision_processor_selections.items()
+            if camera in self._available_cameras
+            and selection.class_name == VT11_VISION_PROCESSOR_CLASS
+        ]
+        has_day = "day" in vt11_profiles
+        has_thermal = "thermal" in vt11_profiles
+        self.vt11_low_light_blur_checkbox.setEnabled(has_day)
+        if has_day:
+            self.vt11_low_light_note_label.setText(
+                "Настройка применяется только к VT11 DAY; THERMAL её игнорирует."
+            )
+        elif has_thermal:
+            self.vt11_low_light_note_label.setText(
+                "Недоступно: настроенные VT11 используют профиль THERMAL."
+            )
+        else:
+            self.vt11_low_light_note_label.setText(
+                "Недоступно: профиль VT11 DAY сейчас не выбран."
+            )
+
+    def _apply_vt11_ui_config(self, _value: int = 0) -> None:
+        if self._syncing_vt11_ui:
+            return
+        config = Vt11UiConfig(
+            low_light_blur_mode=self.vt11_low_light_blur_checkbox.isChecked(),
+            auto_select_candidate_on_first_click=(
+                self.vt11_auto_select_checkbox.isChecked()
+            ),
+            candidate_click_tolerance_px=(
+                self.vt11_candidate_tolerance_input.value()
+            ),
+        )
+        previous = self._vt11_ui_config
+        try:
+            self._on_vt11_ui_config_changed(config)
+        except (OSError, RuntimeError, TypeError, ValueError) as exc:
+            self._sync_vt11_controls(previous)
+            self.vt11_low_light_note_label.setText(
+                f"Ошибка применения VT11: {exc}"
+            )
+            return
+        self._vt11_ui_config = config
+        self._sync_vt11_low_light_availability()
 
     def _build_diagnostics_controls(self) -> None:
         self.platform_source_label = QLabel("Platform source: —")
@@ -592,6 +695,19 @@ class OperatorWindow(QWidget):
             detector_layout.addWidget(controls["apply"], row, 3)
             detector_layout.addWidget(controls["status"], row, 4)
         layout.addWidget(detector_group)
+
+        vt11_selection_group = QGroupBox("VT11 — выбор цели")
+        vt11_selection_layout = QGridLayout(vt11_selection_group)
+        vt11_selection_layout.addWidget(self.vt11_auto_select_checkbox, 0, 0, 1, 2)
+        vt11_selection_layout.addWidget(QLabel("Допуск клика к рамке кандидата"), 1, 0)
+        vt11_selection_layout.addWidget(self.vt11_candidate_tolerance_input, 1, 1)
+        layout.addWidget(vt11_selection_group)
+
+        vt11_conditions_group = QGroupBox("VT11 — условия наблюдения")
+        vt11_conditions_layout = QVBoxLayout(vt11_conditions_group)
+        vt11_conditions_layout.addWidget(self.vt11_low_light_blur_checkbox)
+        vt11_conditions_layout.addWidget(self.vt11_low_light_note_label)
+        layout.addWidget(vt11_conditions_group)
 
         visualization_group = QGroupBox("Визуализация")
         visualization_layout = QVBoxLayout(visualization_group)
@@ -911,6 +1027,7 @@ class OperatorWindow(QWidget):
             status.setText(f"Ошибка: {exc}")
             return
         self._vision_processor_selections[camera] = selection
+        self._sync_vt11_low_light_availability()
         status.setText(
             "Отправлено: "
             f"{_PROCESSOR_LABELS[selection.class_name]} / {selection.profile_name}"

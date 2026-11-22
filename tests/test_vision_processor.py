@@ -14,6 +14,7 @@ from navmin.contracts import (
     TargetAcquired,
     TargetAcquisitionFailed,
     TargetAcquisitionFailureReason,
+    TargetCandidateSelectionRequest,
     TargetLifecycleEvent,
     TargetRef,
     TargetSelectionRequest,
@@ -140,6 +141,15 @@ def test_target_control_and_lifecycle_contracts_are_immutable_unions() -> None:
         x_px=12.5,
         y_px=14.0,
     )
+    candidate_select = TargetCandidateSelectionRequest(
+        selection_id=11,
+        camera=CameraRole.OVERVIEW,
+        generation=2,
+        frame_id=8,
+        candidate_id=3,
+        x_px=13.0,
+        y_px=15.0,
+    )
     clear = ClearTargetSelection(CameraRole.OVERVIEW, generation=2)
     target = TargetRef(CameraRole.OVERVIEW, generation=2, track_id=4)
     acquired = TargetAcquired(
@@ -167,6 +177,7 @@ def test_target_control_and_lifecycle_contracts_are_immutable_unions() -> None:
 
     assert set(get_args(VisionTargetControlCommand)) == {
         TargetSelectionRequest,
+        TargetCandidateSelectionRequest,
         ClearTargetSelection,
     }
     assert set(get_args(TargetLifecycleEvent)) == {
@@ -174,7 +185,7 @@ def test_target_control_and_lifecycle_contracts_are_immutable_unions() -> None:
         TargetAcquisitionFailed,
         TargetTrackingEnded,
     }
-    for value in (request, clear, acquired, failed, ended):
+    for value in (request, candidate_select, clear, acquired, failed, ended):
         with pytest.raises(FrozenInstanceError):
             value.generation = 99
 

@@ -31,6 +31,7 @@ from navmin.contracts import (
     CameraStatus,
     DistanceResult,
     DistanceSource,
+    TargetCandidateSet,
     TargetRef,
     VisionResult,
 )
@@ -46,6 +47,7 @@ _RETICLE_PEN_WIDTH_PX = 3
 _TRACKING_OVERLAY_PEN_WIDTH_PX = 2
 _SEARCH_REGION_COLOR = QColor(255, 80, 180)
 _BEST_CANDIDATE_COLOR = QColor(255, 145, 40)
+_ACQUISITION_CANDIDATE_COLOR = QColor(80, 220, 120)
 _CONTROL_PREDICTION_COLOR = QColor(40, 185, 255)
 _CONTROL_PREDICTION_ENDPOINT_RADIUS_PX = 4.0
 _CALIBRATION_GUIDE_COLOR = QColor(60, 190, 255)
@@ -315,6 +317,7 @@ class VideoView(QWidget):
         self._aim_point: tuple[float, float] | None = None
         self._aim_point_configured = False
         self._tracking_diagnostics: VisionTrackingDiagnostics | None = None
+        self._acquisition_candidates: TargetCandidateSet | None = None
         self._tracking_control_visualization: TrackingControlVisualization | None = None
         self._control_prediction_overlay: ControlPredictionOverlay | None = None
         self._calibration_click_guide: CalibrationClickGuide | None = None
@@ -365,6 +368,10 @@ class VideoView(QWidget):
         return self._tracking_diagnostics
 
     @property
+    def acquisition_candidates(self) -> TargetCandidateSet | None:
+        return self._acquisition_candidates
+
+    @property
     def tracking_control_visualization(self) -> TrackingControlVisualization | None:
         return self._tracking_control_visualization
 
@@ -410,6 +417,7 @@ class VideoView(QWidget):
         self._aim_point = None
         self._aim_point_configured = False
         self._tracking_diagnostics = None
+        self._acquisition_candidates = None
         self._tracking_control_visualization = None
         self._control_prediction_overlay = None
         self._calibration_click_guide = None
@@ -423,6 +431,7 @@ class VideoView(QWidget):
             self._aim_point = None
             self._aim_point_configured = False
             self._tracking_diagnostics = None
+            self._acquisition_candidates = None
             self._tracking_control_visualization = None
             self._control_prediction_overlay = None
         else:
@@ -431,6 +440,11 @@ class VideoView(QWidget):
                 prepared.result,
             ):
                 self._tracking_diagnostics = None
+            if not self._candidate_set_matches_result(
+                self._acquisition_candidates,
+                prepared.result,
+            ):
+                self._acquisition_candidates = None
             if not self._control_visualization_matches_result(
                 self._tracking_control_visualization,
                 prepared.result,
@@ -453,6 +467,22 @@ class VideoView(QWidget):
         if diagnostics == self._tracking_diagnostics:
             return
         self._tracking_diagnostics = diagnostics
+        self.update()
+
+    def set_acquisition_candidates(
+        self,
+        candidates: TargetCandidateSet | None,
+    ) -> None:
+        result = self.displayed_result
+        if candidates is not None and (
+            self._preview
+            or result is None
+            or not self._candidate_set_matches_result(candidates, result)
+        ):
+            candidates = None
+        if candidates == self._acquisition_candidates:
+            return
+        self._acquisition_candidates = candidates
         self.update()
 
     def set_tracking_control_visualization(
@@ -687,6 +717,7 @@ class VideoView(QWidget):
                 QRectF(prepared.pixmap.rect()),
             )
             self._draw_calibration_click_guide(painter, display_rect, prepared.result)
+            self._draw_acquisition_candidates(painter, display_rect, prepared.result)
             self._draw_tracking_overlays(painter, display_rect, prepared.result)
             self._draw_control_prediction_overlay(
                 painter,
@@ -759,6 +790,52 @@ class VideoView(QWidget):
                 )
             )
             painter.drawRect(band)
+        finally:
+            painter.restore()
+
+    @staticmethod
+    def _candidate_set_matches_result(
+        candidates: TargetCandidateSet | None,
+        result: VisionResult,
+    ) -> bool:
+        return bool(
+            candidates is not None
+            and candidates.camera is result.frame.camera
+            and candidates.generation == result.frame.generation
+            and candidates.frame_id == result.frame.frame_id
+        )
+
+    def _draw_acquisition_candidates(
+        self,
+        painter: QPainter,
+        display_rect: QRectF,
+        result: VisionResult,
+    ) -> None:
+        candidates = self._acquisition_candidates
+        if self._preview or not self._candidate_set_matches_result(candidates, result):
+            return
+        assert candidates is not None
+        height, width = result.frame.image.shape[:2]
+        source_size = QSize(width, height)
+        painter.save()
+        try:
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.setPen(
+                QPen(
+                    _ACQUISITION_CANDIDATE_COLOR,
+                    _TRACKING_OVERLAY_PEN_WIDTH_PX,
+                )
+            )
+            for item in candidates.candidates:
+                rect = map_bbox_to_widget(item.bbox, display_rect, source_size)
+                if rect is None:
+                    continue
+                painter.drawRect(rect)
+                painter.drawText(
+                    rect.adjusted(3.0, 2.0, -2.0, -2.0),
+                    Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop,
+                    str(item.rank),
+                )
         finally:
             painter.restore()
 

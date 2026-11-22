@@ -12,7 +12,7 @@ import numpy as np
 
 from navmin.concurrency import LatestValue
 from navmin.config.models import CameraConfig
-from navmin.contracts import CameraModel, CameraRole, CameraState
+from navmin.contracts import CameraModel, CameraRole, CameraState, ConfigUpdate
 from navmin.lifecycle import StopToken
 
 from .camera_source import create_camera_source
@@ -25,6 +25,7 @@ from .pipeline import (
 )
 from .processor import (
     VisionProcessorSelection,
+    VisionRuntimeSettings,
     create_selected_vision_processor,
 )
 
@@ -57,6 +58,7 @@ class CameraWorker:
         clock: Callable[[], float] = monotonic,
         thread_name: str | None = None,
         processor_selection: VisionProcessorSelection | None = None,
+        runtime_settings: VisionRuntimeSettings | None = None,
     ) -> None:
         if idle_wait_s <= 0.0:
             raise ValueError("idle_wait_s must be > 0")
@@ -74,6 +76,11 @@ class CameraWorker:
         self._processor_selection = processor_selection
         self._processor_updates: LatestValue[VisionProcessorSelection] = LatestValue()
         self._processor_update_revision = 0
+        self._runtime_settings = runtime_settings or VisionRuntimeSettings()
+        self._runtime_setting_updates: LatestValue[
+            ConfigUpdate[VisionRuntimeSettings]
+        ] = LatestValue()
+        self._runtime_settings_update_revision = 0
         self._lifecycle_lock = Lock()
         self._thread = Thread(
             target=self._run,
@@ -97,6 +104,15 @@ class CameraWorker:
         if not isinstance(selection, VisionProcessorSelection):
             raise TypeError("selection must be VisionProcessorSelection")
         self._processor_updates.publish(selection)
+
+    def submit_runtime_settings(
+        self, update: ConfigUpdate[VisionRuntimeSettings]
+    ) -> None:
+        if not isinstance(update, ConfigUpdate):
+            raise TypeError("update must be ConfigUpdate[VisionRuntimeSettings]")
+        if not isinstance(update.config, VisionRuntimeSettings):
+            raise TypeError("update.config must be VisionRuntimeSettings")
+        self._runtime_setting_updates.publish(update)
 
     def start(self) -> None:
         self._thread.start()
@@ -140,10 +156,14 @@ class CameraWorker:
         # Preserve the established RTP/JPEG ordering: the generation barrier exists
         # before source data can be published.
         self._apply_latest_processor_selection(restart_session=False)
+        self._apply_latest_runtime_settings(force=True)
         self._pipeline.start()
         self._source.start()
         while not self._stop_token.is_stop_requested():
-            self._apply_latest_processor_selection(restart_session=True)
+            processor_changed = self._apply_latest_processor_selection(
+                restart_session=True
+            )
+            self._apply_latest_runtime_settings(force=processor_changed)
             self._pipeline.apply_latest_target_control()
             failure = self._source.failure
             if failure is not None:
@@ -168,12 +188,16 @@ class CameraWorker:
 
             # A successful source start establishes the next camera session.
             self._apply_latest_processor_selection(restart_session=False)
+            self._apply_latest_runtime_settings(force=True)
             if not self._start_pipeline_session():
                 return
 
             last_frame_time_s: float | None = None
             while not self._stop_token.is_stop_requested():
-                self._apply_latest_processor_selection(restart_session=True)
+                processor_changed = self._apply_latest_processor_selection(
+                    restart_session=True
+                )
+                self._apply_latest_runtime_settings(force=processor_changed)
                 self._pipeline.apply_latest_target_control()
                 failure = self._source.failure
                 if failure is not None:
@@ -218,6 +242,7 @@ class CameraWorker:
         selection = snapshot.value
         processor = create_selected_vision_processor(selection)
         self._pipeline.replace_processor(processor)
+        self._pipeline.apply_processor_runtime_settings(self._runtime_settings)
         self._processor_selection = selection
         self._processor_update_revision = snapshot.revision
         if restart_session:
@@ -228,6 +253,21 @@ class CameraWorker:
             selection.class_name,
             selection.profile_name or "—",
         )
+        return True
+
+    def _apply_latest_runtime_settings(self, *, force: bool = False) -> bool:
+        snapshot = self._runtime_setting_updates.snapshot()
+        changed = False
+        if (
+            snapshot.revision > self._runtime_settings_update_revision
+            and snapshot.value is not None
+        ):
+            self._runtime_settings = snapshot.value.config
+            self._runtime_settings_update_revision = snapshot.revision
+            changed = True
+        if not changed and not force:
+            return False
+        self._pipeline.apply_processor_runtime_settings(self._runtime_settings)
         return True
 
     def _start_pipeline_session(self) -> bool:
@@ -264,6 +304,7 @@ def build_camera_worker(
     source_factory: SourceFactory = create_camera_source,
     corrected_frame_sink: CorrectedFrameSink | None = None,
     idle_wait_s: float = 0.01,
+    runtime_settings: VisionRuntimeSettings | None = None,
 ) -> CameraWorker:
     """Bind typed camera config to one decoded source and VisionPipeline."""
     source = source_factory(config)
@@ -283,6 +324,7 @@ def build_camera_worker(
         pipeline=pipeline,
         idle_wait_s=idle_wait_s,
         processor_selection=processor_selection,
+        runtime_settings=runtime_settings,
     )
 
 

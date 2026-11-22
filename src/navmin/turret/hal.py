@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Callable
 from contextlib import contextmanager
 from dataclasses import dataclass
-from math import ceil, isfinite
+from math import ceil, isfinite, sqrt
 from threading import Lock
 from time import monotonic_ns
 from typing import Literal
@@ -18,6 +19,7 @@ from navmin.contracts import (
     MoveRelativeCommand,
     PlatformMotionSnapshot,
 )
+from navmin.diagnostic_logging import emit_event
 
 from .platform_motion import CommandMotionModel
 from .protocol import (
@@ -37,6 +39,9 @@ type AxisName = Literal["x", "y"]
 type NanosecondClock = Callable[[], int]
 
 _ZERO_SETTLE_MARGIN_NS = 250_000_000
+_RELATIVE_BOUND_STEP_MARGIN = 2
+
+_LOGGER = logging.getLogger(__name__)
 
 
 class HalError(RuntimeError):
@@ -180,6 +185,8 @@ class TurretHal:
         self._platform_zero_recovery_required = False
         self._platform_zero_speed_bound_x_deg_s = 0.0
         self._platform_zero_speed_bound_y_deg_s = 0.0
+        self._relative_motion_speed_bound_x_deg_s: float | None = None
+        self._relative_motion_speed_bound_y_deg_s: float | None = None
 
     @property
     def motor_state(self) -> MotorState:
@@ -291,14 +298,24 @@ class TurretHal:
             mechanics_x=self._mechanics_x,
             mechanics_y=self._mechanics_y,
         )
-        result = self._ordinary(CommandCode.MOVE_RELATIVE, preview.payload)
+        result = self._ordinary(
+            CommandCode.MOVE_RELATIVE,
+            preview.payload,
+            drain_pending_config=False,
+        )
         if self._response_ok(result):
             # Relative target execution has no observable rate lifecycle.
             with self._platform_zero_settle_lock:
+                bound_timestamp_ns = self._read_command_timestamp()
+                self._update_relative_motion_speed_bound_locked(
+                    preview=preview,
+                    timestamp_ns=bound_timestamp_ns,
+                )
                 self._clear_platform_zero_settle_locked()
                 self._platform_zero_recovery_required = True
                 self._platform_motion.invalidate()
             self._record_confirmed_emergency(result)
+        self._drain_pending_config_if_idle()
         return result
 
     def set_velocity(
@@ -359,6 +376,8 @@ class TurretHal:
                         or payload.velocity_y_steps_s != 0
                     ):
                         self._clear_platform_zero_settle_locked()
+                        if self._platform_zero_recovery_required:
+                            self._clear_relative_motion_speed_bound_locked()
                     self._platform_motion.record_velocity_command(
                         timestamp_ns=command_timestamp_ns,
                         commanded_rate_x_deg_s=self._logical_velocity_from_steps_s(
@@ -385,6 +404,7 @@ class TurretHal:
             with self._platform_zero_settle_lock:
                 self._clear_platform_zero_settle_locked()
                 self._platform_zero_recovery_required = False
+                self._clear_relative_motion_speed_bound_locked()
                 self._platform_motion.mark_known_zero(
                     timestamp_ns=self._read_command_timestamp()
                 )
@@ -396,6 +416,7 @@ class TurretHal:
             with self._platform_zero_settle_lock:
                 self._clear_platform_zero_settle_locked()
                 self._platform_zero_recovery_required = False
+                self._clear_relative_motion_speed_bound_locked()
                 self._platform_motion.mark_known_zero(
                     timestamp_ns=self._read_command_timestamp()
                 )
@@ -473,6 +494,12 @@ class TurretHal:
             self._applied_config_revision = pending.revision
             config_timestamp_ns = self._read_command_timestamp()
             with self._platform_zero_settle_lock:
+                if self._platform_zero_recovery_required:
+                    # A live SET_CONFIG can change both the speed ceiling and the
+                    # acceleration used by an already-running relative planner.
+                    # Without STM32 position/velocity feedback, the tighter bound
+                    # can no longer be proven; fall back to configured Vmax.
+                    self._clear_relative_motion_speed_bound_locked()
                 self._platform_motion.record_acceleration_limits(
                     timestamp_ns=config_timestamp_ns,
                     acceleration_x_deg_s2=self._acceleration_from_steps_s2(
@@ -501,6 +528,7 @@ class TurretHal:
         with self._platform_zero_settle_lock:
             self._clear_platform_zero_settle_locked()
             self._platform_zero_recovery_required = False
+            self._clear_relative_motion_speed_bound_locked()
             self._platform_motion.invalidate()
 
     def _ordinary(
@@ -534,6 +562,7 @@ class TurretHal:
             with self._platform_zero_settle_lock:
                 self._clear_platform_zero_settle_locked()
                 self._platform_zero_recovery_required = False
+                self._clear_relative_motion_speed_bound_locked()
                 self._platform_motion.mark_known_zero(
                     timestamp_ns=self._read_command_timestamp()
                 )
@@ -544,11 +573,21 @@ class TurretHal:
         payload = self.make_set_config_payload(
             self._applied_stm32_config or self._desired_stm32_config
         )
-        self._platform_zero_speed_bound_x_deg_s = self._speed_from_steps_s(
-            "x", payload.max_speed_x_steps_s
+        max_speed_x = self._speed_from_steps_s("x", payload.max_speed_x_steps_s)
+        max_speed_y = self._speed_from_steps_s("y", payload.max_speed_y_steps_s)
+        tight_bound_available = (
+            self._relative_motion_speed_bound_x_deg_s is not None
+            and self._relative_motion_speed_bound_y_deg_s is not None
         )
-        self._platform_zero_speed_bound_y_deg_s = self._speed_from_steps_s(
-            "y", payload.max_speed_y_steps_s
+        self._platform_zero_speed_bound_x_deg_s = (
+            min(self._relative_motion_speed_bound_x_deg_s, max_speed_x)
+            if self._relative_motion_speed_bound_x_deg_s is not None
+            else max_speed_x
+        )
+        self._platform_zero_speed_bound_y_deg_s = (
+            min(self._relative_motion_speed_bound_y_deg_s, max_speed_y)
+            if self._relative_motion_speed_bound_y_deg_s is not None
+            else max_speed_y
         )
         settle_ns = self._zero_settle_duration_ns(
             payload=payload,
@@ -558,11 +597,27 @@ class TurretHal:
         self._platform_zero_settle_deadline_ns = (
             confirmed_zero_target_ns + settle_ns
         )
+        emit_event(
+            _LOGGER,
+            "PLATFORM_ZERO_SETTLE_START",
+            source_instance="turret:hal",
+            bound_source=(
+                "relative_motion_bound"
+                if tight_bound_available
+                else "max_speed_fallback"
+            ),
+            confirmed_zero_target_ns=confirmed_zero_target_ns,
+            settle_deadline_ns=self._platform_zero_settle_deadline_ns,
+            settle_duration_ms=settle_ns / 1_000_000.0,
+            speed_bound_x_deg_s=self._platform_zero_speed_bound_x_deg_s,
+            speed_bound_y_deg_s=self._platform_zero_speed_bound_y_deg_s,
+        )
 
     def _extend_platform_zero_settle_after_config_locked(
         self, *, timestamp_ns: int, payload: SetConfigPayload
     ) -> None:
-        if self._platform_zero_settle_deadline_ns is None:
+        previous_deadline = self._platform_zero_settle_deadline_ns
+        if previous_deadline is None:
             return
         self._platform_zero_speed_bound_x_deg_s = max(
             self._platform_zero_speed_bound_x_deg_s,
@@ -578,23 +633,124 @@ class TurretHal:
             speed_bound_y_deg_s=self._platform_zero_speed_bound_y_deg_s,
         )
         self._platform_zero_settle_deadline_ns = max(
-            self._platform_zero_settle_deadline_ns, candidate_deadline
+            previous_deadline, candidate_deadline
         )
+        if self._platform_zero_settle_deadline_ns > previous_deadline:
+            emit_event(
+                _LOGGER,
+                "PLATFORM_ZERO_SETTLE_EXTEND",
+                source_instance="turret:hal",
+                reason="stm32_config_changed",
+                previous_deadline_ns=previous_deadline,
+                settle_deadline_ns=self._platform_zero_settle_deadline_ns,
+                speed_bound_x_deg_s=self._platform_zero_speed_bound_x_deg_s,
+                speed_bound_y_deg_s=self._platform_zero_speed_bound_y_deg_s,
+            )
 
     def _complete_platform_zero_settle_if_due_locked(self) -> None:
         deadline_ns = self._platform_zero_settle_deadline_ns
         if deadline_ns is None:
             return
-        if self._read_command_timestamp() < deadline_ns:
+        observed_ns = self._read_command_timestamp()
+        if observed_ns < deadline_ns:
             return
         self._platform_motion.mark_known_zero(timestamp_ns=deadline_ns)
         self._platform_zero_recovery_required = False
+        self._clear_relative_motion_speed_bound_locked()
+        emit_event(
+            _LOGGER,
+            "PLATFORM_ZERO_SETTLE_END",
+            source_instance="turret:hal",
+            settle_deadline_ns=deadline_ns,
+            completion_observed_ns=observed_ns,
+        )
         self._clear_platform_zero_settle_locked()
 
     def _clear_platform_zero_settle_locked(self) -> None:
         self._platform_zero_settle_deadline_ns = None
         self._platform_zero_speed_bound_x_deg_s = 0.0
         self._platform_zero_speed_bound_y_deg_s = 0.0
+
+    def _update_relative_motion_speed_bound_locked(
+        self,
+        *,
+        preview: RelativeMovePreview,
+        timestamp_ns: int,
+    ) -> None:
+        applied = self._applied_stm32_config
+        if applied is None:
+            self._clear_relative_motion_speed_bound_locked()
+            return
+
+        payload = self.make_set_config_payload(applied)
+        max_speed_x = self._speed_from_steps_s("x", payload.max_speed_x_steps_s)
+        max_speed_y = self._speed_from_steps_s("y", payload.max_speed_y_steps_s)
+        acceleration_x = self._acceleration_from_steps_s2(
+            "x", payload.acceleration_x_steps_s2
+        )
+        acceleration_y = self._acceleration_from_steps_s2(
+            "y", payload.acceleration_y_steps_s2
+        )
+
+        if self._platform_zero_recovery_required:
+            base_x = self._relative_motion_speed_bound_x_deg_s
+            base_y = self._relative_motion_speed_bound_y_deg_s
+        else:
+            rate = self._platform_motion.snapshot().rate_at(timestamp_ns)
+            base_x = None if rate is None else rate.rate_x_deg_s
+            base_y = None if rate is None else rate.rate_y_deg_s
+
+        if base_x is None or base_y is None:
+            self._clear_relative_motion_speed_bound_locked()
+            return
+
+        self._relative_motion_speed_bound_x_deg_s = self._relative_speed_bound(
+            base_speed_deg_s=abs(base_x),
+            delta_deg=preview.quantized_delta_x_deg,
+            delta_steps=preview.payload.delta_x_steps,
+            acceleration_deg_s2=acceleration_x,
+            max_speed_deg_s=max_speed_x,
+            mechanics=self._mechanics_x,
+        )
+        self._relative_motion_speed_bound_y_deg_s = self._relative_speed_bound(
+            base_speed_deg_s=abs(base_y),
+            delta_deg=preview.quantized_delta_y_deg,
+            delta_steps=preview.payload.delta_y_steps,
+            acceleration_deg_s2=acceleration_y,
+            max_speed_deg_s=max_speed_y,
+            mechanics=self._mechanics_y,
+        )
+
+    @staticmethod
+    def _relative_speed_bound(
+        *,
+        base_speed_deg_s: float,
+        delta_deg: float,
+        delta_steps: int,
+        acceleration_deg_s2: float,
+        max_speed_deg_s: float,
+        mechanics: AxisMechanicsConfig,
+    ) -> float:
+        if delta_steps == 0:
+            return min(base_speed_deg_s, max_speed_deg_s)
+        step_deg = 360.0 / _effective_steps_per_revolution(mechanics)
+        # The firmware planner rebases each MOVE_RELATIVE on the current emitted
+        # STEP position. Its sub-step phase is not observable on the PC. Two STEP
+        # widths conservatively cover that hidden phase/quantization boundary;
+        # the energy bound then limits the greatest speed reachable before the
+        # relative target can be crossed, including reversal/overshoot cases.
+        distance_bound_deg = (
+            abs(delta_deg) + _RELATIVE_BOUND_STEP_MARGIN * step_deg
+        )
+        reachable = sqrt(
+            base_speed_deg_s * base_speed_deg_s
+            + 2.0 * acceleration_deg_s2 * distance_bound_deg
+        )
+        return min(reachable, max_speed_deg_s)
+
+    def _clear_relative_motion_speed_bound_locked(self) -> None:
+        self._relative_motion_speed_bound_x_deg_s = None
+        self._relative_motion_speed_bound_y_deg_s = None
 
     def _zero_settle_duration_ns(
         self,

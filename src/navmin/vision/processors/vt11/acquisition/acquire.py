@@ -1,11 +1,13 @@
 """Bounded original VT11 ACQUIRE -> INITIAL TRAIN coordination."""
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 
 import numpy as np
 
 from navmin.vision.processors.vt11.acquisition.candidate_detector import (
+    Candidate,
     CandidateDetectionResult,
     detect_initial_acquire_candidates,
     detect_local_candidates,
@@ -19,14 +21,88 @@ from navmin.vision.processors.vt11.acquisition.roi import (
     make_operator_selection,
 )
 from navmin.vision.processors.vt11.identity.scorer import (
+    ScoredCandidate,
     ScoringResult,
     score_candidates,
 )
+from navmin.vision.processors.vt11.live_features import Vt11LiveFeatures
 from navmin.vision.processors.vt11.runtime_config import (
     Vt11ResolvedConfig,
     Vt11RuntimeSettings,
 )
 from navmin.vision.processors.vt11.tracking.session import Vt11TargetSession
+
+
+@dataclass(frozen=True)
+class Vt11AcquireCandidates:
+    selection: OperatorSelection
+    detection: CandidateDetectionResult
+    scoring: ScoringResult
+
+
+def discover_acquire_candidates(
+    *,
+    frame_index: int,
+    frame_bgr: np.ndarray,
+    click_xy: tuple[float, float],
+    frame_width: int,
+    frame_height: int,
+    resolved_config: Vt11ResolvedConfig,
+) -> Vt11AcquireCandidates:
+    """Run only the single-frame ACQUIRE proposal stage."""
+    if frame_width < 1 or frame_height < 1:
+        raise ValueError("frame dimensions must be >= 1")
+    if frame_bgr.shape[:2] != (frame_height, frame_width):
+        raise ValueError("frame dimensions do not match frame_bgr")
+    acquire_cfg = resolved_config.effective_config["acquire"]
+    selection = make_operator_selection(
+        frame_index=frame_index,
+        click_xy=click_xy,
+        radius_px=int(acquire_cfg["roi_radius_px"]),
+        frame_width=frame_width,
+        frame_height=frame_height,
+    )
+    if resolved_config.profile_name == "thermal":
+        detection, _effective_selection = detect_initial_acquire_candidates(
+            frame_bgr,
+            selection,
+            top_k=resolved_config.initial_train.top_k,
+            config=resolved_config.detector,
+        )
+    else:
+        detection = detect_local_candidates(
+            frame_bgr,
+            selection,
+            top_k=resolved_config.initial_train.top_k,
+            config=resolved_config.detector,
+        )
+    scoring = score_candidates(
+        frame_bgr,
+        detection.candidates,
+        config=resolved_config.acquire_scoring,
+        identity_weights=resolved_config.identity_weights,
+    )
+    return Vt11AcquireCandidates(
+        selection=selection,
+        detection=detection,
+        scoring=scoring,
+    )
+
+
+def _selected_scored_candidate(
+    scoring: ScoringResult,
+    candidate_id: int | None,
+) -> ScoredCandidate | None:
+    if candidate_id is None:
+        return scoring.best
+    return next(
+        (
+            item
+            for item in scoring.candidates
+            if int(item.candidate.candidate_id) == int(candidate_id)
+        ),
+        None,
+    )
 
 
 @dataclass(frozen=True)
@@ -54,6 +130,10 @@ class Vt11AcquisitionAttempt:
         frame_height: int,
         resolved_config: Vt11ResolvedConfig,
         runtime_settings: Vt11RuntimeSettings | None = None,
+        live_features: Vt11LiveFeatures | None = None,
+        target_identity_weights: Mapping[str, float] | None = None,
+        candidate_id: int | None = None,
+        train_click_xy: tuple[float, float] | None = None,
     ) -> None:
         settings = runtime_settings or Vt11RuntimeSettings()
         settings.validate()
@@ -67,35 +147,27 @@ class Vt11AcquisitionAttempt:
         self.start_frame = int(frame_index)
         self.resolved_config = resolved_config
         self.runtime_settings = settings
-        acquire_cfg = resolved_config.effective_config["acquire"]
-        self.selection = make_operator_selection(
+        self.live_features = live_features
+        self.target_identity_weights = target_identity_weights
+        self._train_click_xy = (
+            tuple(map(float, train_click_xy))
+            if train_click_xy is not None
+            else None
+        )
+        discovered = discover_acquire_candidates(
             frame_index=frame_index,
+            frame_bgr=frame_bgr,
             click_xy=click_xy,
-            radius_px=int(acquire_cfg["roi_radius_px"]),
             frame_width=frame_width,
             frame_height=frame_height,
+            resolved_config=resolved_config,
         )
-
-        if resolved_config.profile_name == "thermal":
-            detection, _effective_selection = detect_initial_acquire_candidates(
-                frame_bgr,
-                self.selection,
-                top_k=resolved_config.initial_train.top_k,
-                config=resolved_config.detector,
-            )
-        else:
-            detection = detect_local_candidates(
-                frame_bgr,
-                self.selection,
-                top_k=resolved_config.initial_train.top_k,
-                config=resolved_config.detector,
-            )
-        self.detection = detection
-        self.scoring = score_candidates(
-            frame_bgr,
-            detection.candidates,
-            config=resolved_config.acquire_scoring,
-            identity_weights=resolved_config.identity_weights,
+        self.selection = discovered.selection
+        self.detection = discovered.detection
+        self.scoring = discovered.scoring
+        self.selected_candidate = _selected_scored_candidate(
+            self.scoring,
+            candidate_id,
         )
 
         lookahead = (
@@ -112,7 +184,7 @@ class Vt11AcquisitionAttempt:
         }
         self.result: Vt11AcquisitionResult | None = None
         self.done = False
-        if self.scoring.best is None:
+        if self.selected_candidate is None:
             self.result = Vt11AcquisitionResult(
                 decision="AMBIGUOUS",
                 selection=self.selection,
@@ -120,7 +192,11 @@ class Vt11AcquisitionAttempt:
                 scoring=self.scoring,
                 train_result=None,
                 target_session=None,
-                continuation_error="NO_ACQUIRE_CANDIDATES",
+                continuation_error=(
+                    "NO_ACQUIRE_CANDIDATES"
+                    if candidate_id is None
+                    else "SELECTED_ACQUIRE_CANDIDATE_NOT_FOUND"
+                ),
             )
             self.done = True
             self._frames.clear()
@@ -153,8 +229,8 @@ class Vt11AcquisitionAttempt:
         return self.result
 
     def _finish(self) -> None:
-        best = self.scoring.best
-        if best is None:
+        selected = self.selected_candidate
+        if selected is None:
             raise RuntimeError("cannot run INITIAL TRAIN without an ACQUIRE candidate")
 
         def reader(frame_index: int) -> tuple[int, np.ndarray]:
@@ -173,7 +249,7 @@ class Vt11AcquisitionAttempt:
             frame_width=self.frame_width,
             frame_height=self.frame_height,
             start_frame=self.start_frame,
-            initial_candidate=best.candidate,
+            initial_candidate=selected.candidate,
             roi_radius_px=self.selection.roi_radius_px,
             detector_config=cfg.detector,
             config=cfg.initial_train,
@@ -181,7 +257,11 @@ class Vt11AcquisitionAttempt:
             thermal_identity_weights=cfg.thermal_identity_weights,
             video_mode="thermal" if cfg.profile_name == "thermal" else "visible",
             thermal_config=cfg.thermal,
-            initial_click_xy=(self.selection.click_x, self.selection.click_y),
+            initial_click_xy=(
+                self._train_click_xy
+                if self._train_click_xy is not None
+                else (self.selection.click_x, self.selection.click_y)
+            ),
         )
         target_session: Vt11TargetSession | None = None
         replayed = 0
@@ -222,9 +302,14 @@ class Vt11AcquisitionAttempt:
                         detector_config=cfg.detector,
                         tracking_config=cfg.tracking,
                         reacquisition_config=cfg.reacquisition,
-                        identity_weights=cfg.identity_weights,
+                        identity_weights=(
+                            cfg.identity_weights
+                            if self.target_identity_weights is None
+                            else self.target_identity_weights
+                        ),
                         adaptation_config=cfg.adaptation,
                         thermal_profile=train.thermal_profile,
+                        live_features=self.live_features,
                     )
                     for replay_index, replay_frame in catch_up:
                         target_session.step(replay_index, replay_frame)
@@ -250,3 +335,11 @@ class Vt11AcquisitionAttempt:
         )
         self.done = True
         self._frames.clear()
+
+
+__all__ = [
+    "Vt11AcquireCandidates",
+    "Vt11AcquisitionAttempt",
+    "Vt11AcquisitionResult",
+    "discover_acquire_candidates",
+]

@@ -7,6 +7,7 @@ reference-bank matching, not for category classification.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import lru_cache
 from math import exp
 from typing import Mapping
 
@@ -56,6 +57,7 @@ class DescriptorSimilarity:
     radial_hotspot_profile: float = 0.0
     energy_concentration: float = 0.0
     thermal_2d_ratio: float = 0.0
+    blur_variant: str | None = None
 
 
 def _normalize_image(gray: np.ndarray, size: tuple[int, int] = (16, 16)) -> np.ndarray:
@@ -172,6 +174,11 @@ def descriptor_similarity(
     px = _rmse_similarity(ref.projection_x, cand.projection_x, 0.28)
     py = _rmse_similarity(ref.projection_y, cand.projection_y, 0.28)
     projection = 0.5 * (px + py)
+    blur_variant: str | None = None
+    if identity_weights and identity_weights.get("_visible_blur_robust", 0.0) > 0.0:
+        app, edge, projection, blur_variant = _blur_tolerant_shape_similarity(
+            ref, cand, app, edge, projection, identity_weights
+        )
     geometry = _rmse_similarity(ref.geometry, cand.geometry, 0.65)
     size_ratio = abs(np.log(max(cand.size_px, 1.0) / max(ref.size_px, 1.0)))
     size = clamp01(exp(-size_ratio / 0.55))
@@ -242,4 +249,129 @@ def descriptor_similarity(
         radial_hotspot_profile=float(radial_hotspot_profile),
         energy_concentration=float(energy_concentration),
         thermal_2d_ratio=float(thermal_2d_ratio),
+        blur_variant=blur_variant,
     )
+
+
+def _blur_tolerant_shape_similarity(
+    ref: TargetDescriptor,
+    candidate: TargetDescriptor,
+    appearance: float,
+    edge: float,
+    projection: float,
+    weights: Mapping[str, float],
+) -> tuple[float, float, float, str]:
+    """Compare coherent directional-blur hypotheses for shape evidence only."""
+    best = (appearance, edge, projection)
+    best_variant = "ORIGINAL"
+    shape_weights = tuple(
+        max(0.0, float(weights.get(name, 0.0)))
+        for name in ("appearance", "edge", "projection")
+    )
+    weight_sum = sum(shape_weights)
+    if weight_sum <= 0.0:
+        return (*best, best_variant)
+    best_score = sum(weight * value for weight, value in zip(shape_weights, best))
+    variants = _cached_blur_shapes(
+        ref.appearance.shape,
+        np.asarray(ref.appearance, np.float32).tobytes(),
+        np.asarray(ref.edge_map, np.float32).tobytes(),
+        np.asarray(ref.projection_x, np.float32).tobytes(),
+        np.asarray(ref.projection_y, np.float32).tobytes(),
+    )
+
+    def similarities(
+        references: np.ndarray, values: np.ndarray, scale: float
+    ) -> np.ndarray:
+        axes = tuple(range(1, references.ndim))
+        rmse = np.sqrt(
+            np.mean(
+                (references - np.asarray(values, np.float32)) ** 2,
+                axis=axes,
+            )
+        )
+        return np.exp(-rmse.astype(np.float64) / scale)
+
+    appearance_scores = similarities(variants[0], candidate.appearance, 0.85)
+    edge_scores = similarities(variants[1], candidate.edge_map, 0.95)
+    projection_scores = 0.5 * (
+        similarities(variants[2], candidate.projection_x, 0.28)
+        + similarities(variants[3], candidate.projection_y, 0.28)
+    )
+    # All selected shape features must come from the same blur hypothesis.
+    scores = (
+        shape_weights[0] * appearance_scores
+        + shape_weights[1] * edge_scores
+        + shape_weights[2] * projection_scores
+        - 0.02 * weight_sum / 0.83
+    )
+    index = int(np.argmax(scores))
+    if scores[index] > best_score:
+        best = tuple(
+            float(values[index])
+            for values in (appearance_scores, edge_scores, projection_scores)
+        )
+        length = 3 if index < 4 else 5
+        direction = ("horizontal", "vertical", "diagonal", "antidiagonal")[
+            index % 4
+        ]
+        best_variant = f"{length}-{direction}"
+    return (*best, best_variant)
+
+
+@lru_cache(maxsize=192)
+def _cached_blur_shapes(
+    shape: tuple[int, ...],
+    appearance_bytes: bytes,
+    edge_bytes: bytes,
+    x_bytes: bytes,
+    y_bytes: bytes,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Return eight 3/5-pixel normalized-representation blur hypotheses."""
+    appearance = np.frombuffer(appearance_bytes, np.float32).reshape(shape)
+    edge_map = np.frombuffer(edge_bytes, np.float32).reshape(shape)
+    projection_x = np.frombuffer(x_bytes, np.float32)
+    projection_y = np.frombuffer(y_bytes, np.float32)
+    variants: list[tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]] = []
+    for length in (3, 5):
+        for direction in ("horizontal", "vertical", "diagonal", "antidiagonal"):
+            kernel = np.zeros((length, length), dtype=np.float32)
+            if direction == "horizontal":
+                kernel[length // 2, :] = 1.0 / length
+            elif direction == "vertical":
+                kernel[:, length // 2] = 1.0 / length
+            elif direction == "diagonal":
+                np.fill_diagonal(kernel, 1.0 / length)
+            else:
+                kernel[:] = np.fliplr(np.eye(length, dtype=np.float32)) / length
+
+            blurred = cv2.filter2D(
+                appearance,
+                -1,
+                kernel,
+                borderType=cv2.BORDER_REPLICATE,
+            )
+            blurred *= float(np.std(appearance)) / max(
+                1e-6, float(np.std(blurred))
+            )
+            blurred_edge = cv2.filter2D(
+                edge_map,
+                -1,
+                kernel,
+                borderType=cv2.BORDER_REPLICATE,
+            )
+            blurred_edge *= float(np.std(edge_map)) / max(
+                1e-6, float(np.std(blurred_edge))
+            )
+            x_kernel = kernel.sum(axis=0)
+            y_kernel = kernel.sum(axis=1)
+            x_projection = _unit_vector(
+                np.convolve(projection_x, x_kernel, mode="same")
+            )
+            y_projection = _unit_vector(
+                np.convolve(projection_y, y_kernel, mode="same")
+            )
+            variants.append(
+                (blurred, blurred_edge, x_projection, y_projection)
+            )
+    return tuple(np.stack(values) for values in zip(*variants))
