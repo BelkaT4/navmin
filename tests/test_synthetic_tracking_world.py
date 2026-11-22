@@ -5,23 +5,31 @@ from itertools import pairwise
 import numpy as np
 import pytest
 
-from navmin.calibration import load_stereo_calibration
+from navmin.calibration import overview_camera_model, stereo_camera_models
 from navmin.contracts import CameraRole
+from navmin.diagnostics.synthetic_tracking_calibration import (
+    SYNTHETIC_TRACKING_OVERVIEW_HFOV_DEG,
+    SYNTHETIC_TRACKING_STEREO_BASELINE_M,
+    SYNTHETIC_TRACKING_STEREO_HFOV_DEG,
+    synthetic_tracking_overview_calibration,
+    synthetic_tracking_stereo_calibration,
+)
 from navmin.diagnostics.synthetic_tracking_world import (
     SYNTHETIC_TRACKING_INITIAL_STATIC_S,
     SYNTHETIC_TRACKING_INITIAL_YAW_ACCEL_DEG_S2,
-    SYNTHETIC_TRACKING_OVERVIEW_HFOV_DEG,
-    SYNTHETIC_TRACKING_OVERVIEW_VFOV_DEG,
     SYNTHETIC_TRACKING_TARGET_SIZE_PX,
     SYNTHETIC_TRACKING_WORLD_LIMIT_DEG,
     SyntheticTrackingWorld,
 )
+from navmin.vision.pipeline import (
+    overview_corrector,
+    stereo_left_corrector,
+    stereo_right_corrector,
+)
 
 
 def _world() -> SyntheticTrackingWorld:
-    return SyntheticTrackingWorld(
-        load_stereo_calibration("config/defaults/calibration/stereo.json")
-    )
+    return SyntheticTrackingWorld()
 
 
 def test_tracking_world_geometry_matches_diagnostic_contract() -> None:
@@ -30,12 +38,40 @@ def test_tracking_world_geometry_matches_diagnostic_contract() -> None:
     left = world.geometries[CameraRole.STEREO_LEFT]
     right = world.geometries[CameraRole.STEREO_RIGHT]
 
-    assert overview.horizontal_fov_deg == pytest.approx(SYNTHETIC_TRACKING_OVERVIEW_HFOV_DEG)
-    assert overview.vertical_fov_deg == pytest.approx(SYNTHETIC_TRACKING_OVERVIEW_VFOV_DEG)
-    assert left.horizontal_fov_deg == pytest.approx(6.296, abs=0.01)
-    assert left.vertical_fov_deg == pytest.approx(4.742, abs=0.01)
+    assert overview.horizontal_fov_deg == pytest.approx(
+        SYNTHETIC_TRACKING_OVERVIEW_HFOV_DEG, abs=0.1
+    )
+    assert overview.vertical_fov_deg == pytest.approx(73.9, abs=0.2)
+    assert left.horizontal_fov_deg == pytest.approx(
+        SYNTHETIC_TRACKING_STEREO_HFOV_DEG, abs=0.01
+    )
+    assert left.vertical_fov_deg == pytest.approx(4.74, abs=0.02)
     assert left.stereo_offset_px == pytest.approx(-right.stereo_offset_px)
     assert 30.0 < world.disparity_px < 45.0
+
+
+def test_canonical_simulation_frames_survive_production_correction_geometry() -> None:
+    world = _world()
+    rendered = world.render(220, turret_yaw_deg=0.25, turret_pitch_deg=-0.1)
+    correctors = {
+        CameraRole.OVERVIEW: overview_corrector(
+            synthetic_tracking_overview_calibration()
+        ),
+        CameraRole.STEREO_LEFT: stereo_left_corrector(
+            synthetic_tracking_stereo_calibration()
+        ),
+        CameraRole.STEREO_RIGHT: stereo_right_corrector(
+            synthetic_tracking_stereo_calibration()
+        ),
+    }
+
+    for role, corrector in correctors.items():
+        corrected = corrector.correct(rendered.image(role))
+        ys, xs = np.where(corrected[:, :, 0] > 200)
+        projection = rendered.projection(role)
+        assert xs.size > 0
+        assert float(xs.mean()) == pytest.approx(projection.center_x_px, abs=1.0)
+        assert float(ys.mean()) == pytest.approx(projection.center_y_px, abs=1.0)
 
 
 def test_tracking_world_target_motion_is_continuous_bounded_and_repeats() -> None:
@@ -120,8 +156,9 @@ def test_tracking_world_explicit_turret_pose_moves_background_and_relative_targe
 
     p0 = stationary.projection(CameraRole.STEREO_LEFT)
     p1 = turned.projection(CameraRole.STEREO_LEFT)
-    px_per_degree = world.geometries[CameraRole.STEREO_LEFT].pixels_per_degree_x
-    assert p1.center_x_px - p0.center_x_px == pytest.approx(-px_per_degree)
+    geometry = world.geometries[CameraRole.STEREO_LEFT]
+    expected_shift = geometry.focal_x_px * np.tan(np.radians(-1.0))
+    assert p1.center_x_px - p0.center_x_px == pytest.approx(expected_shift)
     assert not np.array_equal(stationary.stereo_left, turned.stereo_left)
 
 
@@ -363,22 +400,42 @@ def test_synthetic_turret_velocity_watchdog_returns_target_to_zero() -> None:
     assert state.yaw_rate_deg_s > 0.0
 
 
-def test_synthetic_angular_camera_model_matches_linear_world_projection() -> None:
-    from navmin.diagnostics.synthetic_tracking_closed_loop import (
-        SyntheticAngularCameraModel,
+def test_synthetic_world_projection_matches_production_camera_models() -> None:
+    world = _world()
+    overview_model = overview_camera_model(synthetic_tracking_overview_calibration())
+    left_model, right_model = stereo_camera_models(
+        synthetic_tracking_stereo_calibration()
+    )
+    rendered = world.render(220, turret_yaw_deg=0.25, turret_pitch_deg=-0.1)
+    truth = rendered.truth
+
+    overview_projection = rendered.projection(CameraRole.OVERVIEW)
+    overview_ray = overview_model.pixel_to_ray(
+        overview_projection.center_x_px, overview_projection.center_y_px
+    )
+    assert overview_ray.x / overview_ray.z == pytest.approx(
+        np.tan(np.radians(truth.true_error_yaw_deg)), abs=1e-9
+    )
+    assert overview_ray.y / overview_ray.z == pytest.approx(
+        -np.tan(np.radians(truth.true_error_pitch_deg)), abs=1e-9
     )
 
-    world = _world()
-    geometry = world.geometries[CameraRole.STEREO_LEFT]
-    model = SyntheticAngularCameraModel(geometry)
-    rendered = world.render(60, turret_yaw_deg=0.25, turret_pitch_deg=-0.1)
-    projection = rendered.projection(CameraRole.STEREO_LEFT)
-
-    ray = model.pixel_to_ray(projection.center_x_px, projection.center_y_px)
-    roundtrip = model.ray_to_pixel(ray)
-
-    assert roundtrip[0] == pytest.approx(projection.center_x_px)
-    assert roundtrip[1] == pytest.approx(projection.center_y_px)
+    parallax = SYNTHETIC_TRACKING_STEREO_BASELINE_M / (
+        2.0 * world.target_distance_m
+    )
+    for role, model, sign in (
+        (CameraRole.STEREO_LEFT, left_model, +1.0),
+        (CameraRole.STEREO_RIGHT, right_model, -1.0),
+    ):
+        projection = rendered.projection(role)
+        ray = model.pixel_to_ray(projection.center_x_px, projection.center_y_px)
+        assert ray.x / ray.z == pytest.approx(
+            np.tan(np.radians(truth.true_error_yaw_deg)) + sign * parallax,
+            abs=1e-9,
+        )
+        assert ray.y / ray.z == pytest.approx(
+            -np.tan(np.radians(truth.true_error_pitch_deg)), abs=1e-9
+        )
 
 
 def test_synthetic_closed_loop_runs_real_vt11_aiming_estimator_and_turret_chain() -> None:
@@ -388,7 +445,6 @@ def test_synthetic_closed_loop_runs_real_vt11_aiming_estimator_and_turret_chain(
 
     result = run_synthetic_tracking_closed_loop(
         config_path="config/navmin.json",
-        stereo_calibration_path="config/defaults/calibration/stereo.json",
         frame_count=300,
         sample_stride=2,
     )
@@ -434,7 +490,11 @@ def test_synthetic_tracking_stereo_exact_pair_join_and_distance_path() -> None:
     assert result.max_abs_distance_error_m is not None
     assert result.max_abs_distance_error_m < 5.0
     assert all(sample.capture_id == sample.frame_index for sample in result.samples)
-    assert all(sample.measured_disparity_px == pytest.approx(36.0) for sample in result.samples)
+    expected_disparity = SyntheticTrackingWorld().disparity_px
+    assert all(
+        sample.measured_disparity_px == pytest.approx(expected_disparity, abs=2.0)
+        for sample in result.samples
+    )
 
 
 def test_synthetic_tracking_stereo_world_keeps_common_capture_and_constant_disparity() -> None:

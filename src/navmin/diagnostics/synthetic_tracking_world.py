@@ -8,24 +8,29 @@ truth independent from the production control path.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from math import atan, cos, degrees, pi, sin
+from math import atan, cos, degrees, pi, radians, sin, tan
 
 import numpy as np
 
-from navmin.calibration import StereoCalibration
+from navmin.calibration import (
+    OverviewCalibration,
+    StereoCalibration,
+    overview_camera_model,
+    stereo_camera_models,
+)
 from navmin.contracts import BBox, CameraRole
 
-SYNTHETIC_TRACKING_WIDTH = 1296
-SYNTHETIC_TRACKING_HEIGHT = 976
+from .synthetic_tracking_calibration import (
+    SYNTHETIC_TRACKING_HEIGHT,
+    SYNTHETIC_TRACKING_OVERVIEW_HFOV_DEG,
+    SYNTHETIC_TRACKING_WIDTH,
+    synthetic_tracking_overview_calibration,
+    synthetic_tracking_stereo_calibration,
+)
+
 SYNTHETIC_TRACKING_FPS = 20
 SYNTHETIC_TRACKING_TARGET_SIZE_PX = 48
 SYNTHETIC_TRACKING_WORLD_LIMIT_DEG = 30.0
-SYNTHETIC_TRACKING_OVERVIEW_HFOV_DEG = 90.0
-SYNTHETIC_TRACKING_OVERVIEW_VFOV_DEG = (
-    SYNTHETIC_TRACKING_OVERVIEW_HFOV_DEG
-    * SYNTHETIC_TRACKING_HEIGHT
-    / SYNTHETIC_TRACKING_WIDTH
-)
 SYNTHETIC_TRACKING_DISTANCE_M = 150.0
 SYNTHETIC_TRACKING_INITIAL_STATIC_S = 10.0
 SYNTHETIC_TRACKING_INITIAL_YAW_ACCEL_DEG_S2 = 0.75
@@ -38,25 +43,39 @@ class SyntheticTrackingCameraGeometry:
     camera: CameraRole
     width: int
     height: int
-    horizontal_fov_deg: float
-    vertical_fov_deg: float
+    focal_x_px: float
+    focal_y_px: float
+    center_x_px: float
+    center_y_px: float
     stereo_offset_px: float = 0.0
 
     @property
+    def horizontal_fov_deg(self) -> float:
+        left = atan(self.center_x_px / self.focal_x_px)
+        right = atan((self.width - 1 - self.center_x_px) / self.focal_x_px)
+        return degrees(left + right)
+
+    @property
+    def vertical_fov_deg(self) -> float:
+        up = atan(self.center_y_px / self.focal_y_px)
+        down = atan((self.height - 1 - self.center_y_px) / self.focal_y_px)
+        return degrees(up + down)
+
+    @property
     def pixels_per_degree_x(self) -> float:
-        return self.width / self.horizontal_fov_deg
+        return self.focal_x_px * pi / 180.0
 
     @property
     def pixels_per_degree_y(self) -> float:
-        return self.height / self.vertical_fov_deg
+        return self.focal_y_px * pi / 180.0
 
-    @property
-    def center_x_px(self) -> float:
-        return self.width / 2.0
-
-    @property
-    def center_y_px(self) -> float:
-        return self.height / 2.0
+    def project_angles(self, yaw_deg: float, pitch_deg: float) -> tuple[float, float]:
+        return (
+            self.center_x_px
+            + self.focal_x_px * tan(radians(yaw_deg))
+            + self.stereo_offset_px,
+            self.center_y_px - self.focal_y_px * tan(radians(pitch_deg)),
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -267,14 +286,23 @@ def _motion_state_at(time_s: float) -> _MotionState:
     return _MotionState("STATIC_END", 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
 
 
-def _stereo_fov(reference: StereoCalibration) -> tuple[float, float]:
-    fx = float(reference.P1[0][0])
-    fy = float(reference.P1[1][1])
-    if fx <= 0.0 or fy <= 0.0:
-        raise ValueError("stereo projection focal lengths must be > 0")
-    return (
-        degrees(2.0 * atan(reference.image_width / (2.0 * fx))),
-        degrees(2.0 * atan(reference.image_height / (2.0 * fy))),
+def _geometry_from_projection(
+    camera: CameraRole,
+    *,
+    width: int,
+    height: int,
+    projection: tuple[tuple[float, ...], ...],
+    stereo_offset_px: float = 0.0,
+) -> SyntheticTrackingCameraGeometry:
+    return SyntheticTrackingCameraGeometry(
+        camera=camera,
+        width=width,
+        height=height,
+        focal_x_px=float(projection[0][0]),
+        focal_y_px=float(projection[1][1]),
+        center_x_px=float(projection[0][2]),
+        center_y_px=float(projection[1][2]),
+        stereo_offset_px=stereo_offset_px,
     )
 
 
@@ -294,50 +322,65 @@ class SyntheticTrackingWorld:
 
     def __init__(
         self,
-        stereo_calibration: StereoCalibration,
+        stereo_calibration: StereoCalibration | None = None,
         *,
+        overview_calibration: OverviewCalibration | None = None,
         fps: int = SYNTHETIC_TRACKING_FPS,
         target_distance_m: float = SYNTHETIC_TRACKING_DISTANCE_M,
     ) -> None:
         if fps <= 0:
             raise ValueError("fps must be > 0")
+        overview_reference = (
+            synthetic_tracking_overview_calibration()
+            if overview_calibration is None
+            else overview_calibration
+        )
+        stereo_reference = (
+            synthetic_tracking_stereo_calibration()
+            if stereo_calibration is None
+            else stereo_calibration
+        )
         if (
-            stereo_calibration.image_width != SYNTHETIC_TRACKING_WIDTH
-            or stereo_calibration.image_height != SYNTHETIC_TRACKING_HEIGHT
+            overview_reference.image_width != SYNTHETIC_TRACKING_WIDTH
+            or overview_reference.image_height != SYNTHETIC_TRACKING_HEIGHT
         ):
-            raise ValueError("synthetic tracking world requires 1296x976 stereo calibration")
-        self.stereo_calibration = stereo_calibration
+            raise ValueError("synthetic Overview calibration must be 1296x976")
+        if (
+            stereo_reference.image_width != SYNTHETIC_TRACKING_WIDTH
+            or stereo_reference.image_height != SYNTHETIC_TRACKING_HEIGHT
+        ):
+            raise ValueError("synthetic stereo calibration must be 1296x976")
+        self.overview_calibration = overview_reference
+        self.stereo_calibration = stereo_reference
         self.fps = fps
         self.target_distance_m = target_distance_m
-        stereo_hfov, stereo_vfov = _stereo_fov(stereo_calibration)
         disparity_px = _stereo_disparity_px(
-            stereo_calibration,
+            stereo_reference,
             distance_m=target_distance_m,
         )
         self.disparity_px = disparity_px
+        overview_projection = overview_camera_model(overview_reference).projection_matrix
+        left_model, right_model = stereo_camera_models(stereo_reference)
         self.geometries = {
-            CameraRole.OVERVIEW: SyntheticTrackingCameraGeometry(
+            CameraRole.OVERVIEW: _geometry_from_projection(
                 CameraRole.OVERVIEW,
-                SYNTHETIC_TRACKING_WIDTH,
-                SYNTHETIC_TRACKING_HEIGHT,
-                SYNTHETIC_TRACKING_OVERVIEW_HFOV_DEG,
-                SYNTHETIC_TRACKING_OVERVIEW_VFOV_DEG,
+                width=overview_reference.image_width,
+                height=overview_reference.image_height,
+                projection=overview_projection,
             ),
-            CameraRole.STEREO_LEFT: SyntheticTrackingCameraGeometry(
+            CameraRole.STEREO_LEFT: _geometry_from_projection(
                 CameraRole.STEREO_LEFT,
-                SYNTHETIC_TRACKING_WIDTH,
-                SYNTHETIC_TRACKING_HEIGHT,
-                stereo_hfov,
-                stereo_vfov,
-                +disparity_px / 2.0,
+                width=stereo_reference.image_width,
+                height=stereo_reference.image_height,
+                projection=left_model.projection_matrix,
+                stereo_offset_px=+disparity_px / 2.0,
             ),
-            CameraRole.STEREO_RIGHT: SyntheticTrackingCameraGeometry(
+            CameraRole.STEREO_RIGHT: _geometry_from_projection(
                 CameraRole.STEREO_RIGHT,
-                SYNTHETIC_TRACKING_WIDTH,
-                SYNTHETIC_TRACKING_HEIGHT,
-                stereo_hfov,
-                stereo_vfov,
-                -disparity_px / 2.0,
+                width=stereo_reference.image_width,
+                height=stereo_reference.image_height,
+                projection=right_model.projection_matrix,
+                stereo_offset_px=-disparity_px / 2.0,
             ),
         }
         self._background_bases = {
@@ -420,12 +463,10 @@ class SyntheticTrackingWorld:
         geometry: SyntheticTrackingCameraGeometry,
         truth: SyntheticTrackingTruth,
     ) -> SyntheticTrackingProjection:
-        x = (
-            geometry.center_x_px
-            + truth.true_error_yaw_deg * geometry.pixels_per_degree_x
-            + geometry.stereo_offset_px
+        x, y = geometry.project_angles(
+            truth.true_error_yaw_deg,
+            truth.true_error_pitch_deg,
         )
-        y = geometry.center_y_px - truth.true_error_pitch_deg * geometry.pixels_per_degree_y
         half = SYNTHETIC_TRACKING_TARGET_SIZE_PX / 2.0
         x0 = round(x - half)
         y0 = round(y - half)
@@ -479,8 +520,12 @@ class SyntheticTrackingWorld:
     ) -> np.ndarray:
         x = np.arange(geometry.width, dtype=np.float32)
         y = np.arange(geometry.height, dtype=np.float32)
-        world_yaw = (x - geometry.center_x_px) / geometry.pixels_per_degree_x
-        world_pitch = -(y - geometry.center_y_px) / geometry.pixels_per_degree_y
+        world_yaw = np.degrees(
+            np.arctan((x - geometry.center_x_px) / geometry.focal_x_px)
+        )
+        world_pitch = -np.degrees(
+            np.arctan((y - geometry.center_y_px) / geometry.focal_y_px)
+        )
         yaw_grid = world_yaw[None, :]
         pitch_grid = world_pitch[:, None]
 
@@ -504,7 +549,6 @@ __all__ = [
     "SYNTHETIC_TRACKING_FPS",
     "SYNTHETIC_TRACKING_HEIGHT",
     "SYNTHETIC_TRACKING_OVERVIEW_HFOV_DEG",
-    "SYNTHETIC_TRACKING_OVERVIEW_VFOV_DEG",
     "SYNTHETIC_TRACKING_TARGET_SIZE_PX",
     "SYNTHETIC_TRACKING_WIDTH",
     "SYNTHETIC_TRACKING_WORLD_LIMIT_DEG",

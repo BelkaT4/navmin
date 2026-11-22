@@ -15,7 +15,7 @@ from navmin.diagnostics.synthetic_tracking_closed_loop import (
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", default="config/navmin.json")
-    parser.add_argument("--stereo-calibration", default="config/calibration/stereo.json")
+    parser.add_argument("--stereo-calibration", default=None)
     parser.add_argument("--frames", type=int, default=None)
     parser.add_argument("--selection-frame", type=int, default=8)
     parser.add_argument("--sample-stride", type=int, default=1)

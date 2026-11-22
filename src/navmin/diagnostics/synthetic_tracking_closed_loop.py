@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import json
 from dataclasses import asdict, dataclass
-from math import atan2, cos, degrees, hypot, radians, sin
 from pathlib import Path
 from statistics import fmean
 
@@ -36,6 +35,7 @@ from navmin.turret.session import TurretSession
 from navmin.turret.simulator import FakeTransport
 from navmin.vision.processors.vt11.processor import Vt11VisionProcessor
 
+from .synthetic_tracking_calibration import synthetic_tracking_stereo_calibration
 from .synthetic_tracking_turret import (
     SyntheticTrackingSimulation,
     SyntheticTrackingStm32Endpoint,
@@ -62,38 +62,30 @@ class _SimulationClock:
 
 
 class SyntheticAngularCameraModel:
-    """CameraModel matching the world's intentionally linear deg-to-pixel map."""
+    """Pinhole CameraModel matching the world's canonical working geometry."""
 
     def __init__(self, geometry: SyntheticTrackingCameraGeometry) -> None:
         if not isinstance(geometry, SyntheticTrackingCameraGeometry):
             raise TypeError("geometry must be SyntheticTrackingCameraGeometry")
-        self._center_x_px = geometry.center_x_px + geometry.stereo_offset_px
-        self._center_y_px = geometry.center_y_px
-        self._pixels_per_degree_x = geometry.pixels_per_degree_x
-        self._pixels_per_degree_y = geometry.pixels_per_degree_y
+        self._fx = geometry.focal_x_px
+        self._fy = geometry.focal_y_px
+        self._cx = geometry.center_x_px
+        self._cy = geometry.center_y_px
 
     def pixel_to_ray(self, x_px: float, y_px: float) -> CameraRay:
-        yaw_rad = radians(
-            (float(x_px) - self._center_x_px) / self._pixels_per_degree_x
-        )
-        pitch_rad = radians(
-            -(float(y_px) - self._center_y_px) / self._pixels_per_degree_y
-        )
-        cos_pitch = cos(pitch_rad)
-        return CameraRay(
-            x=sin(yaw_rad) * cos_pitch,
-            y=-sin(pitch_rad),
-            z=cos(yaw_rad) * cos_pitch,
-        )
+        x = (float(x_px) - self._cx) / self._fx
+        y = (float(y_px) - self._cy) / self._fy
+        norm = (x * x + y * y + 1.0) ** 0.5
+        return CameraRay(x=x / norm, y=y / norm, z=1.0 / norm)
 
     def ray_to_pixel(self, ray: CameraRay) -> tuple[float, float]:
         if not isinstance(ray, CameraRay):
             raise TypeError("ray must be CameraRay")
-        yaw_deg = degrees(atan2(ray.x, ray.z))
-        pitch_deg = -degrees(atan2(ray.y, hypot(ray.x, ray.z)))
+        if ray.z <= 0.0:
+            raise ValueError("camera ray must point in front of the camera")
         return (
-            self._center_x_px + yaw_deg * self._pixels_per_degree_x,
-            self._center_y_px - pitch_deg * self._pixels_per_degree_y,
+            self._cx + self._fx * ray.x / ray.z,
+            self._cy + self._fy * ray.y / ray.z,
         )
 
 
@@ -205,14 +197,18 @@ def _phase_summary(
 def run_synthetic_tracking_closed_loop(
     *,
     config_path: str | Path = "config/navmin.json",
-    stereo_calibration_path: str | Path = "config/calibration/stereo.json",
+    stereo_calibration_path: str | Path | None = None,
     frame_count: int | None = None,
     selection_frame: int = 8,
     sample_stride: int = 1,
 ) -> SyntheticClosedLoopResult:
     """Run one deterministic headless closed-loop tracking diagnostic."""
     config = load_config(config_path)
-    stereo_calibration = load_stereo_calibration(stereo_calibration_path)
+    stereo_calibration = (
+        synthetic_tracking_stereo_calibration()
+        if stereo_calibration_path is None
+        else load_stereo_calibration(stereo_calibration_path)
+    )
     world = SyntheticTrackingWorld(stereo_calibration)
     total_frames = (
         round(world.cycle_duration_s * world.fps)

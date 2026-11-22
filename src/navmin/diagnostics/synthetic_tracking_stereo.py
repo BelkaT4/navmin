@@ -33,6 +33,7 @@ from navmin.vision.stereo_pairing import StereoPairer
 from navmin.vision.stereo_target_join import StereoTargetJoiner
 
 from .synthetic_stereo import rectified_synthetic_calibration
+from .synthetic_tracking_calibration import synthetic_tracking_stereo_calibration
 from .synthetic_tracking_world import SyntheticTrackingWorld
 
 
@@ -81,7 +82,7 @@ class SyntheticTrackingStereoResult:
 
 def run_synthetic_tracking_stereo_diagnostic(
     *,
-    stereo_calibration_path: str | Path = "config/calibration/stereo.json",
+    stereo_calibration_path: str | Path | None = None,
     frame_count: int | None = None,
     selection_frame: int = 8,
     distance_stride: int = 100,
@@ -93,7 +94,11 @@ def run_synthetic_tracking_stereo_diagnostic(
     trajectory moves the background.  Ground truth is used only to position the
     synthetic camera; it is never passed to VT11, pairing, joining, or SGBM.
     """
-    reference = load_stereo_calibration(stereo_calibration_path)
+    reference = (
+        synthetic_tracking_stereo_calibration()
+        if stereo_calibration_path is None
+        else load_stereo_calibration(stereo_calibration_path)
+    )
     calibration = rectified_synthetic_calibration(reference)
     world = SyntheticTrackingWorld(reference)
     total_frames = (

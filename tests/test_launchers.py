@@ -68,6 +68,10 @@ from navmin.diagnostic_launcher import (
     _parser as diagnostic_parser,
 )
 from navmin.diagnostic_launcher import main as diagnostic_main
+from navmin.diagnostics.synthetic_tracking_calibration import (
+    synthetic_tracking_overview_calibration,
+    synthetic_tracking_stereo_calibration,
+)
 from navmin.diagnostics.synthetic_tracking_turret import SyntheticTrackingFrameSource
 from navmin.host_environment import WindowsHostEnvironment
 from navmin.imu import ImuCalibration
@@ -82,10 +86,7 @@ from navmin.launch_options import (
     default_launch_options,
     resolve_launch_options,
 )
-from navmin.launch_runtime import (
-    LaunchRuntimeBindingError,
-    build_launch_runtime_bindings,
-)
+from navmin.launch_runtime import build_launch_runtime_bindings
 from navmin.launcher import (
     ApplicationInputError,
     LauncherPaths,
@@ -572,14 +573,18 @@ def test_launch_runtime_bindings_mixed_stereo_keep_real_side_calibration(
     else:
         assert len(bindings.selection.warnings) == 1
     if synthetic_side == "left":
-        assert effective.K_left == tuple(tuple(row[:3]) for row in reference.P1)
-        assert effective.D_left == (0.0, 0.0, 0.0, 0.0, 0.0)
+        synthetic = synthetic_tracking_stereo_calibration()
+        assert effective.K_left == synthetic.K_left
+        assert effective.P1 == synthetic.P1
+        assert effective.D_left == synthetic.D_left
         assert effective.K_right == reference.K_right
         assert effective.D_right == reference.D_right
         assert effective.R2 == reference.R2
     else:
-        assert effective.K_right == tuple(tuple(row[:3]) for row in reference.P2)
-        assert effective.D_right == (0.0, 0.0, 0.0, 0.0, 0.0)
+        synthetic = synthetic_tracking_stereo_calibration()
+        assert effective.K_right == synthetic.K_right
+        assert effective.P2 == synthetic.P2
+        assert effective.D_right == synthetic.D_right
         assert effective.K_left == reference.K_left
         assert effective.D_left == reference.D_left
         assert effective.R1 == reference.R1
@@ -699,17 +704,18 @@ def test_launch_runtime_bindings_real_sources_preserve_production_factories() ->
     assert bindings.inputs.stereo_calibration is inputs.stereo_calibration
 
 
-def test_launch_runtime_bindings_reject_unsupported_synthetic_stereo_size() -> None:
-    with pytest.raises(LaunchRuntimeBindingError, match="1296x976"):
-        build_launch_runtime_bindings(
-            _inputs(),
-            LaunchOptions(
-                overview=CameraSourceMode.ON,
-                stereo_left=CameraSourceMode.SIM,
-                stereo_right=StereoRightMode.OFF,
-                stm32=Stm32Mode.ON,
-            ),
-        )
+def test_launch_runtime_bindings_synthetic_only_stereo_uses_canonical_geometry() -> None:
+    bindings = build_launch_runtime_bindings(
+        _inputs(),
+        LaunchOptions(
+            overview=CameraSourceMode.ON,
+            stereo_left=CameraSourceMode.SIM,
+            stereo_right=StereoRightMode.OFF,
+            stm32=Stm32Mode.ON,
+        ),
+    )
+
+    assert bindings.inputs.stereo_calibration == synthetic_tracking_stereo_calibration()
 
 def _overview() -> OverviewCalibration:
     return OverviewCalibration(
@@ -795,6 +801,87 @@ def _copy_default_calibrations(target_root: Path) -> tuple[Path, Path]:
     shutil.copyfile(source_dir / "stereo.json", stereo)
     return overview, stereo
 
+
+
+def test_synthetic_calibration_overrides_do_not_require_hardware_files(tmp_path) -> None:
+    config = _config_with_calibration_refs(
+        "missing-overview.json",
+        "missing-stereo.json",
+    )
+    config_path = tmp_path / "navmin.json"
+    save_config(config_path, config)
+    overview = synthetic_tracking_overview_calibration()
+    stereo = synthetic_tracking_stereo_calibration()
+
+    inputs = load_application_inputs(
+        LauncherPaths(config=config_path),
+        config=config,
+        overview_calibration=overview,
+        stereo_calibration=stereo,
+    )
+
+    assert inputs.overview_calibration == overview
+    assert inputs.stereo_calibration == stereo
+    assert inputs.source_paths is not None
+    assert inputs.source_paths.overview_calibration is None
+    assert inputs.source_paths.stereo_calibration is None
+
+
+def test_noninteractive_all_sim_skips_missing_hardware_calibrations(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    config = _config_with_calibration_refs(
+        "missing-overview.json",
+        "missing-stereo.json",
+    )
+    config_path = tmp_path / "navmin.json"
+    save_config(config_path, config)
+    log_dir = tmp_path / "logs"
+    captured: list[LoadedApplicationInputs] = []
+
+    monkeypatch.setattr("navmin.__main__._DEFAULT_LOG_DIR", log_dir)
+
+    def preflight(inputs, **_kwargs):
+        captured.append(inputs)
+        return _preflight_report()
+
+    monkeypatch.setattr("navmin.__main__.run_startup_preflight", preflight)
+    monkeypatch.setattr(
+        "navmin.__main__.run_loaded_application",
+        lambda _inputs, **_kwargs: 0,
+    )
+
+    assert normal_main(
+        [
+            "--config",
+            str(config_path),
+            "--overview",
+            "sim",
+            "--stereo-left",
+            "sim",
+            "--stereo-right",
+            "off",
+            "--stm32",
+            "sim",
+        ]
+    ) == 0
+
+    assert len(captured) == 1
+    effective = captured[0]
+    assert effective.overview_calibration == synthetic_tracking_overview_calibration()
+    assert effective.stereo_calibration == synthetic_tracking_stereo_calibration()
+    assert effective.source_paths is not None
+    assert effective.source_paths.overview_calibration is None
+    assert effective.source_paths.stereo_calibration is None
+
+    session = _single_session(log_dir)
+    sources = json.loads(
+        (session / "inputs" / "source-hashes.json").read_text(encoding="utf-8")
+    )
+    assert sources["config"]["source"] == "file"
+    assert sources["overview_calibration"]["source"] == "synthetic"
+    assert sources["stereo_calibration"]["source"] == "synthetic"
 
 def test_public_and_diagnostic_parsers_keep_separate_contracts() -> None:
     normal_args = normal_parser().parse_args([])
@@ -2175,7 +2262,8 @@ def test_normal_runtime_failure_and_clean_run_finalize_manifest(
 ) -> None:
     config_path, _overview_path, _stereo_path = _write_source_placeholders(tmp_path)
     inputs = _inputs()
-    monkeypatch.setattr("navmin.__main__.load_application_inputs", lambda _paths: inputs)
+    monkeypatch.setattr("navmin.__main__.load_application_config", lambda _path: inputs.config)
+    monkeypatch.setattr("navmin.__main__.load_application_inputs", lambda _paths, **_kwargs: inputs)
 
     def run_failure(_inputs, **_kwargs) -> int:
         raise RuntimeError("runtime-boom")
@@ -2256,7 +2344,8 @@ def test_normal_preflight_only_pass_skips_runtime_and_keeps_evidence(
     tmp_path,
 ) -> None:
     config_path, _overview_path, _stereo_path = _write_source_placeholders(tmp_path)
-    monkeypatch.setattr("navmin.__main__.load_application_inputs", lambda _paths: _inputs())
+    monkeypatch.setattr("navmin.__main__.load_application_config", lambda _path: _inputs().config)
+    monkeypatch.setattr("navmin.__main__.load_application_inputs", lambda _paths, **_kwargs: _inputs())
     monkeypatch.setattr(
         "navmin.__main__.run_loaded_application",
         lambda _inputs, **_kwargs: pytest.fail(
@@ -2329,7 +2418,7 @@ def test_diagnostic_preflight_passes_explicit_stereo_right_backend(
 
     monkeypatch.setattr(
         "navmin.diagnostic_launcher.load_application_inputs",
-        lambda _paths: inputs,
+        lambda _paths, **_kwargs: inputs,
     )
 
     def preflight(planned, *, selection, session_dir):
@@ -2457,9 +2546,10 @@ def test_preflight_failure_blocks_endpoints_runtime_and_records_status(
         )
     else:
         config_path, _overview_path, _stereo_path = _write_source_placeholders(tmp_path)
+        monkeypatch.setattr("navmin.__main__.load_application_config", lambda _path: _inputs().config)
         monkeypatch.setattr(
             "navmin.__main__.load_application_inputs",
-            lambda _paths: _inputs(),
+            lambda _paths, **_kwargs: _inputs(),
         )
         monkeypatch.setattr(
             "navmin.__main__.run_startup_preflight",
@@ -2546,7 +2636,8 @@ def test_diagnostic_full_launch_orders_preflight_before_endpoints_and_runtime(
 def test_normal_full_launch_orders_preflight_before_runtime(monkeypatch, tmp_path) -> None:
     config_path, _overview_path, _stereo_path = _write_source_placeholders(tmp_path)
     events: list[str] = []
-    monkeypatch.setattr("navmin.__main__.load_application_inputs", lambda _paths: _inputs())
+    monkeypatch.setattr("navmin.__main__.load_application_config", lambda _path: _inputs().config)
+    monkeypatch.setattr("navmin.__main__.load_application_inputs", lambda _paths, **_kwargs: _inputs())
     monkeypatch.setattr("navmin.__main__._DEFAULT_LOG_DIR", tmp_path / "logs")
 
     def preflight(inputs, **kwargs):
@@ -2585,9 +2676,10 @@ def test_normal_launcher_omits_disabled_stereo_right_from_preflight(
             vision=replace(inputs.config.vision, cameras=cameras),
         ),
     )
+    monkeypatch.setattr("navmin.__main__.load_application_config", lambda _path: disabled_inputs.config)
     monkeypatch.setattr(
         "navmin.__main__.load_application_inputs",
-        lambda _paths: disabled_inputs,
+        lambda _paths, **_kwargs: disabled_inputs,
     )
     monkeypatch.setattr("navmin.__main__._DEFAULT_LOG_DIR", tmp_path / "logs")
 
@@ -2606,7 +2698,8 @@ def test_normal_launcher_omits_disabled_stereo_right_from_preflight(
 
 def test_preflight_only_warn_is_success(monkeypatch, tmp_path) -> None:
     config_path, _overview_path, _stereo_path = _write_source_placeholders(tmp_path)
-    monkeypatch.setattr("navmin.__main__.load_application_inputs", lambda _paths: _inputs())
+    monkeypatch.setattr("navmin.__main__.load_application_config", lambda _path: _inputs().config)
+    monkeypatch.setattr("navmin.__main__.load_application_inputs", lambda _paths, **_kwargs: _inputs())
     monkeypatch.setattr(
         "navmin.__main__.run_startup_preflight",
         lambda *args, **kwargs: _preflight_report(PreflightStatus.WARN),
@@ -2631,7 +2724,8 @@ def test_unexpected_preflight_exception_is_runtime_failure_before_runtime(
     tmp_path,
 ) -> None:
     config_path, _overview_path, _stereo_path = _write_source_placeholders(tmp_path)
-    monkeypatch.setattr("navmin.__main__.load_application_inputs", lambda _paths: _inputs())
+    monkeypatch.setattr("navmin.__main__.load_application_config", lambda _path: _inputs().config)
+    monkeypatch.setattr("navmin.__main__.load_application_inputs", lambda _paths, **_kwargs: _inputs())
 
     def explode(*args, **kwargs):
         del args, kwargs
@@ -2833,7 +2927,7 @@ def test_interactive_invalid_choice_and_confirmation_reprompt() -> None:
 
 
 def test_interactive_n_cancels_without_launch(monkeypatch) -> None:
-    monkeypatch.setattr("navmin.__main__.load_application_inputs", lambda _paths: _inputs())
+    monkeypatch.setattr("navmin.__main__.load_application_config", lambda _path: _inputs().config)
     monkeypatch.setattr(
         "navmin.__main__._run_noninteractive",
         lambda *_args, **_kwargs: pytest.fail("cancel must not launch"),
@@ -2850,7 +2944,7 @@ def test_interactive_n_cancels_without_launch(monkeypatch) -> None:
 
 
 def test_interactive_ctrl_c_cancels_cleanly(monkeypatch) -> None:
-    monkeypatch.setattr("navmin.__main__.load_application_inputs", lambda _paths: _inputs())
+    monkeypatch.setattr("navmin.__main__.load_application_config", lambda _path: _inputs().config)
     monkeypatch.setattr(
         "navmin.__main__._run_noninteractive",
         lambda *_args, **_kwargs: pytest.fail("Ctrl+C must not launch"),
@@ -2865,7 +2959,7 @@ def test_interactive_ctrl_c_cancels_cleanly(monkeypatch) -> None:
 
 
 def test_interactive_confirmation_launches_through_unified_execution(monkeypatch) -> None:
-    monkeypatch.setattr("navmin.__main__.load_application_inputs", lambda _paths: _inputs())
+    monkeypatch.setattr("navmin.__main__.load_application_config", lambda _path: _inputs().config)
     calls = []
 
     def run(args, *, origin="non-interactive") -> int:
@@ -2941,7 +3035,8 @@ def test_noninteractive_source_selection_drives_effective_preflight(
 ) -> None:
     inputs = _inputs()
     captured = []
-    monkeypatch.setattr("navmin.__main__.load_application_inputs", lambda _paths: inputs)
+    monkeypatch.setattr("navmin.__main__.load_application_config", lambda _path: inputs.config)
+    monkeypatch.setattr("navmin.__main__.load_application_inputs", lambda _paths, **_kwargs: inputs)
     monkeypatch.setattr("navmin.__main__._DEFAULT_LOG_DIR", tmp_path / "logs")
 
     def preflight(effective_inputs, **kwargs):
@@ -2994,7 +3089,8 @@ def test_host_activation_follows_effective_real_camera_selection(
             requirements.append(camera_network_required)
             yield
 
-    monkeypatch.setattr("navmin.__main__.load_application_inputs", lambda _paths: inputs)
+    monkeypatch.setattr("navmin.__main__.load_application_config", lambda _path: inputs.config)
+    monkeypatch.setattr("navmin.__main__.load_application_inputs", lambda _paths, **_kwargs: inputs)
     monkeypatch.setattr(
         "navmin.__main__.create_host_environment", lambda _root: RecordingHost()
     )

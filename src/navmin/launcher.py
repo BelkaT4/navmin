@@ -246,41 +246,69 @@ def validate_normal_hardware_config(config: AppConfig) -> None:
         )
 
 
-def load_application_inputs(paths: LauncherPaths) -> LoadedApplicationInputs:
-    """Load strict typed inputs from one authoritative resolved source-path set."""
-    config_path = _cwd_resolved(paths.config)
+def load_application_config(path: str | Path) -> AppConfig:
+    """Load only the root config so launch source choices can be resolved first."""
+    config_path = _cwd_resolved(path)
     try:
-        config = load_config(config_path)
+        return load_config(config_path)
     except (OSError, ValueError) as exc:
         raise ApplicationInputError(
             "config", config_path, exc, recoverable=True
         ) from exc
 
+
+def load_application_inputs(
+    paths: LauncherPaths,
+    *,
+    config: AppConfig | None = None,
+    overview_calibration: OverviewCalibration | None = None,
+    stereo_calibration: StereoCalibration | None = None,
+) -> LoadedApplicationInputs:
+    """Load file-backed inputs, accepting explicit synthetic calibration overrides."""
+    config_path = _cwd_resolved(paths.config)
+    if config is None:
+        config = load_application_config(config_path)
+
     try:
-        source_paths = resolve_application_source_paths(paths, config)
+        resolved_paths = resolve_application_source_paths(paths, config)
     except ValueError as exc:
         raise ApplicationInputError(
             "config", config_path, exc, recoverable=True
         ) from exc
 
-    try:
-        overview = load_overview_calibration(source_paths.overview_calibration)
-    except (OSError, ValueError) as exc:
-        raise ApplicationInputError(
-            "overview calibration",
-            source_paths.overview_calibration,
-            exc,
-            recoverable=paths.overview_calibration is None,
-        ) from exc
-    try:
-        stereo = load_stereo_calibration(source_paths.stereo_calibration)
-    except (OSError, ValueError) as exc:
-        raise ApplicationInputError(
-            "stereo calibration",
-            source_paths.stereo_calibration,
-            exc,
-            recoverable=paths.stereo_calibration is None,
-        ) from exc
+    overview = overview_calibration
+    if overview is None:
+        try:
+            overview = load_overview_calibration(resolved_paths.overview_calibration)
+        except (OSError, ValueError) as exc:
+            raise ApplicationInputError(
+                "overview calibration",
+                resolved_paths.overview_calibration,
+                exc,
+                recoverable=paths.overview_calibration is None,
+            ) from exc
+
+    stereo = stereo_calibration
+    if stereo is None:
+        try:
+            stereo = load_stereo_calibration(resolved_paths.stereo_calibration)
+        except (OSError, ValueError) as exc:
+            raise ApplicationInputError(
+                "stereo calibration",
+                resolved_paths.stereo_calibration,
+                exc,
+                recoverable=paths.stereo_calibration is None,
+            ) from exc
+
+    source_paths = SourceInputPaths(
+        config=resolved_paths.config,
+        overview_calibration=(
+            None if overview_calibration is not None else resolved_paths.overview_calibration
+        ),
+        stereo_calibration=(
+            None if stereo_calibration is not None else resolved_paths.stereo_calibration
+        ),
+    )
 
     imu_calibration = None
     if config.imu.enabled:
@@ -545,6 +573,7 @@ __all__ = [
     "LauncherPaths",
     "LoadedApplicationInputs",
     "emit_config_snapshot",
+    "load_application_config",
     "load_application_inputs",
     "resolve_application_source_paths",
     "resolve_imu_calibration_path",

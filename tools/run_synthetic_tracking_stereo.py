@@ -17,8 +17,8 @@ def _parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--stereo-calibration",
-        default="config/calibration/stereo.json",
-        help="Stereo calibration JSON used for synthetic geometry.",
+        default=None,
+        help="Optional Stereo calibration JSON; default uses canonical SIM geometry.",
     )
     parser.add_argument(
         "--frames",

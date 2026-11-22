@@ -8,6 +8,10 @@ import sys
 from collections.abc import Callable, Sequence
 from pathlib import Path
 
+from navmin.diagnostics.synthetic_tracking_calibration import (
+    synthetic_tracking_overview_calibration,
+    synthetic_tracking_stereo_calibration,
+)
 from navmin.host_environment import (
     HostConfigurationCreated,
     HostEnvironmentError,
@@ -30,6 +34,7 @@ from navmin.launch_runtime import build_launch_runtime_bindings
 from navmin.launcher import (
     LauncherPaths,
     emit_config_snapshot,
+    load_application_config,
     load_application_inputs,
     run_loaded_application,
     session_file_logging,
@@ -158,6 +163,29 @@ def _finalize_failure(
     return exit_code
 
 
+def _load_selected_application_inputs(
+    paths: LauncherPaths,
+    config,
+    options: LaunchOptions,
+):
+    any_real_stereo = (
+        options.stereo_left is CameraSourceMode.ON
+        or options.stereo_right is StereoRightMode.ON
+    )
+    return load_application_inputs(
+        paths,
+        config=config,
+        overview_calibration=(
+            synthetic_tracking_overview_calibration()
+            if options.overview is CameraSourceMode.SIM
+            else None
+        ),
+        stereo_calibration=(
+            None if any_real_stereo else synthetic_tracking_stereo_calibration()
+        ),
+    )
+
+
 def _run_noninteractive(
     args: argparse.Namespace,
     *,
@@ -189,9 +217,9 @@ def _run_noninteractive(
             artifacts.session_dir,
         )
         try:
-            inputs = load_application_inputs(paths)
+            config = load_application_config(paths.config)
             options = resolve_launch_options(
-                inputs.config,
+                config,
                 config_path=args.config,
                 overview=(
                     None if args.overview is None else CameraSourceMode(args.overview)
@@ -210,6 +238,7 @@ def _run_noninteractive(
                 preflight_only=args.preflight_only,
                 verbose=args.verbose,
             )
+            inputs = _load_selected_application_inputs(paths, config, options)
             bindings = build_launch_runtime_bindings(inputs, options)
         except (OSError, ValueError) as exc:
             LOGGER.exception("NavMin non-interactive input/source resolution failed")
@@ -554,9 +583,9 @@ def _run_interactive(
 ) -> int:
     paths = LauncherPaths(config=_DEFAULT_CONFIG, log_dir=_DEFAULT_LOG_DIR)
     try:
-        inputs = load_application_inputs(paths)
+        config = load_application_config(paths.config)
         options = _interactive_options(
-            inputs.config,
+            config,
             config_path=_DEFAULT_CONFIG,
             input_fn=input_fn,
             output_fn=output_fn,
@@ -570,6 +599,10 @@ def _run_interactive(
 
     if options is None:
         return 0
+    try:
+        _load_selected_application_inputs(paths, config, options)
+    except (OSError, ValueError) as exc:
+        return _handle_interactive_input_failure(paths, exc)
     return _run_noninteractive(_interactive_namespace(options), origin="interactive")
 
 def main(argv: Sequence[str] | None = None) -> int:
