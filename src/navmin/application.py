@@ -14,6 +14,7 @@ from navmin.calibration import (
     OverviewCalibration,
     StereoCalibration,
     stereo_left_horizontal_fov_deg,
+    stereo_right_horizontal_fov_deg,
 )
 from navmin.concurrency import LatestValue
 from navmin.config.models import (
@@ -134,6 +135,8 @@ class UiRuntimeDependencies:
     apply_vt11_ui_config: Callable[[Vt11UiConfig], None]
     tracking_stereo_left_hfov_deg: float | None = None
     apply_tracking_stereo_left_hfov_deg: Callable[[float], None] | None = None
+    tracking_stereo_right_hfov_deg: float | None = None
+    apply_tracking_stereo_right_hfov_deg: Callable[[float], None] | None = None
     vision_processor_selections: Mapping[CameraRole, VisionProcessorSelection] | None = None
     apply_vision_processor_selection: (
         Callable[[CameraRole, VisionProcessorSelection], None] | None
@@ -288,6 +291,12 @@ class ApplicationRuntime:
             ),
             apply_tracking_stereo_left_hfov_deg=(
                 mediator.set_tracking_stereo_left_hfov_deg
+            ),
+            tracking_stereo_right_hfov_deg=(
+                mediator.tracking_stereo_right_hfov_deg
+            ),
+            apply_tracking_stereo_right_hfov_deg=(
+                mediator.set_tracking_stereo_right_hfov_deg
             ),
             tracking_visualization_config=tracking_visualization_config,
             ui_config=ui_config,
@@ -1051,8 +1060,25 @@ def build_application_runtime(
         camera_identities={
             CameraRole.OVERVIEW: calibration_identity(overview_calibration),
             CameraRole.STEREO_LEFT: calibration_identity(stereo_calibration),
+            CameraRole.STEREO_RIGHT: calibration_identity(stereo_calibration),
         },
     )
+    target_controls = {
+        CameraRole.OVERVIEW: overview_worker.pipeline.target_control,
+        CameraRole.STEREO_LEFT: stereo_left_worker.pipeline.target_control,
+    }
+    vision_processing_enabled = {
+        CameraRole.OVERVIEW: config.vision.cameras.overview.processing_enabled,
+        CameraRole.STEREO_LEFT: config.vision.cameras.stereo_left.processing_enabled,
+    }
+    if stereo_right_worker is not None:
+        target_controls[CameraRole.STEREO_RIGHT] = (
+            stereo_right_worker.pipeline.target_control
+        )
+        vision_processing_enabled[CameraRole.STEREO_RIGHT] = (
+            config.vision.cameras.stereo_right.processing_enabled
+        )
+
     mediator = Mediator(
         aiming_config=config.aiming,
         tracking_control_config=config.tracking_control,
@@ -1060,24 +1086,21 @@ def build_application_runtime(
         initial_manual_distance_m=config.vision.distance.manual_distance_m,
         ui_config=config.ui,
         turret=turret_worker,
-        target_controls={
-            CameraRole.OVERVIEW: overview_worker.pipeline.target_control,
-            CameraRole.STEREO_LEFT: stereo_left_worker.pipeline.target_control,
-        },
+        target_controls=target_controls,
         stereo_target_joiner=stereo_target_joiner,
         stereo_distance_results=(
             None if stereo_distance_worker is None else stereo_distance_worker.results
         ),
         distance_stale_timeout_ms=config.vision.distance.distance_stale_timeout_ms,
-        vision_processing_enabled={
-            CameraRole.OVERVIEW: config.vision.cameras.overview.processing_enabled,
-            CameraRole.STEREO_LEFT: (
-                config.vision.cameras.stereo_left.processing_enabled
-            ),
-        },
+        vision_processing_enabled=vision_processing_enabled,
         motion_calibration=motion_calibration_runtime,
         tracking_stereo_left_nominal_hfov_deg=(
             stereo_left_horizontal_fov_deg(stereo_calibration)
+        ),
+        tracking_stereo_right_nominal_hfov_deg=(
+            stereo_right_horizontal_fov_deg(stereo_calibration)
+            if stereo_right_worker is not None
+            else None
         ),
         camera_motion_control_roles=camera_motion_control_roles,
     )

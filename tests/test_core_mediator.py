@@ -247,8 +247,13 @@ class _FakeClock:
         self.now_ns += milliseconds * 1_000_000
 
 
-def _controls() -> dict[CameraRole, TargetControlChannel]:
-    return {camera: TargetControlChannel(camera) for camera in _NORMAL_CAMERAS}
+def _controls(
+    *, include_stereo_right: bool = False
+) -> dict[CameraRole, TargetControlChannel]:
+    cameras = list(_NORMAL_CAMERAS)
+    if include_stereo_right:
+        cameras.append(CameraRole.STEREO_RIGHT)
+    return {camera: TargetControlChannel(camera) for camera in cameras}
 
 
 _NORMAL_CAMERAS = (CameraRole.OVERVIEW, CameraRole.STEREO_LEFT)
@@ -266,11 +271,13 @@ def _mediator(
     clock_ns=monotonic_ns,
     motion_calibration=None,
     tracking_stereo_left_nominal_hfov_deg: float | None = None,
+    tracking_stereo_right_nominal_hfov_deg: float | None = None,
     camera_motion_control_roles: frozenset[CameraRole] | None = None,
     target_lost_timeout_ms: int = 500,
+    include_stereo_right: bool = False,
 ) -> tuple[Mediator, _FakeTurret, dict[CameraRole, TargetControlChannel]]:
     turret = _FakeTurret(_turret_state(mode=mode, motor=motor))
-    controls = _controls()
+    controls = _controls(include_stereo_right=include_stereo_right)
     mediator = Mediator(
         aiming_config=_aiming_config(
             target_lost_timeout_ms=target_lost_timeout_ms
@@ -288,6 +295,9 @@ def _mediator(
         motion_calibration=motion_calibration,
         tracking_stereo_left_nominal_hfov_deg=(
             tracking_stereo_left_nominal_hfov_deg
+        ),
+        tracking_stereo_right_nominal_hfov_deg=(
+            tracking_stereo_right_nominal_hfov_deg
         ),
         camera_motion_control_roles=camera_motion_control_roles,
     )
@@ -335,6 +345,42 @@ def _failed(request: TargetSelectionRequest) -> TargetAcquisitionFailed:
         decision_frame_id=request.frame_id,
         decision_frame_timestamp_ns=1000,
     )
+
+
+def test_mediator_accepts_optional_stereo_right_control_contract() -> None:
+    mediator, _turret, controls = _mediator(include_stereo_right=True)
+
+    assert set(controls) == {
+        CameraRole.OVERVIEW,
+        CameraRole.STEREO_LEFT,
+        CameraRole.STEREO_RIGHT,
+    }
+    assert set(mediator._target_controls) == set(controls)
+    assert set(mediator._vision_processing_enabled) == set(controls)
+    assert mediator.camera_motion_control_roles == frozenset(controls)
+
+
+def test_mediator_accepts_stereo_right_as_default_when_channel_is_available() -> None:
+    mediator, _turret, _controls_map = _mediator(
+        main=CameraRole.STEREO_RIGHT,
+        include_stereo_right=True,
+    )
+
+    assert mediator.main_camera is CameraRole.STEREO_RIGHT
+
+
+def test_mediator_rejects_stereo_right_default_without_right_channel() -> None:
+    with pytest.raises(ValueError, match="available control camera"):
+        _mediator(main=CameraRole.STEREO_RIGHT)
+
+
+def test_mediator_rejects_motion_role_without_matching_target_control() -> None:
+    with pytest.raises(ValueError, match="available target-control cameras"):
+        _mediator(
+            camera_motion_control_roles=frozenset(
+                {CameraRole.OVERVIEW, CameraRole.STEREO_RIGHT}
+            )
+        )
 
 
 def test_camera_session_gate_rejects_data_before_barrier_and_old_generation() -> None:
@@ -393,6 +439,82 @@ def test_relative_click_applies_camera_correction_at_mediator_boundary() -> None
     assert corrected_turret.relative_commands[-1].delta_x_deg == pytest.approx(
         baseline_turret.relative_commands[-1].delta_x_deg * 2.0
     )
+
+
+def test_stereo_right_relative_click_uses_shared_aiming_and_correction_path() -> None:
+    correction = _CameraCorrection()
+    mediator, turret, _controls_value = _mediator(
+        main=CameraRole.STEREO_RIGHT,
+        include_stereo_right=True,
+        motion_calibration=correction,
+    )
+    result = _accept_main(mediator)
+
+    assert mediator.handle_relative_click(result, 60, 40)
+    assert correction.cameras == [CameraRole.STEREO_RIGHT]
+    assert len(turret.relative_commands) == 1
+    assert turret.relative_commands[0].delta_x_deg > 0
+
+
+def test_stereo_right_tracking_select_acquire_hold_and_reacquire_uses_shared_path() -> None:
+    clock = _FakeClock(10_000_000_000)
+    mediator, turret, controls = _mediator(
+        mode=TurretControlMode.TRACKING,
+        main=CameraRole.STEREO_RIGHT,
+        include_stereo_right=True,
+        clock_ns=clock,
+        target_lost_timeout_ms=500,
+    )
+    initial = _accept_main(mediator)
+    request = _request(mediator, initial)
+
+    assert controls[CameraRole.STEREO_RIGHT].consume_latest(generation=1) == request
+    assert mediator.accept_target_lifecycle_event(_acquired(request))
+    selected = mediator.selected_target
+    assert selected == TargetRef(CameraRole.STEREO_RIGHT, 1, 7)
+    assert turret.tracking_controls[-1].target == selected
+    controls_before = len(turret.tracking_controls)
+
+    assert mediator.accept_vision_result(
+        _result(CameraRole.STEREO_RIGHT, 1, frame_id=5, track_ids=())
+    )
+    clock.advance_ms(200)
+    assert mediator.accept_vision_result(
+        _result(CameraRole.STEREO_RIGHT, 1, frame_id=6, track_ids=())
+    )
+    assert turret.continue_tracking_requests == 2
+    assert turret.stop_requests == 0
+
+    assert mediator.accept_vision_result(
+        _result(
+            CameraRole.STEREO_RIGHT,
+            1,
+            frame_id=7,
+            timestamp_ns=3_000_000_000,
+        )
+    )
+    assert mediator.selected_target == selected
+    assert len(turret.tracking_controls) == controls_before + 1
+    assert turret.tracking_controls[-1].target == selected
+
+
+def test_stereo_right_tracking_can_select_but_cannot_move_when_motion_role_blocked() -> None:
+    mediator, turret, controls = _mediator(
+        mode=TurretControlMode.TRACKING,
+        main=CameraRole.STEREO_RIGHT,
+        include_stereo_right=True,
+        camera_motion_control_roles=frozenset(
+            {CameraRole.OVERVIEW, CameraRole.STEREO_LEFT}
+        ),
+    )
+    result = _accept_main(mediator)
+    request = _request(mediator, result)
+
+    assert controls[CameraRole.STEREO_RIGHT].consume_latest(generation=1) == request
+    assert mediator.accept_target_lifecycle_event(_acquired(request))
+    assert mediator.selected_target == TargetRef(CameraRole.STEREO_RIGHT, 1, 7)
+    assert mediator.tracking_control_visualization is not None
+    assert turret.tracking_controls == []
 
 
 def test_relative_click_from_blocked_camera_cannot_drive_turret() -> None:
@@ -937,6 +1059,75 @@ def test_stereo_left_tracking_hfov_override_rejects_invalid_values() -> None:
             mediator.set_tracking_stereo_left_hfov_deg(invalid)
 
 
+
+@pytest.mark.parametrize(
+    ("camera", "setter_name", "property_name"),
+    (
+        (
+            CameraRole.STEREO_LEFT,
+            "set_tracking_stereo_left_hfov_deg",
+            "tracking_stereo_left_hfov_deg",
+        ),
+        (
+            CameraRole.STEREO_RIGHT,
+            "set_tracking_stereo_right_hfov_deg",
+            "tracking_stereo_right_hfov_deg",
+        ),
+    ),
+)
+def test_stereo_tracking_hfov_override_is_camera_specific(
+    camera: CameraRole, setter_name: str, property_name: str
+) -> None:
+    mediator, turret, _controls_value = _mediator(
+        mode=TurretControlMode.TRACKING,
+        main=camera,
+        include_stereo_right=True,
+        tracking_stereo_left_nominal_hfov_deg=10.0,
+        tracking_stereo_right_nominal_hfov_deg=12.0,
+    )
+    initial = _accept_main(mediator)
+    request = _request(mediator, initial)
+    assert mediator.accept_target_lifecycle_event(_acquired(request))
+    baseline_sample = turret.tracking_controls[-1]
+    base_model = mediator.session_gate.camera_model(camera, 1)
+    assert base_model is not None
+    baseline_invalidations = turret.invalidations
+    other_camera = (
+        CameraRole.STEREO_RIGHT
+        if camera is CameraRole.STEREO_LEFT
+        else CameraRole.STEREO_LEFT
+    )
+    other_before = mediator.tracking_hfov_deg(other_camera)
+
+    getattr(mediator, setter_name)(20.0)
+
+    assert getattr(mediator, property_name) == 20.0
+    assert mediator.tracking_hfov_deg(other_camera) == other_before
+    assert mediator.session_gate.camera_model(camera, 1) is base_model
+    assert mediator.tracking_camera_model(camera, 1) is not base_model
+    assert turret.invalidations == baseline_invalidations + 1
+    assert mediator.tracking_estimator.sample_count == 0
+
+    updated = _result(camera, 1, frame_id=5, timestamp_ns=50_000_000)
+    assert mediator.accept_vision_result(updated)
+    override_sample = turret.tracking_controls[-1]
+    assert abs(override_sample.real_error_x_deg) > abs(
+        baseline_sample.real_error_x_deg
+    )
+
+
+def test_stereo_tracking_hfov_generic_api_rejects_non_stereo_camera() -> None:
+    mediator, _turret, _controls_value = _mediator(
+        tracking_stereo_left_nominal_hfov_deg=10.0,
+        tracking_stereo_right_nominal_hfov_deg=12.0,
+        include_stereo_right=True,
+    )
+
+    with pytest.raises(ValueError):
+        mediator.tracking_hfov_deg(CameraRole.OVERVIEW)
+    with pytest.raises(ValueError):
+        mediator.set_tracking_hfov_deg(CameraRole.OVERVIEW, 10.0)
+
 def test_new_target_requires_estimator_history_to_be_collected_again() -> None:
     mediator, turret, _controls_value = _mediator(
         mode=TurretControlMode.TRACKING
@@ -1108,6 +1299,89 @@ def test_relative_to_tracking_confirms_without_automatic_selection() -> None:
     assert mediator.pending_selection is None
     assert mediator.selected_target is None
     assert turret.mode_requests == [TurretControlMode.TRACKING]
+
+
+def test_select_main_camera_supports_optional_stereo_right_and_rejects_unavailable() -> None:
+    mediator, turret, controls = _mediator(
+        mode=TurretControlMode.TRACKING,
+        include_stereo_right=True,
+    )
+    result = _accept_main(mediator)
+    assert mediator.accept_camera_session(_session(CameraRole.STEREO_RIGHT, 4))
+    _request(mediator, result)
+
+    assert (
+        mediator.select_main_camera(CameraRole.STEREO_RIGHT)
+        is CameraRole.STEREO_RIGHT
+    )
+    assert mediator.main_camera is CameraRole.STEREO_RIGHT
+    assert mediator.pending_selection is None
+    assert mediator.selected_target is None
+    assert turret.stop_requests == 1
+    assert controls[CameraRole.OVERVIEW].consume_latest(generation=1) == (
+        ClearTargetSelection(CameraRole.OVERVIEW, 1)
+    )
+    assert controls[CameraRole.STEREO_RIGHT].consume_latest(generation=4) == (
+        ClearTargetSelection(CameraRole.STEREO_RIGHT, 4)
+    )
+
+    without_right, without_right_turret, _ = _mediator()
+    with pytest.raises(ValueError, match="available control camera"):
+        without_right.select_main_camera(CameraRole.STEREO_RIGHT)
+    assert without_right.main_camera is CameraRole.OVERVIEW
+    assert without_right_turret.stop_requests == 0
+
+
+def test_select_main_camera_from_right_tracking_clears_right_and_new_camera() -> None:
+    mediator, turret, controls = _mediator(
+        main=CameraRole.STEREO_RIGHT,
+        mode=TurretControlMode.TRACKING,
+        include_stereo_right=True,
+    )
+    result = _accept_main(mediator, generation=6)
+    assert mediator.accept_camera_session(_session(CameraRole.STEREO_LEFT, 3))
+    request = _request(mediator, result)
+    assert mediator.accept_target_lifecycle_event(_acquired(request))
+    controls[CameraRole.STEREO_RIGHT].consume_latest(generation=6)
+
+    assert (
+        mediator.select_main_camera(CameraRole.STEREO_LEFT)
+        is CameraRole.STEREO_LEFT
+    )
+    assert mediator.selected_target is None
+    assert mediator.pending_selection is None
+    assert turret.stop_requests == 1
+    assert controls[CameraRole.STEREO_RIGHT].consume_latest(generation=6) == (
+        ClearTargetSelection(CameraRole.STEREO_RIGHT, 6)
+    )
+    assert controls[CameraRole.STEREO_LEFT].consume_latest(generation=3) == (
+        ClearTargetSelection(CameraRole.STEREO_LEFT, 3)
+    )
+
+
+def test_select_main_camera_same_camera_is_noop_and_relative_move_is_not_stopped() -> None:
+    mediator, turret, _controls_map = _mediator(include_stereo_right=True)
+    result = _accept_main(mediator)
+    assert mediator.handle_relative_click(result, 60, 40)
+
+    assert mediator.select_main_camera(CameraRole.OVERVIEW) is CameraRole.OVERVIEW
+    assert turret.stop_requests == 0
+    assert len(turret.relative_commands) == 1
+
+    assert (
+        mediator.select_main_camera(CameraRole.STEREO_RIGHT)
+        is CameraRole.STEREO_RIGHT
+    )
+    assert mediator.main_camera is CameraRole.STEREO_RIGHT
+    assert turret.stop_requests == 0
+    assert len(turret.relative_commands) == 1
+
+
+def test_select_main_camera_validates_camera_type() -> None:
+    mediator, _turret, _controls_map = _mediator(include_stereo_right=True)
+
+    with pytest.raises(TypeError, match="camera must be CameraRole"):
+        mediator.select_main_camera("stereo_right")  # type: ignore[arg-type]
 
 
 def test_tracking_swap_clears_both_processors_and_relative_swap_keeps_move() -> None:
@@ -2338,6 +2612,35 @@ def test_target_selection_publishes_candidate_policy_for_production_vt11() -> No
     assert command.candidate_click_tolerance_px == 23
 
 
+def test_stereo_right_candidate_selection_uses_right_target_control_channel() -> None:
+    mediator, _turret, controls = _mediator(
+        mode=TurretControlMode.TRACKING,
+        main=CameraRole.STEREO_RIGHT,
+        include_stereo_right=True,
+    )
+    first = _accept_main(mediator)
+    request = _request(mediator, first)
+    assert controls[CameraRole.STEREO_RIGHT].consume_latest(generation=1) == request
+
+    current = _result(CameraRole.STEREO_RIGHT, 1, frame_id=9)
+    assert mediator.accept_vision_result(current)
+    candidates = TargetCandidateSet(
+        selection_id=request.selection_id,
+        camera=CameraRole.STEREO_RIGHT,
+        generation=1,
+        frame_id=9,
+        candidates=(TargetCandidateProposal(7, BBox(50, 30, 20, 20), 0.9, 1),),
+    )
+
+    assert mediator.request_target_candidate_selection(candidates, 7, 60.0, 40.0)
+    command = controls[CameraRole.STEREO_RIGHT].consume_latest(generation=1)
+    assert isinstance(command, TargetCandidateSelectionRequest)
+    assert command.camera is CameraRole.STEREO_RIGHT
+    assert command.selection_id == request.selection_id
+    assert command.frame_id == 9
+    assert command.candidate_id == 7
+
+
 def test_candidate_selection_keeps_pending_target_intent_and_uses_exact_latest_frame() -> None:
     mediator, turret, controls = _mediator(mode=TurretControlMode.TRACKING)
     first = _accept_main(mediator)
@@ -2385,3 +2688,184 @@ def test_candidate_selection_keeps_pending_target_intent_and_uses_exact_latest_f
     assert controls[current.frame.camera].consume_latest(
         generation=current.frame.generation
     ) is None
+
+
+def test_stereo_right_generation_change_invalidates_tracking_and_stops() -> None:
+    mediator, turret, controls = _mediator(
+        mode=TurretControlMode.TRACKING,
+        main=CameraRole.STEREO_RIGHT,
+        include_stereo_right=True,
+    )
+    result = _accept_main(mediator, generation=4)
+    request = _request(mediator, result)
+    assert mediator.accept_target_lifecycle_event(_acquired(request))
+    controls[CameraRole.STEREO_RIGHT].consume_latest(generation=4)
+    invalidations_before = turret.invalidations
+
+    assert mediator.accept_camera_session(_session(CameraRole.STEREO_RIGHT, 5))
+
+    assert mediator.selected_target is None
+    assert mediator.pending_selection is None
+    assert turret.invalidations == invalidations_before + 1
+    assert turret.stop_requests == 1
+    assert controls[CameraRole.STEREO_RIGHT].consume_latest(generation=5) is None
+
+
+def test_stereo_right_disconnect_clears_target_and_stops() -> None:
+    mediator, turret, controls = _mediator(
+        mode=TurretControlMode.TRACKING,
+        main=CameraRole.STEREO_RIGHT,
+        include_stereo_right=True,
+    )
+    result = _accept_main(mediator, generation=6)
+    request = _request(mediator, result)
+    assert mediator.accept_target_lifecycle_event(_acquired(request))
+    controls[CameraRole.STEREO_RIGHT].consume_latest(generation=6)
+
+    assert mediator.accept_camera_status(
+        CameraStatus(
+            camera=CameraRole.STEREO_RIGHT,
+            generation=6,
+            state=CameraState.ERROR,
+            last_receive_timestamp_ns=result.frame.receive_timestamp_ns,
+            error_code="right-loss",
+            message="right camera lost",
+        )
+    )
+
+    assert mediator.selected_target is None
+    assert mediator.pending_selection is None
+    assert turret.stop_requests == 1
+    assert controls[CameraRole.STEREO_RIGHT].consume_latest(generation=6) == (
+        ClearTargetSelection(CameraRole.STEREO_RIGHT, 6)
+    )
+
+
+def test_stereo_right_emergency_motor_off_and_transport_loss_clear_target_intent() -> None:
+    for boundary in ("emergency", "motor_off", "transport_loss"):
+        mediator, turret, controls = _mediator(
+            mode=TurretControlMode.TRACKING,
+            main=CameraRole.STEREO_RIGHT,
+            include_stereo_right=True,
+        )
+        result = _accept_main(mediator, generation=7)
+        request = _request(mediator, result)
+        assert mediator.accept_target_lifecycle_event(_acquired(request))
+        controls[CameraRole.STEREO_RIGHT].consume_latest(generation=7)
+
+        if boundary == "emergency":
+            mediator.emergency_stop()
+            assert turret.emergency_requests == 1
+        elif boundary == "motor_off":
+            assert mediator.motor_off()
+            assert turret.motor_off_requests == 1
+        else:
+            mediator.accept_turret_state(
+                _turret_state(
+                    mode=TurretControlMode.TRACKING,
+                    connection=TurretConnectionState.CONNECTING,
+                )
+            )
+
+        assert mediator.selected_target is None
+        assert mediator.pending_selection is None
+        assert isinstance(
+            controls[CameraRole.STEREO_RIGHT].consume_latest(generation=7),
+            ClearTargetSelection,
+        )
+
+
+def test_stereo_right_processing_disabled_rejects_selection_before_vision() -> None:
+    processing = {
+        CameraRole.OVERVIEW: True,
+        CameraRole.STEREO_LEFT: True,
+        CameraRole.STEREO_RIGHT: False,
+    }
+    mediator, turret, controls = _mediator(
+        mode=TurretControlMode.TRACKING,
+        main=CameraRole.STEREO_RIGHT,
+        include_stereo_right=True,
+        processing_enabled=processing,
+    )
+    result = _accept_main(mediator)
+
+    assert not mediator.request_target_selection(result, 60, 40)
+    assert mediator.pending_selection is None
+    assert mediator.selected_target is None
+    assert turret.invalidations == 0
+    assert controls[CameraRole.STEREO_RIGHT].consume_latest(generation=1) is None
+
+
+def test_stereo_right_new_select_stops_old_target_and_clear_stops_pending_intent() -> None:
+    mediator, turret, controls = _mediator(
+        mode=TurretControlMode.TRACKING,
+        main=CameraRole.STEREO_RIGHT,
+        include_stereo_right=True,
+    )
+    result = _accept_main(mediator, generation=8)
+    first = _request(mediator, result)
+    assert mediator.accept_target_lifecycle_event(_acquired(first))
+    controls[CameraRole.STEREO_RIGHT].consume_latest(generation=8)
+    stops_before = turret.stop_requests
+
+    second = _request(mediator, result, x_px=62.0, y_px=42.0)
+
+    assert mediator.selected_target is None
+    assert mediator.pending_selection == second
+    assert second.selection_id == first.selection_id + 1
+    assert turret.stop_requests == stops_before + 1
+    assert controls[CameraRole.STEREO_RIGHT].consume_latest(generation=8) == second
+
+    assert mediator.deselect_target()
+    assert mediator.pending_selection is None
+    assert mediator.selected_target is None
+    assert turret.stop_requests == stops_before + 2
+    assert controls[CameraRole.STEREO_RIGHT].consume_latest(generation=8) == (
+        ClearTargetSelection(CameraRole.STEREO_RIGHT, 8)
+    )
+
+
+def test_stereo_right_target_loss_timeout_keeps_target_for_late_reacquisition() -> None:
+    clock = _FakeClock(40_000_000_000)
+    mediator, turret, controls = _mediator(
+        mode=TurretControlMode.TRACKING,
+        main=CameraRole.STEREO_RIGHT,
+        include_stereo_right=True,
+        clock_ns=clock,
+        target_lost_timeout_ms=500,
+    )
+    initial = _accept_main(mediator)
+    request = _request(mediator, initial)
+    assert mediator.accept_target_lifecycle_event(_acquired(request))
+    controls[CameraRole.STEREO_RIGHT].consume_latest(generation=1)
+    selected = mediator.selected_target
+    assert selected == TargetRef(CameraRole.STEREO_RIGHT, 1, 7)
+    invalidations_before = turret.invalidations
+    tracking_before = len(turret.tracking_controls)
+
+    assert mediator.accept_vision_result(
+        _result(CameraRole.STEREO_RIGHT, 1, frame_id=5, track_ids=())
+    )
+    clock.advance_ms(500)
+    assert mediator.accept_vision_result(
+        _result(CameraRole.STEREO_RIGHT, 1, frame_id=6, track_ids=())
+    )
+
+    assert mediator.selected_target == selected
+    assert turret.invalidations == invalidations_before + 1
+    assert turret.stop_requests == 1
+
+    clock.advance_ms(100)
+    assert mediator.accept_vision_result(
+        _result(
+            CameraRole.STEREO_RIGHT,
+            1,
+            frame_id=7,
+            timestamp_ns=4_000_000_000,
+        )
+    )
+
+    assert mediator.selected_target == selected
+    assert len(turret.tracking_controls) == tracking_before + 1
+    assert turret.tracking_controls[-1].target == selected
+    assert turret.tracking_controls[-1].observation_timestamp_ns == 4_000_000_000

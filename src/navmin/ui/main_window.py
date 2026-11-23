@@ -85,8 +85,8 @@ from .video_view import (
 
 LOGGER = logging.getLogger(__name__)
 
-_NORMAL_CAMERAS = (CameraRole.OVERVIEW, CameraRole.STEREO_LEFT)
-_DISPLAY_CAMERA_ORDER = (*_NORMAL_CAMERAS, CameraRole.STEREO_RIGHT)
+_REQUIRED_CAMERAS = (CameraRole.OVERVIEW, CameraRole.STEREO_LEFT)
+_DISPLAY_CAMERA_ORDER = (*_REQUIRED_CAMERAS, CameraRole.STEREO_RIGHT)
 _DISTANCE_MODE_OPTIONS = (
     (DistanceMeasurementMode.CONSTANT, "Константа"),
     (DistanceMeasurementMode.STEREO_EXACT, "Стерео — точная пара"),
@@ -177,6 +177,8 @@ class MainWindow(QMainWindow):
         ui_config: UiConfig | None = None,
         tracking_stereo_left_hfov_deg: float | None = None,
         apply_tracking_stereo_left_hfov_deg: Callable[[float], None] | None = None,
+        tracking_stereo_right_hfov_deg: float | None = None,
+        apply_tracking_stereo_right_hfov_deg: Callable[[float], None] | None = None,
         persist_ui_config: Callable[[UiConfig], None] | None = None,
         apply_vt11_ui_config: Callable[[Vt11UiConfig], None] | None = None,
         vision_processor_selections: Mapping[CameraRole, VisionProcessorSelection] | None = None,
@@ -208,7 +210,7 @@ class MainWindow(QMainWindow):
     ) -> None:
         super().__init__()
         binding_roles = set(camera_bindings)
-        if not set(_NORMAL_CAMERAS).issubset(binding_roles) or not binding_roles.issubset(
+        if not set(_REQUIRED_CAMERAS).issubset(binding_roles) or not binding_roles.issubset(
             set(_DISPLAY_CAMERA_ORDER)
         ):
             raise ValueError(
@@ -236,6 +238,12 @@ class MainWindow(QMainWindow):
             ui_config.show_stereo_right_camera
             and CameraRole.STEREO_RIGHT in self._available_cameras
         )
+        if (
+            not self._show_stereo_right_camera
+            and mediator.main_camera is CameraRole.STEREO_RIGHT
+        ):
+            mediator.select_main_camera(CameraRole.OVERVIEW)
+            self._display_camera = CameraRole.OVERVIEW
         self._aiming_config = aiming_config
         self._on_apply_aiming_tuning = apply_aiming_tuning
         self._aim_point_selection_active = False
@@ -493,6 +501,10 @@ class MainWindow(QMainWindow):
             on_apply_tracking_stereo_left_hfov_deg=(
                 apply_tracking_stereo_left_hfov_deg
             ),
+            tracking_stereo_right_hfov_deg=tracking_stereo_right_hfov_deg,
+            on_apply_tracking_stereo_right_hfov_deg=(
+                apply_tracking_stereo_right_hfov_deg
+            ),
             tracking_visualization_config=tracking_visualization_config,
             on_tracking_visualization_changed=self._set_tracking_visualization,
             vt11_ui_config=self._ui_config.vt11,
@@ -631,8 +643,8 @@ class MainWindow(QMainWindow):
             return
         self._abort_motion_calibration("основная камера изменена")
         self._set_aim_point_selection(False)
-        if camera in _NORMAL_CAMERAS and camera is not self._mediator.main_camera:
-            self._mediator.swap_main_preview()
+        if camera is not self._mediator.main_camera:
+            self._mediator.select_main_camera(camera)
         self._display_camera = camera
         self._shown_main_camera = self._mediator.main_camera
         self._refresh_view_roles()
@@ -676,6 +688,12 @@ class MainWindow(QMainWindow):
             self._ui_config,
             show_stereo_right_camera=enabled,
         )
+        if not enabled and self._mediator.main_camera is CameraRole.STEREO_RIGHT:
+            self._abort_motion_calibration("правая камера скрыта")
+            self._set_aim_point_selection(False)
+            self._mediator.select_main_camera(CameraRole.OVERVIEW)
+            self._display_camera = CameraRole.OVERVIEW
+            self._shown_main_camera = CameraRole.OVERVIEW
         if next_ui_config != self._ui_config and self._persist_ui_config is not None:
             self._persist_ui_config(next_ui_config)
         self._ui_config = next_ui_config
@@ -719,9 +737,7 @@ class MainWindow(QMainWindow):
         if self._mediator.selected_target != self._shown_selection:
             self._shown_selection = self._mediator.selected_target
             for view in self._all_video_views():
-                view.set_selected_target(
-                    self._shown_selection if view.camera in _NORMAL_CAMERAS else None
-                )
+                view.set_selected_target(self._shown_selection)
         self._refresh_distance_presentation()
         self._refresh_aim_point()
         self._refresh_motion_calibration_guide()
@@ -813,10 +829,7 @@ class MainWindow(QMainWindow):
 
     def _apply_tracking_visualization_to_views(self) -> None:
         config = self._tracking_visualization_config
-        main_is_control = (
-            self._display_camera in _NORMAL_CAMERAS
-            and self._display_camera is self._mediator.main_camera
-        )
+        main_is_control = self._display_camera is self._mediator.main_camera
         self.main_view.set_tracking_visualization(
             show_search_region=config.show_search_region if main_is_control else False,
             show_best_candidate=config.show_best_candidate if main_is_control else False,
@@ -1008,14 +1021,10 @@ class MainWindow(QMainWindow):
     def _apply_view_state(self, view: VideoView) -> None:
         camera = view.camera
         is_control_main = (
-            view is self.main_view
-            and camera in _NORMAL_CAMERAS
-            and camera is self._mediator.main_camera
+            view is self.main_view and camera is self._mediator.main_camera
         )
         view.set_prepared_frame(self._prepared_frames.get(camera))
-        view.set_selected_target(
-            self._mediator.selected_target if camera in _NORMAL_CAMERAS else None
-        )
+        view.set_selected_target(self._mediator.selected_target)
         view.set_tracking_diagnostics(
             self._tracking_diagnostics.get(camera) if is_control_main else None
         )
@@ -1088,10 +1097,7 @@ class MainWindow(QMainWindow):
             self._apply_aim_point_click(displayed_result, x_px, y_px)
             self.refresh_presentation()
             return
-        if (
-            displayed_result.frame.camera not in _NORMAL_CAMERAS
-            or displayed_result.frame.camera is not self._mediator.main_camera
-        ):
+        if displayed_result.frame.camera is not self._mediator.main_camera:
             return
         if (
             self.motion_calibration_window is not None

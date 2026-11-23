@@ -51,6 +51,7 @@ from navmin.motion_calibration import (
 _CAMERAS = (
     (CameraRole.OVERVIEW, "Overview"),
     (CameraRole.STEREO_LEFT, "Stereo Left"),
+    (CameraRole.STEREO_RIGHT, "Stereo Right"),
 )
 _CALIBRATION_CAMERAS = frozenset(camera for camera, _label in _CAMERAS)
 LOGGER = logging.getLogger(__name__)

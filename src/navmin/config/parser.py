@@ -922,11 +922,13 @@ def _parse_ui(
     default_camera = _enum_string(
         obj["default-camera"],
         f"{path}.default-camera",
-        {"overview", "stereo-left"},
+        {"overview", "stereo-left", "stereo-right"},
     )
-    camera_role = (
-        CameraRole.OVERVIEW if default_camera == "overview" else CameraRole.STEREO_LEFT
-    )
+    camera_role = {
+        "overview": CameraRole.OVERVIEW,
+        "stereo-left": CameraRole.STEREO_LEFT,
+        "stereo-right": CameraRole.STEREO_RIGHT,
+    }[default_camera]
 
     vt11 = Vt11UiConfig()
     if "vt11" in obj:
@@ -1300,11 +1302,11 @@ def config_to_mapping(config: AppConfig) -> dict[str, Any]:
             "emulate-stm32": config.turret.emulate_stm32,
         },
         "ui": {
-            "default-camera": (
-                "overview"
-                if config.ui.default_camera is CameraRole.OVERVIEW
-                else "stereo-left"
-            ),
+            "default-camera": {
+                CameraRole.OVERVIEW: "overview",
+                CameraRole.STEREO_LEFT: "stereo-left",
+                CameraRole.STEREO_RIGHT: "stereo-right",
+            }[config.ui.default_camera],
             "show-fps": config.ui.show_fps,
             "show-stereo-right-diagnostics": config.ui.show_stereo_right_diagnostics,
             "show-stereo-right-camera": config.ui.show_stereo_right_camera,

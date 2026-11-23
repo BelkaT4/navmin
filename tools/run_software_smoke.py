@@ -53,6 +53,7 @@ FRAME_WIDTH = 320
 FRAME_HEIGHT = 240
 _OVERVIEW_FPS = 20.0
 _STEREO_LEFT_FPS = 15.0
+_STEREO_RIGHT_FPS = 15.0
 _TARGET_RADIUS_PX = 6
 _TARGET_SPEED_PX_PER_FRAME = 2
 
@@ -131,7 +132,9 @@ def _synthetic_target_center(
         return _ping_pong_coordinate(frame_index, 190, 280), 82
     if camera is CameraRole.STEREO_LEFT:
         return _ping_pong_coordinate(frame_index, 40, 130), 170
-    raise ValueError("software smoke only produces Overview and Stereo Left")
+    if camera is CameraRole.STEREO_RIGHT:
+        return _ping_pong_coordinate(frame_index, 190, 280), 82
+    raise ValueError("unsupported software smoke camera")
 
 
 def _overview_frame(frame_index: int) -> np.ndarray:
@@ -166,6 +169,22 @@ def _stereo_left_frame(frame_index: int) -> np.ndarray:
     return frame
 
 
+def _stereo_right_frame(frame_index: int) -> np.ndarray:
+    frame = np.full(
+        (FRAME_HEIGHT, FRAME_WIDTH, 3),
+        (38, 62, 42),
+        dtype=np.uint8,
+    )
+    cv2.circle(
+        frame,
+        _synthetic_target_center(CameraRole.STEREO_RIGHT, frame_index),
+        _TARGET_RADIUS_PX,
+        (245, 245, 245),
+        -1,
+    )
+    return frame
+
+
 class SyntheticFrameProducer:
     """Small smoke-local producer for one hardware-free camera boundary."""
 
@@ -179,8 +198,10 @@ class SyntheticFrameProducer:
             fps = _OVERVIEW_FPS
         elif camera is CameraRole.STEREO_LEFT:
             fps = _STEREO_LEFT_FPS
+        elif camera is CameraRole.STEREO_RIGHT:
+            fps = _STEREO_RIGHT_FPS
         else:
-            raise ValueError("software smoke only produces Overview and Stereo Left")
+            raise ValueError("unsupported software smoke camera")
         self.camera = camera
         self.source = source
         self.fps = fps
@@ -239,11 +260,12 @@ class SyntheticFrameProducer:
                 if self._stop_token.wait(min(period_s, 0.02)):
                     break
                 continue
-            frame = (
-                _overview_frame(frame_index)
-                if self.camera is CameraRole.OVERVIEW
-                else _stereo_left_frame(frame_index)
-            )
+            if self.camera is CameraRole.OVERVIEW:
+                frame = _overview_frame(frame_index)
+            elif self.camera is CameraRole.STEREO_LEFT:
+                frame = _stereo_left_frame(frame_index)
+            else:
+                frame = _stereo_right_frame(frame_index)
             self.source.push(frame)
             with self._counter_lock:
                 self._frames_produced += 1
@@ -337,7 +359,7 @@ def _smoke_overview_config(port: int) -> OverviewCameraConfig:
     )
 
 
-def _smoke_app_config() -> AppConfig:
+def _smoke_app_config(*, include_stereo_right: bool = False) -> AppConfig:
     default_config = load_config(
         Path(__file__).resolve().parents[1]
         / "config"
@@ -353,8 +375,8 @@ def _smoke_app_config() -> AppConfig:
                 stereo_left=_smoke_camera_config(8889, processing_enabled=True),
                 stereo_right=_smoke_camera_config(
                     8890,
-                    processing_enabled=False,
-                    enabled=False,
+                    processing_enabled=include_stereo_right,
+                    enabled=include_stereo_right,
                 ),
             ),
             distance=VisionDistanceConfig(
@@ -393,9 +415,13 @@ class SoftwareSmokeRuntime:
         self,
         *,
         turret_transport_factory: TransportFactory | None = None,
+        include_stereo_right: bool = False,
+        motion_calibration_path: Path = Path("config/calibration/motion.json"),
     ) -> None:
         self.overview_source = InMemoryFrameSource()
         self.stereo_left_source = InMemoryFrameSource()
+        self.stereo_right_source = InMemoryFrameSource()
+        self._include_stereo_right = include_stereo_right
 
         def overview_source_factory(_config: CameraConfig) -> InMemoryFrameSource:
             return self.overview_source
@@ -403,20 +429,31 @@ class SoftwareSmokeRuntime:
         def stereo_left_source_factory(_config: CameraConfig) -> InMemoryFrameSource:
             return self.stereo_left_source
 
+        def stereo_right_source_factory(_config: CameraConfig) -> InMemoryFrameSource:
+            return self.stereo_right_source
+
         self.application: ApplicationRuntime = build_application_runtime(
-            config=_smoke_app_config(),
+            config=_smoke_app_config(include_stereo_right=include_stereo_right),
             overview_calibration=synthetic_overview_calibration(),
             stereo_calibration=synthetic_stereo_calibration(),
             factories=ApplicationFactories(
                 overview_source_factory=overview_source_factory,
                 stereo_left_source_factory=stereo_left_source_factory,
+                stereo_right_source_factory=stereo_right_source_factory,
                 turret_transport_factory=turret_transport_factory,
             ),
+            motion_calibration_path=motion_calibration_path,
         )
         self.overview_worker = self.application.overview_worker
         self.stereo_left_worker = self.application.stereo_left_worker
+        self.stereo_right_worker = self.application.stereo_right_worker
         self.overview_pipeline = self.overview_worker.pipeline
         self.stereo_left_pipeline = self.stereo_left_worker.pipeline
+        self.stereo_right_pipeline = (
+            None
+            if self.stereo_right_worker is None
+            else self.stereo_right_worker.pipeline
+        )
         self.turret_worker = self.application.turret_worker
         self.mediator = self.application.mediator
         self.overview_producer = SyntheticFrameProducer(
@@ -426,6 +463,14 @@ class SoftwareSmokeRuntime:
         self.stereo_left_producer = SyntheticFrameProducer(
             camera=CameraRole.STEREO_LEFT,
             source=self.stereo_left_source,
+        )
+        self.stereo_right_producer = (
+            SyntheticFrameProducer(
+                camera=CameraRole.STEREO_RIGHT,
+                source=self.stereo_right_source,
+            )
+            if include_stereo_right
+            else None
         )
 
         self._started_producers: list[SyntheticFrameProducer] = []
@@ -441,7 +486,10 @@ class SoftwareSmokeRuntime:
         try:
             self.application.start()
             self._wait_for_camera_sessions(timeout=2.0)
-            for producer in (self.overview_producer, self.stereo_left_producer):
+            producers = [self.overview_producer, self.stereo_left_producer]
+            if self.stereo_right_producer is not None:
+                producers.append(self.stereo_right_producer)
+            for producer in producers:
                 producer.start()
                 self._started_producers.append(producer)
         except RuntimeError as startup_error:
@@ -458,6 +506,8 @@ class SoftwareSmokeRuntime:
 
         LOGGER.info("Overview started")
         LOGGER.info("Stereo Left started")
+        if self.stereo_right_producer is not None:
+            LOGGER.info("Stereo Right started")
 
     def camera_bindings(self):
         """Return the shared runtime's ready-to-use UI camera bindings."""
@@ -476,9 +526,14 @@ class SoftwareSmokeRuntime:
 
         self._shutdown_complete = not failures
         LOGGER.info(
-            "software smoke frames produced Overview=%d Stereo Left=%d",
+            "software smoke frames produced Overview=%d Stereo Left=%d Stereo Right=%d",
             self.overview_producer.frames_produced,
             self.stereo_left_producer.frames_produced,
+            (
+                0
+                if self.stereo_right_producer is None
+                else self.stereo_right_producer.frames_produced
+            ),
         )
         if failures:
             raise RuntimeError("software smoke shutdown failed: " + "; ".join(failures))
@@ -504,12 +559,25 @@ class SoftwareSmokeRuntime:
     def _wait_for_camera_sessions(self, timeout: float) -> None:
         deadline = monotonic() + timeout
         while monotonic() < deadline:
-            if (
+            required_ready = (
                 self.overview_pipeline.generation >= 1
                 and self.stereo_left_pipeline.generation >= 1
-            ):
+                and (
+                    self.stereo_right_pipeline is None
+                    or self.stereo_right_pipeline.generation >= 1
+                )
+            )
+            if required_ready:
                 return
-            if not self.overview_worker.is_alive() or not self.stereo_left_worker.is_alive():
+            if (
+                not self.overview_worker.is_alive()
+                or not self.stereo_left_worker.is_alive()
+            ):
+                break
+            if (
+                self.stereo_right_worker is not None
+                and not self.stereo_right_worker.is_alive()
+            ):
                 break
             self.overview_pipeline.status.wait_for_revision(
                 self.overview_pipeline.status.snapshot().revision,
@@ -527,6 +595,11 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=float,
         default=None,
         help="quit the Qt event loop automatically after a positive number of seconds",
+    )
+    parser.add_argument(
+        "--stereo-right",
+        action="store_true",
+        help="include the synthetic Stereo Right camera and its detector/control path",
     )
     args = parser.parse_args(argv)
     if args.auto_close_seconds is not None and args.auto_close_seconds <= 0.0:
@@ -573,7 +646,7 @@ def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
     configure_logging(logging.INFO)
     LOGGER.info("software smoke starting")
-    runtime = SoftwareSmokeRuntime()
+    runtime = SoftwareSmokeRuntime(include_stereo_right=args.stereo_right)
     exit_code = 1
     try:
         runtime.start()

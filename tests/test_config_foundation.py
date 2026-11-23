@@ -220,6 +220,17 @@ def test_tracking_control_round_trips_through_mapping() -> None:
     assert parse_config(config_to_mapping(config)) == config
 
 
+def test_stereo_right_is_valid_default_camera_and_round_trips() -> None:
+    data = _valid_config()
+    data["ui"]["default-camera"] = "stereo-right"
+
+    config = parse_config(data)
+
+    assert config.ui.default_camera is CameraRole.STEREO_RIGHT
+    assert config_to_mapping(config)["ui"]["default-camera"] == "stereo-right"
+    assert parse_config(config_to_mapping(config)) == config
+
+
 def test_schema_v8_requires_tracking_control_and_rejects_old_pixel_lead() -> None:
     missing = _valid_config()
     missing.pop("tracking-control")
@@ -908,7 +919,7 @@ def test_non_finite_numbers_are_rejected_with_field_path(invalid) -> None:
             "turret.serial.baudrate",
         ),
         (
-            lambda d: d["ui"].__setitem__("default-camera", "stereo-right"),
+            lambda d: d["ui"].__setitem__("default-camera", "sideways"),
             "ui.default-camera",
         ),
     ],

@@ -87,17 +87,19 @@ class EffectiveLaunchSelection:
     def camera_motion_control_roles(self) -> frozenset[CameraRole]:
         """Cameras allowed to originate motion for this launch.
 
-        With a simulated STM32 all camera-derived motion remains software-only,
-        so both normal control cameras are allowed.  With a real STM32, only
-        real cameras may originate motion; synthetic imagery remains available
-        for observation/vision diagnostics but cannot drive physical hardware.
+        With a simulated STM32 all enabled camera-derived motion remains
+        software-only, so every enabled control-capable camera is allowed. With
+        a real STM32, only real cameras may originate motion; synthetic imagery
+        remains available for observation/vision diagnostics but cannot drive
+        physical hardware.
         """
+        enabled_roles = {CameraRole.OVERVIEW, CameraRole.STEREO_LEFT}
+        if self.options.stereo_right is not StereoRightMode.OFF:
+            enabled_roles.add(CameraRole.STEREO_RIGHT)
         if self.options.stm32 is Stm32Mode.SIM:
-            return frozenset((CameraRole.OVERVIEW, CameraRole.STEREO_LEFT))
+            return frozenset(enabled_roles)
         return frozenset(
-            role
-            for role in self.real_camera_roles
-            if role in (CameraRole.OVERVIEW, CameraRole.STEREO_LEFT)
+            role for role in self.real_camera_roles if role in enabled_roles
         )
 
 
@@ -121,6 +123,13 @@ def default_launch_options(
     if not cameras.stereo_left.enabled:
         raise LaunchSelectionError(
             "Stereo Left is disabled in config, but the current runtime requires it"
+        )
+    if (
+        config.ui.default_camera is CameraRole.STEREO_RIGHT
+        and not cameras.stereo_right.enabled
+    ):
+        raise LaunchSelectionError(
+            "Stereo Right is the default camera but is disabled in config"
         )
 
     return LaunchOptions(
@@ -173,6 +182,13 @@ def resolve_launch_options(
         )
     if stm32 is None:
         stm32 = Stm32Mode.SIM if config.turret.emulate_stm32 else Stm32Mode.ON
+    if (
+        config.ui.default_camera is CameraRole.STEREO_RIGHT
+        and stereo_right is StereoRightMode.OFF
+    ):
+        raise LaunchSelectionError(
+            "Stereo Right is the default camera but is OFF for this launch"
+        )
     return LaunchOptions(
         overview=overview,
         stereo_left=stereo_left,
@@ -196,6 +212,13 @@ def apply_launch_options(
     emulation and stereo feature availability are resolved.
     """
     cameras = config.vision.cameras
+    if (
+        config.ui.default_camera is CameraRole.STEREO_RIGHT
+        and options.stereo_right is StereoRightMode.OFF
+    ):
+        raise LaunchSelectionError(
+            "Stereo Right is the default camera but is OFF for this launch"
+        )
     effective_cameras = replace(
         cameras,
         overview=replace(cameras.overview, enabled=True),
@@ -237,6 +260,7 @@ def apply_launch_options(
     if options.stm32 is Stm32Mode.ON and (
         options.overview is CameraSourceMode.SIM
         or options.stereo_left is CameraSourceMode.SIM
+        or options.stereo_right is StereoRightMode.SIM
     ):
         warnings.append(
             "Synthetic camera processing is enabled with a real STM32; "
@@ -245,6 +269,7 @@ def apply_launch_options(
     if options.stm32 is Stm32Mode.SIM and (
         options.overview is CameraSourceMode.ON
         or options.stereo_left is CameraSourceMode.ON
+        or options.stereo_right is StereoRightMode.ON
     ):
         warnings.append(
             "Real camera input with a simulated STM32 is a mixed open-loop "

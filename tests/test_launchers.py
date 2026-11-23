@@ -305,6 +305,56 @@ def test_default_launch_options_reject_disabled_mandatory_camera(
         default_launch_options(config)
 
 
+def test_default_launch_options_reject_disabled_stereo_right_when_it_is_default() -> None:
+    config = _config()
+    config = replace(
+        config,
+        ui=replace(config.ui, default_camera=CameraRole.STEREO_RIGHT),
+        vision=replace(
+            config.vision,
+            cameras=replace(
+                config.vision.cameras,
+                stereo_right=replace(config.vision.cameras.stereo_right, enabled=False),
+            ),
+        ),
+    )
+
+    with pytest.raises(LaunchSelectionError, match="default camera.*disabled"):
+        default_launch_options(config)
+
+
+def test_resolve_launch_options_allows_explicit_stereo_right_for_right_default() -> None:
+    config = _config()
+    config = replace(
+        config,
+        ui=replace(config.ui, default_camera=CameraRole.STEREO_RIGHT),
+        vision=replace(
+            config.vision,
+            cameras=replace(
+                config.vision.cameras,
+                stereo_right=replace(config.vision.cameras.stereo_right, enabled=False),
+            ),
+        ),
+    )
+
+    options = resolve_launch_options(config, stereo_right=StereoRightMode.SIM)
+
+    assert options.stereo_right is StereoRightMode.SIM
+
+
+def test_apply_launch_options_rejects_right_default_when_right_is_off() -> None:
+    config = replace(_config(), ui=replace(_config().ui, default_camera=CameraRole.STEREO_RIGHT))
+    options = LaunchOptions(
+        overview=CameraSourceMode.ON,
+        stereo_left=CameraSourceMode.ON,
+        stereo_right=StereoRightMode.OFF,
+        stm32=Stm32Mode.ON,
+    )
+
+    with pytest.raises(LaunchSelectionError, match="default camera.*OFF"):
+        apply_launch_options(config, options)
+
+
 def test_apply_launch_options_is_immutable_and_resolves_stm32_sim() -> None:
     config = _config()
     options = LaunchOptions(
@@ -420,11 +470,8 @@ def test_apply_launch_options_disables_mixed_stereo_pairing(
     assert effective.config.vision.cameras.stereo_right.enabled is True
     assert effective.config.vision.distance.stereo.stereo_enabled is False
     assert "mixed real/sim" in effective.warnings[0]
-    if left_mode is CameraSourceMode.SIM:
-        assert len(effective.warnings) == 2
-        assert "camera-derived motion" in effective.warnings[1]
-    else:
-        assert len(effective.warnings) == 1
+    assert len(effective.warnings) == 2
+    assert "camera-derived motion" in effective.warnings[1]
 
 
 def test_apply_launch_options_right_off_disables_only_optional_stereo_feature() -> None:
@@ -564,11 +611,8 @@ def test_launch_runtime_bindings_mixed_stereo_keep_real_side_calibration(
     effective = bindings.inputs.stereo_calibration
 
     assert bindings.inputs.config.vision.distance.stereo.stereo_enabled is False
-    if synthetic_side == "left":
-        assert len(bindings.selection.warnings) == 2
-        assert "camera-derived motion" in bindings.selection.warnings[1]
-    else:
-        assert len(bindings.selection.warnings) == 1
+    assert len(bindings.selection.warnings) == 2
+    assert "camera-derived motion" in bindings.selection.warnings[1]
     if synthetic_side == "left":
         synthetic = synthetic_tracking_stereo_calibration()
         assert effective.K_left == synthetic.K_left
@@ -665,16 +709,20 @@ def test_launch_runtime_bindings_support_every_source_combination(
         stm32_mode is Stm32Mode.SIM
     )
 
+    enabled_control_roles = {CameraRole.OVERVIEW, CameraRole.STEREO_LEFT}
+    if right_mode is not StereoRightMode.OFF:
+        enabled_control_roles.add(CameraRole.STEREO_RIGHT)
     expected_motion_roles = (
-        frozenset((CameraRole.OVERVIEW, CameraRole.STEREO_LEFT))
+        frozenset(enabled_control_roles)
         if stm32_mode is Stm32Mode.SIM
         else frozenset(
             camera
-            for camera, mode in (
-                (CameraRole.OVERVIEW, overview_mode),
-                (CameraRole.STEREO_LEFT, left_mode),
+            for camera, is_real in (
+                (CameraRole.OVERVIEW, overview_mode is CameraSourceMode.ON),
+                (CameraRole.STEREO_LEFT, left_mode is CameraSourceMode.ON),
+                (CameraRole.STEREO_RIGHT, right_mode is StereoRightMode.ON),
             )
-            if mode is CameraSourceMode.ON
+            if is_real and camera in enabled_control_roles
         )
     )
     assert bindings.selection.camera_motion_control_roles == expected_motion_roles
@@ -1037,6 +1085,10 @@ def test_run_loaded_application_uses_shared_runtime_ui_surface_and_shutdown() ->
         apply_motion_limits_tuning=lambda _config: None,
         tracking_control_config=inputs.config.tracking_control,
         apply_tracking_control_tuning=lambda _config: None,
+        tracking_stereo_left_hfov_deg=6.3,
+        apply_tracking_stereo_left_hfov_deg=lambda _value: None,
+        tracking_stereo_right_hfov_deg=6.5,
+        apply_tracking_stereo_right_hfov_deg=lambda _value: None,
         tracking_visualization_config=inputs.config.tracking_visualization,
         ui_config=inputs.config.ui,
         vision_processor_selections={},
@@ -1082,6 +1134,16 @@ def test_run_loaded_application_uses_shared_runtime_ui_surface_and_shutdown() ->
         assert (
             kwargs["apply_tracking_control_tuning"]
             is ui_dependencies.apply_tracking_control_tuning
+        )
+        assert kwargs["tracking_stereo_left_hfov_deg"] == pytest.approx(6.3)
+        assert kwargs["tracking_stereo_right_hfov_deg"] == pytest.approx(6.5)
+        assert (
+            kwargs["apply_tracking_stereo_left_hfov_deg"]
+            is ui_dependencies.apply_tracking_stereo_left_hfov_deg
+        )
+        assert (
+            kwargs["apply_tracking_stereo_right_hfov_deg"]
+            is ui_dependencies.apply_tracking_stereo_right_hfov_deg
         )
         assert (
             kwargs["tracking_visualization_config"]

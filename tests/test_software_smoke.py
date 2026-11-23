@@ -20,6 +20,15 @@ from navmin.contracts import (
     TurretConnectionState,
     TurretControlMode,
 )
+from navmin.motion_calibration import (
+    AxisMotionCalibration,
+    CameraMotionCalibration,
+    CurvePoint,
+    DirectionCurve,
+    MechanicalIdentity,
+    MotionProfile,
+    ReversalLoss,
+)
 from navmin.turret.protocol import (
     CommandCode,
     MoveRelativePayload,
@@ -37,6 +46,7 @@ from navmin.vision.pipeline import (
     InMemoryFrameSource,
     overview_corrector,
     stereo_left_corrector,
+    stereo_right_corrector,
 )
 from navmin.vision.processors.legacy_14.processor import Legacy14VisionProcessor
 
@@ -49,6 +59,7 @@ _run_qt_smoke = _SMOKE["_run_qt_smoke"]
 SyntheticFrameProducer = _SMOKE["SyntheticFrameProducer"]
 _overview_frame = _SMOKE["_overview_frame"]
 _stereo_left_frame = _SMOKE["_stereo_left_frame"]
+_stereo_right_frame = _SMOKE["_stereo_right_frame"]
 _synthetic_target_center = _SMOKE["_synthetic_target_center"]
 synthetic_overview_calibration = _SMOKE["synthetic_overview_calibration"]
 synthetic_stereo_calibration = _SMOKE["synthetic_stereo_calibration"]
@@ -110,6 +121,12 @@ def test_synthetic_scenes_produce_one_stable_real_track_per_camera() -> None:
             CameraRole.STEREO_LEFT,
             _stereo_left_frame,
             stereo_left_corrector(synthetic_stereo_calibration()),
+            15.0,
+        ),
+        (
+            CameraRole.STEREO_RIGHT,
+            _stereo_right_frame,
+            stereo_right_corrector(synthetic_stereo_calibration()),
             15.0,
         ),
     )
@@ -727,6 +744,457 @@ def test_tracking_ui_selection_drives_real_velocity_loop_to_fake_stm32() -> None
     assert not runtime.stereo_left_producer.is_alive()
     assert not runtime.overview_worker.is_alive()
     assert not runtime.stereo_left_worker.is_alive()
+    assert not runtime.turret_worker.is_alive()
+
+
+def _right_motion_calibration_profile(
+    runtime: SoftwareSmokeRuntime,
+) -> CameraMotionCalibration:
+    calibration = runtime.application.motion_calibration_runtime
+    mechanics_x = MechanicalIdentity.from_config(calibration.axes.x)
+    mechanics_y = MechanicalIdentity.from_config(calibration.axes.y)
+    curve = DirectionCurve(
+        (
+            CurvePoint(0.0, 0.0),
+            CurvePoint(5.0, 10.0),
+            CurvePoint(10.0, 20.0),
+            CurvePoint(20.0, 40.0),
+        )
+    )
+    axis = AxisMotionCalibration(
+        positive=curve,
+        negative=curve,
+        reversal_loss=ReversalLoss(),
+        observations=(),
+        quality_max_repeat_spread_deg=0.0,
+    )
+    return CameraMotionCalibration(
+        camera=CameraRole.STEREO_RIGHT,
+        camera_calibration_identity=calibration.camera_identities[
+            CameraRole.STEREO_RIGHT
+        ],
+        mechanical_identity_x=mechanics_x,
+        mechanical_identity_y=mechanics_y,
+        calibration_limit_x_deg=20.0,
+        calibration_limit_y_deg=20.0,
+        motion_profile=MotionProfile(5.0, 10.0, 0),
+        axes={"x": axis, "y": axis},
+        created_at_utc="2026-11-24T00:00:00+00:00",
+    )
+
+
+def _steps_for_deg(value_deg: float, *, full_steps: int, microstep: int) -> int:
+    return round(value_deg * full_steps * microstep / 360.0)
+
+
+def test_stereo_right_tracking_detector_reaches_fake_stm32_end_to_end(
+    tmp_path: Path,
+) -> None:
+    os.environ["QT_QPA_PLATFORM"] = "offscreen"
+
+    from PyQt6.QtCore import QPoint, Qt
+    from PyQt6.QtTest import QTest
+    from PyQt6.QtWidgets import QApplication
+
+    from navmin.ui import MainWindow
+
+    endpoint = FakeStm32Endpoint()
+
+    def transport_factory(
+        _port: str,
+        baudrate: int,
+        _emulate_stm32: bool,
+    ) -> FakeTransport:
+        return FakeTransport(endpoint, baudrate=baudrate)
+
+    runtime = SoftwareSmokeRuntime(
+        turret_transport_factory=transport_factory,
+        include_stereo_right=True,
+        motion_calibration_path=tmp_path / "motion.json",
+    )
+    application = QApplication.instance() or QApplication([])
+    window = None
+
+    def executed(command: CommandCode):
+        return [
+            request
+            for request in list(endpoint.executed_request_history)
+            if request.command is command
+        ]
+
+    try:
+        runtime.start()
+        assert runtime.stereo_right_worker is not None
+        assert runtime.stereo_right_producer is not None
+        window = MainWindow(
+            mediator=runtime.mediator,
+            camera_bindings=runtime.camera_bindings(),
+            turret_states=runtime.turret_worker.state_updates,
+            camera_stale_timeout_ms=500,
+            aiming_config=runtime.application.ui_dependencies.aiming_config,
+            apply_aiming_tuning=runtime.application.ui_dependencies.apply_aiming_tuning,
+            pid_controller_config=(
+                runtime.application.ui_dependencies.pid_controller_config
+            ),
+            apply_pid_tuning=runtime.application.ui_dependencies.apply_pid_tuning,
+            stm32_config=runtime.application.ui_dependencies.stm32_config,
+            apply_motion_limits_tuning=(
+                runtime.application.ui_dependencies.apply_motion_limits_tuning
+            ),
+            vision_processor_selections=(
+                runtime.application.ui_dependencies.vision_processor_selections
+            ),
+            apply_vision_processor_selection=(
+                runtime.application.ui_dependencies.apply_vision_processor_selection
+            ),
+            tracking_control_config=(
+                runtime.application.ui_dependencies.tracking_control_config
+            ),
+            apply_tracking_control_tuning=(
+                runtime.application.ui_dependencies.apply_tracking_control_tuning
+            ),
+            tracking_stereo_left_hfov_deg=(
+                runtime.application.ui_dependencies.tracking_stereo_left_hfov_deg
+            ),
+            apply_tracking_stereo_left_hfov_deg=(
+                runtime.application.ui_dependencies.apply_tracking_stereo_left_hfov_deg
+            ),
+            tracking_stereo_right_hfov_deg=(
+                runtime.application.ui_dependencies.tracking_stereo_right_hfov_deg
+            ),
+            apply_tracking_stereo_right_hfov_deg=(
+                runtime.application.ui_dependencies.apply_tracking_stereo_right_hfov_deg
+            ),
+            ui_config=runtime.application.ui_dependencies.ui_config,
+            start_timer=False,
+            start_fullscreen=False,
+        )
+        window.resize(900, 650)
+        window.show()
+        application.processEvents()
+
+        def pump_until(predicate, *, timeout: float, message: str) -> None:
+            deadline = monotonic() + timeout
+            while monotonic() < deadline:
+                window.state_pump.pump_once()
+                application.processEvents()
+                if predicate():
+                    return
+                sleep(0.005)
+            raise AssertionError(message)
+
+        def stable_right_track():
+            result = window.main_view.displayed_result
+            if (
+                result is None
+                or result.frame.camera is not CameraRole.STEREO_RIGHT
+                or len(result.tracked_objects) != 1
+            ):
+                return None
+            tracked = result.tracked_objects[0]
+            if abs(tracked.velocity_x_px_s) <= 5.0:
+                return None
+            return tracked
+
+        pump_until(
+            lambda: (
+                runtime.mediator.turret_state.connection_state
+                is TurretConnectionState.READY
+                and runtime.mediator.session_gate.accepted_generation(
+                    CameraRole.STEREO_RIGHT
+                )
+                is not None
+                and window.preview_view_2.camera is CameraRole.STEREO_RIGHT
+                and window.preview_view_2.displayed_result is not None
+            ),
+            timeout=4.0,
+            message="Stereo Right did not become a live preview",
+        )
+
+        QTest.mouseClick(
+            window.preview_view_2,
+            Qt.MouseButton.LeftButton,
+            pos=window.preview_view_2.rect().center(),
+        )
+        pump_until(
+            lambda: (
+                runtime.mediator.main_camera is CameraRole.STEREO_RIGHT
+                and window.main_view.camera is CameraRole.STEREO_RIGHT
+                and stable_right_track() is not None
+                and window.main_view.interaction_allowed(
+                    runtime.mediator.session_gate,
+                    monotonic_ns(),
+                )
+            ),
+            timeout=2.0,
+            message="Stereo Right did not become the live control main camera",
+        )
+
+        QTest.mouseClick(window.mode_button, Qt.MouseButton.LeftButton)
+        pump_until(
+            lambda: (
+                runtime.mediator.turret_state.control_mode
+                is TurretControlMode.TRACKING
+                and runtime.mediator.pending_control_mode is None
+            ),
+            timeout=1.0,
+            message="mode did not confirm TRACKING",
+        )
+        QTest.mouseClick(window.motor_button, Qt.MouseButton.LeftButton)
+        pump_until(
+            lambda: runtime.mediator.turret_state.motor_state is MotorState.ON,
+            timeout=1.0,
+            message="motor did not confirm ON",
+        )
+
+        displayed = window.main_view.displayed_result
+        tracked = stable_right_track()
+        assert displayed is not None
+        assert tracked is not None
+        center_x = tracked.bbox.x + tracked.bbox.width / 2.0
+        center_y = tracked.bbox.y + tracked.bbox.height / 2.0
+        rendered = window.main_view.rendered_rect()
+        assert not rendered.isEmpty()
+        height, width = displayed.frame.image.shape[:2]
+        click = QPoint(
+            round(rendered.left() + center_x * rendered.width() / width),
+            round(rendered.top() + center_y * rendered.height() / height),
+        )
+        velocity_baseline = len(executed(CommandCode.SET_VELOCITY))
+
+        QTest.mouseClick(window.main_view, Qt.MouseButton.LeftButton, pos=click)
+        pump_until(
+            lambda: (
+                runtime.mediator.selected_target is not None
+                and runtime.mediator.selected_target.camera
+                is CameraRole.STEREO_RIGHT
+            ),
+            timeout=1.0,
+            message="Stereo Right detector did not confirm TargetAcquired",
+        )
+        selected = runtime.mediator.selected_target
+        assert selected is not None
+        assert selected.track_id == tracked.track_id
+
+        pump_until(
+            lambda: any(
+                isinstance(request.payload, SetVelocityPayload)
+                and (
+                    request.payload.velocity_x_steps_s != 0
+                    or request.payload.velocity_y_steps_s != 0
+                )
+                for request in executed(CommandCode.SET_VELOCITY)[velocity_baseline:]
+            ),
+            timeout=2.0,
+            message="Stereo Right tracking did not reach fake STM32 SET_VELOCITY",
+        )
+    finally:
+        if window is not None:
+            window.state_pump.stop()
+            window.close()
+            application.processEvents()
+        runtime.shutdown(timeout=1.0)
+
+    assert runtime.stereo_right_producer is not None
+    assert runtime.stereo_right_worker is not None
+    assert not runtime.stereo_right_producer.is_alive()
+    assert not runtime.stereo_right_worker.is_alive()
+    assert not runtime.turret_worker.is_alive()
+
+
+def test_stereo_right_relative_click_applies_motion_calibration_before_fake_stm32(
+    tmp_path: Path,
+) -> None:
+    os.environ["QT_QPA_PLATFORM"] = "offscreen"
+
+    from PyQt6.QtCore import QPoint, Qt
+    from PyQt6.QtTest import QTest
+    from PyQt6.QtWidgets import QApplication
+
+    from navmin.ui import MainWindow
+
+    endpoint = FakeStm32Endpoint()
+
+    def transport_factory(
+        _port: str,
+        baudrate: int,
+        _emulate_stm32: bool,
+    ) -> FakeTransport:
+        return FakeTransport(endpoint, baudrate=baudrate)
+
+    runtime = SoftwareSmokeRuntime(
+        turret_transport_factory=transport_factory,
+        include_stereo_right=True,
+        motion_calibration_path=tmp_path / "motion.json",
+    )
+    runtime.application.motion_calibration_runtime.save_and_apply(
+        _right_motion_calibration_profile(runtime),
+        extrapolation_percent=20.0,
+    )
+    application = QApplication.instance() or QApplication([])
+    window = None
+
+    def move_requests():
+        return [
+            request
+            for request in list(endpoint.executed_request_history)
+            if request.command is CommandCode.MOVE_RELATIVE
+        ]
+
+    try:
+        runtime.start()
+        window = MainWindow(
+            mediator=runtime.mediator,
+            camera_bindings=runtime.camera_bindings(),
+            turret_states=runtime.turret_worker.state_updates,
+            camera_stale_timeout_ms=500,
+            aiming_config=runtime.application.ui_dependencies.aiming_config,
+            apply_aiming_tuning=runtime.application.ui_dependencies.apply_aiming_tuning,
+            pid_controller_config=(
+                runtime.application.ui_dependencies.pid_controller_config
+            ),
+            apply_pid_tuning=runtime.application.ui_dependencies.apply_pid_tuning,
+            stm32_config=runtime.application.ui_dependencies.stm32_config,
+            apply_motion_limits_tuning=(
+                runtime.application.ui_dependencies.apply_motion_limits_tuning
+            ),
+            vision_processor_selections=(
+                runtime.application.ui_dependencies.vision_processor_selections
+            ),
+            apply_vision_processor_selection=(
+                runtime.application.ui_dependencies.apply_vision_processor_selection
+            ),
+            tracking_control_config=(
+                runtime.application.ui_dependencies.tracking_control_config
+            ),
+            apply_tracking_control_tuning=(
+                runtime.application.ui_dependencies.apply_tracking_control_tuning
+            ),
+            tracking_stereo_left_hfov_deg=(
+                runtime.application.ui_dependencies.tracking_stereo_left_hfov_deg
+            ),
+            apply_tracking_stereo_left_hfov_deg=(
+                runtime.application.ui_dependencies.apply_tracking_stereo_left_hfov_deg
+            ),
+            tracking_stereo_right_hfov_deg=(
+                runtime.application.ui_dependencies.tracking_stereo_right_hfov_deg
+            ),
+            apply_tracking_stereo_right_hfov_deg=(
+                runtime.application.ui_dependencies.apply_tracking_stereo_right_hfov_deg
+            ),
+            ui_config=runtime.application.ui_dependencies.ui_config,
+            start_timer=False,
+            start_fullscreen=False,
+        )
+        window.resize(900, 650)
+        window.show()
+        application.processEvents()
+
+        def pump_until(predicate, *, timeout: float, message: str) -> None:
+            deadline = monotonic() + timeout
+            while monotonic() < deadline:
+                window.state_pump.pump_once()
+                application.processEvents()
+                if predicate():
+                    return
+                sleep(0.005)
+            raise AssertionError(message)
+
+        pump_until(
+            lambda: (
+                runtime.mediator.turret_state.connection_state
+                is TurretConnectionState.READY
+                and runtime.mediator.session_gate.accepted_generation(
+                    CameraRole.STEREO_RIGHT
+                )
+                is not None
+                and window.preview_view_2.camera is CameraRole.STEREO_RIGHT
+                and window.preview_view_2.displayed_result is not None
+            ),
+            timeout=4.0,
+            message="Stereo Right did not become a live preview",
+        )
+        QTest.mouseClick(
+            window.preview_view_2,
+            Qt.MouseButton.LeftButton,
+            pos=window.preview_view_2.rect().center(),
+        )
+        pump_until(
+            lambda: (
+                runtime.mediator.main_camera is CameraRole.STEREO_RIGHT
+                and window.main_view.camera is CameraRole.STEREO_RIGHT
+                and window.main_view.displayed_result is not None
+                and window.main_view.interaction_allowed(
+                    runtime.mediator.session_gate,
+                    monotonic_ns(),
+                )
+            ),
+            timeout=2.0,
+            message="Stereo Right did not become the RELATIVE control main camera",
+        )
+
+        displayed = window.main_view.displayed_result
+        assert displayed is not None
+        rendered = window.main_view.rendered_rect()
+        assert not rendered.isEmpty()
+        height, width = displayed.frame.image.shape[:2]
+        requested_x = width * 0.60
+        requested_y = height * 0.40
+        click = QPoint(
+            round(rendered.left() + requested_x * rendered.width() / width),
+            round(rendered.top() + requested_y * rendered.height() / height),
+        )
+        source_x = (click.x() - rendered.left()) * width / rendered.width()
+        source_y = (click.y() - rendered.top()) * height / rendered.height()
+        model = runtime.mediator.session_gate.camera_model(
+            CameraRole.STEREO_RIGHT,
+            displayed.frame.generation,
+        )
+        assert model is not None
+        raw = runtime.mediator.aiming.relative_command(
+            camera_model=model,
+            frame=displayed.frame,
+            x_px=source_x,
+            y_px=source_y,
+        )
+        corrected = runtime.application.motion_calibration_runtime.correct(
+            CameraRole.STEREO_RIGHT,
+            raw,
+        )
+        assert corrected != raw
+        assert abs(corrected.delta_x_deg) > abs(raw.delta_x_deg)
+        assert abs(corrected.delta_y_deg) > abs(raw.delta_y_deg)
+
+        QTest.mouseClick(window.main_view, Qt.MouseButton.LeftButton, pos=click)
+        pump_until(
+            lambda: len(move_requests()) >= 1,
+            timeout=1.0,
+            message="calibrated Stereo Right RELATIVE did not reach fake STM32",
+        )
+        payload = move_requests()[-1].payload
+        assert isinstance(payload, MoveRelativePayload)
+        axes = runtime.application.motion_calibration_runtime.axes
+        assert payload.delta_x_steps == _steps_for_deg(
+            corrected.delta_x_deg,
+            full_steps=axes.x.full_steps_per_revolution,
+            microstep=axes.x.microstep_divider,
+        )
+        assert payload.delta_y_steps == _steps_for_deg(
+            corrected.delta_y_deg,
+            full_steps=axes.y.full_steps_per_revolution,
+            microstep=axes.y.microstep_divider,
+        )
+    finally:
+        if window is not None:
+            window.state_pump.stop()
+            window.close()
+            application.processEvents()
+        runtime.shutdown(timeout=1.0)
+
+    assert runtime.stereo_right_producer is not None
+    assert runtime.stereo_right_worker is not None
+    assert not runtime.stereo_right_producer.is_alive()
+    assert not runtime.stereo_right_worker.is_alive()
     assert not runtime.turret_worker.is_alive()
 
 
