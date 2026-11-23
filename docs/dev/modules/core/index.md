@@ -16,14 +16,14 @@ Core
 Все компоненты Core выполняются в главном Qt-потоке. Общий `CameraSessionGate` также находится в main thread и используется Core и UI.
 
 - [Mediator](./mediator.md) — `main_camera`, selection, camera sessions, mode/control intents и coordination;
-- [Aiming](./aiming.md) — `CameraModel`, aim point, lead и угловая ошибка;
+- [Aiming](./aiming.md) — `CameraModel`, точка кадрирования `aim point`, прогнозируемая точка сопровождения `lead` и угловая ошибка;
 - [Config Manager](./config-manager.md) — typed config snapshots и revision.
 
 Camera reconnect принадлежит Vision, UART recovery — Turret, runtime состояние передаётся typed state, диагностика — logging. Отдельный orchestration-компонент без собственной ответственности заранее не вводится.
 
 ## Роль Core
 
-Core — Mediator, а не Broker. Он понимает семантику `main_camera`, выбранной цели и camera session, но не выполняет Vision, PID или UART.
+Core — Mediator, а не Broker. Он понимает семантику `main_camera`, выбранного отслеживаемого объекта и camera session, но не выполняет Vision, PID или UART.
 
 ```text
 CameraSessionStarted / VisionResult / DistanceResult / TurretState
@@ -54,7 +54,7 @@ Core не должен:
 Core должен:
 
 - хранить/координировать `main_camera`;
-- хранить одну `selected_target`, но только в подтверждённом TRACKING;
+- хранить одну `selected_target` — программную ссылку на выбранный отслеживаемый объект — только в подтверждённом TRACKING;
 - принимать camera sessions через `CameraSessionGate`;
 - использовать `TurretState` как источник applied mode/motor/connection state;
 - вызывать Aiming;

@@ -84,11 +84,11 @@ TRACKING:
     selected_target = None | TargetRef
 ```
 
-При `TRACKING → RELATIVE` selection очищается; при возврате в TRACKING цель выбирается заново.
+При `TRACKING → RELATIVE` selection очищается; при возврате в TRACKING отслеживаемый объект выбирается заново.
 
 ### Почему
 
-В RELATIVE target identity не участвует в управлении: пользователь кликает в точку, Aiming один раз вычисляет относительное перемещение. Сохранение target в RELATIVE создаёт двусмысленное состояние «цель выбрана, но не управляет турелью» и позволяет target loss/deselect случайно влиять на manual motion.
+В RELATIVE `target` identity не участвует в управлении: пользователь кликает в точку, Aiming один раз вычисляет относительное перемещение. Сохранение `target` в RELATIVE создаёт двусмысленное состояние «отслеживаемый объект выбран, но не используется для управления приводами штатива камеры» и позволяет target loss/deselect случайно влиять на manual motion.
 
 ### Отвергнутые альтернативы
 
@@ -377,7 +377,7 @@ Stereo pairing — отдельная сложная задача синхрон
 
 ### Решение
 
-В v1 предполагается достаточная параллельность camera/turret axes; постоянный boresight компенсируется aim point. Полный `R_camera_to_turret` вводится только если mechanical tests покажут необходимость.
+В v1 предполагается достаточная параллельность осей камеры и штатива; постоянное угловое смещение оптической оси камеры компенсируется через `aim point` (точку кадрирования). Полный `R_camera_to_turret` вводится только если mechanical tests покажут необходимость.
 
 ### Почему
 
@@ -524,7 +524,7 @@ Serial timing является свойством bounded transaction/session и
 
 ### Почему
 
-Старая турель уже работала через обычный UART, а доступа к физической STM32/RS485 сборке сейчас нет. Protocol/control firmware можно реализовать и полноценно тестировать без смешивания новых RS485 electrical/timing unknowns с parser, request sequence, Emergency, motor planner и watchdog. Изоляция physical byte transport делает последующий переход на RS485 ограниченным hardware change.
+Предыдущая версия привода штатива камеры уже работала через обычный UART, а доступа к физической STM32/RS485 сборке сейчас нет. Protocol/control firmware можно реализовать и полноценно тестировать без смешивания новых RS485 electrical/timing unknowns с parser, request sequence, Emergency, motor planner и watchdog. Изоляция physical byte transport делает последующий переход на RS485 ограниченным hardware change.
 
 ### Отвергнутые альтернативы
 
@@ -711,7 +711,7 @@ ESP32-C3 HIL не является prerequisite первых реальных ha
 
 ### Почему
 
-Один composition path предотвращает drift между «боевым» и диагностическим приложением: проверяется ровно тот же UI/Core/Vision/Turret stack, а меняется только физическая boundary. При этом тяжёлые transport emulators не ухудшают быстрые deterministic E2E tests.
+Один composition path предотвращает drift между основным и диагностическим приложением: проверяется ровно тот же UI/Core/Vision/Turret stack, а меняется только физическая boundary. При этом тяжёлые transport emulators не ухудшают быстрые deterministic E2E tests.
 
 Localhost RTP и PTY закрывают два крупных PC-side риска до поездки без дополнительного hardware: production camera transport и production serial byte transport. Явный backend selection исключает опасную ситуацию, когда оператор считает, что работает с реальным устройством, а приложение незаметно использует fake.
 
@@ -771,7 +771,7 @@ tracklets, scale continuity и другие rich states остаются private
 V1/V2 не добавляет callback `Mediator/UI → vision backend` для seed/reference click.
 VT11 может публиковать валидированную identity как обычный `TrackedObject`, но turret
 по-прежнему начинает TRACKING только после явного выбора пользователем опубликованного
-bbox. Предложение backend не равно автоматическому выбору цели.
+bbox. Предложение backend не равно автоматическому выбору отслеживаемого объекта.
 
 ### Post-tag roadmap
 

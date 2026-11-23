@@ -222,7 +222,7 @@ class TargetRef:
     track_id: int
 ```
 
-`TargetRef` однозначно ссылается на track внутри конкретной camera session.
+`TargetRef` однозначно ссылается на track отслеживаемого объекта внутри конкретной camera session.
 
 Core хранит **один** authoritative `selected_target`, но только для режима `TRACKING`:
 
@@ -234,9 +234,9 @@ TRACKING:
     selected_target: TargetRef | None
 ```
 
-Цель разрешено выбирать только на `main_camera` и только после подтверждённого `TurretState.control_mode == TRACKING`. `Stereo Right` пользовательского selection не имеет.
+Отслеживаемый объект разрешено выбирать только на `main_camera` и только после подтверждённого `TurretState.control_mode == TRACKING`. `Stereo Right` пользовательского selection не имеет.
 
-Совпадение цели требует `camera + generation + track_id`. При новом запуске camera pipeline старый `TargetRef` немедленно становится недействительным.
+Совпадение выбранного отслеживаемого объекта требует `camera + generation + track_id`. При новом запуске camera pipeline старый `TargetRef` немедленно становится недействительным.
 
 При временном отсутствии выбранного track Core сохраняет `TargetRef` до `target-lost-timeout-ms`. После timeout selection очищается, но applied `TurretControlMode` автоматически не меняется. При переходе в `RELATIVE` selection всегда очищается.
 
@@ -266,7 +266,7 @@ class DistanceResult:
 - `generation` отдельно не дублируется, поскольку входит в `target`;
 - Stereo-result используется не дольше `distance-stale-timeout-ms`;
 - Manual-result действителен, пока источник manual и `TargetRef` актуален;
-- при смене/снятии цели или camera generation результат старой цели немедленно инвалидируется;
+- при смене/снятии отслеживаемого объекта или camera generation результат прежнего объекта немедленно инвалидируется;
 - межпотоковая семантика — latest state, который должен уметь явно переходить в `None`/invalid.
 
 ## Motion intent и команда относительного движения
@@ -437,7 +437,7 @@ Turret Controller может сохранить applied mode через UART rec
 ```text
 selected_target → None
 lead / TrackingError → clear/invalidate
-DistanceResult старой цели → invalidate
+DistanceResult прежнего отслеживаемого объекта → invalidate
 ```
 
 Turret Controller, владеющий PID, видит control boundary, инвалидирует старый неотправленный `pending_motion`, reset'ит PID и при motors ON выполняет `SET_VELOCITY(0,0)`. Applied mode остаётся TRACKING.

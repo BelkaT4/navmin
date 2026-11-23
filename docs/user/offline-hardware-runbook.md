@@ -5,8 +5,10 @@
 launchers, preflight и session artifacts в воспроизводимый порядок действий.
 
 Runbook **не добавляет новый runtime mode** и не заменяет архитектурные документы.
-Технически diagnostic launcher по-прежнему допускает независимый выбор backend для
-Overview, Stereo Left и Turret. Для обычной работы ниже выделены только четыре
+Внутреннее имя `Turret` означает подсистему управления приводами моторизованного
+штатива камеры; `--turret`, `turret.*`, `TurretWorker` и другие такие имена остаются
+реальными техническими идентификаторами. Технически diagnostic launcher по-прежнему
+допускает независимый выбор backend для Overview, Stereo Left и Turret. Для обычной работы ниже выделены только четыре
 рекомендуемых профиля; остальные combinations предназначены для узкой диагностики.
 
 ## 1. Что считается evidence
@@ -73,14 +75,14 @@ Preflight **не доказывает**, что:
 
 - реальные камеры уже передают RTP/JPEG или отвечают по RTSP;
 - STM32 отвечает по NavMin protocol;
-- motors/mechanics безопасны;
+- приводы и механика штатива камеры безопасны;
 - camera image quality или latency приемлемы;
-- mechanical scale откалиброван;
+- масштаб движения приводов штатива камеры откалиброван;
 - hardware test пройден.
 
-Для real Turret preflight может проверить `pyserial`, наличие serial path и права,
-но не открывает real serial port, не переключает DTR/RTS, не отправляет STM32 `PING`
-и не двигает motors.
+Для реальной подсистемы приводов штатива (`Turret`) preflight может проверить
+`pyserial`, наличие serial path и права, но не открывает real serial port, не
+переключает DTR/RTS, не отправляет STM32 `PING` и не приводит штатив в движение.
 
 Для реальных камер preflight проверяет статическую готовность приёмника, конфигурацию/калибровку и условия, необходимые выбранному транспорту. Для RTP/JPEG он также проверяет локальную UDP-точку приёма; для RTSP — URI, конфигурацию и нужные компоненты GStreamer. Preflight не ждёт RTP-трафик, не подключается к RTSP-источнику, не проверяет состояние камеры `ONLINE` и не
 подключается по SSH и не оценивает изображение.
@@ -133,9 +135,9 @@ Diagnostic launcher технически поддерживает восемь �
 | Profile | Overview | Stereo Left | Turret | Inputs | Physical boundary | Назначение |
 | --- | --- | --- | --- | --- | --- | --- |
 | **VIRTUAL** | localhost | localhost | pty | synthetic | none | Offline rehearsal и software-only readiness |
-| **STM32** | localhost | localhost | real | files | STM32/turret only | Controlled physical STM32 preparation |
-| **CAMERAS** | real | real | pty | files | cameras only | Проверка реальных камер без реальной Turret; источник каждой камеры берётся из конфигурации (`rtp-jpeg | rtsp`) |
-| **REAL** | real | real | real | files | cameras + STM32/turret | Eventual combined hardware run |
+| **STM32** | localhost | localhost | real | files | STM32 + приводы штатива камеры | Controlled physical STM32 preparation |
+| **CAMERAS** | real | real | pty | files | cameras only | Проверка реальных камер без реальных приводов штатива камеры; источник каждой камеры берётся из конфигурации (`rtp-jpeg | rtsp`) |
+| **REAL** | real | real | real | files | cameras + STM32 + приводы штатива камеры | Eventual combined hardware run |
 
 `--synthetic-inputs` используется только в **VIRTUAL**. Current launcher запрещает
 его для mixed/real profiles.
@@ -178,7 +180,7 @@ python tools/run_diagnostic_app.py \
 ```
 
 Это основной profile для offline rehearsal. Localhost cameras проходят через
-production `GStreamerRtpJpegSource`, а PTY Turret — через production
+production `GStreamerRtpJpegSource`, а PTY-подсистема приводов `Turret` — через production
 `SerialTransport`/pyserial.
 
 При visual smoke обе synthetic camera показывают `SOURCE HH:MM:SS.mmm` и
@@ -187,7 +189,7 @@ production `GStreamerRtpJpegSource`, а PTY Turret — через production
 - сравнить `SOURCE` и `NOW` как приблизительный текущий visual lag;
 - подтвердить, что `FRAME` постоянно увеличивается;
 - в течение короткого наблюдения убедиться, что gap `SOURCE` → `NOW` визуально
-  не растёт и bbox движущейся цели продолжает обновляться.
+  не растёт и bbox движущегося отслеживаемого объекта продолжает обновляться.
 
 Это localhost-only проверка в clock domain одного PC, а не измерение latency
 реальных Raspberry Pi cameras.
@@ -200,12 +202,12 @@ Boundary:
 Overview       localhost
 Stereo Left    localhost
 Turret         real
-physical HW    STM32 / turret only
+physical HW    STM32 + приводы штатива камеры
 ```
 
 Термин **STM32-only physical boundary** не означает запуск приложения без cameras
-или UI. Единственный физический endpoint здесь — STM32/turret; camera inputs
-заменены localhost RTP/JPEG diagnostics.
+или UI. Физическая часть здесь — STM32 и подключённые к ней приводы штатива камеры;
+camera inputs заменены localhost RTP/JPEG diagnostics.
 
 Используются current file-backed inputs:
 
@@ -215,7 +217,7 @@ calibration/overview.json
 calibration/stereo.json
 ```
 
-Это локальные site-specific inputs, они не входят в repository baseline. Если обычный GUI startup обнаруживает missing/invalid input, оператор может закрыть программу либо явно восстановить safe defaults; существующие файлы получают backup вида `<filename>-YYYYMMDD-HHMMSS[-NN].bak` по местному системному времени. Recovery не продолжает запуск автоматически и не заменяет on-site настройку serial/mechanics/calibration. Preflight/diagnostic paths остаются неинтерактивными.
+Это локальные site-specific inputs, они не входят в repository baseline. Если обычный GUI startup обнаруживает missing/invalid input, оператор может закрыть программу либо явно восстановить safe defaults; существующие файлы получают backup вида `<filename>-YYYYMMDD-HHMMSS[-NN].bak` по местному системному времени. Recovery не продолжает запуск автоматически и не заменяет on-site настройку serial/механики штатива камеры/calibration. Preflight/diagnostic paths остаются неинтерактивными.
 
 Preflight:
 
@@ -240,7 +242,7 @@ python tools/run_diagnostic_app.py \
   --turret real
 ```
 
-Отдельный Turret-only production runner для этого не нужен.
+Отдельный production runner только для подсистемы приводов `Turret` для этого не нужен.
 
 ### 4.3 CAMERAS
 
@@ -279,7 +281,7 @@ python tools/run_diagnostic_app.py \
 ```
 
 Это проверяет физические камеры, настроенные рабочие источники камер, реальные Vision/UI/Core и PTY
-Turret boundary без физической турели.
+`Turret` boundary без физического штатива камеры и его приводов.
 
 ### 4.4 REAL
 
@@ -395,7 +397,7 @@ cp calibration/stereo.json calibration/stereo-hardware-day.json
    worksheet](#7-hardware-measurement-worksheet).
 
 `PASS` здесь означает только статическую готовность выбранных inputs/backends. Для реальной
-камеры preflight не видит фактические декодированные пиксели и не устанавливает RTSP-сессию, а для реальной Turret не открывает
+камеры preflight не видит фактические декодированные пиксели и не устанавливает RTSP-сессию, а для реальной подсистемы приводов штатива (`Turret`) не открывает
 serial port и не проверяет protocol response.
 
 #### Что именно менять в `config.json`
@@ -480,7 +482,7 @@ resolution нужна calibration, реально рассчитанная дл�
 Ниже примеры с условными hardware-day filenames. Использовать один и тот же набор
 paths для preflight и последующего launch.
 
-**STM32 — localhost cameras + real Turret:**
+**STM32 — localhost cameras + реальные приводы штатива (`Turret`):**
 
 ```bash
 cd ~/NAV\ MIN
@@ -507,7 +509,7 @@ python tools/run_diagnostic_app.py \
   --stereo-calibration calibration/stereo-hardware-day.json
 ```
 
-**CAMERAS — real cameras + PTY Turret:**
+**CAMERAS — real cameras + PTY-подсистема приводов (`Turret`):**
 
 ```bash
 cd ~/NAV\ MIN
@@ -552,13 +554,13 @@ advanced mixed combinations. Новый `--profile` flag для этого не 
 
 #### Serial device и baudrate
 
-Для real Turret изменить:
+Для реальной подсистемы приводов штатива (`Turret`) изменить:
 
 ```text
 turret.serial.port
 ```
 
-На Linux-хосте временный путь адаптера задаётся в `SERIAL_SETUP_DEVICE` локального `config/host.local.env` и используется только одноразовым `tools/platform/linux/setup_serial_access.sh`. После setup рекомендуется использовать стабильный `/dev/navmin-turret` (или `/dev/<SERIAL_ALIAS>` при другом alias). Ручной `chmod 666/777` для `/dev/ttyUSB*` не является постоянной настройкой и не должен использоваться как штатное решение. Прямые `/dev/ttyUSB0` или `/dev/ttyACM0` допустимы только для setup/временной диагностики. Real-Turret preflight проверит наличие пути и права чтения/записи, но **не** откроет serial port,
+На Linux-хосте временный путь адаптера задаётся в `SERIAL_SETUP_DEVICE` локального `config/host.local.env` и используется только одноразовым `tools/platform/linux/setup_serial_access.sh`. После setup рекомендуется использовать стабильный `/dev/navmin-turret` (или `/dev/<SERIAL_ALIAS>` при другом alias). Ручной `chmod 666/777` для `/dev/ttyUSB*` не является постоянной настройкой и не должен использоваться как штатное решение. Прямые `/dev/ttyUSB0` или `/dev/ttyACM0` допустимы только для setup/временной диагностики. Preflight реальной подсистемы приводов (`Turret`) проверит наличие пути и права чтения/записи, но **не** откроет serial port,
 не переключит DTR/RTS и не докажет, что STM32 отвечает.
 
 Желаемая рабочая скорость задаётся:
@@ -578,7 +580,7 @@ Current schema разрешает только:
 ```
 
 Это desired working baud; current STM32 startup baseline остаётся `9600`, после
-чего production Turret path при необходимости выполняет controlled
+чего production path подсистемы приводов `Turret` при необходимости выполняет controlled
 `SET_BAUDRATE`. Static preflight не является доказательством успешного baud
 transition на конкретном physical STM32.
 
@@ -607,8 +609,8 @@ turret.stm32.acceleration-y-deg-s2
 physical-limit assumptions
 ```
 
-`full-steps-per-revolution * microstep-divider` участвует в PC mechanical
-conversion. `invert`, mechanics scale и `max-relative-move-deg` являются
+`full-steps-per-revolution * microstep-divider` участвует в пересчёте движения
+приводов штатива. `invert`, масштаб механики штатива и `max-relative-move-deg` являются
 restart-only settings в current v1. Speed/acceleration участвуют в STM32 config.
 Ни один из этих facts не заменяет measurement/safety gates раздела B.
 
@@ -744,7 +746,7 @@ python tools/run_diagnostic_app.py \
 - Overview и Stereo Left показывают diagnostic streams;
 - labels соответствуют cameras;
 - main/preview swap работает;
-- Turret достигает рабочего diagnostic state через PTY/production serial path;
+- подсистема приводов `Turret` достигает рабочего diagnostic state через PTY/production serial path;
 - нет очевидного accumulating visual latency за короткий run;
 - normal operator shutdown возвращает terminal без зависания.
 
@@ -842,7 +844,7 @@ python tools/run_pty_stm32_diagnostic.py \
 ```text
 localhost Overview
 localhost Stereo Left
-real Turret / STM32
+real STM32 + приводы штатива камеры (`Turret`)
 ```
 
 Это controlled physical boundary для подготовки и измерений. Это **не unrestricted
@@ -851,7 +853,7 @@ motion procedure** и не доказательство механической
 ```text
 pre-hardware software readiness
 !=
-proof that mechanics are safe for full-range movement
+proof that механика штатива камеры безопасна для полного диапазона движения
 ```
 
 Prompt/runbook ничего физически не выполняет сам: реальные действия делаются
@@ -915,7 +917,7 @@ Future controlled sequence:
 
 1. заранее идентифицировать exact DM860 variant и иметь его manual offline;
 2. проверить wiring и driver settings;
-3. оставить механику в безопасном диапазоне;
+3. оставить штатив камеры в безопасном диапазоне движения;
 4. использовать deliberately low movement/rate;
 5. измерить STEP/DIR на driver connector oscilloscope/logic analyzer;
 6. измерить STEP high;
@@ -1001,7 +1003,7 @@ Emergency
 → does NOT inherently mean MOTOR_OFF
 ```
 
-Application normal shutdown при доступном Turret и confirmed Motor ON сохраняет
+Application normal shutdown при доступной подсистеме приводов `Turret` и confirmed Motor ON сохраняет
 safety boundary:
 
 ```text
@@ -1012,7 +1014,7 @@ STOP_MOTION
 → TurretWorker shutdown
 ```
 
-Если Turret недоступен, application не ждёт недостижимого confirmation бесконечно и
+Если подсистема приводов `Turret` недоступна, application не ждёт недостижимого confirmation бесконечно и
 переходит к bounded cleanup.
 
 ---
@@ -1029,7 +1031,7 @@ Stereo Left    real
 Turret         pty
 ```
 
-Physical Turret здесь не участвует. Acceptance path cameras идёт через production
+Физические приводы штатива камеры здесь не участвуют. Acceptance path cameras идёт через production
 RTP receiver; `FakeTransport` не заменяет camera acceptance.
 
 ## C2. Preflight
@@ -1127,7 +1129,7 @@ bring-up.
 3. inspect `preflight.json`, `manifest.json`, `runtime.log` и session directory;
 4. запустить application;
 5. подтвердить обе real cameras;
-6. подтвердить Turret connection;
+6. подтвердить связь с подсистемой приводов `Turret`;
 7. подтвердить safe motor state;
 8. выполнить deliberate Motor ON только когда площадка готова;
 9. сделать tiny controlled RELATIVE movement;
@@ -1178,7 +1180,7 @@ Target selection в current NavMin остаётся explicit user click по pub
 ```text
 vision backend proposal identity
 !=
-automatic turret selection
+автоматический выбор объекта для управления приводами штатива камеры
 ```
 
 Runbook не добавляет VT11 seed callback и не меняет Vision public contract.
@@ -1189,7 +1191,7 @@ Future combined run может по отдельности проверять:
 
 ```text
 camera traffic loss
-Turret disconnect
+отключение подсистемы приводов (`Turret`)
 Emergency
 normal shutdown
 ```
@@ -1363,7 +1365,7 @@ physical limit enforcement
 IWDG
 real STM32 validation
 real camera validation
-mechanical scale/timing/tuning
+масштаб/тайминги/настройка механики штатива камеры
 Stage 5/6/7/8 completion
 VT11 vision backend integration
 protocol 4.0 / SERVO_BOTH lineage

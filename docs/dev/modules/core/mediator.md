@@ -99,7 +99,7 @@ Applied mode остаётся TRACKING.
 ```text
 selected_target → None
 lead / TrackingError → clear/invalidate
-DistanceResult старой цели → invalidate
+DistanceResult старого отслеживаемого объекта → invalidate
 request normal StopMotion
 ```
 
@@ -107,9 +107,9 @@ Applied mode остаётся TRACKING.
 
 PID принадлежит Turret Controller. Core сообщает только domain boundary через state/action; отдельного `PID_RESET` нет.
 
-## Смена цели A → B
+## Смена отслеживаемого объекта A → B
 
-Новая цель принимается только если B существует в latest `VisionResult`.
+Новый отслеживаемый объект принимается только если B существует в latest `VisionResult`.
 
 После accepted switch:
 

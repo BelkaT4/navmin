@@ -80,7 +80,7 @@ calibration/
 ```text
 unit         один owner / state machine / parser / math / policy
 integration несколько реальных project components через их публичные boundaries
-hardware     физические камеры, Raspberry Pi, RS485/UART, STM32, турель
+hardware     физические камеры, Raspberry Pi, RS485/UART, STM32, штатив камеры и его приводы
 ```
 
 Normal test run не должен требовать hardware.
@@ -705,15 +705,15 @@ Rejection stale/unaccepted generation проверяется на реальны
 - relative angle delta;
 - tracking error;
 - lead computation согласно текущим contracts/config;
-- Core хранит/передаёт только актуальный target-bound `DistanceResult` по существующему контракту; Stage 6 не придумывает новое влияние distance на Aiming/ballistics.
+- Core хранит/передаёт только актуальный target-bound `DistanceResult` по существующему контракту; Stage 6 не вводит новое влияние distance на позиционирование камеры или сопровождение отслеживаемого объекта.
 
 Для первого runnable vertical slice приоритетны только подтверждённый `RELATIVE` click-to-move и минимальный `TRACKING` path `selection → TrackingError → Turret`. Остальные loss/config/diagnostic edge cases закрываются до полного `done` Stage 6.
 
 ### Decision checkpoint до target-loss runtime-ветки
 
-До реализации поведения временно потерянной цели управляющий чат должен закрыть Core-часть `problems.md` #7:
+До реализации поведения временно потерянного отслеживаемого объекта управляющий чат должен закрыть Core-часть `problems.md` #7:
 
-- как изменение `target-lost-timeout-ms` применяется к цели, которая уже находится в состоянии temporary loss.
+- как изменение `target-lost-timeout-ms` применяется к отслеживаемому объекту, который уже находится в состоянии temporary loss.
 
 Это observable state-machine semantics; рабочий чат не выбирает её самостоятельно.
 
@@ -883,7 +883,7 @@ Future latest-live-frame mode (#22) остаётся deferred. Gesture/overlay/S
 launchers, localhost RTP/JPEG, PTY production-transport check, session artifacts,
 bounded logging, backend-aware static preflight, operator-facing offline hardware
 runbook и VIRTUAL latency observability. Offline rehearsal без доступа к интернету
-принята. Production RTSP transport и automatic reconnect реализованы software-side; реальный H.264 RTSP smoke остаётся endpoint-dependent hardware gate. Следующая pre-hardware задача — UI aim-point/reticle observability и затем актуальный hardware-readiness audit.
+принята. Production RTSP transport и automatic reconnect реализованы software-side; реальный H.264 RTSP smoke остаётся endpoint-dependent hardware gate. Следующая pre-hardware задача — наблюдаемость `aim point` и её экранной метки в UI, а затем актуальный hardware-readiness audit.
 
 ### Timing and tuning
 

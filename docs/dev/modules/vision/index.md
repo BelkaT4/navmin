@@ -508,7 +508,7 @@ FramePacket.image
 
 без UI overlays.
 
-В файл не добавляются bbox, reticle, aim point, lead, FPS и status text. Это позволяет использовать запись повторно для тестирования detector/tracker.
+В файл не добавляются bbox, экранная метка `aim point`, `aim point`, lead, FPS и status text. Это позволяет использовать запись повторно для тестирования detector/tracker.
 
 ## Обмен с Core/UI
 

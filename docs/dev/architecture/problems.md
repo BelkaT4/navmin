@@ -51,7 +51,7 @@ Generation уже не позволяет смешивать разные camera
 
 Остаются детали:
 
-- изменение `target-lost-timeout-ms` для уже временно потерянной цели;
+- изменение `target-lost-timeout-ms` для уже временно потерянного отслеживаемого объекта;
 
 STM32 max speed / acceleration / velocity watchdog уже применяются dynamic полным атомарным `SET_CONFIG` snapshot. Axis mechanics (`invert`, steps/rev, microstep, `max-relative-move-deg`) — restart-only и safe-point semantics для них не нужна.
 
@@ -139,7 +139,7 @@ inter-request-delay-ms = 2
 
 ### 17. Camera-to-turret rotational extrinsic
 
-Первая версия предполагает близкую параллельность axes и компенсирует constant boresight через aim point.
+Первая версия предполагает близкую параллельность осей камеры и штатива и компенсирует постоянное угловое смещение оптической оси камеры через `aim point` (точку кадрирования).
 
 После tests решить необходимость `R_camera_to_turret`, calibration procedure и storage.
 

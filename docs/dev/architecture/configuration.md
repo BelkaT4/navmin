@@ -472,7 +472,7 @@ Schema v8 добавляет группу `ui.vt11` как persisted operator pr
 `low-light-blur-mode` относится к операторскому DAY-режиму VT11; THERMAL его не
 применяет. `auto-select-candidate-on-first-click` и
 `candidate-click-tolerance-px` задают способ выбора кандидата оператором и не
-заменяют последующее initial-train подтверждение цели. Алгоритмическое подключение
+заменяют последующее initial-train подтверждение отслеживаемого объекта. Алгоритмическое подключение
 этих preferences выполняется соответствующими этапами VT11 REV5; наличие поля в
 `config.json` само по себе не включает скрытый альтернативный tracker path.
 
@@ -489,7 +489,7 @@ UI overlays не являются частью recorded working frame.
 | PID `Kp/Ki/Kd` | dynamic; изменение gains reset'ит PID state только соответствующей оси перед следующим новым sample в TRACKING |
 | `lead-time-ms` | dynamic |
 | aim point | dynamic |
-| `target-lost-timeout-ms` | dynamic, точная семантика для уже потерянной цели уточняется при реализации |
+| `target-lost-timeout-ms` | dynamic, точная семантика для уже потерянного отслеживаемого объекта уточняется при реализации |
 | `processing-scope` | dynamic |
 | `processing-enabled` | dynamic |
 | `vision-processor-class` | camera pipeline restart / new generation |
