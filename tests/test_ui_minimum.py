@@ -156,6 +156,7 @@ class _FakeTurret:
         self._state = state
         self.relative_commands: list[MoveRelativeCommand] = []
         self.tracking_controls: list[TrackingControlSample] = []
+        self.continue_tracking_requests = 0
         self.invalidations = 0
         self.mode_requests: list[TurretControlMode] = []
         self.stop_requests = 0
@@ -172,6 +173,9 @@ class _FakeTurret:
 
     def submit_tracking_control(self, sample: TrackingControlSample) -> None:
         self.tracking_controls.append(sample)
+
+    def continue_tracking_motion(self) -> None:
+        self.continue_tracking_requests += 1
 
     def invalidate_tracking_control(self) -> None:
         self.invalidations += 1
@@ -2192,7 +2196,7 @@ def test_new_generation_clears_display_and_old_result_cannot_return(
 def test_temporary_target_miss_keeps_authoritative_selection_without_old_bbox(
     qt_application: QApplication,
 ) -> None:
-    window, mediator, _turret, bindings, _states = _window(
+    window, mediator, turret, bindings, _states = _window(
         qt_application, mode=TurretControlMode.TRACKING
     )
     initial = _result(CameraRole.OVERVIEW, 1)
@@ -2205,6 +2209,7 @@ def test_temporary_target_miss_keeps_authoritative_selection_without_old_bbox(
     window.state_pump.pump_once()
 
     assert mediator.selected_target == selected
+    assert turret.continue_tracking_requests == 1
     assert window.main_view.displayed_result is missing
     assert missing.tracked_objects == ()
     window.close()
@@ -2780,6 +2785,36 @@ def test_operator_tracking_panel_queues_only_exposed_typed_runtime_fields(
     assert update.platform_motion == initial.platform_motion
     assert operator.tracking_status_label.text().startswith("Отправлено:")
     assert operator.tracking_error_label.text() == ""
+    window.close()
+
+
+def test_operator_tracking_panel_applies_and_retains_target_loss_timeout(
+    qt_application: QApplication,
+) -> None:
+    aiming_updates: list[AimingConfig] = []
+    window, _mediator_value, _turret, _bindings_value, _states = _window(
+        qt_application,
+        apply_aiming_tuning=aiming_updates.append,
+    )
+    operator = window.operator_window
+
+    assert operator.target_lost_timeout_input.minimum() == 0
+    assert operator.target_lost_timeout_input.maximum() == 5_000
+    assert operator.target_lost_timeout_input.singleStep() == 50
+    assert operator.target_lost_timeout_input.suffix() == " мс"
+    assert operator.target_lost_timeout_input.value() == 500
+
+    operator.target_lost_timeout_input.setValue(0)
+    QTest.mouseClick(operator.tracking_apply_button, Qt.MouseButton.LeftButton)
+
+    assert len(aiming_updates) == 1
+    assert aiming_updates[-1].target_lost_timeout_ms == 0
+    assert "потеря цели=0 мс" in operator.tracking_status_label.text()
+
+    window.reset_aim_point(CameraRole.OVERVIEW)
+    assert len(aiming_updates) == 2
+    assert aiming_updates[-1].target_lost_timeout_ms == 0
+    assert operator.target_lost_timeout_input.value() == 0
     window.close()
 
 

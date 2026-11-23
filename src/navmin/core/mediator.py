@@ -113,6 +113,8 @@ class TurretPort(Protocol):
 
     def submit_tracking_control(self, sample: TrackingControlSample) -> None: ...
 
+    def continue_tracking_motion(self) -> None: ...
+
     def invalidate_tracking_control(self) -> None: ...
 
     def platform_motion_snapshot(self) -> PlatformMotionSnapshot: ...
@@ -267,6 +269,8 @@ class Mediator:
         self._main_camera = ui_config.default_camera
         self._pending_selection: TargetSelectionRequest | None = None
         self._selected_target: TargetRef | None = None
+        self._tracking_target_missing_since_ns: int | None = None
+        self._tracking_target_loss_timeout_expired = False
         self._distance_mode = DistanceMeasurementMode.CONSTANT
         self._manual_distance_m = quantize_constant_distance(initial_manual_distance_m)
         self._distance_stale_timeout_ns = distance_stale_timeout_ms * 1_000_000
@@ -856,6 +860,7 @@ class Mediator:
         had_selected_target = self._selected_target is not None
         self._pending_selection = request
         self._selected_target = None
+        self._clear_tracking_target_loss_state()
         self._invalidate_distance_intent()
         self._refresh_stereo_join_target()
         self._tracking_estimator.reset()
@@ -1109,6 +1114,7 @@ class Mediator:
 
         self._pending_selection = None
         self._selected_target = target
+        self._clear_tracking_target_loss_state()
         self._invalidate_distance_intent()
         self._refresh_stereo_join_target()
         self._refresh_manual_distance()
@@ -1136,6 +1142,7 @@ class Mediator:
             return False
         self._pending_selection = None
         self._selected_target = None
+        self._clear_tracking_target_loss_state()
         self._invalidate_distance_intent()
         self._refresh_stereo_join_target()
         self._tracking_estimator.reset()
@@ -1154,6 +1161,7 @@ class Mediator:
         ):
             return False
         self._selected_target = None
+        self._clear_tracking_target_loss_state()
         self._invalidate_distance_intent()
         self._refresh_stereo_join_target()
         self._tracking_estimator.reset()
@@ -1424,12 +1432,87 @@ class Mediator:
             return
         tracked = self._find_track(result, target.track_id)
         if tracked is None:
+            self._handle_tracking_target_missing()
+            return
+        missing_since_ns = self._tracking_target_missing_since_ns
+        if missing_since_ns is not None:
+            now_ns = self._clock_ns()
+            _LOGGER.info(
+                "Tracking target reacquired camera=%s generation=%d track_id=%d "
+                "gap_ms=%.3f timeout_ms=%d timeout_expired=%s",
+                target.camera.value,
+                target.generation,
+                target.track_id,
+                max(0, now_ns - missing_since_ns) / 1_000_000.0,
+                self._aiming.config.target_lost_timeout_ms,
+                self._tracking_target_loss_timeout_expired,
+            )
+        self._clear_tracking_target_loss_state()
+        self._submit_tracking_control(result, tracked, target)
+
+    def _handle_tracking_target_missing(self) -> None:
+        now_ns = self._clock_ns()
+        timeout_ms = self._aiming.config.target_lost_timeout_ms
+        if self._tracking_target_missing_since_ns is None:
+            self._tracking_target_missing_since_ns = now_ns
+            self._tracking_target_loss_timeout_expired = False
             self._tracking_estimator.reset_history()
             self._tracking_estimator_reset_reason = "track_missing"
             self._tracking_control_visualization = None
+            target = self._selected_target
+            if target is not None:
+                _LOGGER.info(
+                    "Tracking target temporarily missing camera=%s generation=%d "
+                    "track_id=%d timeout_ms=%d",
+                    target.camera.value,
+                    target.generation,
+                    target.track_id,
+                    timeout_ms,
+                )
+
+        if timeout_ms == 0:
+            if not self._tracking_target_loss_timeout_expired:
+                target = self._selected_target
+                if target is not None:
+                    _LOGGER.info(
+                        "Tracking target loss timeout expired camera=%s "
+                        "generation=%d track_id=%d elapsed_ms=0.000 timeout_ms=0",
+                        target.camera.value,
+                        target.generation,
+                        target.track_id,
+                    )
+            self._tracking_target_loss_timeout_expired = True
             self._turret.invalidate_tracking_control()
             return
-        self._submit_tracking_control(result, tracked, target)
+        if self._tracking_target_loss_timeout_expired:
+            return
+
+        missing_since_ns = self._tracking_target_missing_since_ns
+        if missing_since_ns is None:
+            raise RuntimeError("tracking target loss state is inconsistent")
+        elapsed_ns = max(0, now_ns - missing_since_ns)
+        if elapsed_ns < timeout_ms * 1_000_000:
+            self._turret.continue_tracking_motion()
+            return
+
+        self._tracking_target_loss_timeout_expired = True
+        target = self._selected_target
+        if target is not None:
+            _LOGGER.info(
+                "Tracking target loss timeout expired camera=%s generation=%d "
+                "track_id=%d elapsed_ms=%.3f timeout_ms=%d",
+                target.camera.value,
+                target.generation,
+                target.track_id,
+                elapsed_ns / 1_000_000.0,
+                timeout_ms,
+            )
+        self._turret.invalidate_tracking_control()
+        self._turret.stop_motion()
+
+    def _clear_tracking_target_loss_state(self) -> None:
+        self._tracking_target_missing_since_ns = None
+        self._tracking_target_loss_timeout_expired = False
 
     def _submit_tracking_control(
         self,
@@ -1759,6 +1842,7 @@ class Mediator:
     def _invalidate_target_intent(self, *, stop_motion: bool) -> None:
         self._pending_selection = None
         self._selected_target = None
+        self._clear_tracking_target_loss_state()
         self._invalidate_distance_intent()
         self._refresh_stereo_join_target()
         self._tracking_estimator.reset()

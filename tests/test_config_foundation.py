@@ -933,6 +933,44 @@ def test_watchdog_less_than_target_lost_is_not_an_undocumented_hard_rule() -> No
     assert config.turret.stm32.velocity_watchdog_timeout_ms == 900
 
 
+def test_target_lost_timeout_zero_is_valid_and_round_trips() -> None:
+    data = _valid_config()
+    data["aiming"]["target-lost-timeout-ms"] = 0
+
+    config = parse_config(data)
+
+    assert config.aiming.target_lost_timeout_ms == 0
+    assert config_to_mapping(config)["aiming"]["target-lost-timeout-ms"] == 0
+
+
+def test_target_lost_timeout_negative_is_rejected() -> None:
+    data = _valid_config()
+    data["aiming"]["target-lost-timeout-ms"] = -1
+
+    with pytest.raises(ConfigValidationError) as exc_info:
+        parse_config(data)
+
+    assert exc_info.value.path == "aiming.target-lost-timeout-ms"
+
+
+def test_target_lost_timeout_zero_runtime_update_is_dynamic_and_persisted(
+    tmp_path,
+) -> None:
+    path = tmp_path / "config.json"
+    data = _valid_config()
+    _write_json(path, data)
+    manager = ConfigManager.load(path)
+
+    changed = copy.deepcopy(data)
+    changed["aiming"]["target-lost-timeout-ms"] = 0
+
+    assert manager.apply_runtime_update(changed, persist=True)
+    update = manager.aiming_updates.get()
+    assert update is not None
+    assert update.config.target_lost_timeout_ms == 0
+    assert load_config(path).aiming.target_lost_timeout_ms == 0
+
+
 def test_tracking_visualization_runtime_update_is_dynamic_and_persisted(tmp_path) -> None:
     path = tmp_path / "config.json"
     data = _valid_config()

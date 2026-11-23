@@ -79,6 +79,7 @@ class _FakeTurret:
         self._state = state or _turret_state()
         self.relative_commands: list[MoveRelativeCommand] = []
         self.tracking_controls: list[TrackingControlSample] = []
+        self.continue_tracking_requests = 0
         self.invalidations = 0
         self.mode_requests: list[TurretControlMode] = []
         self.stop_requests = 0
@@ -111,6 +112,9 @@ class _FakeTurret:
 
     def submit_tracking_control(self, sample: TrackingControlSample) -> None:
         self.tracking_controls.append(sample)
+
+    def continue_tracking_motion(self) -> None:
+        self.continue_tracking_requests += 1
 
     def invalidate_tracking_control(self) -> None:
         self.invalidations += 1
@@ -163,9 +167,9 @@ def _turret_state(
     )
 
 
-def _aiming_config() -> AimingConfig:
+def _aiming_config(*, target_lost_timeout_ms: int = 500) -> AimingConfig:
     return AimingConfig(
-        target_lost_timeout_ms=500,
+        target_lost_timeout_ms=target_lost_timeout_ms,
         aim_points=AimPointsConfig(
             overview=AimPointConfig(50, 40),
             stereo_left=AimPointConfig(50, 40),
@@ -263,11 +267,14 @@ def _mediator(
     motion_calibration=None,
     tracking_stereo_left_nominal_hfov_deg: float | None = None,
     camera_motion_control_roles: frozenset[CameraRole] | None = None,
+    target_lost_timeout_ms: int = 500,
 ) -> tuple[Mediator, _FakeTurret, dict[CameraRole, TargetControlChannel]]:
     turret = _FakeTurret(_turret_state(mode=mode, motor=motor))
     controls = _controls()
     mediator = Mediator(
-        aiming_config=_aiming_config(),
+        aiming_config=_aiming_config(
+            target_lost_timeout_ms=target_lost_timeout_ms
+        ),
         tracking_control_config=_tracking_control_config(),
         tracking_gap_timeout_ms=200,
         ui_config=_ui_config(main),
@@ -1220,28 +1227,174 @@ def test_selection_is_rejected_before_vision_when_motors_or_processing_are_off()
     assert off_controls[CameraRole.OVERVIEW].consume_latest(generation=1) is None
 
 
-def test_temporary_track_miss_keeps_target_and_invalidates_tracking_error() -> None:
+def test_target_lost_timeout_zero_preserves_immediate_invalidation_contract(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.INFO, logger="navmin.core.mediator")
     mediator, turret, _controls_value = _mediator(
-        mode=TurretControlMode.TRACKING
+        mode=TurretControlMode.TRACKING,
+        target_lost_timeout_ms=0,
+    )
+    initial = _accept_main(mediator)
+    request = _request(mediator, initial)
+    assert mediator.accept_target_lifecycle_event(_acquired(request))
+    before = turret.invalidations
+
+    assert mediator.accept_vision_result(
+        _result(CameraRole.OVERVIEW, 1, frame_id=5, track_ids=())
+    )
+    assert mediator.accept_vision_result(
+        _result(CameraRole.OVERVIEW, 1, frame_id=6, track_ids=())
+    )
+
+    assert mediator.selected_target is not None
+    assert turret.continue_tracking_requests == 0
+    assert turret.invalidations == before + 2
+    assert turret.stop_requests == 0
+    messages = [record.getMessage() for record in caplog.records]
+    assert sum("Tracking target temporarily missing" in message for message in messages) == 1
+    assert sum("Tracking target loss timeout expired" in message for message in messages) == 1
+
+
+def test_temporary_track_miss_starts_grace_and_reacquisition_resumes(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.INFO, logger="navmin.core.mediator")
+    clock = _FakeClock(10_000_000_000)
+    mediator, turret, _controls_value = _mediator(
+        mode=TurretControlMode.TRACKING,
+        clock_ns=clock,
+        target_lost_timeout_ms=500,
     )
     initial = _accept_main(mediator)
     request = _request(mediator, initial)
     assert mediator.accept_target_lifecycle_event(_acquired(request))
     selected = mediator.selected_target
     assert selected is not None
-    before = turret.invalidations
+    before_invalidations = turret.invalidations
+    before_controls = len(turret.tracking_controls)
 
     assert mediator.accept_vision_result(
         _result(CameraRole.OVERVIEW, 1, frame_id=5, track_ids=())
     )
+    clock.advance_ms(400)
+    assert mediator.accept_vision_result(
+        _result(CameraRole.OVERVIEW, 1, frame_id=6, track_ids=())
+    )
+
     assert mediator.selected_target == selected
-    assert turret.invalidations == before + 1
+    assert turret.continue_tracking_requests == 2
+    assert turret.invalidations == before_invalidations
+    assert turret.stop_requests == 0
 
     assert mediator.accept_vision_result(
-        _result(CameraRole.OVERVIEW, 1, frame_id=6, timestamp_ns=3000)
+        _result(CameraRole.OVERVIEW, 1, frame_id=7, timestamp_ns=3000)
     )
     assert mediator.selected_target == selected
+    assert turret.invalidations == before_invalidations
+    assert len(turret.tracking_controls) == before_controls + 1
     assert turret.tracking_controls[-1].observation_timestamp_ns == 3000
+    messages = [record.getMessage() for record in caplog.records]
+    assert sum("Tracking target temporarily missing" in message for message in messages) == 1
+    assert sum("Tracking target reacquired" in message for message in messages) == 1
+    reacquired = next(message for message in messages if "Tracking target reacquired" in message)
+    assert "gap_ms=400.000" in reacquired
+    assert "timeout_ms=500" in reacquired
+    assert "timeout_expired=False" in reacquired
+
+
+def test_target_loss_grace_expires_once_and_keeps_target_for_late_reacquisition(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.INFO, logger="navmin.core.mediator")
+    clock = _FakeClock(20_000_000_000)
+    mediator, turret, _controls_value = _mediator(
+        mode=TurretControlMode.TRACKING,
+        clock_ns=clock,
+        target_lost_timeout_ms=500,
+    )
+    initial = _accept_main(mediator)
+    request = _request(mediator, initial)
+    assert mediator.accept_target_lifecycle_event(_acquired(request))
+    selected = mediator.selected_target
+    assert selected is not None
+    before_invalidations = turret.invalidations
+
+    assert mediator.accept_vision_result(
+        _result(CameraRole.OVERVIEW, 1, frame_id=5, track_ids=())
+    )
+    clock.advance_ms(499)
+    assert mediator.accept_vision_result(
+        _result(CameraRole.OVERVIEW, 1, frame_id=6, track_ids=())
+    )
+    assert turret.continue_tracking_requests == 2
+    assert turret.invalidations == before_invalidations
+    assert turret.stop_requests == 0
+
+    clock.advance_ms(1)
+    assert mediator.accept_vision_result(
+        _result(CameraRole.OVERVIEW, 1, frame_id=7, track_ids=())
+    )
+    assert mediator.selected_target == selected
+    assert turret.invalidations == before_invalidations + 1
+    assert turret.stop_requests == 1
+    messages = [record.getMessage() for record in caplog.records]
+    assert sum("Tracking target temporarily missing" in message for message in messages) == 1
+    assert sum("Tracking target loss timeout expired" in message for message in messages) == 1
+    expired = next(
+        message for message in messages if "Tracking target loss timeout expired" in message
+    )
+    assert "elapsed_ms=500.000" in expired
+    assert "timeout_ms=500" in expired
+
+    clock.advance_ms(100)
+    assert mediator.accept_vision_result(
+        _result(CameraRole.OVERVIEW, 1, frame_id=8, track_ids=())
+    )
+    assert turret.invalidations == before_invalidations + 1
+    assert turret.stop_requests == 1
+
+    assert mediator.accept_vision_result(
+        _result(CameraRole.OVERVIEW, 1, frame_id=9, timestamp_ns=4000)
+    )
+    assert mediator.selected_target == selected
+    assert turret.tracking_controls[-1].observation_timestamp_ns == 4000
+
+
+def test_target_loss_grace_uses_dynamic_timeout_from_original_missing_time() -> None:
+    clock = _FakeClock(30_000_000_000)
+    mediator, turret, _controls_value = _mediator(
+        mode=TurretControlMode.TRACKING,
+        clock_ns=clock,
+        target_lost_timeout_ms=500,
+    )
+    initial = _accept_main(mediator)
+    request = _request(mediator, initial)
+    assert mediator.accept_target_lifecycle_event(_acquired(request))
+    before_invalidations = turret.invalidations
+
+    assert mediator.accept_vision_result(
+        _result(CameraRole.OVERVIEW, 1, frame_id=5, track_ids=())
+    )
+    clock.advance_ms(400)
+    mediator.aiming.replace_config(_aiming_config(target_lost_timeout_ms=1000))
+    assert mediator.accept_vision_result(
+        _result(CameraRole.OVERVIEW, 1, frame_id=6, track_ids=())
+    )
+    assert turret.invalidations == before_invalidations
+
+    clock.advance_ms(500)
+    assert mediator.accept_vision_result(
+        _result(CameraRole.OVERVIEW, 1, frame_id=7, track_ids=())
+    )
+    assert turret.invalidations == before_invalidations
+
+    mediator.aiming.replace_config(_aiming_config(target_lost_timeout_ms=800))
+    assert mediator.accept_vision_result(
+        _result(CameraRole.OVERVIEW, 1, frame_id=8, track_ids=())
+    )
+    assert turret.invalidations == before_invalidations + 1
+    assert turret.stop_requests == 1
 
 
 def test_turret_connection_loss_clears_tracking_intent() -> None:

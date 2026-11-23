@@ -25,6 +25,7 @@ from PyQt6.QtWidgets import (
 )
 
 from navmin.config.models import (
+    AimingConfig,
     PidControllerConfig,
     Stm32Config,
     TrackingControlConfig,
@@ -76,6 +77,8 @@ class OperatorWindow(QWidget):
         on_apply_motion_limits_tuning: Callable[[Stm32Config], None],
         tracking_control_config: TrackingControlConfig,
         on_apply_tracking_control_tuning: Callable[[TrackingControlConfig], None],
+        aiming_config: AimingConfig,
+        on_apply_aiming_tuning: Callable[[AimingConfig], None],
         tracking_visualization_config: TrackingVisualizationConfig,
         on_tracking_visualization_changed: Callable[[TrackingVisualizationConfig], None],
         vt11_ui_config: Vt11UiConfig,
@@ -108,6 +111,8 @@ class OperatorWindow(QWidget):
         self._on_apply_motion_limits_tuning = on_apply_motion_limits_tuning
         self._tracking_control_config = tracking_control_config
         self._on_apply_tracking_control_tuning = on_apply_tracking_control_tuning
+        self._aiming_config = aiming_config
+        self._on_apply_aiming_tuning = on_apply_aiming_tuning
         self._tracking_stereo_left_hfov_deg = tracking_stereo_left_hfov_deg
         self._on_apply_tracking_stereo_left_hfov_deg = (
             on_apply_tracking_stereo_left_hfov_deg
@@ -174,7 +179,7 @@ class OperatorWindow(QWidget):
         self._build_pid_controls(pid_controller_config)
         self._build_feed_forward_controls(tracking_control_config)
         self._build_motion_limits_controls(stm32_config)
-        self._build_tracking_controls(tracking_control_config)
+        self._build_tracking_controls(tracking_control_config, aiming_config)
         self._build_visualization_controls(tracking_visualization_config)
         self._build_detector_controls()
         self._build_vt11_controls(vt11_ui_config)
@@ -246,7 +251,11 @@ class OperatorWindow(QWidget):
         self.motion_limits_error_label = QLabel("")
         self.motion_limits_error_label.setWordWrap(True)
 
-    def _build_tracking_controls(self, config: TrackingControlConfig) -> None:
+    def _build_tracking_controls(
+        self,
+        config: TrackingControlConfig,
+        aiming_config: AimingConfig,
+    ) -> None:
         self.prediction_enabled_checkbox = QCheckBox(
             "Использовать прогноз для управления"
         )
@@ -262,6 +271,17 @@ class OperatorWindow(QWidget):
         window.setToolTip(
             "Интервал истории наблюдений для оценки скорости цели. "
             "Меньшее значение быстрее реагирует, большее лучше сглаживает шум."
+        )
+        self.target_lost_timeout_input = QSpinBox()
+        self.target_lost_timeout_input.setRange(0, 5_000)
+        self.target_lost_timeout_input.setSingleStep(50)
+        self.target_lost_timeout_input.setSuffix(" мс")
+        self.target_lost_timeout_input.setValue(aiming_config.target_lost_timeout_ms)
+        self.target_lost_timeout_input.setMaximumWidth(150)
+        self.target_lost_timeout_input.setToolTip(
+            "Время, в течение которого турель продолжает последнюю успешно "
+            "применённую скорость после временной потери выбранной цели. "
+            "0 мс отключает удержание скорости и сохраняет прежнее поведение."
         )
         self.tracking_apply_button = QPushButton("Применить настройки отслеживания")
         self.tracking_apply_button.clicked.connect(self._apply_tracking_tuning)
@@ -721,13 +741,15 @@ class OperatorWindow(QWidget):
         tracking_layout.addWidget(self.prediction_enabled_checkbox, 0, 0, 1, 2)
         tracking_layout.addWidget(QLabel("Окно оценки скорости цели"), 1, 0)
         tracking_layout.addWidget(self.tracking_inputs["window_ms"], 1, 1)
-        tracking_layout.addWidget(QLabel("HFOV Stereo Left для сопровождения"), 2, 0)
-        tracking_layout.addWidget(self.tracking_hfov_input, 2, 1)
-        tracking_layout.addWidget(self.tracking_hfov_apply_button, 3, 0, 1, 2)
-        tracking_layout.addWidget(self.tracking_hfov_status_label, 4, 0, 1, 2)
-        tracking_layout.addWidget(self.tracking_apply_button, 5, 0, 1, 2)
-        tracking_layout.addWidget(self.tracking_status_label, 6, 0, 1, 2)
-        tracking_layout.addWidget(self.tracking_error_label, 7, 0, 1, 2)
+        tracking_layout.addWidget(QLabel("Продолжать движение после потери цели"), 2, 0)
+        tracking_layout.addWidget(self.target_lost_timeout_input, 2, 1)
+        tracking_layout.addWidget(QLabel("HFOV Stereo Left для сопровождения"), 3, 0)
+        tracking_layout.addWidget(self.tracking_hfov_input, 3, 1)
+        tracking_layout.addWidget(self.tracking_hfov_apply_button, 4, 0, 1, 2)
+        tracking_layout.addWidget(self.tracking_hfov_status_label, 5, 0, 1, 2)
+        tracking_layout.addWidget(self.tracking_apply_button, 6, 0, 1, 2)
+        tracking_layout.addWidget(self.tracking_status_label, 7, 0, 1, 2)
+        tracking_layout.addWidget(self.tracking_error_label, 8, 0, 1, 2)
         layout.addWidget(tracking_group)
         layout.addStretch(1)
         return page
@@ -911,6 +933,10 @@ class OperatorWindow(QWidget):
     def set_tracking_control_config(self, config: TrackingControlConfig) -> None:
         self._sync_tracking_controls(config)
 
+    def set_aiming_config(self, config: AimingConfig) -> None:
+        self._aiming_config = config
+        self.target_lost_timeout_input.setValue(config.target_lost_timeout_ms)
+
     def set_tracking_control_horizon_ms(self, horizon_ms: int) -> None:
         self._tracking_control_config = replace(
             self._tracking_control_config,
@@ -965,17 +991,31 @@ class OperatorWindow(QWidget):
                 window_ms=self.tracking_inputs["window_ms"].value(),
             ),
         )
+        aiming_config = replace(
+            self._aiming_config,
+            target_lost_timeout_ms=self.target_lost_timeout_input.value(),
+        )
         try:
             self._on_apply_tracking_control_tuning(config)
         except (OSError, RuntimeError, TypeError, ValueError) as exc:
             self.tracking_error_label.setText(f"Ошибка отслеживания: {exc}")
             return
         self._tracking_control_config = config
+        try:
+            self._on_apply_aiming_tuning(aiming_config)
+        except (OSError, RuntimeError, TypeError, ValueError) as exc:
+            self.target_lost_timeout_input.setValue(
+                self._aiming_config.target_lost_timeout_ms
+            )
+            self.tracking_error_label.setText(f"Ошибка таймера потери цели: {exc}")
+            return
+        self._aiming_config = aiming_config
         self.tracking_error_label.clear()
         self.tracking_status_label.setText(
             "Отправлено: "
             f"Prediction={'ON' if config.prediction.enabled else 'OFF'}; "
-            f"окно={config.velocity_estimator.window_ms} мс"
+            f"окно={config.velocity_estimator.window_ms} мс; "
+            f"потеря цели={aiming_config.target_lost_timeout_ms} мс"
         )
 
     def _apply_tracking_hfov_tuning(self) -> None:

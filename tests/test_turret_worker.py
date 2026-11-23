@@ -1362,3 +1362,54 @@ def test_emergency_preempts_video_latency_calibration_and_releases_ownership() -
         )
     finally:
         _shutdown(worker)
+
+
+def test_continue_tracking_motion_repeats_last_confirmed_velocity_through_latest_slot() -> None:
+    endpoint = FakeStm32Endpoint()
+    factory = _RecordingFactory(endpoint)
+    worker = TurretWorker(_config(), transport_factory=factory)
+    worker.start()
+    try:
+        _wait_state(worker, TurretConnectionState.READY)
+        assert worker.motor_on()
+        _wait_until(lambda: worker.current_state.motor_state is MotorState.ON)
+        assert worker.set_control_mode(TurretControlMode.TRACKING)
+        _wait_until(lambda: worker.current_state.control_mode is TurretControlMode.TRACKING)
+
+        history_start = len(endpoint.executed_request_history)
+        worker.submit_tracking_control(_tracking_sample(2.0, 1))
+        _wait_until(
+            lambda: len(
+                [
+                    request
+                    for request in endpoint.executed_request_history[history_start:]
+                    if request.command is CommandCode.SET_VELOCITY
+                    and isinstance(request.payload, SetVelocityPayload)
+                    and request.payload.velocity_x_steps_s != 0
+                ]
+            )
+            >= 1
+        )
+        first = [
+            request.payload
+            for request in endpoint.executed_request_history[history_start:]
+            if request.command is CommandCode.SET_VELOCITY
+            and isinstance(request.payload, SetVelocityPayload)
+            and request.payload.velocity_x_steps_s != 0
+        ][-1]
+
+        worker.continue_tracking_motion()
+        _wait_until(
+            lambda: len(
+                [
+                    request
+                    for request in endpoint.executed_request_history[history_start:]
+                    if request.command is CommandCode.SET_VELOCITY
+                    and isinstance(request.payload, SetVelocityPayload)
+                    and request.payload == first
+                ]
+            )
+            >= 2
+        )
+    finally:
+        _shutdown(worker)

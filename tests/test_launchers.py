@@ -1249,6 +1249,75 @@ def test_run_loaded_application_persists_aim_point_before_runtime_apply(
     assert saved.tracking_control == config.tracking_control
 
 
+def test_run_loaded_application_persists_target_lost_timeout_before_runtime_apply(
+    tmp_path: Path,
+) -> None:
+    config = _config()
+    config_path = tmp_path / "navmin.json"
+    save_config(config_path, config)
+    inputs = LoadedApplicationInputs(
+        config=config,
+        overview_calibration=_overview(),
+        stereo_calibration=_stereo(),
+        source_paths=SourceInputPaths(
+            config=config_path,
+            overview_calibration=tmp_path / "overview.json",
+            stereo_calibration=tmp_path / "stereo.json",
+        ),
+    )
+    applied: list[AimingConfig] = []
+    ui_dependencies = SimpleNamespace(
+        mediator=object(),
+        camera_bindings={},
+        turret_states=object(),
+        imu_states=None,
+        imu_controls=None,
+        camera_stale_timeout_ms=500,
+        aiming_config=config.aiming,
+        apply_aiming_tuning=applied.append,
+        pid_controller_config=config.turret.controller,
+        apply_pid_tuning=lambda _config: None,
+        stm32_config=config.turret.stm32,
+        apply_motion_limits_tuning=lambda _config: None,
+        tracking_control_config=config.tracking_control,
+        apply_tracking_control_tuning=lambda _config: None,
+        tracking_visualization_config=config.tracking_visualization,
+        ui_config=config.ui,
+        vision_processor_selections={},
+        apply_vision_processor_selection=lambda _camera, _selection: None,
+    )
+
+    class FakeRuntime:
+        def __init__(self) -> None:
+            self.imu_runtime = None
+            self.ui_dependencies = ui_dependencies
+
+        def start(self) -> None:
+            pass
+
+        def shutdown(self) -> None:
+            pass
+
+    updated = replace(config.aiming, target_lost_timeout_ms=0)
+
+    def ui_runner(**kwargs) -> int:
+        kwargs["apply_aiming_tuning"](updated)
+        return 0
+
+    run_loaded_application(
+        inputs,
+        runtime_builder=lambda **_kwargs: FakeRuntime(),
+        ui_runner=ui_runner,
+    )
+
+    assert applied == [updated]
+    saved = load_config(config_path)
+    assert saved.aiming.target_lost_timeout_ms == 0
+    assert saved.aiming.aim_points == config.aiming.aim_points
+    assert saved.turret == config.turret
+    assert saved.tracking_control == config.tracking_control
+
+
 def test_run_loaded_application_persists_all_operator_config_backed_updates_before_apply(
     tmp_path: Path,
 ) -> None:

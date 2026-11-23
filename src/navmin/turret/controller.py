@@ -77,6 +77,7 @@ class TurretController:
         self._last_processed_revision: int | None = None
         self._target: TargetRef | None = None
         self._last_tracking_time_s: float | None = None
+        self._last_applied_tracking_velocity: AxisVelocitySetpoint | None = None
         self._next_control_id = 1
         self._pid_x = AxisPid(
             self._x_gains(config.controller),
@@ -148,6 +149,7 @@ class TurretController:
         elif gap_exceeded:
             reset_reason = "tracking_gap_exceeded"
         if reset_reason is not None:
+            self._last_applied_tracking_velocity = None
             self._reset_pid()
 
         prediction = self._tracking_control_config.prediction
@@ -322,6 +324,44 @@ class TurretController:
             raise TypeError("config must be TrackingControlConfig")
         self._tracking_control_config = config
 
+    def continue_tracking_motion(self, revision: int) -> bool:
+        """Repeat the last confirmed tracking velocity without recomputing PID."""
+        self._require_revision(revision)
+        if (
+            self._last_processed_revision is not None
+            and revision <= self._last_processed_revision
+        ):
+            return False
+        self._last_processed_revision = revision
+        if self._control_mode is not TurretControlMode.TRACKING:
+            return False
+        previous = self._last_applied_tracking_velocity
+        if previous is None or self._hal.platform_motion_zero_settling:
+            return False
+
+        control_id = self._next_control_id
+        self._next_control_id += 1
+        self._pending_motion = AxisVelocitySetpoint(
+            velocity_x_deg_s=previous.velocity_x_deg_s,
+            velocity_y_deg_s=previous.velocity_y_deg_s,
+            timestamp_ns=previous.timestamp_ns,
+            control_id=control_id,
+        )
+        emit_event(
+            _LOGGER,
+            "CONTROL_DECISION",
+            source_instance="turret:controller",
+            control_id=control_id,
+            decision="repeat",
+            command_type="SET_VELOCITY",
+            logical_velocity_x_deg_s=previous.velocity_x_deg_s,
+            logical_velocity_y_deg_s=previous.velocity_y_deg_s,
+            replaced_control_id=previous.control_id,
+            reason="target_temporarily_missing",
+            pending_revision=revision,
+        )
+        return True
+
     def invalidate_tracking_control(self, revision: int) -> bool:
         self._require_revision(revision)
         if (
@@ -331,6 +371,7 @@ class TurretController:
             return False
         pending = self._pending_motion
         self._pending_motion = None
+        self._last_applied_tracking_velocity = None
         if isinstance(pending, AxisVelocitySetpoint) and pending.control_id is not None:
             emit_event(
                 _LOGGER,
@@ -360,7 +401,10 @@ class TurretController:
             return self._hal.move_relative(motion)
         if self._control_mode is not TurretControlMode.TRACKING:
             raise ControllerModeError("pending velocity motion in non-TRACKING mode")
-        return self._hal.set_velocity(motion)
+        result = self._hal.set_velocity(motion)
+        if self._session_result_ok(result):
+            self._last_applied_tracking_velocity = motion
+        return result
 
     def set_control_mode(self, mode: TurretControlMode) -> SessionResult | None:
         if not isinstance(mode, TurretControlMode):
@@ -371,6 +415,7 @@ class TurretController:
             raise ControllerStateError("mode transition requires confirmed motor state")
 
         self._pending_motion = None
+        self._last_applied_tracking_velocity = None
         old_mode = self._control_mode
 
         if old_mode is TurretControlMode.TRACKING:
@@ -399,6 +444,7 @@ class TurretController:
 
     def stop_motion(self) -> SessionResult | None:
         self._pending_motion = None
+        self._last_applied_tracking_velocity = None
         self._reset_pid()
         if self._hal.motor_state is MotorState.ON:
             return self._hal.set_velocity(self._zero_velocity())
@@ -411,6 +457,7 @@ class TurretController:
         if self._hal.motor_state is not MotorState.ON:
             raise ControllerStateError("calibration velocity requires MOTOR ON")
         self._pending_motion = None
+        self._last_applied_tracking_velocity = None
         self._reset_pid()
         self._target = None
         self._last_tracking_time_s = None
@@ -418,22 +465,26 @@ class TurretController:
 
     def motor_off(self) -> SessionResult:
         self._pending_motion = None
+        self._last_applied_tracking_velocity = None
         self._reset_pid()
         return self._hal.motor_off()
 
     def motor_on(self) -> SessionResult:
         # Never retain/replay a motion intent across a MOTOR_ON boundary.
         self._pending_motion = None
+        self._last_applied_tracking_velocity = None
         return self._hal.motor_on()
 
     def emergency_stop(self) -> ProtocolResponse | None:
         self._pending_motion = None
+        self._last_applied_tracking_velocity = None
         self._reset_pid()
         return self._hal.emergency_stop()
 
     def reset_for_transport_recovery(self) -> None:
         """Controller-side reset boundary; Stage 3D owns actual reconnect."""
         self._pending_motion = None
+        self._last_applied_tracking_velocity = None
         self._reset_pid()
         self._hal.mark_transport_lost()
 

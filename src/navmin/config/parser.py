@@ -487,7 +487,7 @@ def _parse_aiming(value: Any, *, allow_missing_right: bool = False) -> AimingCon
         target_lost_timeout_ms=_int(
             obj["target-lost-timeout-ms"],
             f"{path}.target-lost-timeout-ms",
-            minimum=1,
+            minimum=0,
         ),
         aim_points=AimPointsConfig(
             overview=_parse_aim_point(

@@ -1430,3 +1430,127 @@ def test_verbose_tracking_control_correlates_control_id_to_uart_tx(tmp_path) -> 
     )
     assert rx["control_id"] == control_id
     assert rx["transaction_result"] == "ok"
+
+
+def test_continue_tracking_motion_repeats_last_confirmed_velocity_without_pid_step() -> None:
+    controller, _, _, transport, clock = _stack(_config(watchdog_ms=1000))
+    controller.motor_on()
+    controller.set_control_mode(TurretControlMode.TRACKING)
+    transport.raw_write_history.clear()
+    target = _target()
+
+    controller.submit_tracking_control(1, _tracking_error(target, 2.0, timestamp_ns=123))
+    first_pending = controller.pending_motion
+    assert isinstance(first_pending, AxisVelocitySetpoint)
+    first_result = controller.flush_pending_motion()
+    assert first_result is not None and first_result.response is not None
+    assert first_result.response.result is ResultCode.OK
+    first_payload = decode_request(transport.raw_write_history[-1]).payload
+    pid_step_before = controller.pid_x.last_step
+    i_term_before = controller.pid_x.i_term
+
+    clock.now = 0.5
+    assert controller.continue_tracking_motion(2)
+    repeated = controller.pending_motion
+    assert isinstance(repeated, AxisVelocitySetpoint)
+    assert repeated.velocity_x_deg_s == first_pending.velocity_x_deg_s
+    assert repeated.velocity_y_deg_s == first_pending.velocity_y_deg_s
+    assert repeated.timestamp_ns == first_pending.timestamp_ns
+    assert repeated.control_id != first_pending.control_id
+    assert controller.pid_x.last_step is pid_step_before
+    assert controller.pid_x.i_term == i_term_before
+
+    repeated_result = controller.flush_pending_motion()
+    assert repeated_result is not None and repeated_result.response is not None
+    assert repeated_result.response.result is ResultCode.OK
+    assert decode_request(transport.raw_write_history[-1]).payload == first_payload
+    assert controller.pid_x.last_step is pid_step_before
+    assert controller.pid_x.i_term == i_term_before
+
+
+def test_verbose_continue_tracking_motion_records_repeat_decision(tmp_path) -> None:
+    runtime_log = tmp_path / "runtime.log"
+    with session_file_logging(
+        runtime_log,
+        level=logging.DEBUG,
+        run_id="target-loss-hold-test",
+        verbose=True,
+    ):
+        controller, _, _, transport, _ = _stack(_config(watchdog_ms=1000))
+        controller.motor_on()
+        controller.set_control_mode(TurretControlMode.TRACKING)
+        transport.raw_write_history.clear()
+        target = _target()
+        assert controller.submit_tracking_control(1, _tracking_error(target, 2.0))
+        first_pending = controller.pending_motion
+        assert isinstance(first_pending, AxisVelocitySetpoint)
+        controller.flush_pending_motion()
+        assert controller.continue_tracking_motion(2)
+        repeated = controller.pending_motion
+        assert isinstance(repeated, AxisVelocitySetpoint)
+        controller.flush_pending_motion()
+
+    repeat_events: list[dict[str, object]] = []
+    for line in runtime_log.read_text(encoding="utf-8").splitlines():
+        marker = "CONTROL_DECISION "
+        if marker not in line:
+            continue
+        payload = json.loads(line.split(marker, 1)[1])
+        if payload.get("decision") == "repeat":
+            repeat_events.append(payload)
+
+    assert len(repeat_events) == 1
+    repeat = repeat_events[0]
+    assert repeat["control_id"] == repeated.control_id
+    assert repeat["replaced_control_id"] == first_pending.control_id
+    assert repeat["reason"] == "target_temporarily_missing"
+    assert repeat["command_type"] == "SET_VELOCITY"
+
+
+def test_continue_tracking_motion_requires_confirmed_velocity_and_is_cleared_by_invalidation() -> None:
+    controller, _, _, transport, _ = _stack()
+    controller.motor_on()
+    controller.set_control_mode(TurretControlMode.TRACKING)
+    transport.raw_write_history.clear()
+
+    assert not controller.continue_tracking_motion(1)
+    assert controller.flush_pending_motion() is None
+    assert transport.raw_write_history == []
+
+    controller.submit_tracking_control(2, _tracking_error(_target(), 2.0))
+    controller.flush_pending_motion()
+    history_after_tracking = len(transport.raw_write_history)
+    assert controller.invalidate_tracking_control(3)
+    assert not controller.continue_tracking_motion(4)
+    assert controller.flush_pending_motion() is None
+    assert len(transport.raw_write_history) == history_after_tracking
+
+
+@pytest.mark.parametrize(
+    "boundary",
+    ["stop", "motor_off", "emergency", "recovery", "mode_change"],
+)
+def test_tracking_velocity_hold_does_not_survive_safety_boundaries(boundary: str) -> None:
+    controller, _, _, transport, _ = _stack()
+    controller.motor_on()
+    controller.set_control_mode(TurretControlMode.TRACKING)
+    controller.submit_tracking_control(1, _tracking_error(_target(), 2.0))
+    controller.flush_pending_motion()
+
+    if boundary == "stop":
+        controller.stop_motion()
+    elif boundary == "motor_off":
+        controller.motor_off()
+    elif boundary == "emergency":
+        controller.emergency_stop()
+    elif boundary == "recovery":
+        controller.reset_for_transport_recovery()
+    elif boundary == "mode_change":
+        controller.set_control_mode(TurretControlMode.RELATIVE)
+    else:  # pragma: no cover
+        raise AssertionError(boundary)
+
+    history_start = len(transport.raw_write_history)
+    assert not controller.continue_tracking_motion(2)
+    assert controller.flush_pending_motion() is None
+    assert len(transport.raw_write_history) == history_start

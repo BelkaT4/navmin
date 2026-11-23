@@ -487,6 +487,8 @@ class MainWindow(QMainWindow):
             on_apply_motion_limits_tuning=apply_motion_limits_tuning,
             tracking_control_config=tracking_control_config,
             on_apply_tracking_control_tuning=self._apply_tracking_control_tuning,
+            aiming_config=self._aiming_config,
+            on_apply_aiming_tuning=self._apply_aiming_config,
             tracking_stereo_left_hfov_deg=tracking_stereo_left_hfov_deg,
             on_apply_tracking_stereo_left_hfov_deg=(
                 apply_tracking_stereo_left_hfov_deg
@@ -695,9 +697,14 @@ class MainWindow(QMainWindow):
         else:
             points = replace(points, stereo_right=point)
         config = replace(self._aiming_config, aim_points=points)
+        self._apply_aiming_config(config)
+        self._refresh_aim_point()
+
+    def _apply_aiming_config(self, config: AimingConfig) -> None:
         self._on_apply_aiming_tuning(config)
         self._aiming_config = config
-        self._refresh_aim_point()
+        if hasattr(self, "operator_window"):
+            self.operator_window.set_aiming_config(config)
 
     def refresh_presentation(self) -> None:
         self.operator_window.set_tracking_diagnostics(
@@ -1159,11 +1166,10 @@ class MainWindow(QMainWindow):
             points = replace(points, stereo_right=point)
         config = replace(self._aiming_config, aim_points=points)
         try:
-            self._on_apply_aiming_tuning(config)
+            self._apply_aiming_config(config)
         except (OSError, RuntimeError, TypeError, ValueError):
             LOGGER.exception("Aim-point update failed camera=%s", camera.value)
             return
-        self._aiming_config = config
         self._set_aim_point_selection(False)
 
     @staticmethod
