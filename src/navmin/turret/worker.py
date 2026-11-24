@@ -29,7 +29,7 @@ from navmin.diagnostic_logging import emit_event
 from navmin.lifecycle import StopToken, stop_and_join
 
 from .controller import ControllerError, TurretController
-from .hal import TurretHal
+from .hal import RelativeMoveLimitError, TurretHal
 from .protocol import ResultCode
 from .session import (
     SessionError,
@@ -80,7 +80,16 @@ class _ControlIntent:
     mode: TurretControlMode | None = None
 
 
-type MotionInput = MoveRelativeCommand | TrackingControlSample
+@dataclass(frozen=True)
+class _ContinueTrackingMotion:
+    pass
+
+
+_CONTINUE_TRACKING_MOTION = _ContinueTrackingMotion()
+
+type MotionInput = (
+    MoveRelativeCommand | TrackingControlSample | _ContinueTrackingMotion
+)
 type TransportFactory = Callable[[str, int, bool], PhysicalTransport]
 type CooperativeWait = Callable[[StopToken, float], bool]
 
@@ -251,6 +260,11 @@ class TurretWorker:
             if self._normal_ingress_open:
                 self._motion_inputs.publish(sample)
 
+    def continue_tracking_motion(self) -> None:
+        with self._normal_ingress_lock:
+            if self._normal_ingress_open:
+                self._motion_inputs.publish(_CONTINUE_TRACKING_MOTION)
+
     def invalidate_tracking_control(self) -> None:
         with self._normal_ingress_lock:
             if self._normal_ingress_open:
@@ -407,6 +421,9 @@ class TurretWorker:
                     continue
                 except ControllerError as exc:
                     _LOGGER.warning("Rejected Turret control intent: %s", exc)
+                    continue
+                except RelativeMoveLimitError as exc:
+                    _LOGGER.warning("Rejected Turret relative move: %s", exc)
                     continue
                 except Exception:
                     _LOGGER.exception("Unrecoverable local Turret worker failure")
@@ -788,8 +805,10 @@ class TurretWorker:
             return
         if isinstance(motion, MoveRelativeCommand):
             controller.submit_move_relative(motion)
-        else:
+        elif isinstance(motion, TrackingControlSample):
             controller.submit_tracking_control(revision, motion)
+        else:
+            controller.continue_tracking_motion(revision)
         result = controller.flush_pending_motion()
         if result is not None:
             self._handle_session_result(result)

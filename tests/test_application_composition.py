@@ -614,7 +614,7 @@ def test_stereo_right_disabled_does_not_call_source_factory() -> None:
     assert CameraRole.STEREO_RIGHT not in runtime.camera_bindings
 
 
-def test_stereo_right_enabled_is_owned_and_observable_but_excluded_from_targeting() -> None:
+def test_stereo_right_enabled_is_owned_observable_and_wired_for_targeting() -> None:
     runtime, sources, _endpoint = _injected_runtime(stereo_right_enabled=True)
 
     assert runtime.stereo_right_worker is not None
@@ -632,11 +632,25 @@ def test_stereo_right_enabled_is_owned_and_observable_but_excluded_from_targetin
     assert set(runtime.mediator._target_controls) == {
         CameraRole.OVERVIEW,
         CameraRole.STEREO_LEFT,
+        CameraRole.STEREO_RIGHT,
     }
     assert set(runtime.mediator._vision_processing_enabled) == {
         CameraRole.OVERVIEW,
         CameraRole.STEREO_LEFT,
+        CameraRole.STEREO_RIGHT,
     }
+    assert runtime.mediator._vision_processing_enabled[CameraRole.STEREO_RIGHT] is False
+
+
+def test_stereo_right_can_be_an_explicit_camera_motion_control_role() -> None:
+    runtime, _sources, _endpoint = _injected_runtime(
+        stereo_right_enabled=True,
+        camera_motion_control_roles=frozenset({CameraRole.STEREO_RIGHT}),
+    )
+
+    assert runtime.mediator.camera_motion_control_roles == frozenset(
+        {CameraRole.STEREO_RIGHT}
+    )
 
 
 @pytest.mark.parametrize(
@@ -683,6 +697,30 @@ def test_stereo_disabled_keeps_modes_selectable_without_compute_path() -> None:
     assert runtime.mediator.current_distance is None
 
 
+def test_enabled_stereo_right_has_motion_calibration_identity() -> None:
+    runtime, _sources, _endpoint = _injected_runtime(stereo_right_enabled=True)
+
+    identities = runtime.motion_calibration_runtime.camera_identities
+    assert CameraRole.STEREO_RIGHT in identities
+    assert identities[CameraRole.STEREO_RIGHT] == identities[CameraRole.STEREO_LEFT]
+
+
+
+def test_right_tracking_hfov_dependencies_follow_right_camera_availability() -> None:
+    enabled_runtime, _sources, _endpoint = _injected_runtime(
+        stereo_right_enabled=True
+    )
+    disabled_runtime, _sources, _endpoint = _injected_runtime(
+        stereo_right_enabled=False
+    )
+
+    enabled_ui = enabled_runtime.ui_dependencies
+    assert enabled_ui.tracking_stereo_left_hfov_deg is not None
+    assert enabled_ui.tracking_stereo_right_hfov_deg is not None
+    assert enabled_ui.apply_tracking_stereo_right_hfov_deg is not None
+    assert disabled_runtime.ui_dependencies.tracking_stereo_right_hfov_deg is None
+
+
 def test_enabled_stereo_pairer_receives_both_corrected_frame_paths_and_resets() -> None:
     runtime, sources, _endpoint = _injected_runtime(
         stereo_right_enabled=True,
@@ -703,8 +741,8 @@ def test_enabled_stereo_pairer_receives_both_corrected_frame_paths_and_resets() 
         CameraRole.STEREO_LEFT,
         CameraRole.STEREO_RIGHT,
     }
-    assert CameraRole.STEREO_RIGHT not in runtime.mediator._target_controls
-    assert CameraRole.STEREO_RIGHT not in runtime.mediator._vision_processing_enabled
+    assert CameraRole.STEREO_RIGHT in runtime.mediator._target_controls
+    assert CameraRole.STEREO_RIGHT in runtime.mediator._vision_processing_enabled
 
     frame = np.zeros((HEIGHT, WIDTH, 3), dtype=np.uint8)
     runtime.mediator.set_distance_mode(DistanceMeasurementMode.STEREO_EXACT)

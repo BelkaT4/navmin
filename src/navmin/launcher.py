@@ -15,6 +15,7 @@ from navmin.calibration import (
     load_overview_calibration,
     load_stereo_calibration,
     stereo_left_horizontal_fov_deg,
+    stereo_right_horizontal_fov_deg,
 )
 from navmin.config import AppConfig, ConfigManager, config_to_mapping, load_config
 from navmin.contracts import CameraRole
@@ -97,7 +98,8 @@ def emit_config_snapshot(
     cameras = vision["cameras"]
     source_paths = inputs.source_paths
     stereo = inputs.stereo_calibration
-    nominal_hfov = stereo_left_horizontal_fov_deg(stereo)
+    left_nominal_hfov = stereo_left_horizontal_fov_deg(stereo)
+    right_nominal_hfov = stereo_right_horizontal_fov_deg(stereo)
     camera_backends = {
         "overview": overview_backend,
         "stereo-left": stereo_left_backend,
@@ -146,10 +148,14 @@ def emit_config_snapshot(
             "prediction": tracking["prediction"],
             "velocity_estimator": tracking["velocity-estimator"],
             "platform_motion": tracking["platform-motion"],
-            "stereo_left_nominal_hfov_deg": nominal_hfov,
-            "stereo_left_effective_hfov_deg": nominal_hfov,
+            "stereo_left_nominal_hfov_deg": left_nominal_hfov,
+            "stereo_left_effective_hfov_deg": left_nominal_hfov,
             "stereo_left_fx_px": float(stereo.P1[0][0]),
             "stereo_left_fy_px": float(stereo.P1[1][1]),
+            "stereo_right_nominal_hfov_deg": right_nominal_hfov,
+            "stereo_right_effective_hfov_deg": right_nominal_hfov,
+            "stereo_right_fx_px": float(stereo.P2[0][0]),
+            "stereo_right_fy_px": float(stereo.P2[1][1]),
         },
         turret={
             "backend": turret_backend,
@@ -533,6 +539,12 @@ def run_loaded_application(
             ),
             apply_tracking_stereo_left_hfov_deg=getattr(
                 ui, "apply_tracking_stereo_left_hfov_deg", None
+            ),
+            tracking_stereo_right_hfov_deg=getattr(
+                ui, "tracking_stereo_right_hfov_deg", None
+            ),
+            apply_tracking_stereo_right_hfov_deg=getattr(
+                ui, "apply_tracking_stereo_right_hfov_deg", None
             ),
             tracking_visualization_config=ui.tracking_visualization_config,
             ui_config=ui.ui_config,

@@ -31,6 +31,7 @@ MOTION_CALIBRATION_SCHEMA_VERSION = 2
 SUPPORTED_MOTION_CALIBRATION_CAMERAS = (
     CameraRole.OVERVIEW,
     CameraRole.STEREO_LEFT,
+    CameraRole.STEREO_RIGHT,
 )
 type AxisName = Literal["x", "y"]
 type DirectionName = Literal["positive", "negative"]
@@ -162,7 +163,9 @@ class CameraMotionCalibration:
 
     def __post_init__(self) -> None:
         if self.camera not in SUPPORTED_MOTION_CALIBRATION_CAMERAS:
-            raise MotionCalibrationError("camera profile must be Overview or Stereo Left")
+            raise MotionCalibrationError(
+                "camera profile must be Overview, Stereo Left or Stereo Right"
+            )
         if not self.camera_calibration_identity:
             raise MotionCalibrationError("camera calibration identity must not be empty")
         _positive_finite(self.calibration_limit_x_deg, "calibration_limit_x_deg")

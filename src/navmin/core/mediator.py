@@ -63,8 +63,9 @@ from .tracking_estimator import (
     TrackingEstimatorDiagnostics,
 )
 
-_NORMAL_CAMERAS = (CameraRole.OVERVIEW, CameraRole.STEREO_LEFT)
-_OBSERVABLE_CAMERAS = (*_NORMAL_CAMERAS, CameraRole.STEREO_RIGHT)
+_REQUIRED_CONTROL_CAMERAS = (CameraRole.OVERVIEW, CameraRole.STEREO_LEFT)
+_CONTROL_CAPABLE_CAMERAS = (*_REQUIRED_CONTROL_CAMERAS, CameraRole.STEREO_RIGHT)
+_OBSERVABLE_CAMERAS = _CONTROL_CAPABLE_CAMERAS
 _DISCONNECTED_CAMERA_STATES = (
     CameraState.RECONNECTING,
     CameraState.ERROR,
@@ -112,6 +113,8 @@ class TurretPort(Protocol):
     def submit_move_relative(self, command: MoveRelativeCommand) -> None: ...
 
     def submit_tracking_control(self, sample: TrackingControlSample) -> None: ...
+
+    def continue_tracking_motion(self) -> None: ...
 
     def invalidate_tracking_control(self) -> None: ...
 
@@ -186,25 +189,33 @@ class Mediator:
         clock_ns: Callable[[], int] = monotonic_ns,
         motion_calibration: MotionCalibrationCorrectionPort | None = None,
         tracking_stereo_left_nominal_hfov_deg: float | None = None,
+        tracking_stereo_right_nominal_hfov_deg: float | None = None,
         camera_motion_control_roles: Collection[CameraRole] | None = None,
     ) -> None:
-        if ui_config.default_camera not in _NORMAL_CAMERAS:
-            raise ValueError("ui.default_camera must be Overview or Stereo Left")
-        if set(target_controls) != set(_NORMAL_CAMERAS):
+        target_control_roles = set(target_controls)
+        required_control_roles = set(_REQUIRED_CONTROL_CAMERAS)
+        allowed_control_roles = set(_CONTROL_CAPABLE_CAMERAS)
+        if not required_control_roles.issubset(target_control_roles):
             raise ValueError("target_controls must contain Overview and Stereo Left")
+        if not target_control_roles.issubset(allowed_control_roles):
+            raise ValueError(
+                "target_controls may contain only Overview, Stereo Left, and Stereo Right"
+            )
+        if ui_config.default_camera not in target_control_roles:
+            raise ValueError("ui.default_camera must be an available control camera")
         if any(
             channel.camera is not camera
             for camera, channel in target_controls.items()
         ):
             raise ValueError("target-control mapping key must match channel.camera")
         enabled = (
-            {camera: True for camera in _NORMAL_CAMERAS}
+            {camera: True for camera in target_control_roles}
             if vision_processing_enabled is None
             else dict(vision_processing_enabled)
         )
-        if set(enabled) != set(_NORMAL_CAMERAS):
+        if set(enabled) != target_control_roles:
             raise ValueError(
-                "vision_processing_enabled must contain Overview and Stereo Left"
+                "vision_processing_enabled must match the available target controls"
             )
         if (
             isinstance(tracking_gap_timeout_ms, bool)
@@ -223,14 +234,16 @@ class Mediator:
             raise TypeError("clock_ns must be callable")
         if tracking_stereo_left_nominal_hfov_deg is not None:
             self._validate_tracking_hfov(tracking_stereo_left_nominal_hfov_deg)
+        if tracking_stereo_right_nominal_hfov_deg is not None:
+            self._validate_tracking_hfov(tracking_stereo_right_nominal_hfov_deg)
         motion_roles = (
-            frozenset(_NORMAL_CAMERAS)
+            frozenset(target_control_roles)
             if camera_motion_control_roles is None
             else frozenset(camera_motion_control_roles)
         )
-        if not motion_roles.issubset(_NORMAL_CAMERAS):
+        if not motion_roles.issubset(target_control_roles):
             raise ValueError(
-                "camera_motion_control_roles may contain only Overview and Stereo Left"
+                "camera_motion_control_roles must be available target-control cameras"
             )
 
         self._turret = turret
@@ -267,19 +280,27 @@ class Mediator:
         self._main_camera = ui_config.default_camera
         self._pending_selection: TargetSelectionRequest | None = None
         self._selected_target: TargetRef | None = None
+        self._tracking_target_missing_since_ns: int | None = None
+        self._tracking_target_loss_timeout_expired = False
+        self._tracking_target_hold_suppressed = False
         self._distance_mode = DistanceMeasurementMode.CONSTANT
         self._manual_distance_m = quantize_constant_distance(initial_manual_distance_m)
         self._distance_stale_timeout_ns = distance_stale_timeout_ms * 1_000_000
         self._clock_ns = clock_ns
         self._motion_calibration = motion_calibration
-        self._tracking_stereo_left_nominal_hfov_deg = (
-            None
-            if tracking_stereo_left_nominal_hfov_deg is None
-            else float(tracking_stereo_left_nominal_hfov_deg)
-        )
-        self._tracking_stereo_left_hfov_deg = (
-            self._tracking_stereo_left_nominal_hfov_deg
-        )
+        self._tracking_nominal_hfov_deg = {
+            CameraRole.STEREO_LEFT: (
+                None
+                if tracking_stereo_left_nominal_hfov_deg is None
+                else float(tracking_stereo_left_nominal_hfov_deg)
+            ),
+            CameraRole.STEREO_RIGHT: (
+                None
+                if tracking_stereo_right_nominal_hfov_deg is None
+                else float(tracking_stereo_right_nominal_hfov_deg)
+            ),
+        }
+        self._tracking_hfov_deg = dict(self._tracking_nominal_hfov_deg)
         self._distance_intent_revision = 0
         self._current_distance: DistanceResult | None = None
         self._distance_shutdown = False
@@ -357,35 +378,75 @@ class Mediator:
     def tracking_control_visualization(self) -> TrackingControlVisualization | None:
         return self._tracking_control_visualization
 
+    def tracking_hfov_deg(self, camera: CameraRole) -> float | None:
+        if camera not in (CameraRole.STEREO_LEFT, CameraRole.STEREO_RIGHT):
+            raise ValueError("tracking HFOV tuning is available only for stereo cameras")
+        return self._tracking_hfov_deg[camera]
+
+    def tracking_nominal_hfov_deg(self, camera: CameraRole) -> float | None:
+        if camera not in (CameraRole.STEREO_LEFT, CameraRole.STEREO_RIGHT):
+            raise ValueError("tracking HFOV tuning is available only for stereo cameras")
+        return self._tracking_nominal_hfov_deg[camera]
+
     @property
     def tracking_stereo_left_hfov_deg(self) -> float | None:
-        return self._tracking_stereo_left_hfov_deg
+        return self.tracking_hfov_deg(CameraRole.STEREO_LEFT)
 
     @property
     def tracking_stereo_left_nominal_hfov_deg(self) -> float | None:
-        return self._tracking_stereo_left_nominal_hfov_deg
+        return self.tracking_nominal_hfov_deg(CameraRole.STEREO_LEFT)
+
+    @property
+    def tracking_stereo_right_hfov_deg(self) -> float | None:
+        return self.tracking_hfov_deg(CameraRole.STEREO_RIGHT)
+
+    @property
+    def tracking_stereo_right_nominal_hfov_deg(self) -> float | None:
+        return self.tracking_nominal_hfov_deg(CameraRole.STEREO_RIGHT)
 
     def set_tracking_stereo_left_hfov_deg(self, hfov_deg: float) -> None:
-        """Apply a temporary tracking-only focal scale for Stereo Left."""
-        nominal = self._tracking_stereo_left_nominal_hfov_deg
+        self.set_tracking_hfov_deg(CameraRole.STEREO_LEFT, hfov_deg)
+
+    def set_tracking_stereo_right_hfov_deg(self, hfov_deg: float) -> None:
+        self.set_tracking_hfov_deg(CameraRole.STEREO_RIGHT, hfov_deg)
+
+    def set_tracking_hfov_deg(self, camera: CameraRole, hfov_deg: float) -> None:
+        """Apply a temporary control focal scale for one stereo camera.
+
+        The public name is retained for compatibility with the existing UI/wiring,
+        but the effective model is shared by RELATIVE and TRACKING control paths.
+        """
+        if camera not in (CameraRole.STEREO_LEFT, CameraRole.STEREO_RIGHT):
+            raise ValueError("tracking HFOV tuning is available only for stereo cameras")
+        nominal = self._tracking_nominal_hfov_deg[camera]
         if nominal is None:
-            raise RuntimeError("Stereo Left tracking HFOV tuning is unavailable")
+            raise RuntimeError(f"{camera.value} tracking HFOV tuning is unavailable")
         value = self._validate_tracking_hfov(hfov_deg)
-        if value == self._tracking_stereo_left_hfov_deg:
+        if value == self._tracking_hfov_deg[camera]:
             return
-        old_value = self._tracking_stereo_left_hfov_deg
-        self._tracking_stereo_left_hfov_deg = value
+        old_value = self._tracking_hfov_deg[camera]
+        self._tracking_hfov_deg[camera] = value
         self._tracking_hfov_revision += 1
-        self._tracking_estimator.reset_history()
-        self._tracking_estimator_reset_reason = "tracking_hfov_changed"
-        self._tracking_control_visualization = None
-        self._turret.invalidate_tracking_control()
+        selected_target = self._selected_target
+        affects_active_target = (
+            selected_target is not None
+            and selected_target.camera is camera
+            and self._turret_state.control_mode is TurretControlMode.TRACKING
+        )
+        if affects_active_target:
+            self._tracking_estimator.reset_history()
+            self._tracking_estimator_reset_reason = "tracking_hfov_changed"
+            self._tracking_control_visualization = None
+            self._tracking_target_hold_suppressed = True
+            self._turret.invalidate_tracking_control()
+            self._turret.stop_motion()
+        scale = self._tracking_focal_scale(camera)
         _LOGGER.info(
-            "Stereo Left tracking HFOV updated nominal=%.6f effective=%.6f "
-            "focal_scale=%.6f",
+            "%s tracking HFOV updated nominal=%.6f effective=%.6f focal_scale=%.6f",
+            camera.value,
             nominal,
             value,
-            self._tracking_stereo_left_focal_scale(),
+            scale,
         )
         emit_event(
             _LOGGER,
@@ -393,7 +454,7 @@ class Mediator:
             source_instance="core:mediator",
             revision=self._tracking_hfov_revision,
             owner="core.aiming",
-            parameter="tracking.stereo_left_hfov_deg",
+            parameter=f"tracking.{camera.value}_hfov_deg",
             old_value={
                 "nominal_hfov_deg": nominal,
                 "effective_hfov_deg": old_value,
@@ -401,25 +462,41 @@ class Mediator:
             new_value={
                 "nominal_hfov_deg": nominal,
                 "effective_hfov_deg": value,
-                "focal_scale": self._tracking_stereo_left_focal_scale(),
+                "focal_scale": scale,
             },
             apply_result="applied",
             reason=None,
         )
+
+    def control_camera_model(
+        self,
+        camera: CameraRole,
+        generation: int,
+    ) -> CameraModel | None:
+        """Return the effective pixel-to-angle model used by turret control.
+
+        Session/calibration geometry remains the immutable base model. Stereo HFOV
+        tuning is applied only at this control boundary, so Vision, rectification,
+        stereo distance, and motion-calibration measurement keep nominal geometry.
+        """
+        model = self._session_gate.camera_model(camera, generation)
+        if model is None or camera not in (
+            CameraRole.STEREO_LEFT,
+            CameraRole.STEREO_RIGHT,
+        ):
+            return model
+        scale = self._tracking_focal_scale(camera)
+        if scale == 1.0:
+            return model
+        return FocalScaleCameraModel(model, scale)
 
     def tracking_camera_model(
         self,
         camera: CameraRole,
         generation: int,
     ) -> CameraModel | None:
-        """Return the camera model used only by the tracking-control path."""
-        model = self._session_gate.camera_model(camera, generation)
-        if model is None or camera is not CameraRole.STEREO_LEFT:
-            return model
-        scale = self._tracking_stereo_left_focal_scale()
-        if scale == 1.0:
-            return model
-        return FocalScaleCameraModel(model, scale)
+        """Compatibility wrapper for the shared control camera model."""
+        return self.control_camera_model(camera, generation)
 
     @staticmethod
     def _validate_tracking_hfov(hfov_deg: float) -> float:
@@ -430,9 +507,9 @@ class Mediator:
             raise ValueError("tracking HFOV must be in [0.1, 179.0) degrees")
         return value
 
-    def _tracking_stereo_left_focal_scale(self) -> float:
-        nominal = self._tracking_stereo_left_nominal_hfov_deg
-        effective = self._tracking_stereo_left_hfov_deg
+    def _tracking_focal_scale(self, camera: CameraRole) -> float:
+        nominal = self._tracking_nominal_hfov_deg[camera]
+        effective = self._tracking_hfov_deg[camera]
         if nominal is None or effective is None or effective == nominal:
             return 1.0
         return tan(radians(nominal) / 2.0) / tan(radians(effective) / 2.0)
@@ -713,6 +790,7 @@ class Mediator:
     ) -> bool:
         frame = vision_result.frame
         reason: str | None = None
+        model: CameraModel | None = None
         if self._turret_state.control_mode is not TurretControlMode.RELATIVE:
             reason = "control_mode_not_relative"
         elif self._pending_control_mode is not None:
@@ -722,7 +800,7 @@ class Mediator:
         elif frame.camera not in self._camera_motion_control_roles:
             reason = "camera_motion_control_blocked"
         else:
-            model = self._session_gate.camera_model(frame.camera, frame.generation)
+            model = self.control_camera_model(frame.camera, frame.generation)
             if model is None:
                 reason = "generation_not_accepted"
             elif not self._pixel_in_frame(frame, x_px, y_px):
@@ -739,7 +817,6 @@ class Mediator:
                 image_y_px=float(y_px),
             )
             return False
-        model = self._session_gate.camera_model(frame.camera, frame.generation)
         if model is None:
             raise RuntimeError("accepted relative click lost camera model")
         command = self._aiming.relative_command(
@@ -856,6 +933,7 @@ class Mediator:
         had_selected_target = self._selected_target is not None
         self._pending_selection = request
         self._selected_target = None
+        self._clear_tracking_target_loss_state()
         self._invalidate_distance_intent()
         self._refresh_stereo_join_target()
         self._tracking_estimator.reset()
@@ -980,14 +1058,17 @@ class Mediator:
         )
         return True
 
-    def swap_main_preview(self) -> CameraRole:
+    def select_main_camera(self, camera: CameraRole) -> CameraRole:
+        if not isinstance(camera, CameraRole):
+            raise TypeError("camera must be CameraRole")
+        if camera not in self._target_controls:
+            raise ValueError("camera must be an available control camera")
+        if camera is self._main_camera:
+            return self._main_camera
+
         old_main = self._main_camera
         self._invalidate_distance_intent()
-        self._main_camera = (
-            CameraRole.STEREO_LEFT
-            if self._main_camera is CameraRole.OVERVIEW
-            else CameraRole.OVERVIEW
-        )
+        self._main_camera = camera
         self._refresh_stereo_join_target()
         if (
             self._turret_state.control_mode is TurretControlMode.TRACKING
@@ -999,11 +1080,22 @@ class Mediator:
         self._emit_operator_action(
             "camera_swap",
             accepted=True,
-            requested={"old_main_camera": old_main.value, "new_main_camera": self._main_camera.value},
+            requested={
+                "old_main_camera": old_main.value,
+                "new_main_camera": self._main_camera.value,
+            },
             camera=self._main_camera,
             resulting_control_mode=self._turret_state.control_mode,
         )
         return self._main_camera
+
+    def swap_main_preview(self) -> CameraRole:
+        camera = (
+            CameraRole.STEREO_LEFT
+            if self._main_camera is CameraRole.OVERVIEW
+            else CameraRole.OVERVIEW
+        )
+        return self.select_main_camera(camera)
 
     def request_control_mode(self, mode: TurretControlMode) -> bool:
         if not isinstance(mode, TurretControlMode):
@@ -1109,6 +1201,7 @@ class Mediator:
 
         self._pending_selection = None
         self._selected_target = target
+        self._clear_tracking_target_loss_state()
         self._invalidate_distance_intent()
         self._refresh_stereo_join_target()
         self._refresh_manual_distance()
@@ -1136,6 +1229,7 @@ class Mediator:
             return False
         self._pending_selection = None
         self._selected_target = None
+        self._clear_tracking_target_loss_state()
         self._invalidate_distance_intent()
         self._refresh_stereo_join_target()
         self._tracking_estimator.reset()
@@ -1154,6 +1248,7 @@ class Mediator:
         ):
             return False
         self._selected_target = None
+        self._clear_tracking_target_loss_state()
         self._invalidate_distance_intent()
         self._refresh_stereo_join_target()
         self._tracking_estimator.reset()
@@ -1424,12 +1519,91 @@ class Mediator:
             return
         tracked = self._find_track(result, target.track_id)
         if tracked is None:
+            self._handle_tracking_target_missing()
+            return
+        missing_since_ns = self._tracking_target_missing_since_ns
+        if missing_since_ns is not None:
+            now_ns = self._clock_ns()
+            _LOGGER.info(
+                "Tracking target reacquired camera=%s generation=%d track_id=%d "
+                "gap_ms=%.3f timeout_ms=%d timeout_expired=%s",
+                target.camera.value,
+                target.generation,
+                target.track_id,
+                max(0, now_ns - missing_since_ns) / 1_000_000.0,
+                self._aiming.config.target_lost_timeout_ms,
+                self._tracking_target_loss_timeout_expired,
+            )
+        self._clear_tracking_target_loss_state()
+        self._submit_tracking_control(result, tracked, target)
+
+    def _handle_tracking_target_missing(self) -> None:
+        now_ns = self._clock_ns()
+        timeout_ms = self._aiming.config.target_lost_timeout_ms
+        if self._tracking_target_missing_since_ns is None:
+            self._tracking_target_missing_since_ns = now_ns
+            self._tracking_target_loss_timeout_expired = False
             self._tracking_estimator.reset_history()
             self._tracking_estimator_reset_reason = "track_missing"
             self._tracking_control_visualization = None
+            target = self._selected_target
+            if target is not None:
+                _LOGGER.info(
+                    "Tracking target temporarily missing camera=%s generation=%d "
+                    "track_id=%d timeout_ms=%d",
+                    target.camera.value,
+                    target.generation,
+                    target.track_id,
+                    timeout_ms,
+                )
+
+        if self._tracking_target_hold_suppressed:
+            return
+
+        if timeout_ms == 0:
+            if not self._tracking_target_loss_timeout_expired:
+                target = self._selected_target
+                if target is not None:
+                    _LOGGER.info(
+                        "Tracking target loss timeout expired camera=%s "
+                        "generation=%d track_id=%d elapsed_ms=0.000 timeout_ms=0",
+                        target.camera.value,
+                        target.generation,
+                        target.track_id,
+                    )
+            self._tracking_target_loss_timeout_expired = True
             self._turret.invalidate_tracking_control()
             return
-        self._submit_tracking_control(result, tracked, target)
+        if self._tracking_target_loss_timeout_expired:
+            return
+
+        missing_since_ns = self._tracking_target_missing_since_ns
+        if missing_since_ns is None:
+            raise RuntimeError("tracking target loss state is inconsistent")
+        elapsed_ns = max(0, now_ns - missing_since_ns)
+        if elapsed_ns < timeout_ms * 1_000_000:
+            self._turret.continue_tracking_motion()
+            return
+
+        self._tracking_target_loss_timeout_expired = True
+        target = self._selected_target
+        if target is not None:
+            _LOGGER.info(
+                "Tracking target loss timeout expired camera=%s generation=%d "
+                "track_id=%d elapsed_ms=%.3f timeout_ms=%d",
+                target.camera.value,
+                target.generation,
+                target.track_id,
+                elapsed_ns / 1_000_000.0,
+                timeout_ms,
+            )
+        self._turret.invalidate_tracking_control()
+        self._turret.stop_motion()
+
+    def _clear_tracking_target_loss_state(self) -> None:
+        self._tracking_target_missing_since_ns = None
+        self._tracking_target_loss_timeout_expired = False
+        self._tracking_target_hold_suppressed = False
 
     def _submit_tracking_control(
         self,
@@ -1437,7 +1611,7 @@ class Mediator:
         tracked: TrackedObject,
         target: TargetRef,
     ) -> None:
-        model = self.tracking_camera_model(target.camera, target.generation)
+        model = self.control_camera_model(target.camera, target.generation)
         if model is None:
             self._tracking_estimator.reset_history()
             self._tracking_estimator_reset_reason = "camera_model_unavailable"
@@ -1468,16 +1642,8 @@ class Mediator:
         fy_px = None if projection is None else float(projection[1][1])
         cx_px = None if projection is None else float(projection[0][2])
         cy_px = None if projection is None else float(projection[1][2])
-        nominal_hfov = (
-            self._tracking_stereo_left_nominal_hfov_deg
-            if result.frame.camera is CameraRole.STEREO_LEFT
-            else None
-        )
-        effective_hfov = (
-            self._tracking_stereo_left_hfov_deg
-            if result.frame.camera is CameraRole.STEREO_LEFT
-            else None
-        )
+        nominal_hfov = self._tracking_nominal_hfov_deg.get(result.frame.camera)
+        effective_hfov = self._tracking_hfov_deg.get(result.frame.camera)
         emit_event(
             _LOGGER,
             "AIMING_SAMPLE",
@@ -1759,6 +1925,7 @@ class Mediator:
     def _invalidate_target_intent(self, *, stop_motion: bool) -> None:
         self._pending_selection = None
         self._selected_target = None
+        self._clear_tracking_target_loss_state()
         self._invalidate_distance_intent()
         self._refresh_stereo_join_target()
         self._tracking_estimator.reset()

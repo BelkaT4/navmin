@@ -115,6 +115,7 @@ def _runtime(
         camera_identities={
             CameraRole.OVERVIEW: "sha256:camera",
             CameraRole.STEREO_LEFT: "sha256:stereo",
+            CameraRole.STEREO_RIGHT: "sha256:stereo",
         },
         document=MotionCalibrationDocument(
             extrapolation_percent=percent,
@@ -209,16 +210,31 @@ def test_camera_specific_profiles_and_generic_baseline_are_independent(
     tmp_path: Path,
 ) -> None:
     overview = _camera_profile(CameraRole.OVERVIEW, x=_axis_profile())
-    stereo = _camera_profile(
+    stereo_left = _camera_profile(
         CameraRole.STEREO_LEFT,
         identity="sha256:stereo",
-        x=_axis_profile(positive=DirectionCurve(
-            (CurvePoint(0, 0), CurvePoint(4, 5), CurvePoint(8, 10))
-        )),
+        x=_axis_profile(
+            positive=DirectionCurve(
+                (CurvePoint(0, 0), CurvePoint(4, 5), CurvePoint(8, 10))
+            )
+        ),
+    )
+    stereo_right = _camera_profile(
+        CameraRole.STEREO_RIGHT,
+        identity="sha256:stereo",
+        x=_axis_profile(
+            positive=DirectionCurve(
+                (CurvePoint(0, 0), CurvePoint(4, 6), CurvePoint(8, 11))
+            )
+        ),
     )
     runtime = _runtime(
         tmp_path,
-        profiles={CameraRole.OVERVIEW: overview, CameraRole.STEREO_LEFT: stereo},
+        profiles={
+            CameraRole.OVERVIEW: overview,
+            CameraRole.STEREO_LEFT: stereo_left,
+            CameraRole.STEREO_RIGHT: stereo_right,
+        },
     )
 
     assert runtime.correct(
@@ -229,7 +245,7 @@ def test_camera_specific_profiles_and_generic_baseline_are_independent(
     ).delta_x_deg == 5.0
     assert runtime.correct(
         CameraRole.STEREO_RIGHT, MoveRelativeCommand(4.0, 0.0)
-    ) == MoveRelativeCommand(4.0, 0.0)
+    ).delta_x_deg == 6.0
     generic_command = MoveRelativeCommand(4.0, 0.0)
     assert generic_command == MoveRelativeCommand(4.0, 0.0)
 
@@ -423,7 +439,7 @@ def test_unsafe_transition_is_disabled_without_invalidating_curve() -> None:
     assert any("transition disabled" in warning for warning in warnings)
 
 
-def test_persistence_round_trip_preserves_both_cameras_axes_and_raw_evidence(
+def test_persistence_round_trip_preserves_all_camera_profiles_axes_and_raw_evidence(
     tmp_path: Path,
 ) -> None:
     x, _ = build_axis_calibration(
@@ -440,14 +456,30 @@ def test_persistence_round_trip_preserves_both_cameras_axes_and_raw_evidence(
             for item in x.observations
         ),
     )
-    stereo = _camera_profile(
+    stereo_left = _camera_profile(
         CameraRole.STEREO_LEFT,
         identity="sha256:stereo",
         x=stereo_x,
     )
+    stereo_right_x = replace(
+        x,
+        observations=tuple(
+            replace(item, camera=CameraRole.STEREO_RIGHT)
+            for item in x.observations
+        ),
+    )
+    stereo_right = _camera_profile(
+        CameraRole.STEREO_RIGHT,
+        identity="sha256:stereo",
+        x=stereo_right_x,
+    )
     document = MotionCalibrationDocument(
         extrapolation_percent=17.5,
-        profiles={CameraRole.OVERVIEW: overview, CameraRole.STEREO_LEFT: stereo},
+        profiles={
+            CameraRole.OVERVIEW: overview,
+            CameraRole.STEREO_LEFT: stereo_left,
+            CameraRole.STEREO_RIGHT: stereo_right,
+        },
     )
 
     restored = motion_calibration_from_mapping(
@@ -457,7 +489,13 @@ def test_persistence_round_trip_preserves_both_cameras_axes_and_raw_evidence(
     assert restored == document
     assert len(restored.profiles[CameraRole.OVERVIEW].axes["x"].observations) == 16
 
-    runtime = _runtime(tmp_path, profiles={CameraRole.STEREO_LEFT: stereo})
+    runtime = _runtime(
+        tmp_path,
+        profiles={
+            CameraRole.STEREO_LEFT: stereo_left,
+            CameraRole.STEREO_RIGHT: stereo_right,
+        },
+    )
     runtime.save_and_apply(overview, extrapolation_percent=17.5)
     loaded = MotionCalibrationRuntime.load(
         path=runtime.path,
@@ -467,6 +505,7 @@ def test_persistence_round_trip_preserves_both_cameras_axes_and_raw_evidence(
     assert set(loaded.document.profiles) == {
         CameraRole.OVERVIEW,
         CameraRole.STEREO_LEFT,
+        CameraRole.STEREO_RIGHT,
     }
 
 

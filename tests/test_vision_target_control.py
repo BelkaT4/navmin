@@ -81,11 +81,12 @@ def _packet(
     *,
     generation: int = 1,
     receive_timestamp_ns: int | None = None,
+    camera: CameraRole = CameraRole.OVERVIEW,
 ) -> FramePacket:
     image = np.zeros((12, 16, 3), dtype=np.uint8)
     image.flags.writeable = False
     return FramePacket(
-        camera=CameraRole.OVERVIEW,
+        camera=camera,
         generation=generation,
         frame_id=frame_id,
         capture_id=None,
@@ -105,10 +106,11 @@ def _select(
     y_px: float,
     *,
     generation: int = 1,
+    camera: CameraRole = CameraRole.OVERVIEW,
 ) -> TargetSelectionRequest:
     return TargetSelectionRequest(
         selection_id=selection_id,
-        camera=CameraRole.OVERVIEW,
+        camera=camera,
         generation=generation,
         frame_id=frame_id,
         x_px=x_px,
@@ -144,6 +146,31 @@ def test_legacy14_exact_frame_selection_returns_immediate_acquired_event() -> No
         TargetAcquired(
             selection_id=31,
             target=TargetRef(CameraRole.OVERVIEW, generation=1, track_id=7),
+            request_frame_id=4,
+            decision_frame_id=4,
+            decision_frame_timestamp_ns=444,
+        ),
+    )
+
+
+def test_legacy14_target_control_is_camera_role_neutral_for_stereo_right() -> None:
+    clock = _Clock(100)
+    processor, _tracker = _legacy_processor(
+        (_tracked(7, BBox(2, 3, 8, 6)),),
+        clock,
+    )
+    processor.process(
+        _packet(4, receive_timestamp_ns=444, camera=CameraRole.STEREO_RIGHT)
+    )
+
+    events = processor.apply_target_control(
+        _select(31, 4, 5.0, 5.0, camera=CameraRole.STEREO_RIGHT)
+    )
+
+    assert events == (
+        TargetAcquired(
+            selection_id=31,
+            target=TargetRef(CameraRole.STEREO_RIGHT, generation=1, track_id=7),
             request_frame_id=4,
             decision_frame_id=4,
             decision_frame_timestamp_ns=444,

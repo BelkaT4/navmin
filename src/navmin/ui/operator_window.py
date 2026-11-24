@@ -25,6 +25,7 @@ from PyQt6.QtWidgets import (
 )
 
 from navmin.config.models import (
+    AimingConfig,
     PidControllerConfig,
     Stm32Config,
     TrackingControlConfig,
@@ -76,6 +77,8 @@ class OperatorWindow(QWidget):
         on_apply_motion_limits_tuning: Callable[[Stm32Config], None],
         tracking_control_config: TrackingControlConfig,
         on_apply_tracking_control_tuning: Callable[[TrackingControlConfig], None],
+        aiming_config: AimingConfig,
+        on_apply_aiming_tuning: Callable[[AimingConfig], None],
         tracking_visualization_config: TrackingVisualizationConfig,
         on_tracking_visualization_changed: Callable[[TrackingVisualizationConfig], None],
         vt11_ui_config: Vt11UiConfig,
@@ -84,6 +87,8 @@ class OperatorWindow(QWidget):
         on_use_camera_time_for_tracking_changed: Callable[[bool], None],
         tracking_stereo_left_hfov_deg: float | None = None,
         on_apply_tracking_stereo_left_hfov_deg: Callable[[float], None] | None = None,
+        tracking_stereo_right_hfov_deg: float | None = None,
+        on_apply_tracking_stereo_right_hfov_deg: Callable[[float], None] | None = None,
         vision_processor_selections: Mapping[CameraRole, VisionProcessorSelection] | None = None,
         on_apply_vision_processor_selection: (
             Callable[[CameraRole, VisionProcessorSelection], None] | None
@@ -108,9 +113,15 @@ class OperatorWindow(QWidget):
         self._on_apply_motion_limits_tuning = on_apply_motion_limits_tuning
         self._tracking_control_config = tracking_control_config
         self._on_apply_tracking_control_tuning = on_apply_tracking_control_tuning
+        self._aiming_config = aiming_config
+        self._on_apply_aiming_tuning = on_apply_aiming_tuning
         self._tracking_stereo_left_hfov_deg = tracking_stereo_left_hfov_deg
         self._on_apply_tracking_stereo_left_hfov_deg = (
             on_apply_tracking_stereo_left_hfov_deg
+        )
+        self._tracking_stereo_right_hfov_deg = tracking_stereo_right_hfov_deg
+        self._on_apply_tracking_stereo_right_hfov_deg = (
+            on_apply_tracking_stereo_right_hfov_deg
         )
         self._tracking_visualization_config = tracking_visualization_config
         self._on_tracking_visualization_changed = on_tracking_visualization_changed
@@ -174,7 +185,7 @@ class OperatorWindow(QWidget):
         self._build_pid_controls(pid_controller_config)
         self._build_feed_forward_controls(tracking_control_config)
         self._build_motion_limits_controls(stm32_config)
-        self._build_tracking_controls(tracking_control_config)
+        self._build_tracking_controls(tracking_control_config, aiming_config)
         self._build_visualization_controls(tracking_visualization_config)
         self._build_detector_controls()
         self._build_vt11_controls(vt11_ui_config)
@@ -246,7 +257,11 @@ class OperatorWindow(QWidget):
         self.motion_limits_error_label = QLabel("")
         self.motion_limits_error_label.setWordWrap(True)
 
-    def _build_tracking_controls(self, config: TrackingControlConfig) -> None:
+    def _build_tracking_controls(
+        self,
+        config: TrackingControlConfig,
+        aiming_config: AimingConfig,
+    ) -> None:
         self.prediction_enabled_checkbox = QCheckBox(
             "Использовать прогноз для управления"
         )
@@ -263,41 +278,79 @@ class OperatorWindow(QWidget):
             "Интервал истории наблюдений для оценки скорости цели. "
             "Меньшее значение быстрее реагирует, большее лучше сглаживает шум."
         )
+        self.target_lost_timeout_input = QSpinBox()
+        self.target_lost_timeout_input.setRange(0, 5_000)
+        self.target_lost_timeout_input.setSingleStep(50)
+        self.target_lost_timeout_input.setSuffix(" мс")
+        self.target_lost_timeout_input.setValue(aiming_config.target_lost_timeout_ms)
+        self.target_lost_timeout_input.setMaximumWidth(150)
+        self.target_lost_timeout_input.setToolTip(
+            "Время, в течение которого турель продолжает последнюю успешно "
+            "применённую скорость после временной потери выбранной цели. "
+            "0 мс отключает удержание скорости и сохраняет прежнее поведение."
+        )
         self.tracking_apply_button = QPushButton("Применить настройки отслеживания")
         self.tracking_apply_button.clicked.connect(self._apply_tracking_tuning)
         self.tracking_status_label = QLabel("Статус отслеживания: —")
         self.tracking_status_label.setWordWrap(True)
         self.tracking_error_label = QLabel("")
         self.tracking_error_label.setWordWrap(True)
-        self.tracking_hfov_input = QDoubleSpinBox()
-        self.tracking_hfov_input.setRange(0.1, 178.99)
-        self.tracking_hfov_input.setSingleStep(0.1)
-        self.tracking_hfov_input.setDecimals(3)
-        self.tracking_hfov_input.setSuffix(" °")
-        self.tracking_hfov_input.setMaximumWidth(150)
-        if self._tracking_stereo_left_hfov_deg is not None:
-            self.tracking_hfov_input.setValue(self._tracking_stereo_left_hfov_deg)
-        self.tracking_hfov_input.setToolTip(
-            "Временный HFOV Stereo Left только для контура сопровождения. "
-            "Меняет перевод пикселей в углы для P/FF/Prediction, но не меняет "
-            "rectification и стереогеометрию."
+        self.tracking_hfov_inputs: dict[CameraRole, QDoubleSpinBox] = {}
+        self.tracking_hfov_apply_buttons: dict[CameraRole, QPushButton] = {}
+        self.tracking_hfov_status_labels: dict[CameraRole, QLabel] = {}
+        hfov_specs = (
+            (
+                CameraRole.STEREO_LEFT,
+                self._tracking_stereo_left_hfov_deg,
+                self._on_apply_tracking_stereo_left_hfov_deg,
+                "Stereo Left",
+            ),
+            (
+                CameraRole.STEREO_RIGHT,
+                self._tracking_stereo_right_hfov_deg,
+                self._on_apply_tracking_stereo_right_hfov_deg,
+                "Stereo Right",
+            ),
         )
-        self.tracking_hfov_apply_button = QPushButton("Применить HFOV")
-        self.tracking_hfov_apply_button.clicked.connect(
-            self._apply_tracking_hfov_tuning
-        )
-        hfov_available = (
-            self._tracking_stereo_left_hfov_deg is not None
-            and self._on_apply_tracking_stereo_left_hfov_deg is not None
-        )
-        self.tracking_hfov_input.setEnabled(hfov_available)
-        self.tracking_hfov_apply_button.setEnabled(hfov_available)
-        self.tracking_hfov_status_label = QLabel(
-            "HFOV сопровождения: —"
-            if self._tracking_stereo_left_hfov_deg is None
-            else f"HFOV сопровождения: {self._tracking_stereo_left_hfov_deg:.3f}°"
-        )
-        self.tracking_hfov_status_label.setWordWrap(True)
+        for camera, value, callback, label in hfov_specs:
+            field = QDoubleSpinBox()
+            field.setRange(0.1, 178.99)
+            field.setSingleStep(0.1)
+            field.setDecimals(3)
+            field.setSuffix(" °")
+            field.setMaximumWidth(150)
+            if value is not None:
+                field.setValue(value)
+            field.setToolTip(
+                f"Временный HFOV наведения {label}. Меняет перевод пикселей в углы "
+                "для MOVE_RELATIVE и TRACKING сразу после применения. Не меняет "
+                "rectification, стереогеометрию, stereo distance и сохранённую "
+                "калибровку движения."
+            )
+            button = QPushButton("Применить HFOV")
+            button.clicked.connect(
+                lambda _checked=False, role=camera: self._apply_tracking_hfov_tuning(role)
+            )
+            available = value is not None and callback is not None
+            field.setEnabled(available)
+            button.setEnabled(available)
+            status = QLabel(
+                "HFOV наведения: —"
+                if value is None
+                else f"HFOV наведения: {value:.3f}°"
+            )
+            status.setWordWrap(True)
+            self.tracking_hfov_inputs[camera] = field
+            self.tracking_hfov_apply_buttons[camera] = button
+            self.tracking_hfov_status_labels[camera] = status
+        # Compatibility aliases retained for existing Left-side tests/callers.
+        self.tracking_hfov_input = self.tracking_hfov_inputs[CameraRole.STEREO_LEFT]
+        self.tracking_hfov_apply_button = self.tracking_hfov_apply_buttons[
+            CameraRole.STEREO_LEFT
+        ]
+        self.tracking_hfov_status_label = self.tracking_hfov_status_labels[
+            CameraRole.STEREO_LEFT
+        ]
         self._sync_tracking_controls(config)
 
     def _build_visualization_controls(
@@ -721,13 +774,11 @@ class OperatorWindow(QWidget):
         tracking_layout.addWidget(self.prediction_enabled_checkbox, 0, 0, 1, 2)
         tracking_layout.addWidget(QLabel("Окно оценки скорости цели"), 1, 0)
         tracking_layout.addWidget(self.tracking_inputs["window_ms"], 1, 1)
-        tracking_layout.addWidget(QLabel("HFOV Stereo Left для сопровождения"), 2, 0)
-        tracking_layout.addWidget(self.tracking_hfov_input, 2, 1)
-        tracking_layout.addWidget(self.tracking_hfov_apply_button, 3, 0, 1, 2)
-        tracking_layout.addWidget(self.tracking_hfov_status_label, 4, 0, 1, 2)
-        tracking_layout.addWidget(self.tracking_apply_button, 5, 0, 1, 2)
-        tracking_layout.addWidget(self.tracking_status_label, 6, 0, 1, 2)
-        tracking_layout.addWidget(self.tracking_error_label, 7, 0, 1, 2)
+        tracking_layout.addWidget(QLabel("Продолжать движение после потери цели"), 2, 0)
+        tracking_layout.addWidget(self.target_lost_timeout_input, 2, 1)
+        tracking_layout.addWidget(self.tracking_apply_button, 3, 0, 1, 2)
+        tracking_layout.addWidget(self.tracking_status_label, 4, 0, 1, 2)
+        tracking_layout.addWidget(self.tracking_error_label, 5, 0, 1, 2)
         layout.addWidget(tracking_group)
         layout.addStretch(1)
         return page
@@ -743,6 +794,29 @@ class OperatorWindow(QWidget):
         for camera in _CAMERA_ORDER:
             reset_layout.addWidget(self.aim_point_reset_buttons[camera])
         layout.addWidget(reset_row)
+
+        self.control_hfov_group = QGroupBox("HFOV наведения")
+        hfov_layout = QGridLayout(self.control_hfov_group)
+        for row, (camera, label) in enumerate(
+            (
+                (CameraRole.STEREO_LEFT, "Stereo Left"),
+                (CameraRole.STEREO_RIGHT, "Stereo Right"),
+            )
+        ):
+            base_row = row * 3
+            hfov_layout.addWidget(QLabel(f"HFOV {label}"), base_row, 0)
+            hfov_layout.addWidget(self.tracking_hfov_inputs[camera], base_row, 1)
+            hfov_layout.addWidget(
+                self.tracking_hfov_apply_buttons[camera], base_row + 1, 0, 1, 2
+            )
+            hfov_layout.addWidget(
+                self.tracking_hfov_status_labels[camera], base_row + 2, 0, 1, 2
+            )
+        self.hfov_error_label = QLabel("")
+        self.hfov_error_label.setWordWrap(True)
+        hfov_layout.addWidget(self.hfov_error_label, 6, 0, 1, 2)
+        layout.addWidget(self.control_hfov_group)
+
         layout.addWidget(self.motion_calibration_button)
         layout.addWidget(self.video_latency_calibration_button)
         if self._on_show_video_latency_calibration is None:
@@ -911,6 +985,10 @@ class OperatorWindow(QWidget):
     def set_tracking_control_config(self, config: TrackingControlConfig) -> None:
         self._sync_tracking_controls(config)
 
+    def set_aiming_config(self, config: AimingConfig) -> None:
+        self._aiming_config = config
+        self.target_lost_timeout_input.setValue(config.target_lost_timeout_ms)
+
     def set_tracking_control_horizon_ms(self, horizon_ms: int) -> None:
         self._tracking_control_config = replace(
             self._tracking_control_config,
@@ -965,33 +1043,54 @@ class OperatorWindow(QWidget):
                 window_ms=self.tracking_inputs["window_ms"].value(),
             ),
         )
+        aiming_config = replace(
+            self._aiming_config,
+            target_lost_timeout_ms=self.target_lost_timeout_input.value(),
+        )
         try:
             self._on_apply_tracking_control_tuning(config)
         except (OSError, RuntimeError, TypeError, ValueError) as exc:
             self.tracking_error_label.setText(f"Ошибка отслеживания: {exc}")
             return
         self._tracking_control_config = config
+        try:
+            self._on_apply_aiming_tuning(aiming_config)
+        except (OSError, RuntimeError, TypeError, ValueError) as exc:
+            self.target_lost_timeout_input.setValue(
+                self._aiming_config.target_lost_timeout_ms
+            )
+            self.tracking_error_label.setText(f"Ошибка таймера потери цели: {exc}")
+            return
+        self._aiming_config = aiming_config
         self.tracking_error_label.clear()
         self.tracking_status_label.setText(
             "Отправлено: "
             f"Prediction={'ON' if config.prediction.enabled else 'OFF'}; "
-            f"окно={config.velocity_estimator.window_ms} мс"
+            f"окно={config.velocity_estimator.window_ms} мс; "
+            f"потеря цели={aiming_config.target_lost_timeout_ms} мс"
         )
 
-    def _apply_tracking_hfov_tuning(self) -> None:
-        callback = self._on_apply_tracking_stereo_left_hfov_deg
+    def _apply_tracking_hfov_tuning(self, camera: CameraRole) -> None:
+        callbacks = {
+            CameraRole.STEREO_LEFT: self._on_apply_tracking_stereo_left_hfov_deg,
+            CameraRole.STEREO_RIGHT: self._on_apply_tracking_stereo_right_hfov_deg,
+        }
+        callback = callbacks[camera]
         if callback is None:
             return
-        value = self.tracking_hfov_input.value()
+        value = self.tracking_hfov_inputs[camera].value()
         try:
             callback(value)
         except (OSError, RuntimeError, TypeError, ValueError) as exc:
-            self.tracking_error_label.setText(f"Ошибка HFOV сопровождения: {exc}")
+            self.hfov_error_label.setText(f"Ошибка HFOV наведения: {exc}")
             return
-        self._tracking_stereo_left_hfov_deg = value
-        self.tracking_error_label.clear()
-        self.tracking_hfov_status_label.setText(
-            f"HFOV сопровождения применён: {value:.3f}°"
+        if camera is CameraRole.STEREO_LEFT:
+            self._tracking_stereo_left_hfov_deg = value
+        else:
+            self._tracking_stereo_right_hfov_deg = value
+        self.hfov_error_label.clear()
+        self.tracking_hfov_status_labels[camera].setText(
+            f"HFOV наведения применён: {value:.3f}°"
         )
 
     def _detector_changed(self, camera: CameraRole) -> None:

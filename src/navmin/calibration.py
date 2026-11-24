@@ -489,15 +489,33 @@ def stereo_camera_models(
     )
 
 
-def stereo_left_horizontal_fov_deg(calibration: StereoCalibration) -> float:
-    """Return the effective horizontal FOV implied by rectified Stereo Left P1."""
+def _stereo_horizontal_fov_deg(
+    calibration: StereoCalibration,
+    *,
+    projection: tuple[tuple[float, ...], ...],
+    label: str,
+) -> float:
     if not isinstance(calibration, StereoCalibration):
         raise TypeError("calibration must be StereoCalibration")
-    focal_length_px = float(calibration.P1[0][0])
+    focal_length_px = float(projection[0][0])
     if not math.isfinite(focal_length_px) or focal_length_px <= 0.0:
-        raise ValueError("Stereo Left P1 horizontal focal length must be > 0")
+        raise ValueError(f"{label} horizontal focal length must be > 0")
     return math.degrees(
         2.0 * math.atan(calibration.image_width / (2.0 * focal_length_px))
+    )
+
+
+def stereo_left_horizontal_fov_deg(calibration: StereoCalibration) -> float:
+    """Return the effective horizontal FOV implied by rectified Stereo Left P1."""
+    return _stereo_horizontal_fov_deg(
+        calibration, projection=calibration.P1, label="Stereo Left P1"
+    )
+
+
+def stereo_right_horizontal_fov_deg(calibration: StereoCalibration) -> float:
+    """Return the effective horizontal FOV implied by rectified Stereo Right P2."""
+    return _stereo_horizontal_fov_deg(
+        calibration, projection=calibration.P2, label="Stereo Right P2"
     )
 
 
@@ -517,4 +535,5 @@ __all__ = [
     "overview_camera_model",
     "stereo_camera_models",
     "stereo_left_horizontal_fov_deg",
+    "stereo_right_horizontal_fov_deg",
 ]

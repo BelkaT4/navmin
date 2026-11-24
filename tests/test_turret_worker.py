@@ -292,6 +292,39 @@ def test_cross_thread_emergency_signal_never_writes_from_caller_thread() -> None
         _shutdown(worker)
 
 
+def test_relative_move_over_pc_limit_is_rejected_without_worker_failure() -> None:
+    endpoint = FakeStm32Endpoint()
+    factory = _RecordingFactory(endpoint)
+    worker = TurretWorker(_config(), transport_factory=factory)
+    worker.start()
+    try:
+        _wait_state(worker, TurretConnectionState.READY)
+        call_count = len(factory.calls)
+        before = len(endpoint.request_history)
+
+        worker.submit_move_relative(MoveRelativeCommand(45.1, 0.0))
+
+        # HAL validation happens before any protocol frame is emitted.  The
+        # invalid operator intent is rejected locally and the worker remains
+        # available for the next valid command.
+        Event().wait(0.05)
+        assert len(endpoint.request_history) == before
+        assert len(factory.calls) == call_count
+        assert worker.is_alive()
+        assert worker.ready
+        assert worker.current_state.connection_state is TurretConnectionState.READY
+
+        worker.submit_move_relative(MoveRelativeCommand(1.0, 0.0))
+        deadline = monotonic() + 1.0
+        while len(endpoint.request_history) == before:
+            assert monotonic() < deadline
+            Event().wait(0.002)
+        assert endpoint.request_history[-1].command is CommandCode.MOVE_RELATIVE
+        assert len(factory.calls) == call_count
+        assert worker.ready
+    finally:
+        _shutdown(worker)
+
 def test_invalid_request_id_resyncs_with_emergency_without_reconnect() -> None:
     endpoint = FakeStm32Endpoint()
     factory = _RecordingFactory(endpoint)
@@ -1359,6 +1392,57 @@ def test_emergency_preempts_video_latency_calibration_and_releases_ownership() -
         assert any(
             request.command is CommandCode.EMERGENCY_STOP
             for request in endpoint.executed_request_history
+        )
+    finally:
+        _shutdown(worker)
+
+
+def test_continue_tracking_motion_repeats_last_confirmed_velocity_through_latest_slot() -> None:
+    endpoint = FakeStm32Endpoint()
+    factory = _RecordingFactory(endpoint)
+    worker = TurretWorker(_config(), transport_factory=factory)
+    worker.start()
+    try:
+        _wait_state(worker, TurretConnectionState.READY)
+        assert worker.motor_on()
+        _wait_until(lambda: worker.current_state.motor_state is MotorState.ON)
+        assert worker.set_control_mode(TurretControlMode.TRACKING)
+        _wait_until(lambda: worker.current_state.control_mode is TurretControlMode.TRACKING)
+
+        history_start = len(endpoint.executed_request_history)
+        worker.submit_tracking_control(_tracking_sample(2.0, 1))
+        _wait_until(
+            lambda: len(
+                [
+                    request
+                    for request in endpoint.executed_request_history[history_start:]
+                    if request.command is CommandCode.SET_VELOCITY
+                    and isinstance(request.payload, SetVelocityPayload)
+                    and request.payload.velocity_x_steps_s != 0
+                ]
+            )
+            >= 1
+        )
+        first = [
+            request.payload
+            for request in endpoint.executed_request_history[history_start:]
+            if request.command is CommandCode.SET_VELOCITY
+            and isinstance(request.payload, SetVelocityPayload)
+            and request.payload.velocity_x_steps_s != 0
+        ][-1]
+
+        worker.continue_tracking_motion()
+        _wait_until(
+            lambda: len(
+                [
+                    request
+                    for request in endpoint.executed_request_history[history_start:]
+                    if request.command is CommandCode.SET_VELOCITY
+                    and isinstance(request.payload, SetVelocityPayload)
+                    and request.payload == first
+                ]
+            )
+            >= 2
         )
     finally:
         _shutdown(worker)
