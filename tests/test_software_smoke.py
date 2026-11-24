@@ -11,6 +11,7 @@ from pathlib import Path
 from time import monotonic, monotonic_ns, sleep
 
 import numpy as np
+import pytest
 
 from navmin.contracts import (
     CameraRole,
@@ -747,8 +748,9 @@ def test_tracking_ui_selection_drives_real_velocity_loop_to_fake_stm32() -> None
     assert not runtime.turret_worker.is_alive()
 
 
-def _right_motion_calibration_profile(
+def _motion_calibration_profile(
     runtime: SoftwareSmokeRuntime,
+    camera: CameraRole,
 ) -> CameraMotionCalibration:
     calibration = runtime.application.motion_calibration_runtime
     mechanics_x = MechanicalIdentity.from_config(calibration.axes.x)
@@ -769,10 +771,8 @@ def _right_motion_calibration_profile(
         quality_max_repeat_spread_deg=0.0,
     )
     return CameraMotionCalibration(
-        camera=CameraRole.STEREO_RIGHT,
-        camera_calibration_identity=calibration.camera_identities[
-            CameraRole.STEREO_RIGHT
-        ],
+        camera=camera,
+        camera_calibration_identity=calibration.camera_identities[camera],
         mechanical_identity_x=mechanics_x,
         mechanical_identity_y=mechanics_y,
         calibration_limit_x_deg=20.0,
@@ -781,6 +781,12 @@ def _right_motion_calibration_profile(
         axes={"x": axis, "y": axis},
         created_at_utc="2026-11-24T00:00:00+00:00",
     )
+
+
+def _right_motion_calibration_profile(
+    runtime: SoftwareSmokeRuntime,
+) -> CameraMotionCalibration:
+    return _motion_calibration_profile(runtime, CameraRole.STEREO_RIGHT)
 
 
 def _steps_for_deg(value_deg: float, *, full_steps: int, microstep: int) -> int:
@@ -987,6 +993,63 @@ def test_stereo_right_tracking_detector_reaches_fake_stm32_end_to_end(
             ),
             timeout=2.0,
             message="Stereo Right tracking did not reach fake STM32 SET_VELOCITY",
+        )
+
+        selected_before_hfov = runtime.mediator.selected_target
+        assert selected_before_hfov is not None
+        apply_velocity_baseline = len(executed(CommandCode.SET_VELOCITY))
+        right_hfov_input = window.operator_window.tracking_hfov_inputs[
+            CameraRole.STEREO_RIGHT
+        ]
+        right_hfov_button = window.operator_window.tracking_hfov_apply_buttons[
+            CameraRole.STEREO_RIGHT
+        ]
+        right_hfov_input.setValue(right_hfov_input.value() * 1.5)
+        QTest.mouseClick(right_hfov_button, Qt.MouseButton.LeftButton)
+
+        def post_apply_velocity_payloads() -> list[SetVelocityPayload]:
+            return [
+                request.payload
+                for request in executed(CommandCode.SET_VELOCITY)[
+                    apply_velocity_baseline:
+                ]
+                if isinstance(request.payload, SetVelocityPayload)
+            ]
+
+        pump_until(
+            lambda: any(
+                payload.velocity_x_steps_s == 0
+                and payload.velocity_y_steps_s == 0
+                for payload in post_apply_velocity_payloads()
+            ),
+            timeout=1.0,
+            message="HFOV Apply during tracking did not produce STOP boundary",
+        )
+        assert runtime.mediator.selected_target == selected_before_hfov
+
+        def resumed_after_stop() -> bool:
+            payloads = post_apply_velocity_payloads()
+            stop_index = next(
+                (
+                    index
+                    for index, payload in enumerate(payloads)
+                    if payload.velocity_x_steps_s == 0
+                    and payload.velocity_y_steps_s == 0
+                ),
+                None,
+            )
+            if stop_index is None:
+                return False
+            return any(
+                payload.velocity_x_steps_s != 0
+                or payload.velocity_y_steps_s != 0
+                for payload in payloads[stop_index + 1 :]
+            )
+
+        pump_until(
+            resumed_after_stop,
+            timeout=2.0,
+            message="tracking did not resume after HFOV Apply with the same target",
         )
     finally:
         if window is not None:
@@ -1196,6 +1259,393 @@ def test_stereo_right_relative_click_applies_motion_calibration_before_fake_stm3
     assert not runtime.stereo_right_producer.is_alive()
     assert not runtime.stereo_right_worker.is_alive()
     assert not runtime.turret_worker.is_alive()
+
+
+@pytest.mark.parametrize(
+    "camera,preview_attr",
+    (
+        (CameraRole.STEREO_LEFT, "preview_view"),
+        (CameraRole.STEREO_RIGHT, "preview_view_2"),
+    ),
+)
+def test_control_hfov_apply_immediately_changes_relative_payload_with_motion_calibration(
+    tmp_path: Path,
+    camera: CameraRole,
+    preview_attr: str,
+) -> None:
+    os.environ["QT_QPA_PLATFORM"] = "offscreen"
+
+    from PyQt6.QtCore import QPoint, Qt
+    from PyQt6.QtTest import QTest
+    from PyQt6.QtWidgets import QApplication
+
+    from navmin.ui import MainWindow
+
+    endpoint = FakeStm32Endpoint()
+
+    def transport_factory(
+        _port: str,
+        baudrate: int,
+        _emulate_stm32: bool,
+    ) -> FakeTransport:
+        return FakeTransport(endpoint, baudrate=baudrate)
+
+    runtime = SoftwareSmokeRuntime(
+        turret_transport_factory=transport_factory,
+        include_stereo_right=True,
+        motion_calibration_path=tmp_path / f"motion-{camera.value}.json",
+    )
+    runtime.application.motion_calibration_runtime.save_and_apply(
+        _motion_calibration_profile(runtime, camera),
+        extrapolation_percent=20.0,
+    )
+    application = QApplication.instance() or QApplication([])
+    window = None
+
+    def move_requests():
+        return [
+            request
+            for request in list(endpoint.executed_request_history)
+            if request.command is CommandCode.MOVE_RELATIVE
+        ]
+
+    try:
+        runtime.start()
+        ui = runtime.application.ui_dependencies
+        window = MainWindow(
+            mediator=runtime.mediator,
+            camera_bindings=runtime.camera_bindings(),
+            turret_states=runtime.turret_worker.state_updates,
+            camera_stale_timeout_ms=500,
+            aiming_config=ui.aiming_config,
+            apply_aiming_tuning=ui.apply_aiming_tuning,
+            pid_controller_config=ui.pid_controller_config,
+            apply_pid_tuning=ui.apply_pid_tuning,
+            stm32_config=ui.stm32_config,
+            apply_motion_limits_tuning=ui.apply_motion_limits_tuning,
+            vision_processor_selections=ui.vision_processor_selections,
+            apply_vision_processor_selection=ui.apply_vision_processor_selection,
+            tracking_control_config=ui.tracking_control_config,
+            apply_tracking_control_tuning=ui.apply_tracking_control_tuning,
+            tracking_stereo_left_hfov_deg=ui.tracking_stereo_left_hfov_deg,
+            apply_tracking_stereo_left_hfov_deg=(
+                ui.apply_tracking_stereo_left_hfov_deg
+            ),
+            tracking_stereo_right_hfov_deg=ui.tracking_stereo_right_hfov_deg,
+            apply_tracking_stereo_right_hfov_deg=(
+                ui.apply_tracking_stereo_right_hfov_deg
+            ),
+            ui_config=ui.ui_config,
+            start_timer=False,
+            start_fullscreen=False,
+        )
+        window.resize(900, 650)
+        window.show()
+        application.processEvents()
+
+        def pump_until(predicate, *, timeout: float, message: str) -> None:
+            deadline = monotonic() + timeout
+            while monotonic() < deadline:
+                window.state_pump.pump_once()
+                application.processEvents()
+                if predicate():
+                    return
+                sleep(0.005)
+            raise AssertionError(message)
+
+        preview = getattr(window, preview_attr)
+        pump_until(
+            lambda: (
+                runtime.mediator.turret_state.connection_state
+                is TurretConnectionState.READY
+                and runtime.mediator.session_gate.accepted_generation(camera) is not None
+                and preview.camera is camera
+                and preview.displayed_result is not None
+            ),
+            timeout=4.0,
+            message=f"{camera.value} did not become a live preview",
+        )
+        QTest.mouseClick(
+            preview,
+            Qt.MouseButton.LeftButton,
+            pos=preview.rect().center(),
+        )
+        pump_until(
+            lambda: (
+                runtime.mediator.main_camera is camera
+                and window.main_view.camera is camera
+                and window.main_view.displayed_result is not None
+                and window.main_view.interaction_allowed(
+                    runtime.mediator.session_gate,
+                    monotonic_ns(),
+                )
+            ),
+            timeout=2.0,
+            message=f"{camera.value} did not become the RELATIVE main camera",
+        )
+
+        displayed = window.main_view.displayed_result
+        assert displayed is not None
+        rendered = window.main_view.rendered_rect()
+        assert not rendered.isEmpty()
+        height, width = displayed.frame.image.shape[:2]
+        requested_x = width * 0.60
+        requested_y = height * 0.40
+        click = QPoint(
+            round(rendered.left() + requested_x * rendered.width() / width),
+            round(rendered.top() + requested_y * rendered.height() / height),
+        )
+        source_x = (click.x() - rendered.left()) * width / rendered.width()
+        source_y = (click.y() - rendered.top()) * height / rendered.height()
+        baseline_model = runtime.mediator.control_camera_model(
+            camera,
+            displayed.frame.generation,
+        )
+        assert baseline_model is not None
+        baseline_raw = runtime.mediator.aiming.relative_command(
+            camera_model=baseline_model,
+            frame=displayed.frame,
+            x_px=source_x,
+            y_px=source_y,
+        )
+        baseline_corrected = runtime.application.motion_calibration_runtime.correct(
+            camera,
+            baseline_raw,
+        )
+        assert baseline_corrected != baseline_raw
+
+        QTest.mouseClick(window.main_view, Qt.MouseButton.LeftButton, pos=click)
+        pump_until(
+            lambda: len(move_requests()) >= 1,
+            timeout=1.0,
+            message="baseline RELATIVE did not reach fake STM32",
+        )
+        baseline = move_requests()[-1].payload
+        assert isinstance(baseline, MoveRelativePayload)
+        axes = runtime.application.motion_calibration_runtime.axes
+        assert baseline.delta_x_steps == _steps_for_deg(
+            baseline_corrected.delta_x_deg,
+            full_steps=axes.x.full_steps_per_revolution,
+            microstep=axes.x.microstep_divider,
+        )
+        assert baseline.delta_y_steps == _steps_for_deg(
+            baseline_corrected.delta_y_deg,
+            full_steps=axes.y.full_steps_per_revolution,
+            microstep=axes.y.microstep_divider,
+        )
+
+        hfov_input = window.operator_window.tracking_hfov_inputs[camera]
+        hfov_button = window.operator_window.tracking_hfov_apply_buttons[camera]
+        baseline_hfov = hfov_input.value()
+        hfov_input.setValue(baseline_hfov * 1.5)
+        QTest.mouseClick(hfov_button, Qt.MouseButton.LeftButton)
+        application.processEvents()
+
+        updated_model = runtime.mediator.control_camera_model(
+            camera,
+            displayed.frame.generation,
+        )
+        assert updated_model is not None
+        updated_raw = runtime.mediator.aiming.relative_command(
+            camera_model=updated_model,
+            frame=displayed.frame,
+            x_px=source_x,
+            y_px=source_y,
+        )
+        updated_corrected = runtime.application.motion_calibration_runtime.correct(
+            camera,
+            updated_raw,
+        )
+        assert updated_corrected != updated_raw
+        assert abs(updated_corrected.delta_x_deg) > abs(baseline_corrected.delta_x_deg)
+        assert abs(updated_corrected.delta_y_deg) > abs(baseline_corrected.delta_y_deg)
+
+        baseline_count = len(move_requests())
+        QTest.mouseClick(window.main_view, Qt.MouseButton.LeftButton, pos=click)
+        pump_until(
+            lambda: len(move_requests()) == baseline_count + 1,
+            timeout=1.0,
+            message="post-HFOV RELATIVE did not reach fake STM32",
+        )
+        updated = move_requests()[-1].payload
+        assert isinstance(updated, MoveRelativePayload)
+        assert updated != baseline
+        assert updated.delta_x_steps == _steps_for_deg(
+            updated_corrected.delta_x_deg,
+            full_steps=axes.x.full_steps_per_revolution,
+            microstep=axes.x.microstep_divider,
+        )
+        assert updated.delta_y_steps == _steps_for_deg(
+            updated_corrected.delta_y_deg,
+            full_steps=axes.y.full_steps_per_revolution,
+            microstep=axes.y.microstep_divider,
+        )
+        assert runtime.application.motion_calibration_runtime.document.profiles[camera] == (
+            _motion_calibration_profile(runtime, camera)
+        )
+    finally:
+        if window is not None:
+            window.state_pump.stop()
+            window.close()
+            application.processEvents()
+        runtime.shutdown(timeout=1.0)
+
+
+def test_high_control_hfov_rejects_oversized_relative_and_worker_stays_ready(
+    tmp_path: Path,
+) -> None:
+    os.environ["QT_QPA_PLATFORM"] = "offscreen"
+
+    from PyQt6.QtCore import QPoint, Qt
+    from PyQt6.QtTest import QTest
+    from PyQt6.QtWidgets import QApplication
+
+    from navmin.ui import MainWindow
+
+    endpoint = FakeStm32Endpoint()
+
+    def transport_factory(
+        _port: str,
+        baudrate: int,
+        _emulate_stm32: bool,
+    ) -> FakeTransport:
+        return FakeTransport(endpoint, baudrate=baudrate)
+
+    runtime = SoftwareSmokeRuntime(
+        turret_transport_factory=transport_factory,
+        motion_calibration_path=tmp_path / "motion.json",
+    )
+    application = QApplication.instance() or QApplication([])
+    window = None
+
+    def move_requests():
+        return [
+            request
+            for request in list(endpoint.executed_request_history)
+            if request.command is CommandCode.MOVE_RELATIVE
+        ]
+
+    try:
+        runtime.start()
+        ui = runtime.application.ui_dependencies
+        window = MainWindow(
+            mediator=runtime.mediator,
+            camera_bindings=runtime.camera_bindings(),
+            turret_states=runtime.turret_worker.state_updates,
+            camera_stale_timeout_ms=500,
+            aiming_config=ui.aiming_config,
+            apply_aiming_tuning=ui.apply_aiming_tuning,
+            pid_controller_config=ui.pid_controller_config,
+            apply_pid_tuning=ui.apply_pid_tuning,
+            stm32_config=ui.stm32_config,
+            apply_motion_limits_tuning=ui.apply_motion_limits_tuning,
+            vision_processor_selections=ui.vision_processor_selections,
+            apply_vision_processor_selection=ui.apply_vision_processor_selection,
+            tracking_control_config=ui.tracking_control_config,
+            apply_tracking_control_tuning=ui.apply_tracking_control_tuning,
+            tracking_stereo_left_hfov_deg=ui.tracking_stereo_left_hfov_deg,
+            apply_tracking_stereo_left_hfov_deg=(
+                ui.apply_tracking_stereo_left_hfov_deg
+            ),
+            ui_config=ui.ui_config,
+            start_timer=False,
+            start_fullscreen=False,
+        )
+        window.resize(900, 650)
+        window.show()
+        application.processEvents()
+
+        def pump_until(predicate, *, timeout: float, message: str) -> None:
+            deadline = monotonic() + timeout
+            while monotonic() < deadline:
+                window.state_pump.pump_once()
+                application.processEvents()
+                if predicate():
+                    return
+                sleep(0.005)
+            raise AssertionError(message)
+
+        pump_until(
+            lambda: (
+                runtime.mediator.turret_state.connection_state
+                is TurretConnectionState.READY
+                and runtime.mediator.session_gate.accepted_generation(
+                    CameraRole.STEREO_LEFT
+                )
+                is not None
+                and window.preview_view.displayed_result is not None
+            ),
+            timeout=4.0,
+            message="Stereo Left did not become a live preview",
+        )
+        QTest.mouseClick(
+            window.preview_view,
+            Qt.MouseButton.LeftButton,
+            pos=window.preview_view.rect().center(),
+        )
+        pump_until(
+            lambda: (
+                window.main_view.camera is CameraRole.STEREO_LEFT
+                and window.main_view.displayed_result is not None
+                and window.main_view.interaction_allowed(
+                    runtime.mediator.session_gate,
+                    monotonic_ns(),
+                )
+            ),
+            timeout=2.0,
+            message="Stereo Left did not become the RELATIVE main camera",
+        )
+
+        hfov_input = window.operator_window.tracking_hfov_inputs[
+            CameraRole.STEREO_LEFT
+        ]
+        hfov_button = window.operator_window.tracking_hfov_apply_buttons[
+            CameraRole.STEREO_LEFT
+        ]
+        hfov_input.setValue(178.0)
+        QTest.mouseClick(hfov_button, Qt.MouseButton.LeftButton)
+        application.processEvents()
+
+        displayed = window.main_view.displayed_result
+        assert displayed is not None
+        rendered = window.main_view.rendered_rect()
+        assert not rendered.isEmpty()
+        height, width = displayed.frame.image.shape[:2]
+        click = QPoint(
+            round(rendered.left() + width * 0.95 * rendered.width() / width),
+            round(rendered.top() + height * 0.50 * rendered.height() / height),
+        )
+        before = len(move_requests())
+        QTest.mouseClick(window.main_view, Qt.MouseButton.LeftButton, pos=click)
+
+        no_motion_deadline = monotonic() + 0.25
+        while monotonic() < no_motion_deadline:
+            window.state_pump.pump_once()
+            application.processEvents()
+            assert len(move_requests()) == before
+            assert runtime.turret_worker.current_state.connection_state is (
+                TurretConnectionState.READY
+            )
+            sleep(0.005)
+
+        hfov_input.setValue(10.0)
+        QTest.mouseClick(hfov_button, Qt.MouseButton.LeftButton)
+        application.processEvents()
+        QTest.mouseClick(window.main_view, Qt.MouseButton.LeftButton, pos=click)
+        pump_until(
+            lambda: len(move_requests()) == before + 1,
+            timeout=1.0,
+            message="valid RELATIVE after high-HFOV rejection did not reach fake STM32",
+        )
+        assert runtime.turret_worker.current_state.connection_state is (
+            TurretConnectionState.READY
+        )
+    finally:
+        if window is not None:
+            window.state_pump.stop()
+            window.close()
+            application.processEvents()
+        runtime.shutdown(timeout=1.0)
 
 
 class _FailOpenTransport(FakeTransport):

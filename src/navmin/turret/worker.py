@@ -29,7 +29,7 @@ from navmin.diagnostic_logging import emit_event
 from navmin.lifecycle import StopToken, stop_and_join
 
 from .controller import ControllerError, TurretController
-from .hal import TurretHal
+from .hal import RelativeMoveLimitError, TurretHal
 from .protocol import ResultCode
 from .session import (
     SessionError,
@@ -421,6 +421,9 @@ class TurretWorker:
                     continue
                 except ControllerError as exc:
                     _LOGGER.warning("Rejected Turret control intent: %s", exc)
+                    continue
+                except RelativeMoveLimitError as exc:
+                    _LOGGER.warning("Rejected Turret relative move: %s", exc)
                     continue
                 except Exception:
                     _LOGGER.exception("Unrecoverable local Turret worker failure")

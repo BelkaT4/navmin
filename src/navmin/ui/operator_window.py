@@ -322,9 +322,10 @@ class OperatorWindow(QWidget):
             if value is not None:
                 field.setValue(value)
             field.setToolTip(
-                f"Временный HFOV {label} только для контура сопровождения. "
-                "Меняет перевод пикселей в углы для P/FF/Prediction, но не меняет "
-                "rectification и стереогеометрию."
+                f"Временный HFOV наведения {label}. Меняет перевод пикселей в углы "
+                "для MOVE_RELATIVE и TRACKING сразу после применения. Не меняет "
+                "rectification, стереогеометрию, stereo distance и сохранённую "
+                "калибровку движения."
             )
             button = QPushButton("Применить HFOV")
             button.clicked.connect(
@@ -334,9 +335,9 @@ class OperatorWindow(QWidget):
             field.setEnabled(available)
             button.setEnabled(available)
             status = QLabel(
-                "HFOV сопровождения: —"
+                "HFOV наведения: —"
                 if value is None
-                else f"HFOV сопровождения: {value:.3f}°"
+                else f"HFOV наведения: {value:.3f}°"
             )
             status.setWordWrap(True)
             self.tracking_hfov_inputs[camera] = field
@@ -775,29 +776,9 @@ class OperatorWindow(QWidget):
         tracking_layout.addWidget(self.tracking_inputs["window_ms"], 1, 1)
         tracking_layout.addWidget(QLabel("Продолжать движение после потери цели"), 2, 0)
         tracking_layout.addWidget(self.target_lost_timeout_input, 2, 1)
-        tracking_layout.addWidget(QLabel("HFOV Stereo Left для сопровождения"), 3, 0)
-        tracking_layout.addWidget(
-            self.tracking_hfov_inputs[CameraRole.STEREO_LEFT], 3, 1
-        )
-        tracking_layout.addWidget(
-            self.tracking_hfov_apply_buttons[CameraRole.STEREO_LEFT], 4, 0, 1, 2
-        )
-        tracking_layout.addWidget(
-            self.tracking_hfov_status_labels[CameraRole.STEREO_LEFT], 5, 0, 1, 2
-        )
-        tracking_layout.addWidget(QLabel("HFOV Stereo Right для сопровождения"), 6, 0)
-        tracking_layout.addWidget(
-            self.tracking_hfov_inputs[CameraRole.STEREO_RIGHT], 6, 1
-        )
-        tracking_layout.addWidget(
-            self.tracking_hfov_apply_buttons[CameraRole.STEREO_RIGHT], 7, 0, 1, 2
-        )
-        tracking_layout.addWidget(
-            self.tracking_hfov_status_labels[CameraRole.STEREO_RIGHT], 8, 0, 1, 2
-        )
-        tracking_layout.addWidget(self.tracking_apply_button, 9, 0, 1, 2)
-        tracking_layout.addWidget(self.tracking_status_label, 10, 0, 1, 2)
-        tracking_layout.addWidget(self.tracking_error_label, 11, 0, 1, 2)
+        tracking_layout.addWidget(self.tracking_apply_button, 3, 0, 1, 2)
+        tracking_layout.addWidget(self.tracking_status_label, 4, 0, 1, 2)
+        tracking_layout.addWidget(self.tracking_error_label, 5, 0, 1, 2)
         layout.addWidget(tracking_group)
         layout.addStretch(1)
         return page
@@ -813,6 +794,29 @@ class OperatorWindow(QWidget):
         for camera in _CAMERA_ORDER:
             reset_layout.addWidget(self.aim_point_reset_buttons[camera])
         layout.addWidget(reset_row)
+
+        self.control_hfov_group = QGroupBox("HFOV наведения")
+        hfov_layout = QGridLayout(self.control_hfov_group)
+        for row, (camera, label) in enumerate(
+            (
+                (CameraRole.STEREO_LEFT, "Stereo Left"),
+                (CameraRole.STEREO_RIGHT, "Stereo Right"),
+            )
+        ):
+            base_row = row * 3
+            hfov_layout.addWidget(QLabel(f"HFOV {label}"), base_row, 0)
+            hfov_layout.addWidget(self.tracking_hfov_inputs[camera], base_row, 1)
+            hfov_layout.addWidget(
+                self.tracking_hfov_apply_buttons[camera], base_row + 1, 0, 1, 2
+            )
+            hfov_layout.addWidget(
+                self.tracking_hfov_status_labels[camera], base_row + 2, 0, 1, 2
+            )
+        self.hfov_error_label = QLabel("")
+        self.hfov_error_label.setWordWrap(True)
+        hfov_layout.addWidget(self.hfov_error_label, 6, 0, 1, 2)
+        layout.addWidget(self.control_hfov_group)
+
         layout.addWidget(self.motion_calibration_button)
         layout.addWidget(self.video_latency_calibration_button)
         if self._on_show_video_latency_calibration is None:
@@ -1078,15 +1082,15 @@ class OperatorWindow(QWidget):
         try:
             callback(value)
         except (OSError, RuntimeError, TypeError, ValueError) as exc:
-            self.tracking_error_label.setText(f"Ошибка HFOV сопровождения: {exc}")
+            self.hfov_error_label.setText(f"Ошибка HFOV наведения: {exc}")
             return
         if camera is CameraRole.STEREO_LEFT:
             self._tracking_stereo_left_hfov_deg = value
         else:
             self._tracking_stereo_right_hfov_deg = value
-        self.tracking_error_label.clear()
+        self.hfov_error_label.clear()
         self.tracking_hfov_status_labels[camera].setText(
-            f"HFOV сопровождения применён: {value:.3f}°"
+            f"HFOV наведения применён: {value:.3f}°"
         )
 
     def _detector_changed(self, camera: CameraRole) -> None:

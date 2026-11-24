@@ -1036,7 +1036,7 @@ class MainWindow(QMainWindow):
         model = (
             None
             if result is None or not is_control_main
-            else self._mediator.tracking_camera_model(
+            else self._mediator.control_camera_model(
                 result.frame.camera,
                 result.frame.generation,
             )
@@ -1276,7 +1276,7 @@ class MainWindow(QMainWindow):
         control_prediction = None
         control_state = None
         if control is not None:
-            model = self._mediator.session_gate.camera_model(
+            model = self._mediator.control_camera_model(
                 result.frame.camera, result.frame.generation
             )
             projected = (

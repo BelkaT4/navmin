@@ -456,6 +456,93 @@ def test_stereo_right_relative_click_uses_shared_aiming_and_correction_path() ->
     assert turret.relative_commands[0].delta_x_deg > 0
 
 
+@pytest.mark.parametrize(
+    ("camera", "nominal_hfov_deg"),
+    (
+        (CameraRole.STEREO_LEFT, 10.0),
+        (CameraRole.STEREO_RIGHT, 12.0),
+    ),
+)
+def test_hfov_override_still_changes_corrected_relative_move_with_motion_calibration(
+    camera: CameraRole, nominal_hfov_deg: float
+) -> None:
+    correction = _CameraCorrection()
+    mediator, turret, _controls_value = _mediator(
+        main=camera,
+        include_stereo_right=camera is CameraRole.STEREO_RIGHT,
+        motion_calibration=correction,
+        tracking_stereo_left_nominal_hfov_deg=(
+            nominal_hfov_deg if camera is CameraRole.STEREO_LEFT else None
+        ),
+        tracking_stereo_right_nominal_hfov_deg=(
+            nominal_hfov_deg if camera is CameraRole.STEREO_RIGHT else None
+        ),
+    )
+    result = _accept_main(mediator)
+
+    assert mediator.handle_relative_click(result, 60, 40)
+    before = turret.relative_commands[-1]
+
+    mediator.set_tracking_hfov_deg(camera, nominal_hfov_deg * 2.0)
+    assert mediator.handle_relative_click(result, 60, 40)
+    after = turret.relative_commands[-1]
+
+    assert correction.cameras == [camera, camera]
+    assert abs(after.delta_x_deg) > abs(before.delta_x_deg)
+
+
+@pytest.mark.parametrize(
+    ("camera", "nominal_hfov_deg"),
+    (
+        (CameraRole.STEREO_LEFT, 10.0),
+        (CameraRole.STEREO_RIGHT, 12.0),
+    ),
+)
+def test_stereo_hfov_override_changes_next_relative_move_immediately(
+    camera: CameraRole, nominal_hfov_deg: float
+) -> None:
+    mediator, turret, _controls_value = _mediator(
+        main=camera,
+        include_stereo_right=camera is CameraRole.STEREO_RIGHT,
+        tracking_stereo_left_nominal_hfov_deg=(
+            nominal_hfov_deg if camera is CameraRole.STEREO_LEFT else None
+        ),
+        tracking_stereo_right_nominal_hfov_deg=(
+            nominal_hfov_deg if camera is CameraRole.STEREO_RIGHT else None
+        ),
+    )
+    result = _accept_main(mediator)
+    base_model = mediator.session_gate.camera_model(camera, 1)
+    assert base_model is not None
+
+    assert mediator.handle_relative_click(result, 60.0, 40.0)
+    baseline_command = turret.relative_commands[-1]
+
+    mediator.set_tracking_hfov_deg(camera, nominal_hfov_deg * 2.0)
+
+    assert mediator.session_gate.camera_model(camera, 1) is base_model
+    assert mediator.control_camera_model(camera, 1) is not base_model
+    assert mediator.handle_relative_click(result, 60.0, 40.0)
+    updated_command = turret.relative_commands[-1]
+
+    assert abs(updated_command.delta_x_deg) > abs(baseline_command.delta_x_deg)
+    assert updated_command.delta_y_deg == pytest.approx(
+        baseline_command.delta_y_deg
+    )
+
+
+def test_overview_relative_move_keeps_nominal_camera_model() -> None:
+    mediator, turret, _controls_value = _mediator(
+        tracking_stereo_left_nominal_hfov_deg=10.0,
+    )
+    result = _accept_main(mediator)
+    base_model = mediator.session_gate.camera_model(CameraRole.OVERVIEW, 1)
+
+    assert mediator.control_camera_model(CameraRole.OVERVIEW, 1) is base_model
+    assert mediator.handle_relative_click(result, 60.0, 40.0)
+    assert len(turret.relative_commands) == 1
+
+
 def test_stereo_right_tracking_select_acquire_hold_and_reacquire_uses_shared_path() -> None:
     clock = _FakeClock(10_000_000_000)
     mediator, turret, controls = _mediator(
@@ -1013,7 +1100,7 @@ def test_control_visualization_is_exact_frame_bound_and_cleared_on_new_select() 
     assert mediator.tracking_control_visualization is None
 
 
-def test_stereo_left_tracking_hfov_override_changes_control_geometry_only() -> None:
+def test_stereo_left_tracking_hfov_override_changes_shared_control_geometry() -> None:
     mediator, turret, _controls_value = _mediator(
         mode=TurretControlMode.TRACKING,
         main=CameraRole.STEREO_LEFT,
@@ -1026,13 +1113,19 @@ def test_stereo_left_tracking_hfov_override_changes_control_geometry_only() -> N
     base_model = mediator.session_gate.camera_model(CameraRole.STEREO_LEFT, 1)
     assert base_model is not None
     baseline_invalidations = turret.invalidations
+    baseline_stops = turret.stop_requests
+    selected = mediator.selected_target
+    assert selected is not None
 
     mediator.set_tracking_stereo_left_hfov_deg(20.0)
 
     assert mediator.tracking_stereo_left_hfov_deg == 20.0
+    assert mediator.selected_target == selected
     assert mediator.session_gate.camera_model(CameraRole.STEREO_LEFT, 1) is base_model
+    assert mediator.control_camera_model(CameraRole.STEREO_LEFT, 1) is not base_model
     assert mediator.tracking_camera_model(CameraRole.STEREO_LEFT, 1) is not base_model
     assert turret.invalidations == baseline_invalidations + 1
+    assert turret.stop_requests == baseline_stops + 1
     assert mediator.tracking_estimator.sample_count == 0
 
     updated = _result(
@@ -1057,7 +1150,6 @@ def test_stereo_left_tracking_hfov_override_rejects_invalid_values() -> None:
     for invalid in (0.0, 179.0, float("nan"), float("inf")):
         with pytest.raises(ValueError):
             mediator.set_tracking_stereo_left_hfov_deg(invalid)
-
 
 
 @pytest.mark.parametrize(
@@ -1098,14 +1190,20 @@ def test_stereo_tracking_hfov_override_is_camera_specific(
         else CameraRole.STEREO_LEFT
     )
     other_before = mediator.tracking_hfov_deg(other_camera)
+    selected = mediator.selected_target
+    assert selected is not None
+    stops_before = turret.stop_requests
 
     getattr(mediator, setter_name)(20.0)
 
     assert getattr(mediator, property_name) == 20.0
+    assert mediator.selected_target == selected
     assert mediator.tracking_hfov_deg(other_camera) == other_before
     assert mediator.session_gate.camera_model(camera, 1) is base_model
+    assert mediator.control_camera_model(camera, 1) is not base_model
     assert mediator.tracking_camera_model(camera, 1) is not base_model
     assert turret.invalidations == baseline_invalidations + 1
+    assert turret.stop_requests == stops_before + 1
     assert mediator.tracking_estimator.sample_count == 0
 
     updated = _result(camera, 1, frame_id=5, timestamp_ns=50_000_000)
@@ -1114,6 +1212,93 @@ def test_stereo_tracking_hfov_override_is_camera_specific(
     assert abs(override_sample.real_error_x_deg) > abs(
         baseline_sample.real_error_x_deg
     )
+
+
+def test_hfov_change_for_other_stereo_camera_does_not_interrupt_active_tracking() -> None:
+    mediator, turret, _controls_value = _mediator(
+        mode=TurretControlMode.TRACKING,
+        main=CameraRole.STEREO_LEFT,
+        include_stereo_right=True,
+        tracking_stereo_left_nominal_hfov_deg=10.0,
+        tracking_stereo_right_nominal_hfov_deg=12.0,
+    )
+    initial = _accept_main(mediator)
+    request = _request(mediator, initial)
+    assert mediator.accept_target_lifecycle_event(_acquired(request))
+    selected = mediator.selected_target
+    assert selected is not None
+    invalidations_before = turret.invalidations
+    stops_before = turret.stop_requests
+    samples_before = mediator.tracking_estimator.sample_count
+
+    mediator.set_tracking_stereo_right_hfov_deg(24.0)
+
+    assert mediator.selected_target == selected
+    assert turret.invalidations == invalidations_before
+    assert turret.stop_requests == stops_before
+    assert mediator.tracking_estimator.sample_count == samples_before
+
+
+@pytest.mark.parametrize(
+    ("camera", "nominal_hfov_deg"),
+    (
+        (CameraRole.STEREO_LEFT, 10.0),
+        (CameraRole.STEREO_RIGHT, 12.0),
+    ),
+)
+def test_hfov_change_stops_old_target_loss_hold_until_fresh_reacquisition(
+    camera: CameraRole,
+    nominal_hfov_deg: float,
+) -> None:
+    mediator, turret, _controls_value = _mediator(
+        mode=TurretControlMode.TRACKING,
+        main=camera,
+        include_stereo_right=True,
+        target_lost_timeout_ms=500,
+        tracking_stereo_left_nominal_hfov_deg=(
+            nominal_hfov_deg if camera is CameraRole.STEREO_LEFT else 10.0
+        ),
+        tracking_stereo_right_nominal_hfov_deg=(
+            nominal_hfov_deg if camera is CameraRole.STEREO_RIGHT else 12.0
+        ),
+    )
+    initial = _accept_main(mediator)
+    request = _request(mediator, initial)
+    assert mediator.accept_target_lifecycle_event(_acquired(request))
+    selected = mediator.selected_target
+    assert selected is not None
+
+    assert mediator.accept_vision_result(
+        _result(camera, 1, frame_id=5, track_ids=())
+    )
+    assert turret.continue_tracking_requests == 1
+    invalidations_before = turret.invalidations
+    stops_before = turret.stop_requests
+    controls_before = len(turret.tracking_controls)
+
+    mediator.set_tracking_hfov_deg(camera, nominal_hfov_deg * 2.0)
+
+    assert mediator.selected_target == selected
+    assert turret.invalidations == invalidations_before + 1
+    assert turret.stop_requests == stops_before + 1
+    assert turret.continue_tracking_requests == 1
+
+    assert mediator.accept_vision_result(
+        _result(camera, 1, frame_id=6, track_ids=())
+    )
+    assert turret.continue_tracking_requests == 1
+    assert turret.stop_requests == stops_before + 1
+
+    assert mediator.accept_vision_result(
+        _result(camera, 1, frame_id=7, timestamp_ns=3_000_000_000)
+    )
+    assert mediator.selected_target == selected
+    assert len(turret.tracking_controls) == controls_before + 1
+
+    assert mediator.accept_vision_result(
+        _result(camera, 1, frame_id=8, track_ids=())
+    )
+    assert turret.continue_tracking_requests == 2
 
 
 def test_stereo_tracking_hfov_generic_api_rejects_non_stereo_camera() -> None:

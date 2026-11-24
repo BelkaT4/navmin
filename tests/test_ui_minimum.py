@@ -17,6 +17,7 @@ from PyQt6.QtGui import QPixmap, QWheelEvent
 from PyQt6.QtTest import QTest
 from PyQt6.QtWidgets import QApplication, QDoubleSpinBox, QMessageBox, QScrollArea
 
+import navmin.ui.motion_calibration_window as motion_calibration_window_module
 from navmin.calibration import load_stereo_calibration, stereo_camera_models
 from navmin.concurrency import (
     CameraSessionBarrierChannel,
@@ -73,7 +74,11 @@ from navmin.core import (
     TrackingEstimatorDiagnostics,
 )
 from navmin.imu import GyroBiasState, ImuRuntimeState, ImuSourceIdentity
-from navmin.motion_calibration import MotionCalibrationRuntime, MotionProfile
+from navmin.motion_calibration import (
+    MotionCalibrationRuntime,
+    MotionCalibrationWizard,
+    MotionProfile,
+)
 from navmin.recording import RecordingRuntime, RecordingSessionInfo
 from navmin.ui import (
     CameraUiBinding,
@@ -2878,6 +2883,139 @@ def test_operator_tracking_panel_applies_and_retains_target_loss_timeout(
     window.close()
 
 
+def test_control_hfov_ui_describes_immediate_relative_and_tracking_geometry(
+    qt_application: QApplication,
+) -> None:
+    window, _mediator, _turret, _bindings_value, _states = _window(qt_application)
+    operator = window.operator_window
+
+    assert operator.control_hfov_group.title() == "HFOV наведения"
+    tooltip = operator.tracking_hfov_input.toolTip()
+    assert "MOVE_RELATIVE" in tooltip
+    assert "TRACKING" in tooltip
+    assert "сразу после применения" in tooltip
+    assert "stereo distance" in tooltip
+    assert "калибровку движения" in tooltip
+    assert "HFOV наведения" in operator.tracking_hfov_status_label.text()
+    window.close()
+
+
+def test_hfov_apply_does_not_modify_motion_calibration_file(
+    qt_application: QApplication,
+    tmp_path: Path,
+) -> None:
+    axis = AxisMechanicsConfig(False, 200, 16, 45.0)
+    path = tmp_path / "motion.json"
+    path.write_text(
+        json.dumps(
+            {
+                "schema_version": 2,
+                "extrapolation_percent": 20.0,
+                "profiles": {},
+            },
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    runtime = MotionCalibrationRuntime.load(
+        path=path,
+        axes=AxesConfig(axis, axis),
+        camera_identities={
+            CameraRole.OVERVIEW: "sha256:overview",
+            CameraRole.STEREO_LEFT: "sha256:stereo",
+        },
+    )
+    before = path.read_bytes()
+    window, mediator, _turret, _bindings_value, _states = _window(
+        qt_application,
+        motion_calibration_runtime=runtime,
+    )
+    operator = window.operator_window
+
+    operator.tracking_hfov_input.setValue(10.0)
+    QTest.mouseClick(operator.tracking_hfov_apply_button, Qt.MouseButton.LeftButton)
+
+    assert mediator.tracking_stereo_left_hfov_deg == pytest.approx(10.0)
+    assert path.read_bytes() == before
+    assert runtime.document.profiles == {}
+    window.close()
+
+
+def test_motion_calibration_preflight_and_measurement_keep_nominal_camera_model_after_hfov(
+    qt_application: QApplication,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    axis = AxisMechanicsConfig(False, 200, 16, 45.0)
+    runtime = MotionCalibrationRuntime(
+        path=tmp_path / "motion.json",
+        axes=AxesConfig(axis, axis),
+        camera_identities={
+            CameraRole.OVERVIEW: "sha256:overview",
+            CameraRole.STEREO_LEFT: "sha256:stereo",
+        },
+    )
+    begun: list[MotionProfile] = []
+    window, mediator, _turret, _bindings_value, _states = _window(
+        qt_application,
+        motion_calibration_runtime=runtime,
+        begin_motion_calibration_profile=begun.append,
+        restore_motion_calibration_profile=lambda: None,
+    )
+    assert mediator.accept_camera_session(_session(CameraRole.STEREO_LEFT, 1))
+    mediator.swap_main_preview()
+    nominal_model = mediator.session_gate.camera_model(CameraRole.STEREO_LEFT, 1)
+    assert nominal_model is not None
+    mediator.set_tracking_stereo_left_hfov_deg(12.6)
+    assert mediator.control_camera_model(CameraRole.STEREO_LEFT, 1) is not nominal_model
+
+    calibration = window.motion_calibration_window
+    assert calibration is not None
+    calibration.camera_combo.setCurrentIndex(1)
+    result = _result(CameraRole.STEREO_LEFT, 1)
+    calibration.accept_vision_result(result)
+
+    preflight_models: list[object] = []
+    original_assess = motion_calibration_window_module.assess_calibration_plan
+
+    def capture_assessment(*, camera_model, **kwargs):
+        preflight_models.append(camera_model)
+        return original_assess(camera_model=camera_model, **kwargs)
+
+    monkeypatch.setattr(
+        motion_calibration_window_module,
+        "assess_calibration_plan",
+        capture_assessment,
+    )
+    calibration._start()
+
+    assert begun
+    assert preflight_models == [nominal_model]
+    measurement_models: list[object] = []
+
+    def capture_click(
+        self,
+        *,
+        frame,
+        camera_model,
+        x_px,
+        y_px,
+    ):
+        del self, frame, x_px, y_px
+        measurement_models.append(camera_model)
+        return False
+
+    monkeypatch.setattr(MotionCalibrationWizard, "handle_click", capture_click)
+    assert calibration.handle_click(result, 50.0, 40.0)
+    assert measurement_models == [nominal_model]
+
+    calibration.abort("test complete")
+    window.close()
+    qt_application.processEvents()
+
+
 def test_operator_tracking_hfov_uses_numeric_degrees_and_applies_runtime_override(
     qt_application: QApplication,
 ) -> None:
@@ -2889,14 +3027,16 @@ def test_operator_tracking_hfov_uses_numeric_degrees_and_applies_runtime_overrid
     assert operator.tracking_hfov_input.suffix() == " °"
     assert operator.tracking_hfov_input.singleStep() == pytest.approx(0.1)
     invalidations = turret.invalidations
+    stops = turret.stop_requests
 
     operator.tracking_hfov_input.setValue(10.0)
     QTest.mouseClick(operator.tracking_hfov_apply_button, Qt.MouseButton.LeftButton)
 
     assert mediator.tracking_stereo_left_hfov_deg == pytest.approx(10.0)
-    assert turret.invalidations == invalidations + 1
+    assert turret.invalidations == invalidations
+    assert turret.stop_requests == stops
     assert "10.000°" in operator.tracking_hfov_status_label.text()
-    assert operator.tracking_error_label.text() == ""
+    assert operator.hfov_error_label.text() == ""
     window.close()
 
 
@@ -2916,15 +3056,17 @@ def test_operator_tracking_hfov_right_is_independent_from_left(
     assert right_input.value() == pytest.approx(6.5)
     left_before = mediator.tracking_stereo_left_hfov_deg
     invalidations = turret.invalidations
+    stops = turret.stop_requests
 
     right_input.setValue(11.0)
     QTest.mouseClick(right_button, Qt.MouseButton.LeftButton)
 
     assert mediator.tracking_stereo_right_hfov_deg == pytest.approx(11.0)
     assert mediator.tracking_stereo_left_hfov_deg == left_before
-    assert turret.invalidations == invalidations + 1
+    assert turret.invalidations == invalidations
+    assert turret.stop_requests == stops
     assert "11.000°" in right_status.text()
-    assert operator.tracking_error_label.text() == ""
+    assert operator.hfov_error_label.text() == ""
     window.close()
 
 def test_operator_ff_apply_is_independent_from_tracking_apply(
@@ -3701,4 +3843,66 @@ def test_recording_button_writes_exact_frame_jsonl_and_selection(
     assert lines[1]["selection"] is None
     assert window.recording_button.text() == "REC"
     assert window.recording_time_label.text() == "00:00:00"
+    window.close()
+
+
+def test_recording_control_prediction_uses_control_camera_model(
+    qt_application: QApplication,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = RecordingRuntime(
+        tmp_path,
+        video_writer_factory=_FakeRecordingWriter,
+    )
+    window, mediator, _turret, _bindings_value, _turret_states = _window(
+        qt_application,
+        mode=TurretControlMode.TRACKING,
+        recording_runtime=runtime,
+    )
+    camera = CameraRole.STEREO_LEFT
+    generation = 1
+    result = _result(camera, generation, frame_id=9)
+    target = TargetRef(camera, generation, 7)
+    control = _control_visualization(camera, generation, result.frame.frame_id)
+    mediator._selected_target = target
+    mediator._tracking_control_visualization = control
+    runtime.start(
+        camera=camera,
+        width=result.frame.image.shape[1],
+        height=result.frame.image.shape[0],
+        nominal_fps=20.0,
+        vision_backend="Vt11VisionProcessor",
+    )
+    window._recording_camera = camera
+
+    control_model = object()
+    seen_models: list[object] = []
+
+    monkeypatch.setattr(
+        mediator,
+        "control_camera_model",
+        lambda requested_camera, requested_generation: (
+            control_model
+            if (requested_camera, requested_generation) == (camera, generation)
+            else None
+        ),
+    )
+
+    class _Projected:
+        observed_px = (50.0, 25.0)
+        predicted_px = (55.0, 27.0)
+
+    def _project(_control, model):
+        seen_models.append(model)
+        return _Projected()
+
+    monkeypatch.setattr("navmin.ui.main_window.project_control_prediction", _project)
+
+    window._recording_accept_result(result, None)
+
+    assert seen_models == [control_model]
+    assert window._recording_pending is not None
+    assert window._recording_pending.control_prediction is not None
+    window._stop_recording()
     window.close()
