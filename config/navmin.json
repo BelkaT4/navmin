@@ -1,5 +1,5 @@
 {
-  "schema-version": 7,
+  "schema-version": 8,
   "vision": {
     "processing-scope": "main-and-preview",
     "cameras": {
@@ -36,9 +36,9 @@
           "port": 8890,
           "buffer-size": 1
         },
-        "processing-enabled": false,
-        "vision-processor-class": "Legacy14VisionProcessor",
-        "vision-processor-profile": "default"
+        "processing-enabled": true,
+        "vision-processor-class": "Vt11VisionProcessor",
+        "vision-processor-profile": "day"
       }
     },
     "distance": {
@@ -56,7 +56,7 @@
     "simulation-mode": false
   },
   "aiming": {
-    "target-lost-timeout-ms": 500,
+    "target-lost-timeout-ms": 2000,
     "aim-points": {
       "overview": {
         "x-px": null,
@@ -157,6 +157,11 @@
     "default-camera": "overview",
     "show-fps": true,
     "show-stereo-right-diagnostics": false,
-    "show-stereo-right-camera": false
+    "show-stereo-right-camera": true,
+    "vt11": {
+      "low-light-blur-mode": true,
+      "auto-select-candidate-on-first-click": true,
+      "candidate-click-tolerance-px": 15
+    }
   }
 }
